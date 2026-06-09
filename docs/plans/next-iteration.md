@@ -65,7 +65,16 @@ M7 只给了边界 + StubOcr。接一个真实模型证明可插拔端到端。
 - [ ] 列检测修 M3 多栏左列；列表层级；title-case 同字号标题（amt/韩文）——**确定性天花板，属 N3 外接**。
 - **验收**：经 `compare_docling.py` 持续回升。
 
-> **本会话进展（参 veraPDF/ODL/Docling 源码 + harness 数据驱动）**：表格召回 **1/6→5/6**；TEDS **0.006→0.101**；NID 0.601→**0.640**；MHS 0.265→**0.603**。速度始终领先（5MB 单二进制 / <10ms / 700 页/s / 零依赖）。**剩余大头是表格结构精度**（神经领域，Docling TableFormer）与同字号/非拉丁标题（属 N3 外接模型）——确定性已近天花板。
+> **本会话进展（参 veraPDF/ODL/Docling 源码 + harness 数据驱动）**：表格召回 1/6→5/6；TEDS 0.006→0.101；NID 0.601→**0.697**；MHS 0.265→**0.610**。速度始终领先。
+
+### 与 ODL 同台（`compare_odl.py`，ODL 是确定性同类，水平**可达**）
+
+跑通 ODL（MS OpenJDK 21；brew openjdk 原生库损坏）拿全 15 份 born-digital 输出对比，**结论明确**：
+- **文本/阅读顺序/标题：已基本追平 ODL**——code_and_formula 0.999/1.0/1.0、picture_classification 0.998、2305-pg9 0.990/—/1.0。在这些维度我们=确定性同类水平。
+- **表格检出覆盖：明显落后**——ODL `wcag-algs` 确定性检出**远多**于我方（2203：ODL 13 vs 我方 3；2305 全：12 vs 2；amt：4 vs 0）。这是**确定性可达**的差距，非神经领域。
+- 汇总（LTR 12）：NID 0.651、MHS 0.583、含表 TEDS 0.052。
+
+**→ 达 ODL 水平的明确路径**：把表格**检出覆盖**做到 ODL 级——深挖 `veraPDF-wcag-algs` 的 `TableBorderConsumer`/`ClusterTableConsumer`（比我方 bordered+booktabs+borderless 覆盖更多表型）。确定性、可量化、可达。这是下一步最高价值项。
 
 ### N5 · 安全预检与复杂度画像 — *模块 9*（可随时插入）
 接入面的治理层，面向 agent/RAG 的安全底线。
