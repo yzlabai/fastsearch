@@ -17,7 +17,7 @@
 use crate::font::FontInfo;
 use crate::matrix::Matrix;
 use docparse_core::ir::{BBox, Element, Page, TextChunk};
-use docparse_core::table::{detect_tables, Segment};
+use docparse_core::table::{detect_borderless_tables, detect_tables, Segment};
 use lopdf::content::Content;
 use lopdf::Object;
 use std::collections::HashMap;
@@ -253,9 +253,12 @@ pub fn interpret(input: &PageInput) -> Page {
             _ => None,
         })
         .collect();
-    let tables = detect_tables(&text_refs, &segments, input.number);
+    let bordered = detect_tables(&text_refs, &segments, input.number);
+    let bordered_boxes: Vec<BBox> = bordered.iter().map(|t| t.bbox).collect();
+    // Borderless (alignment-based) tables on text not already in a bordered one.
+    let borderless = detect_borderless_tables(&text_refs, &bordered_boxes);
     drop(text_refs);
-    elements.extend(tables.into_iter().map(Element::Table));
+    elements.extend(bordered.into_iter().chain(borderless).map(Element::Table));
 
     Page {
         number: input.number,
