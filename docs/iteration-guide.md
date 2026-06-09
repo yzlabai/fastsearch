@@ -105,9 +105,9 @@ Document                                          [docparse-core/ir.rs]
 - [x] ToUnicode CMap 文本解码（CID 子集字体）
 - [x] 字形宽度（`Widths` / `W`/`DW`）+ 几何词重建
 - [x] MediaBox / Resources 的 Pages 树继承
-- [ ] **标准 14 字体 AFM 度量**（进行中）—— 无内嵌 `Widths` 的字体回退估算，致词距/连字错（`Rectified`→`Rectied`）。移植 veraPDF `StandardFontMetrics`/`AFMParser`，内置 14 套 AFM 宽度表。
-- [ ] 简单字体 `Encoding`/`Differences` + AGL —— 无 ToUnicode 时按字形名映射 Unicode。参考 veraPDF `Encoding` + `AdobeGlyphList`。
-- [ ] 字间距/词间距操作符 `Tc`/`Tw`/`Tz` —— 提升 advance 与词边界精度。
+- [x] **标准 14 字体 AFM 度量** —— 内置 14 套 AFM 宽度表（`stdmetrics.rs`），无 `Widths` 时按字形名查宽度。参考 veraPDF `StandardFontMetrics`/`AFMParser`。
+- [x] 简单字体 `Encoding`/`Differences` + AGL —— 无 ToUnicode 时 code→字形名→Unicode（`encoding.rs` + `encoding_tables.rs`）。修复 `rectification` 连字丢失。
+- [x] 字间距/词间距操作符 `Tc`/`Tw`/`Tz` —— 位移公式 `tx=(Σw·Tfs+Tc·n+Tw·spaces)·Th`。详见 [devlogs/2026-06-09-m1-text-fidelity.md](devlogs/2026-06-09-m1-text-fidelity.md)。
 - [ ] 图片 XObject 像素抽取 —— 当前仅 `ImageChunk` 位置。
 - [ ] 段落聚合 —— 输出层把相邻行按垂直间距聚成段落，而非一行一段。
 - [ ] **语义层**：表格识别 / 列表层级 / 标题分级（veraPDF `wcag-algorithms` 等价物）。最大、最有价值、最难，建在 chunk 之上。
