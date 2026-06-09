@@ -5,8 +5,8 @@
 //! table is excluded, running headers/footers dropped, and consecutive lines
 //! grouped into paragraphs/headings. Tables render as their own blocks.
 
-use crate::ir::{BBox, Document, Element, Page, Table, TextChunk};
-use crate::layout::{self, Block, Line};
+use crate::ir::{Document, Element, Page, Table};
+use crate::layout::{self, Block};
 
 /// Full IR as pretty JSON.
 pub fn to_json(doc: &Document) -> anyhow::Result<String> {
@@ -32,43 +32,10 @@ struct PageContent<'a> {
 }
 
 fn document_content(doc: &Document) -> Vec<PageContent<'_>> {
-    // Per-page non-table text chunks, then reconstructed lines.
-    let table_boxes: Vec<Vec<BBox>> = doc
-        .pages
-        .iter()
-        .map(|p| page_tables(p).iter().map(|t| t.bbox).collect())
-        .collect();
-
-    let chunks_per_page: Vec<Vec<&TextChunk>> = doc
-        .pages
-        .iter()
-        .zip(&table_boxes)
-        .map(|(p, boxes)| {
-            p.text_chunks()
-                .into_iter()
-                .filter(|c| !layout::in_any(c, boxes))
-                .collect()
-        })
-        .collect();
-    let lines_per_page: Vec<Vec<Line>> = chunks_per_page
-        .iter()
-        .map(|cs| layout::reconstruct_lines(cs))
-        .collect();
-    let hf = layout::detect_header_footer(&doc.pages, &lines_per_page);
-    let body_size = layout::body_font_size(doc);
-
-    lines_per_page
+    layout::page_blocks(doc)
         .into_iter()
         .zip(&doc.pages)
-        .map(|(lines, page)| {
-            let body: Vec<Line> = lines.into_iter().filter(|l| !hf.is_running(l)).collect();
-            let right = body.iter().map(|l| l.x1).fold(0.0f32, f32::max);
-            let fill_x = right - page.width.max(1.0) * 0.05;
-            PageContent {
-                blocks: layout::group_blocks(&body, body_size, fill_x),
-                tables: page_tables(page),
-            }
-        })
+        .map(|(blocks, page)| PageContent { blocks, tables: page_tables(page) })
         .collect()
 }
 

@@ -9,7 +9,7 @@
 //! spacing. Output formats consume blocks instead of raw chunks so Markdown is
 //! readable paragraphs, not one block per line.
 
-use crate::ir::{Document, Page, TextChunk};
+use crate::ir::{BBox, Document, Page, TextChunk};
 use crate::reading_order::reading_order;
 use std::collections::HashMap;
 
@@ -32,13 +32,17 @@ pub struct Line {
     pub cy: f32,
     pub x0: f32,
     pub x1: f32,
+    pub page: usize,
 }
 
-/// A body block: a paragraph or a heading, after grouping lines.
+/// A body block: a paragraph or a heading, after grouping lines. Carries page +
+/// union bbox so downstream (chunking/citation) can point back to the source.
 pub struct Block {
     pub text: String,
     pub size: f32,
     pub heading: bool,
+    pub page: usize,
+    pub bbox: BBox,
 }
 
 /// Group chunks into lines (shared baseline) and words (by gap). A horizontal
@@ -73,6 +77,7 @@ pub fn reconstruct_lines(chunks: &[&TextChunk]) -> Vec<Line> {
                     cy,
                     x0: c.bbox.x0,
                     x1: c.bbox.x1,
+                    page: c.page,
                 });
             }
         }
@@ -172,7 +177,7 @@ fn is_numeric_row(text: &str) -> bool {
 }
 
 /// One line of an in-progress block: text + the geometry needed to decide
-/// whether the next line continues it.
+/// whether the next line continues it, plus the accumulating union bbox.
 struct Acc {
     text: String,
     size: f32,
@@ -181,6 +186,41 @@ struct Acc {
     x1: f32,
     numeric: bool,
     lines: usize,
+    page: usize,
+    x0_min: f32,
+    x1_max: f32,
+    y_top: f32,
+    y_bot: f32,
+}
+
+impl Acc {
+    fn start(line: &Line, text: String, numeric: bool) -> Self {
+        Self {
+            text,
+            size: line.size,
+            cy: line.cy,
+            x1: line.x1,
+            numeric,
+            lines: 1,
+            page: line.page,
+            x0_min: line.x0,
+            x1_max: line.x1,
+            y_top: line.cy + line.size / 2.0,
+            y_bot: line.cy - line.size / 2.0,
+        }
+    }
+    fn extend(&mut self, line: &Line, text: &str, numeric: bool) {
+        self.text.push(' ');
+        self.text.push_str(text);
+        self.cy = line.cy;
+        self.size = self.size.max(line.size);
+        self.x1 = line.x1;
+        self.numeric = numeric;
+        self.lines += 1;
+        self.x0_min = self.x0_min.min(line.x0);
+        self.x1_max = self.x1_max.max(line.x1);
+        self.y_bot = self.y_bot.min(line.cy - line.size / 2.0);
+    }
 }
 
 /// Group body lines (top-to-bottom) into paragraphs/headings. A line continues
@@ -193,7 +233,7 @@ struct Acc {
 ///
 /// TODO: left columns in multi-column pages don't reach the page-wide `fill_x`,
 /// so their prose isn't reflowed yet — needs per-column edges (M4).
-pub fn group_blocks(lines: &[Line], median_size: f32, fill_x: f32) -> Vec<Block> {
+pub fn group_blocks(lines: &[Line], body_size: f32, fill_x: f32) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut cur: Option<Acc> = None;
 
@@ -212,40 +252,72 @@ pub fn group_blocks(lines: &[Line], median_size: f32, fill_x: f32) -> Vec<Block>
         });
 
         match cur.as_mut() {
-            Some(a) if continues => {
-                a.text.push(' ');
-                a.text.push_str(t);
-                a.cy = line.cy;
-                a.size = a.size.max(line.size);
-                a.x1 = line.x1;
-                a.numeric = numeric;
-                a.lines += 1;
-            }
+            Some(a) if continues => a.extend(line, t, numeric),
             _ => {
                 if let Some(a) = cur.take() {
-                    blocks.push(make_block(a.text, a.size, a.lines, median_size));
+                    blocks.push(make_block(a, body_size));
                 }
-                cur = Some(Acc {
-                    text: t.to_string(),
-                    size: line.size,
-                    cy: line.cy,
-                    x1: line.x1,
-                    numeric,
-                    lines: 1,
-                });
+                cur = Some(Acc::start(line, t.to_string(), numeric));
             }
         }
     }
     if let Some(a) = cur {
-        blocks.push(make_block(a.text, a.size, a.lines, median_size));
+        blocks.push(make_block(a, body_size));
     }
     blocks
 }
 
-fn make_block(text: String, size: f32, line_count: usize, median_size: f32) -> Block {
+fn make_block(a: Acc, body_size: f32) -> Block {
     // A heading is a short (single-line) block notably larger than body text.
-    let heading = line_count == 1 && median_size > 0.0 && size > median_size * 1.25;
-    Block { text, size, heading }
+    let heading = a.lines == 1 && body_size > 0.0 && a.size > body_size * 1.25;
+    Block {
+        text: a.text,
+        size: a.size,
+        heading,
+        page: a.page,
+        bbox: BBox { x0: a.x0_min, y0: a.y_bot, x1: a.x1_max, y1: a.y_top },
+    }
+}
+
+/// Full reconstruction pipeline per page: exclude text inside detected tables,
+/// drop running headers/footers, group into paragraph/heading [`Block`]s.
+/// Shared by output serialization and RAG chunking so they agree on structure.
+pub fn page_blocks(doc: &Document) -> Vec<Vec<Block>> {
+    use crate::ir::Element;
+    let table_boxes: Vec<Vec<BBox>> = doc
+        .pages
+        .iter()
+        .map(|p| {
+            p.elements
+                .iter()
+                .filter_map(|e| match e {
+                    Element::Table(t) => Some(t.bbox),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    let chunks_per_page: Vec<Vec<&TextChunk>> = doc
+        .pages
+        .iter()
+        .zip(&table_boxes)
+        .map(|(p, boxes)| p.text_chunks().into_iter().filter(|c| !in_any(c, boxes)).collect())
+        .collect();
+    let lines_per_page: Vec<Vec<Line>> =
+        chunks_per_page.iter().map(|cs| reconstruct_lines(cs)).collect();
+    let hf = detect_header_footer(&doc.pages, &lines_per_page);
+    let body = body_font_size(doc);
+
+    lines_per_page
+        .into_iter()
+        .zip(&doc.pages)
+        .map(|(lines, page)| {
+            let body_lines: Vec<Line> = lines.into_iter().filter(|l| !hf.is_running(l)).collect();
+            let right = body_lines.iter().map(|l| l.x1).fold(0.0f32, f32::max);
+            let fill_x = right - page.width.max(1.0) * 0.05;
+            group_blocks(&body_lines, body, fill_x)
+        })
+        .collect()
 }
 
 /// Body font size: the most common chunk size (mode, in 0.5 pt bins). More
@@ -271,7 +343,7 @@ mod tests {
         line_w(text, size, cy, 100.0)
     }
     fn line_w(text: &str, size: f32, cy: f32, x1: f32) -> Line {
-        Line { text: text.into(), size, cy, x0: 0.0, x1 }
+        Line { text: text.into(), size, cy, x0: 0.0, x1, page: 1 }
     }
 
     // fill_x = 90: lines reaching x1≈100 count as wrapped prose.

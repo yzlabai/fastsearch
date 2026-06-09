@@ -32,6 +32,8 @@ enum Format {
     Json,
     Markdown,
     Text,
+    /// Retrieval chunks with source page+bbox and heading breadcrumb (JSON).
+    Chunks,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -55,6 +57,7 @@ fn main() -> anyhow::Result<()> {
         Format::Json => output::to_json(&doc)?,
         Format::Markdown => output::to_markdown(&doc),
         Format::Text => output::to_text(&doc),
+        Format::Chunks => docparse_core::chunk::to_json(&docparse_core::chunk::chunk_document(&doc)),
     };
 
     match cli.out {

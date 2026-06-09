@@ -2,6 +2,7 @@
 //!
 //! It defines:
 //! - [`ir`] — the intermediate representation every parser produces.
+//! - [`chunk`] — RAG chunking with chunk↔source-bbox citation.
 //! - [`parser`] — the [`parser::DocumentParser`] trait that PDF/DOCX/HTML
 //!   backends implement.
 //! - [`reading_order`] — a recursive XY-cut that linearizes a page.
@@ -14,6 +15,7 @@
 //! opendataloader-pdf: parsers emit positioned chunks; this crate turns them
 //! into reading order and output without ever rasterizing.
 
+pub mod chunk;
 pub mod ir;
 pub mod layout;
 pub mod output;

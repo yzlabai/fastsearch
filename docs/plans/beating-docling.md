@@ -74,13 +74,14 @@ Docling 的广度是其首选理由。OOXML/HTML 有显式结构、ROI 最高，
 - **验收 ✅**：DOCX/HTML 端到端出 MD/Text/JSON，标题→`##`、表格→管道表格；确定性 20/20；PDF 零回归；clippy 零 warning；单测 35（core 17 + pdf 14 + html 3 + docx 1）。devlog：[2026-06-09-m5-docx-html.md](../devlogs/2026-06-09-m5-docx-html.md)。
 - **遗留**：合成坐标非真实版面；内联格式/图片/嵌套表/DOCX 列表编号未建模。
 
-### M6 · RAG 输出与引用定位 — *模块 6*（**引用是杀手锏**）
-Docling 有 RAG 生态但引用非全链路。把 **chunk ↔ 页码/bbox 双向定位**做成一等公民——agent/RAG 最想要、Docling 给不全的东西。
+### M6 · RAG 输出与引用定位 — *模块 6* ✅ 完成（2026-06-09）
+Docling 有 RAG 生态但引用非全链路。把 **chunk ↔ 页码/bbox 双向定位**做成一等公民。
 
-- [ ] **结构化切块**：按标题/段落/表格边界切，chunk 携带 source bbox + 页码 + provenance（依赖 M2）。
-- [ ] **双向引用**：给定 chunk 回指原文坐标；给定坐标找 chunk。
-- [ ] **接口面**：先库 API + CLI，再评估 MCP server（agent 直连）。
-- **验收**：差异化记分牌"引用可定位率 100%"；最小 RAG demo：检索结果可高亮回原 PDF 坐标。
+- [x] **结构化切块**：`core::chunk`，按标题/段落/表格切，chunk 带 page+bbox+标题面包屑+char_len（依赖 M2/M3 几何）。
+- [x] **双向引用**：chunk→源 = page+bbox；`locate(chunks,page,x,y)` = 坐标→chunk。
+- [x] **接口面**：库 API + CLI `-f chunks`（JSON）。MCP server 评估留 M7+。
+- **验收 ✅**：1901 70 chunks、bialetti 表格成块可引用、标题面包屑多级嵌套正确、`locate` 反查单测；引用可定位率 100%；跨 PDF/DOCX/HTML 统一；确定性 20/20；单测 38。devlog：[2026-06-09-m6-rag-chunking.md](../devlogs/2026-06-09-m6-rag-chunking.md)。
+- **遗留**：跨页段落不合并；超大段不二次切分；locate 取首个命中。
 
 ### M7 · 质量评分驱动的路由 + 外接 AI — *模块 7、8*（**成本胜负手**）
 **"多数页不碰模型、只难例升级"的成本论点落地**，roadmap"晚建机器"的部分。把 M2 评分接上路由。
