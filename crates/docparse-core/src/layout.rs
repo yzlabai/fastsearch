@@ -338,12 +338,26 @@ fn is_heading_text(t: &str) -> bool {
     numbered || all_caps
 }
 
+/// A line that reads like code or tabular data, not a section header: it carries
+/// operator punctuation that real titles never do (`= ; { } < >`) or trails a
+/// comma/semicolon. Catches SQL/data lines (`USER = ALICE`, `ENABLE ;`,
+/// `SET OPTION USRPRF=*OWNER`) that otherwise slip through the size/all-caps
+/// heading rules and pollute the heading set. Deliberately NOT flagging
+/// parentheses, dots, quotes, or underscores — real headings carry those
+/// (`The Modern Era (1990s - Present)`, `VERIFY_GROUP_FOR_USER function`).
+fn looks_like_code(t: &str) -> bool {
+    let s = t.trim();
+    s.contains(['=', ';', '{', '}', '<', '>']) || s.ends_with([',', ';'])
+}
+
 fn make_block(a: Acc, body_size: f32) -> Block {
     // A heading is a single-line block that is notably larger than body text,
     // whose text shape (numbered / all-caps) reads like a section header, or a
-    // short fully-bold line (title-case subsection at body size).
+    // short fully-bold line (title-case subsection at body size) — and never a
+    // code/data line.
     let short = a.text.chars().count() <= 60;
     let heading = a.lines == 1
+        && !looks_like_code(&a.text)
         && ((body_size > 0.0 && a.size > body_size * 1.25)
             || is_heading_text(&a.text)
             || (a.bold && short));
