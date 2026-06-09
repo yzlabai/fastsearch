@@ -6,6 +6,37 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Version of this IR schema. Bumped when the serialized shape changes so an
+/// agent consuming the JSON can check compatibility. Semantic versioning.
+pub const SCHEMA_VERSION: &str = "0.2.0";
+
+/// Where a [`Document`] came from: which parser/version produced it, under
+/// which schema. The agent-facing trust/repro anchor (one per document; an
+/// element's *source location* is its own `bbox`+`page`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Provenance {
+    pub schema_version: String,
+    /// Producing parser, e.g. "pdf".
+    pub parser: String,
+    /// Producing parser/crate version.
+    pub parser_version: String,
+}
+
+impl Provenance {
+    pub fn new(parser: impl Into<String>, parser_version: impl Into<String>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION.to_string(),
+            parser: parser.into(),
+            parser_version: parser_version.into(),
+        }
+    }
+}
+
+/// Default confidence for deterministic (non-model) extraction.
+fn full_confidence() -> f32 {
+    1.0
+}
+
 /// Axis-aligned bounding box in PDF user space (origin bottom-left).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BBox {
@@ -38,6 +69,10 @@ pub struct TextChunk {
     /// Font resource name (e.g. "F1"), if known. TODO: resolve to PostScript name.
     pub font: Option<String>,
     pub page: usize,
+    /// Extraction confidence in [0,1]. 1.0 for deterministic parsing; lower
+    /// when a pluggable model (OCR/VLM) produced or corrected this chunk (M7).
+    #[serde(default = "full_confidence")]
+    pub confidence: f32,
 }
 
 /// A raster/vector image region. Position only for now (no pixel extraction yet).
@@ -47,13 +82,31 @@ pub struct ImageChunk {
     pub page: usize,
 }
 
-/// One element on a page. Semantic blocks (tables, lists, headings) are a
-/// future layer built on top of these primitives.
+/// One cell of a [`Table`]. MVP: single grid cell (no row/col span yet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cell {
+    pub text: String,
+    pub bbox: BBox,
+}
+
+/// A detected table: a grid of cells bounded by ruling lines. Built by the
+/// semantic layer ([`crate::table`]) from text chunks + vector segments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Table {
+    pub bbox: BBox,
+    pub page: usize,
+    /// Row-major: `rows[r][c]`. All rows have the same length (column count).
+    pub rows: Vec<Vec<Cell>>,
+}
+
+/// One element on a page. `Table` is the first semantic block; lists/headings
+/// build on these primitives later.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Element {
     Text(TextChunk),
     Image(ImageChunk),
+    Table(Table),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,5 +134,9 @@ impl Page {
 pub struct Document {
     /// Source path or identifier the document was parsed from.
     pub source: String,
+    /// Producing parser/version + schema version. `default` keeps older JSON
+    /// (pre-provenance) loadable.
+    #[serde(default)]
+    pub provenance: Option<Provenance>,
     pub pages: Vec<Page>,
 }

@@ -150,6 +150,7 @@ mod tests {
             font_size: (y1 - y0),
             font: None,
             page: 0,
+            confidence: 1.0,
         }
     }
 

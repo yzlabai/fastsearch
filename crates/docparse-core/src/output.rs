@@ -1,24 +1,91 @@
 //! Output serializers: JSON (full IR), Markdown, and plain text.
 //!
-//! Markdown/text first reconstruct *lines* from the per-glyph/per-run chunks a
-//! parser emits, inserting word spaces by geometric gap (subset fonts often
-//! emit one chunk per glyph, so we must not blindly space-join). This mirrors
-//! how text extractors turn positioned glyphs back into readable words.
+//! Markdown/text are built from [`crate::layout`] blocks: per-glyph chunks are
+//! rebuilt into lines (word spaces by geometric gap), text inside a detected
+//! table is excluded, running headers/footers dropped, and consecutive lines
+//! grouped into paragraphs/headings. Tables render as their own blocks.
 
-use crate::ir::{Page, TextChunk};
-use crate::reading_order::reading_order;
+use crate::ir::{BBox, Document, Element, Page, Table, TextChunk};
+use crate::layout::{self, Block, Line};
 
 /// Full IR as pretty JSON.
-pub fn to_json(doc: &crate::ir::Document) -> anyhow::Result<String> {
+pub fn to_json(doc: &Document) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(doc)?)
 }
 
-/// Plain text in reading order, one reconstructed line per line.
-pub fn to_text(doc: &crate::ir::Document) -> String {
+/// Tables detected on a page.
+fn page_tables(page: &Page) -> Vec<&Table> {
+    page.elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Table(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Per-page reconstruction: text blocks (table content excluded, headers/footers
+/// dropped, paragraphs grouped) plus the page's tables.
+struct PageContent<'a> {
+    blocks: Vec<Block>,
+    tables: Vec<&'a Table>,
+}
+
+fn document_content(doc: &Document) -> Vec<PageContent<'_>> {
+    // Per-page non-table text chunks, then reconstructed lines.
+    let table_boxes: Vec<Vec<BBox>> = doc
+        .pages
+        .iter()
+        .map(|p| page_tables(p).iter().map(|t| t.bbox).collect())
+        .collect();
+
+    let chunks_per_page: Vec<Vec<&TextChunk>> = doc
+        .pages
+        .iter()
+        .zip(&table_boxes)
+        .map(|(p, boxes)| {
+            p.text_chunks()
+                .into_iter()
+                .filter(|c| !layout::in_any(c, boxes))
+                .collect()
+        })
+        .collect();
+    let lines_per_page: Vec<Vec<Line>> = chunks_per_page
+        .iter()
+        .map(|cs| layout::reconstruct_lines(cs))
+        .collect();
+    let hf = layout::detect_header_footer(&doc.pages, &lines_per_page);
+    let median = layout::median_font_size(doc);
+
+    lines_per_page
+        .into_iter()
+        .zip(&doc.pages)
+        .map(|(lines, page)| {
+            let body: Vec<Line> = lines.into_iter().filter(|l| !hf.is_running(l)).collect();
+            let right = body.iter().map(|l| l.x1).fold(0.0f32, f32::max);
+            let fill_x = right - page.width.max(1.0) * 0.05;
+            PageContent {
+                blocks: layout::group_blocks(&body, median, fill_x),
+                tables: page_tables(page),
+            }
+        })
+        .collect()
+}
+
+/// Plain text: paragraphs one per line; tables as tab-separated rows.
+pub fn to_text(doc: &Document) -> String {
     let mut s = String::new();
-    for page in &doc.pages {
-        for line in reconstruct_lines(page) {
-            s.push_str(&line.text);
+    for pc in document_content(doc) {
+        for block in &pc.blocks {
+            s.push_str(block.text.trim());
+            s.push('\n');
+        }
+        for table in &pc.tables {
+            for row in &table.rows {
+                let cells: Vec<&str> = row.iter().map(|c| c.text.trim()).collect();
+                s.push_str(&cells.join("\t"));
+                s.push('\n');
+            }
             s.push('\n');
         }
         s.push('\n');
@@ -26,84 +93,53 @@ pub fn to_text(doc: &crate::ir::Document) -> String {
     s
 }
 
-/// Markdown with a light heading heuristic (line font size ≥ 1.25× document
-/// median becomes `##`). Tables/lists are a future semantic layer.
-pub fn to_markdown(doc: &crate::ir::Document) -> String {
-    let median = median_font_size(doc);
-
+/// Markdown: blocks become paragraphs (`##` for headings); tables become pipe
+/// tables (first row treated as the header).
+pub fn to_markdown(doc: &Document) -> String {
     let mut md = format!("<!-- source: {} -->\n\n", doc.source);
-    for page in &doc.pages {
-        for line in reconstruct_lines(page) {
-            let t = line.text.trim();
+    for pc in document_content(doc) {
+        for block in &pc.blocks {
+            let t = block.text.trim();
             if t.is_empty() {
                 continue;
             }
-            if median > 0.0 && line.size > median * 1.25 {
+            if block.heading {
                 md.push_str("## ");
             }
             md.push_str(t);
             md.push_str("\n\n");
         }
+        for table in &pc.tables {
+            md.push_str(&markdown_table(table));
+            md.push('\n');
+        }
     }
     md
 }
 
-/// A reconstructed text line.
-struct Line {
-    text: String,
-    /// Representative (max) font size on the line — drives heading detection.
-    size: f32,
-}
-
-/// Group reading-ordered chunks into lines (by shared baseline) and words
-/// (by horizontal gap). A gap wider than ~0.25 em starts a new word.
-fn reconstruct_lines(page: &Page) -> Vec<Line> {
-    let chunks: Vec<&TextChunk> = page.text_chunks();
-    let order = reading_order(&chunks);
-
-    let mut lines: Vec<Line> = Vec::new();
-    // Accumulator: (text, max_size, baseline_cy, last_x1).
-    let mut cur: Option<(String, f32, f32, f32)> = None;
-
-    for &i in &order {
-        let c = chunks[i];
-        let cy = c.bbox.cy();
-        match cur.as_mut() {
-            Some((text, size, line_cy, last_x1))
-                if (*line_cy - cy).abs() <= c.font_size.max(1.0) * 0.5 =>
-            {
-                // Same line — insert a space only if there's a real gap.
-                if c.bbox.x0 - *last_x1 > c.font_size * 0.25 {
-                    text.push(' ');
-                }
-                text.push_str(&c.text);
-                *last_x1 = c.bbox.x1;
-                *size = size.max(c.font_size);
+/// Render a table as a GitHub-flavored Markdown pipe table.
+fn markdown_table(table: &Table) -> String {
+    let mut s = String::new();
+    let cols = table.rows.first().map(|r| r.len()).unwrap_or(0);
+    if cols == 0 {
+        return s;
+    }
+    let esc = |t: &str| t.replace('|', "\\|").replace('\n', " ");
+    for (r, row) in table.rows.iter().enumerate() {
+        s.push('|');
+        for cell in row {
+            s.push(' ');
+            s.push_str(esc(cell.text.trim()).trim());
+            s.push_str(" |");
+        }
+        s.push('\n');
+        if r == 0 {
+            s.push('|');
+            for _ in 0..cols {
+                s.push_str(" --- |");
             }
-            _ => {
-                if let Some((text, size, _, _)) = cur.take() {
-                    lines.push(Line { text, size });
-                }
-                cur = Some((c.text.clone(), c.font_size, cy, c.bbox.x1));
-            }
+            s.push('\n');
         }
     }
-    if let Some((text, size, _, _)) = cur {
-        lines.push(Line { text, size });
-    }
-    lines
-}
-
-fn median_font_size(doc: &crate::ir::Document) -> f32 {
-    let mut sizes: Vec<f32> = doc
-        .pages
-        .iter()
-        .flat_map(|p| p.text_chunks().into_iter().map(|c| c.font_size))
-        .collect();
-    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if sizes.is_empty() {
-        0.0
-    } else {
-        sizes[sizes.len() / 2]
-    }
+    s
 }
