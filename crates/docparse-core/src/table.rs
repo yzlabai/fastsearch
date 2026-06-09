@@ -394,6 +394,143 @@ fn build_borderless(rows: &[Row], region: &[usize], cols: &[f32]) -> Option<Tabl
     })
 }
 
+// ---- ruled (booktabs) tables: bounded by wide horizontal rules ------------
+
+const MIN_RULE_W: f32 = 80.0; // a rule must span this many points to bound a table
+const RULE_X_TOL: f32 = 24.0; // rules of one table share left/right edges within this
+const RULE_Y_GAP: f32 = 320.0; // rules farther apart vertically are different tables
+const COL_CLUSTER_TOL: f32 = 6.0; // text column alignment tolerance
+
+/// Detect tables delimited by ≥2 wide horizontal rules (academic "booktabs"
+/// style: top/mid/bottom rules, no verticals). The rules confirm the region, so
+/// false positives are unlikely; columns are inferred from text alignment
+/// inside. Skips regions already covered by `exclude`.
+pub fn detect_ruled_tables(
+    chunks: &[&TextChunk],
+    segments: &[Segment],
+    exclude: &[BBox],
+    page: usize,
+) -> Vec<Table> {
+    // Wide horizontal rules: (y, x_lo, x_hi).
+    let mut rules: Vec<(f32, f32, f32)> = segments
+        .iter()
+        .filter(|s| s.is_h())
+        .map(|s| ((s.y0 + s.y1) / 2.0, s.x0.min(s.x1), s.x0.max(s.x1)))
+        .filter(|(_, lo, hi)| hi - lo >= MIN_RULE_W)
+        .collect();
+    rules.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // y desc
+
+    // Group rules that share an x-extent and are vertically adjacent.
+    let mut groups: Vec<Vec<(f32, f32, f32)>> = Vec::new();
+    for r in rules {
+        let g = groups.iter_mut().find(|g| {
+            let last = g.last().unwrap();
+            (last.1 - r.1).abs() <= RULE_X_TOL
+                && (last.2 - r.2).abs() <= RULE_X_TOL
+                && (last.0 - r.0).abs() <= RULE_Y_GAP
+        });
+        match g {
+            Some(g) => g.push(r),
+            None => groups.push(vec![r]),
+        }
+    }
+
+    let mut tables = Vec::new();
+    for g in groups.iter().filter(|g| g.len() >= 2) {
+        let top = g.iter().map(|r| r.0).fold(f32::MIN, f32::max);
+        let bottom = g.iter().map(|r| r.0).fold(f32::MAX, f32::min);
+        let left = g.iter().map(|r| r.1).fold(f32::MAX, f32::min);
+        let right = g.iter().map(|r| r.2).fold(f32::MIN, f32::max);
+        let region = BBox { x0: left, y0: bottom, x1: right, y1: top };
+        if exclude.iter().any(|b| overlaps(&region, b)) {
+            continue;
+        }
+        // Text strictly inside the ruled band.
+        let inside: Vec<&TextChunk> = chunks
+            .iter()
+            .copied()
+            .filter(|c| {
+                let cy = c.bbox.cy();
+                let cx = (c.bbox.x0 + c.bbox.x1) / 2.0;
+                cy > bottom && cy < top && cx >= left - 5.0 && cx <= right + 5.0
+            })
+            .collect();
+        if inside.len() < 4 {
+            continue;
+        }
+        let rows: Vec<Row> = build_rows(&inside).into_iter().filter(|r| !r.segs.is_empty()).collect();
+        if rows.len() < 2 {
+            continue;
+        }
+        let cols = stable_columns(&rows);
+        if cols.len() < 2 {
+            continue;
+        }
+        tables.push(build_grid(&rows, &cols, region, page));
+    }
+    tables
+}
+
+/// Column x-positions that recur across rows: cluster row-cell left edges and
+/// keep clusters present in at least half the rows (filters spurious columns
+/// from the occasional multi-value cell).
+fn stable_columns(rows: &[Row]) -> Vec<f32> {
+    let mut xs: Vec<f32> = rows.iter().flat_map(|r| r.segs.iter().map(|s| s.x0)).collect();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Cluster, tracking how many distinct rows contribute (approx via count).
+    let mut clusters: Vec<(f32, usize)> = Vec::new(); // (mean, count)
+    for x in xs {
+        match clusters.last_mut() {
+            Some((m, n)) if x - *m <= COL_CLUSTER_TOL => {
+                *m = (*m * *n as f32 + x) / (*n as f32 + 1.0);
+                *n += 1;
+            }
+            _ => clusters.push((x, 1)),
+        }
+    }
+    let min_support = rows.len().div_ceil(2).max(2);
+    clusters.into_iter().filter(|(_, n)| *n >= min_support).map(|(m, _)| m).collect()
+}
+
+/// Assign each row's cells to the nearest column and build the table.
+fn build_grid(rows: &[Row], cols: &[f32], region: BBox, page: usize) -> Table {
+    let ncols = cols.len();
+    let mut out_rows: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let half = row.size.max(1.0) / 2.0;
+        let mut cells: Vec<Vec<&TextChunk>> = vec![Vec::new(); ncols];
+        for s in &row.segs {
+            let ci = (0..ncols)
+                .min_by(|&a, &b| {
+                    (cols[a] - s.x0).abs().partial_cmp(&(cols[b] - s.x0).abs()).unwrap()
+                })
+                .unwrap_or(0);
+            cells[ci].extend(&s.chunks);
+        }
+        let cell_row = cells
+            .into_iter()
+            .enumerate()
+            .map(|(ci, cs)| {
+                let text = crate::layout::reconstruct_lines(&cs)
+                    .iter()
+                    .map(|l| l.text.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let x0 = cols[ci];
+                let x1 = if ci + 1 < ncols { cols[ci + 1] } else { region.x1 };
+                Cell { text, bbox: BBox { x0, y0: row.cy - half, x1, y1: row.cy + half } }
+            })
+            .collect();
+        out_rows.push(cell_row);
+    }
+    Table { bbox: region, page, rows: out_rows }
+}
+
+fn overlaps(a: &BBox, b: &BBox) -> bool {
+    a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +628,31 @@ mod tests {
         ];
         let refs: Vec<&TextChunk> = cs.iter().collect();
         assert!(detect_borderless_tables(&refs, &[]).is_empty());
+    }
+
+    #[test]
+    fn ruled_table_between_two_wide_rules() {
+        // Two wide horizontal rules bound a 2-col × 2-row table.
+        let segs = vec![h(100.0, 0.0, 200.0), h(60.0, 0.0, 200.0)];
+        let cs: Vec<TextChunk> = vec![
+            cc("a1", 10.0, 30.0, 90.0), cc("b1", 110.0, 130.0, 90.0),
+            cc("a2", 10.0, 30.0, 75.0), cc("b2", 110.0, 130.0, 75.0),
+        ];
+        let refs: Vec<&TextChunk> = cs.iter().collect();
+        let tables = detect_ruled_tables(&refs, &segs, &[], 1);
+        assert_eq!(tables.len(), 1, "ruled region is a table");
+        assert_eq!(tables[0].rows.len(), 2);
+        assert_eq!(tables[0].rows[0].len(), 2);
+        assert_eq!(tables[0].rows[0][0].text, "a1");
+    }
+
+    #[test]
+    fn single_wide_rule_is_not_a_table() {
+        // One rule (e.g. a figure separator) is not a table.
+        let segs = vec![h(100.0, 0.0, 200.0)];
+        let cs: Vec<TextChunk> = vec![cc("x", 10.0, 30.0, 90.0), cc("y", 110.0, 130.0, 90.0)];
+        let refs: Vec<&TextChunk> = cs.iter().collect();
+        assert!(detect_ruled_tables(&refs, &segs, &[], 1).is_empty());
     }
 
     #[test]

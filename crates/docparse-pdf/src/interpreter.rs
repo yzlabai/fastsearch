@@ -17,7 +17,9 @@
 use crate::font::FontInfo;
 use crate::matrix::Matrix;
 use docparse_core::ir::{BBox, Element, Page, TextChunk};
-use docparse_core::table::{detect_borderless_tables, detect_tables, Segment};
+use docparse_core::table::{
+    detect_borderless_tables, detect_ruled_tables, detect_tables, Segment,
+};
 use lopdf::content::Content;
 use lopdf::Object;
 use std::collections::HashMap;
@@ -254,11 +256,16 @@ pub fn interpret(input: &PageInput) -> Page {
         })
         .collect();
     let bordered = detect_tables(&text_refs, &segments, input.number);
-    let bordered_boxes: Vec<BBox> = bordered.iter().map(|t| t.bbox).collect();
-    // Borderless (alignment-based) tables on text not already in a bordered one.
-    let borderless = detect_borderless_tables(&text_refs, &bordered_boxes);
+    let mut excl: Vec<BBox> = bordered.iter().map(|t| t.bbox).collect();
+    // Ruled (booktabs) tables bounded by wide horizontal rules — high-confidence.
+    let ruled = detect_ruled_tables(&text_refs, &segments, &excl, input.number);
+    excl.extend(ruled.iter().map(|t| t.bbox));
+    // Borderless (alignment-based) tables on text not in any detected table.
+    let borderless = detect_borderless_tables(&text_refs, &excl);
     drop(text_refs);
-    elements.extend(bordered.into_iter().chain(borderless).map(Element::Table));
+    elements.extend(
+        bordered.into_iter().chain(ruled).chain(borderless).map(Element::Table),
+    );
 
     Page {
         number: input.number,
