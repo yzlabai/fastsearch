@@ -1,0 +1,16 @@
+[package]
+name = "docparse-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for docparse-rs"
+
+[[bin]]
+name = "docparse"
+path = "src/main.rs"
+
+[dependencies]
+docparse-core = { path = "../docparse-core" }
+docparse-pdf = { path = "../docparse-pdf" }
+anyhow.workspace = true
+clap.workspace = true
