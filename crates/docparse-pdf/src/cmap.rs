@@ -29,8 +29,7 @@ impl CodeSpace {
         if self.begin.len() != code.len() {
             return false;
         }
-        for i in 0..code.len() {
-            let (b, e, c) = (self.begin[i], self.end[i], code[i]);
+        for ((&b, &e), &c) in self.begin.iter().zip(&self.end).zip(code) {
             if c < b || c > e {
                 return false;
             }

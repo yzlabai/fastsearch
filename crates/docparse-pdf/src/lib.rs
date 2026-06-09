@@ -7,11 +7,14 @@
 //! per-page `ForkJoinPool` model.
 
 mod cmap;
+mod encoding;
+mod encoding_tables;
 mod font;
 mod interpreter;
 mod matrix;
+mod stdmetrics;
 
-use docparse_core::ir::Document;
+use docparse_core::ir::{Document, Provenance};
 use docparse_core::parser::DocumentParser;
 use interpreter::{interpret, PageInput};
 use lopdf::{Document as PdfDocument, Object, ObjectId};
@@ -59,6 +62,7 @@ impl DocumentParser for PdfParser {
 
         Ok(Document {
             source: path.display().to_string(),
+            provenance: Some(Provenance::new("pdf", env!("CARGO_PKG_VERSION"))),
             pages,
         })
     }
@@ -73,7 +77,7 @@ fn page_dimensions(doc: &PdfDocument, page_id: ObjectId) -> (f32, f32) {
                 .iter()
                 .map(|o| match o {
                     Object::Integer(i) => *i as f32,
-                    Object::Real(r) => *r as f32,
+                    Object::Real(r) => *r,
                     _ => 0.0,
                 })
                 .collect();

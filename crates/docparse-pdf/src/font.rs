@@ -4,10 +4,15 @@
 //! `PDType0Font` provide for text extraction:
 //! - a `ToUnicode` [`CMap`] (code → text) and its codespaces (byte splitting),
 //! - glyph widths (simple `Widths`+`FirstChar`, or CID `W`+`DW`),
-//! so the interpreter can turn a show-string into real text and advance the
+//! - for simple fonts without `ToUnicode`, a base `/Encoding` + `/Differences`
+//!   (code → glyph name → Unicode via the AGL) and standard-14 AFM widths.
+//!
+//! So the interpreter can turn a show-string into real text and advance the
 //! pen by true glyph widths instead of a flat estimate.
 
 use crate::cmap::CMap;
+use crate::encoding::{self, Diff};
+use crate::stdmetrics;
 use lopdf::{Dictionary, Document as PdfDocument, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -25,31 +30,62 @@ pub struct FontInfo {
     to_unicode: Option<CMap>,
     widths: Widths,
     default_width: f64,
+    /// Simple-font `code -> glyph name` (base encoding + `/Differences`),
+    /// used both to decode text (no ToUnicode) and to look up AFM widths.
+    encoding: Option<Vec<Option<String>>>,
+    /// Standard-14 width table (glyph name -> 1/1000 em), used only when the
+    /// font has no embedded `/Widths`.
+    afm_widths: Option<&'static HashMap<String, f64>>,
 }
 
 /// Default advance when a glyph width is unknown (0.5 em, in 1/1000 units).
 const FALLBACK_WIDTH: f64 = 500.0;
 
+/// Result of decoding one show-string: the text plus the metrics the
+/// interpreter needs to advance the pen with `Tc`/`Tw` spacing.
+pub struct Decoded {
+    pub text: String,
+    /// Sum of glyph widths, in 1/1000 em.
+    pub advance: f64,
+    /// Number of glyphs (for `Tc` char spacing).
+    pub glyphs: u32,
+    /// Number of single-byte code-32 glyphs (for `Tw` word spacing).
+    pub spaces: u32,
+}
+
 impl FontInfo {
-    /// Decode a show-string into (text, total advance in 1/1000 em).
-    pub fn decode(&self, bytes: &[u8]) -> (String, f64) {
+    /// Decode a show-string into text and pen-advance metrics.
+    pub fn decode(&self, bytes: &[u8]) -> Decoded {
         let mut text = String::new();
         let mut advance = 0.0;
+        let mut glyphs = 0u32;
+        let mut spaces = 0u32;
         let mut pos = 0;
         while pos < bytes.len() {
             let (code, len) = self.next_code(bytes, pos);
             pos += len;
+            glyphs += 1;
+            // Tw word spacing applies only to a single-byte code 32.
+            if code == 32 && len == 1 {
+                spaces += 1;
+            }
 
             match &self.to_unicode {
+                // ToUnicode is authoritative when present.
                 Some(cm) => {
                     if let Some(u) = cm.unicode(code) {
                         text.push_str(&u);
                     }
                 }
-                // Simple font without ToUnicode: best-effort Latin-1 (the prior
-                // behavior, which already worked for standard-encoded fonts).
+                // Simple font without ToUnicode: resolve code -> glyph name
+                // (base encoding + /Differences) -> Unicode via the AGL.
                 None if !self.is_type0 => {
-                    if (0x20..=0xFF).contains(&code) {
+                    if let Some(name) = self.glyph_name(code) {
+                        if let Some(u) = encoding::glyph_to_unicode(name) {
+                            text.push_str(&u);
+                        }
+                    } else if (0x20..=0xFF).contains(&code) {
+                        // No encoding entry: last-resort Latin-1.
                         text.push(code as u8 as char);
                     }
                 }
@@ -60,7 +96,12 @@ impl FontInfo {
 
             advance += self.width(code).unwrap_or(FALLBACK_WIDTH);
         }
-        (text, advance)
+        Decoded {
+            text,
+            advance,
+            glyphs,
+            spaces,
+        }
     }
 
     /// Split off the next character code (veraPDF codespace logic, or a fixed
@@ -79,15 +120,26 @@ impl FontInfo {
         (code, len)
     }
 
+    /// Glyph name for a code in a simple font, if an encoding is present.
+    fn glyph_name(&self, code: u32) -> Option<&str> {
+        self.encoding
+            .as_ref()
+            .and_then(|e| e.get(code as usize))
+            .and_then(|n| n.as_deref())
+    }
+
     fn width(&self, code: u32) -> Option<f64> {
         match &self.widths {
             Widths::Simple { first, w } => {
                 let idx = code as i64 - first;
                 if idx >= 0 && (idx as usize) < w.len() {
-                    Some(w[idx as usize])
-                } else {
-                    None
+                    return Some(w[idx as usize]);
                 }
+                // No embedded width for this code: fall back to standard-14 AFM
+                // metrics looked up by glyph name (fixes 0.5em-estimate spacing
+                // for non-embedded base fonts).
+                let afm = self.afm_widths?;
+                afm.get(self.glyph_name(code)?).copied()
             }
             Widths::Cid(map) => Some(map.get(&code).copied().unwrap_or(self.default_width)),
         }
@@ -122,13 +174,23 @@ fn build_font(doc: &PdfDocument, fd: &Dictionary) -> FontInfo {
         .and_then(|o| stream_bytes(doc, o))
         .map(|b| CMap::parse(&b));
 
+    let mut encoding = None;
+    let mut afm_widths = None;
+
     let (widths, default_width) = if is_type0 {
         cid_widths(doc, fd)
     } else {
+        encoding = Some(simple_encoding(doc, fd));
         let first = int_of(fd, b"FirstChar").unwrap_or(0);
-        let w = array_of(doc, fd, b"Widths")
+        let w: Vec<f64> = array_of(doc, fd, b"Widths")
             .map(|a| a.iter().filter_map(num).collect())
             .unwrap_or_default();
+        // No embedded widths → try standard-14 AFM metrics by BaseFont name.
+        if w.is_empty() {
+            if let Some(base) = name_of(fd, b"BaseFont") {
+                afm_widths = stdmetrics::widths_for(&base);
+            }
+        }
         (Widths::Simple { first, w }, 0.0)
     };
 
@@ -137,7 +199,49 @@ fn build_font(doc: &PdfDocument, fd: &Dictionary) -> FontInfo {
         to_unicode,
         widths,
         default_width,
+        encoding,
+        afm_widths,
     }
+}
+
+/// Resolve a simple font's `code -> glyph name` table from its `/Encoding`
+/// (a predefined name, or a dict with `/BaseEncoding` + `/Differences`).
+/// Absent encoding defaults to StandardEncoding.
+fn simple_encoding(doc: &PdfDocument, fd: &Dictionary) -> Vec<Option<String>> {
+    let enc = fd.get(b"Encoding").ok().and_then(|o| deref(doc, o));
+    match enc {
+        Some(Object::Name(n)) => {
+            let base = encoding::base_table(&String::from_utf8_lossy(n));
+            encoding::build_encoding(base, &[])
+        }
+        Some(Object::Dictionary(ed)) => {
+            let base_name = name_of(ed, b"BaseEncoding").unwrap_or_default();
+            let base = encoding::base_table(&base_name);
+            let diffs = parse_differences(doc, ed);
+            encoding::build_encoding(base, &diffs)
+        }
+        // No /Encoding: default to StandardEncoding. TODO: a non-symbolic
+        // TrueType font without /Encoding should use its built-in cmap (often
+        // WinAnsi-equivalent); Standard is a safe approximation for the Type1
+        // base fonts this path mainly serves, and only matters without ToUnicode.
+        _ => encoding::build_encoding(encoding::base_table("StandardEncoding"), &[]),
+    }
+}
+
+/// Extract a `/Differences` array (integer code resets + glyph names).
+fn parse_differences(doc: &PdfDocument, ed: &Dictionary) -> Vec<Diff> {
+    let mut out = Vec::new();
+    if let Some(arr) = array_of(doc, ed, b"Differences") {
+        for o in arr {
+            match o {
+                Object::Integer(i) => out.push(Diff::Code(*i as u32)),
+                Object::Real(r) => out.push(Diff::Code(*r as u32)),
+                Object::Name(n) => out.push(Diff::Name(String::from_utf8_lossy(n).into_owned())),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Extract `W`/`DW` from the descendant CID font. The `W` array is a sequence
@@ -193,7 +297,7 @@ fn parse_w_array(doc: &PdfDocument, w: &[Object], map: &mut HashMap<u32, f64>) {
 
 // ---- resources / dictionary helpers -------------------------------------
 
-fn resolve_resources<'a>(doc: &'a PdfDocument, page_id: ObjectId) -> Option<&'a Dictionary> {
+fn resolve_resources(doc: &PdfDocument, page_id: ObjectId) -> Option<&Dictionary> {
     let mut id = page_id;
     for _ in 0..16 {
         let dict = doc.get_dictionary(id).ok()?;
