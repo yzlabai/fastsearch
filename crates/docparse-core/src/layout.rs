@@ -42,6 +42,8 @@ pub struct Line {
     pub x0: f32,
     pub x1: f32,
     pub page: usize,
+    /// True when every chunk on the line is bold (heading signal).
+    pub bold: bool,
 }
 
 /// A body block: a paragraph or a heading, after grouping lines. Carries page +
@@ -81,6 +83,7 @@ pub fn reconstruct_lines(chunks: &[&TextChunk]) -> Vec<Line> {
                 line.text.push_str(&c.text);
                 line.x1 = c.bbox.x1;
                 line.size = line.size.max(c.font_size);
+                line.bold = line.bold && c.bold;
             }
             _ => {
                 if let Some(line) = cur.take() {
@@ -93,6 +96,7 @@ pub fn reconstruct_lines(chunks: &[&TextChunk]) -> Vec<Line> {
                     x0: c.bbox.x0,
                     x1: c.bbox.x1,
                     page: c.page,
+                    bold: c.bold,
                 });
             }
         }
@@ -206,6 +210,7 @@ struct Acc {
     x1_max: f32,
     y_top: f32,
     y_bot: f32,
+    bold: bool,
 }
 
 impl Acc {
@@ -222,6 +227,7 @@ impl Acc {
             x1_max: line.x1,
             y_top: line.cy + line.size / 2.0,
             y_bot: line.cy - line.size / 2.0,
+            bold: line.bold,
         }
     }
     fn extend(&mut self, line: &Line, text: &str, numeric: bool) {
@@ -232,6 +238,7 @@ impl Acc {
         self.x1 = line.x1;
         self.numeric = numeric;
         self.lines += 1;
+        self.bold = self.bold && line.bold;
         self.x0_min = self.x0_min.min(line.x0);
         self.x1_max = self.x1_max.max(line.x1);
         self.y_bot = self.y_bot.min(line.cy - line.size / 2.0);
@@ -307,9 +314,13 @@ fn is_heading_text(t: &str) -> bool {
 
 fn make_block(a: Acc, body_size: f32) -> Block {
     // A heading is a single-line block that is notably larger than body text,
-    // or whose text shape (numbered / all-caps) reads like a section header.
-    let heading =
-        a.lines == 1 && ((body_size > 0.0 && a.size > body_size * 1.25) || is_heading_text(&a.text));
+    // whose text shape (numbered / all-caps) reads like a section header, or a
+    // short fully-bold line (title-case subsection at body size).
+    let short = a.text.chars().count() <= 60;
+    let heading = a.lines == 1
+        && ((body_size > 0.0 && a.size > body_size * 1.25)
+            || is_heading_text(&a.text)
+            || (a.bold && short));
     Block {
         text: a.text,
         size: a.size,
@@ -383,7 +394,7 @@ mod tests {
         line_w(text, size, cy, 100.0)
     }
     fn line_w(text: &str, size: f32, cy: f32, x1: f32) -> Line {
-        Line { text: text.into(), size, cy, x0: 0.0, x1, page: 1 }
+        Line { text: text.into(), size, cy, x0: 0.0, x1, page: 1, bold: false }
     }
 
     // fill_x = 90: lines reaching x1≈100 count as wrapped prose.
@@ -462,6 +473,7 @@ mod tests {
                     font: None,
                     page: number,
                     confidence: 1.0,
+            bold: false,
                 })
             })
             .collect();

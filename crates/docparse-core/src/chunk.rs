@@ -240,6 +240,7 @@ mod tests {
             font: None,
             page,
             confidence: 1.0,
+            bold: false,
         })
     }
 

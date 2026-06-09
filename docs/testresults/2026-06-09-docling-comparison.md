@@ -14,10 +14,10 @@
 | 2305.03393v1 | 0.788 | 0.000 | 0.500 | 表格 我方0/Docling2 |
 | amt_handbook_sample | 0.526 | 1.000 | 0.000 |  |
 | code_and_formula | 0.983 | 1.000 | 1.000 |  |
-| multi_page | 0.593 | 1.000 | 0.000 |  |
+| multi_page | 0.593 | 1.000 | 1.000 |  |
 | normal_4pages | 0.480 | 0.000 | 0.000 | 表格 我方0/Docling1 |
 | picture_classification | 0.504 | 1.000 | 1.000 |  |
-| redp5110_sampled | 0.651 | 0.034 | 0.277 | 表格 我方4/Docling6 |
+| redp5110_sampled | 0.651 | 0.034 | 0.291 | 表格 我方4/Docling6 |
 | right_to_left_01 | 0.048 | 1.000 | 0.000 | RTL（我方 LTR，超范围） |
 | right_to_left_02 | 0.000 | 0.000 | 1.000 | RTL（我方 LTR，超范围） |
 | right_to_left_03 | 0.000 | 0.000 | 0.000 | RTL（我方 LTR，超范围） |
@@ -26,7 +26,7 @@
 
 | 切片 | 文档数 | NID | TEDS | MHS |
 |---|---|---|---|---|
-| **born-digital LTR**（去 RTL）| 10 | **0.626** | — | **0.412** |
+| **born-digital LTR**（去 RTL）| 10 | **0.626** | — | **0.514** |
 | 含表格子集（TEDS 仅在有表文档有意义）| 6 | — | **0.028** | — |
 | RTL（超范围，仅记录）| 3 | 0.016 | — | — |
 

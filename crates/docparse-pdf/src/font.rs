@@ -36,6 +36,8 @@ pub struct FontInfo {
     /// Standard-14 width table (glyph name -> 1/1000 em), used only when the
     /// font has no embedded `/Widths`.
     afm_widths: Option<&'static HashMap<String, f64>>,
+    /// Whether this font is bold (from the BaseFont name or descriptor flags).
+    bold: bool,
 }
 
 /// Default advance when a glyph width is unknown (0.5 em, in 1/1000 units).
@@ -144,6 +146,54 @@ impl FontInfo {
             Widths::Cid(map) => Some(map.get(&code).copied().unwrap_or(self.default_width)),
         }
     }
+
+    /// Whether the font is bold.
+    pub fn is_bold(&self) -> bool {
+        self.bold
+    }
+}
+
+/// Detect bold from the BaseFont name or the FontDescriptor (Type0 fonts carry
+/// it on the descendant). Name-based (`-Bold`, `Black`, `Heavy`, `Semibold`) is
+/// the most reliable signal; descriptor `Flags` bit 19 (ForceBold) is a backup.
+fn font_is_bold(doc: &PdfDocument, fd: &Dictionary) -> bool {
+    let base = name_of(fd, b"BaseFont").unwrap_or_default().to_ascii_lowercase();
+    if ["bold", "black", "heavy", "semibold", "-bd", ",bd"].iter().any(|k| base.contains(k)) {
+        return true;
+    }
+    // FontDescriptor (directly, or on the descendant CID font for Type0).
+    let descr = font_descriptor(doc, fd);
+    if let Some(d) = descr {
+        if let Some(flags) = int_of(d, b"Flags") {
+            if flags & (1 << 18) != 0 {
+                return true; // ForceBold
+            }
+        }
+        if let Some(w) = name_of(d, b"FontWeight") {
+            if w.parse::<f64>().map(|v| v >= 600.0).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve a font's `/FontDescriptor`, following `/DescendantFonts` for Type0.
+fn font_descriptor<'a>(doc: &'a PdfDocument, fd: &'a Dictionary) -> Option<&'a Dictionary> {
+    if let Some(Object::Dictionary(d)) = fd.get(b"FontDescriptor").ok().and_then(|o| deref(doc, o)) {
+        return Some(d);
+    }
+    let Some(Object::Array(desc)) = fd.get(b"DescendantFonts").ok().and_then(|o| deref(doc, o))
+    else {
+        return None;
+    };
+    let Some(Object::Dictionary(cid)) = desc.first().and_then(|o| deref(doc, o)) else {
+        return None;
+    };
+    match cid.get(b"FontDescriptor").ok().and_then(|o| deref(doc, o)) {
+        Some(Object::Dictionary(d)) => Some(d),
+        _ => None,
+    }
 }
 
 /// Build decoders for every font in a page's resources (with Pages-tree
@@ -201,6 +251,7 @@ fn build_font(doc: &PdfDocument, fd: &Dictionary) -> FontInfo {
         default_width,
         encoding,
         afm_widths,
+        bold: font_is_bold(doc, fd),
     }
 }
 

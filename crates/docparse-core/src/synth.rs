@@ -85,6 +85,7 @@ impl PageBuilder {
             font: None,
             page: self.page_no,
             confidence: 1.0,
+            bold: false,
         }));
         self.y -= lh;
     }

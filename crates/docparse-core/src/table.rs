@@ -413,6 +413,7 @@ mod tests {
             font: None,
             page: 1,
             confidence: 1.0,
+            bold: false,
         }
     }
 

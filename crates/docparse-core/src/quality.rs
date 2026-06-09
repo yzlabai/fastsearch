@@ -177,6 +177,7 @@ mod tests {
                 font: None,
                 page: number,
                 confidence: 1.0,
+            bold: false,
             })]
         };
         Page { number, width: 100.0, height: 100.0, elements }

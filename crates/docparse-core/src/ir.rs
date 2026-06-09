@@ -73,6 +73,10 @@ pub struct TextChunk {
     /// when a pluggable model (OCR/VLM) produced or corrected this chunk (M7).
     #[serde(default = "full_confidence")]
     pub confidence: f32,
+    /// Whether the glyphs are bold (from the font weight). Helps heading
+    /// detection when headings are body-size but bold.
+    #[serde(default)]
+    pub bold: bool,
 }
 
 /// A raster/vector image region. Position only for now (no pixel extraction yet).

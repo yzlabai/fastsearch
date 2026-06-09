@@ -331,6 +331,7 @@ fn show_text(
             font: ts.font.clone(),
             page,
             confidence: 1.0,
+            bold: font.map(|f| f.is_bold()).unwrap_or(false),
         }));
     }
 

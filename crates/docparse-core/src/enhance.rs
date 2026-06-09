@@ -138,6 +138,7 @@ mod tests {
                 font: None,
                 page: page.number,
                 confidence: 0.5,
+            bold: false,
             })])
         }
     }
@@ -151,6 +152,7 @@ mod tests {
                 font: None,
                 page: number,
                 confidence: 1.0,
+            bold: false,
             })],
             None => vec![],
         };

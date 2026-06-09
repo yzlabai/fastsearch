@@ -151,6 +151,7 @@ mod tests {
             font: None,
             page: 0,
             confidence: 1.0,
+            bold: false,
         }
     }
 
