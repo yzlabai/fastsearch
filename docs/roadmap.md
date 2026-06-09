@@ -220,4 +220,4 @@ flowchart TD
   Q -->|供 agent/RAG 调用| E[P3: 服务化接口 + 切块溯源 + AI 可插拔增强]
 ```
 
-进度（2026-06-09）：**M1 文本保真**、**M2 IR 脊梁**、**M3 版面可读**、**M4 有框表格检测**（TEDS 入口，`core::table`，bialetti 检出、图形页零误判）**均已完成**。下一步：**M5 多格式（DOCX→HTML）**——需新依赖，按 CLAUDE.md §4 先征询选型。里程碑细节见 [plans/beating-docling.md](plans/beating-docling.md)，devlog 见 [devlogs/](devlogs/)。
+进度（2026-06-09）：**M1–M5 均已完成**——M1 文本保真、M2 IR 脊梁、M3 版面可读、M4 有框表格（`core::table`）、M5 多格式（`docparse-docx`/`docparse-html`，DOCX/HTML 汇入同一 IR）。当前进行中：**M6 RAG 切块 + chunk↔bbox 双向引用**（纯 core，引用是相对 Docling 的杀手锏）。里程碑细节见 [plans/beating-docling.md](plans/beating-docling.md)，devlog 见 [devlogs/](devlogs/)。

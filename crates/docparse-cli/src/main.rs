@@ -3,13 +3,15 @@
 use clap::{Parser, ValueEnum};
 use docparse_core::output;
 use docparse_core::parser::DocumentParser;
+use docparse_docx::DocxParser;
+use docparse_html::HtmlParser;
 use docparse_pdf::PdfParser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "docparse", version, about = "Efficient multi-format document parser (Rust)")]
 struct Cli {
-    /// Input document (currently supported: PDF).
+    /// Input document (PDF, DOCX, or HTML).
     input: PathBuf,
 
     /// Output format.
@@ -35,8 +37,9 @@ enum Format {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Parser registry — add DOCX/HTML backends here as they land.
-    let parsers: Vec<Box<dyn DocumentParser>> = vec![Box::new(PdfParser)];
+    // Parser registry — one line per format backend.
+    let parsers: Vec<Box<dyn DocumentParser>> =
+        vec![Box::new(PdfParser), Box::new(DocxParser), Box::new(HtmlParser)];
     let parser = parsers
         .into_iter()
         .find(|p| p.supports(&cli.input))

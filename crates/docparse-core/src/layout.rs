@@ -248,19 +248,18 @@ fn make_block(text: String, size: f32, line_count: usize, median_size: f32) -> B
     Block { text, size, heading }
 }
 
-/// Median font size across all text chunks (drives heading detection).
-pub fn median_font_size(doc: &Document) -> f32 {
-    let mut sizes: Vec<f32> = doc
-        .pages
-        .iter()
-        .flat_map(|p| p.text_chunks().into_iter().map(|c| c.font_size))
-        .collect();
-    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if sizes.is_empty() {
-        0.0
-    } else {
-        sizes[sizes.len() / 2]
+/// Body font size: the most common chunk size (mode, in 0.5 pt bins). More
+/// robust than the median for heading detection — a doc with many headings
+/// inflates the median, but body text is still the *most frequent* size.
+/// Deterministic tie-break: highest count, then smallest size.
+pub fn body_font_size(doc: &Document) -> f32 {
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    for c in doc.pages.iter().flat_map(|p| p.text_chunks()) {
+        *counts.entry((c.font_size * 2.0).round() as u32).or_insert(0) += 1;
     }
+    let mut entries: Vec<(u32, usize)> = counts.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    entries.first().map(|&(k, _)| k as f32 / 2.0).unwrap_or(0.0)
 }
 
 #[cfg(test)]

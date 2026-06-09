@@ -20,4 +20,5 @@ pub mod output;
 pub mod parser;
 pub mod quality;
 pub mod reading_order;
+pub mod synth;
 pub mod table;

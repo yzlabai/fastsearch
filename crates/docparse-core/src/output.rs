@@ -55,7 +55,7 @@ fn document_content(doc: &Document) -> Vec<PageContent<'_>> {
         .map(|cs| layout::reconstruct_lines(cs))
         .collect();
     let hf = layout::detect_header_footer(&doc.pages, &lines_per_page);
-    let median = layout::median_font_size(doc);
+    let body_size = layout::body_font_size(doc);
 
     lines_per_page
         .into_iter()
@@ -65,7 +65,7 @@ fn document_content(doc: &Document) -> Vec<PageContent<'_>> {
             let right = body.iter().map(|l| l.x1).fold(0.0f32, f32::max);
             let fill_x = right - page.width.max(1.0) * 0.05;
             PageContent {
-                blocks: layout::group_blocks(&body, median, fill_x),
+                blocks: layout::group_blocks(&body, body_size, fill_x),
                 tables: page_tables(page),
             }
         })

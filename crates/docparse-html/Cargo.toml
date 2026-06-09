@@ -1,0 +1,12 @@
+[package]
+name = "docparse-html"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+docparse-core = { path = "../docparse-core" }
+anyhow.workspace = true
+scraper.workspace = true
+ego-tree = "0.9"

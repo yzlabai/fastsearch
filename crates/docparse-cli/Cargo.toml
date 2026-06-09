@@ -12,5 +12,7 @@ path = "src/main.rs"
 [dependencies]
 docparse-core = { path = "../docparse-core" }
 docparse-pdf = { path = "../docparse-pdf" }
+docparse-docx = { path = "../docparse-docx" }
+docparse-html = { path = "../docparse-html" }
 anyhow.workspace = true
 clap.workspace = true

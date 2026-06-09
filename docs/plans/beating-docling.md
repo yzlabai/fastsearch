@@ -65,13 +65,14 @@ flowchart LR
 - **验收 ✅**：bialetti 财报检出 2 表（25×5 / 8×5），单元格干净；**图形页（lorem/1901/2408）零误判**（外框+≥2×2 硬门控）；零回归；确定性 30/30；clippy 零 warning；core 15 + pdf 14 单测。devlog：[2026-06-09-m4-bordered-tables.md](../devlogs/2026-06-09-m4-bordered-tables.md)。
 - **遗留（显式未覆盖）**：单元格粗于视觉行（源按段画线）、合并单元格 span、多表/页分离、无框表格（→M7 外接）。
 
-### M5 · 多格式广度：DOCX → HTML — *模块 5*（可与 M3/M4 并行）
-Docling 的广度是其首选理由。**OOXML/HTML 有显式结构、无需版面推断、ROI 最高**，且 `core` 阅读顺序/输出自动复用（iteration-guide §3C）。
+### M5 · 多格式广度：DOCX → HTML — *模块 5* ✅ 完成（2026-06-09）
+Docling 的广度是其首选理由。OOXML/HTML 有显式结构、ROI 最高，`core` 自动复用。依赖经确认走高层库（docx-rs / scraper）。
 
-- [ ] `docparse-docx`：`impl DocumentParser`，解析 OOXML 段落/标题/表格/列表，坐标按 PDF 约定用合成布局折算。
-- [ ] `docparse-html`：DOM → 同一 IR。
-- [ ] CLI 注册表各加一行（[main.rs](../../crates/docparse-cli/src/main.rs)）。
-- **验收**：DOCX/HTML 端到端出 JSON/MD/Text；标题层级直接拿到（OOXML 有显式 style），抬 **MHS**。
+- [x] `docparse-docx`（docx-rs）：段落/标题（style 名）/表格 → IR；新 `core::synth` 合成 PDF 约定坐标。
+- [x] `docparse-html`（scraper）：DOM 前序遍历 → 标题/段落/列表/表格；script/style 丢弃。
+- [x] CLI 注册表各加一行；标题检测改众数（`body_font_size`）更稳健，通用提升。
+- **验收 ✅**：DOCX/HTML 端到端出 MD/Text/JSON，标题→`##`、表格→管道表格；确定性 20/20；PDF 零回归；clippy 零 warning；单测 35（core 17 + pdf 14 + html 3 + docx 1）。devlog：[2026-06-09-m5-docx-html.md](../devlogs/2026-06-09-m5-docx-html.md)。
+- **遗留**：合成坐标非真实版面；内联格式/图片/嵌套表/DOCX 列表编号未建模。
 
 ### M6 · RAG 输出与引用定位 — *模块 6*（**引用是杀手锏**）
 Docling 有 RAG 生态但引用非全链路。把 **chunk ↔ 页码/bbox 双向定位**做成一等公民——agent/RAG 最想要、Docling 给不全的东西。
