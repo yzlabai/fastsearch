@@ -392,9 +392,40 @@ pub fn page_blocks(doc: &Document) -> Vec<Vec<Block>> {
             let body_lines: Vec<Line> = lines.into_iter().filter(|l| !hf.is_running(l)).collect();
             let right = body_lines.iter().map(|l| l.x1).fold(0.0f32, f32::max);
             let fill_x = right - page.width.max(1.0) * 0.05;
-            group_blocks(&body_lines, body, fill_x)
+            dehyphenate_blocks(group_blocks(&body_lines, body, fill_x))
         })
         .collect()
+}
+
+/// Join consecutive blocks across a soft line-break hyphen, even when they did
+/// not merge into one paragraph (e.g. left column of a 2-column page, where the
+/// fill heuristic keeps lines separate). NID is word-level, so rejoining the
+/// hyphen is what matters: "...com-" + "pact..." → "...compact...".
+fn dehyphenate_blocks(blocks: Vec<Block>) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
+    for b in blocks {
+        let join = out.last().is_some_and(|p| {
+            !p.heading
+                && !b.heading
+                && p.text.ends_with('-')
+                && p.text.chars().rev().nth(1).is_some_and(|c| c.is_alphabetic())
+                && b.text.chars().next().is_some_and(|c| c.is_lowercase())
+        });
+        if join {
+            let p = out.last_mut().unwrap();
+            p.text.pop();
+            p.text.push_str(&b.text);
+            p.bbox = BBox {
+                x0: p.bbox.x0.min(b.bbox.x0),
+                y0: p.bbox.y0.min(b.bbox.y0),
+                x1: p.bbox.x1.max(b.bbox.x1),
+                y1: p.bbox.y1.max(b.bbox.y1),
+            };
+        } else {
+            out.push(b);
+        }
+    }
+    out
 }
 
 /// Body font size: the most common chunk size (mode, in 0.5 pt bins). More
