@@ -13,6 +13,11 @@ use crate::ir::{BBox, Document, Page, TextChunk};
 use crate::reading_order::reading_order;
 use std::collections::HashMap;
 
+/// Inter-chunk gap (in em) above which a word space is inserted. Below the
+/// ~0.25 em space advance so an exactly-one-space gap still breaks the word.
+/// Ref: veraPDF-wcag-algs `SPLIT_THRESHOLD_FACTOR` = 0.21.
+const WORD_GAP_EM: f32 = 0.2;
+
 /// Whether a chunk's center lies inside any of the given (table) boxes — used
 /// to exclude table content from line/paragraph reconstruction.
 pub fn in_any(chunk: &TextChunk, boxes: &[crate::ir::BBox]) -> bool {
@@ -60,7 +65,13 @@ pub fn reconstruct_lines(chunks: &[&TextChunk]) -> Vec<Line> {
         let cy = c.bbox.cy();
         match cur.as_mut() {
             Some(line) if (line.cy - cy).abs() <= c.font_size.max(1.0) * 0.5 => {
-                if c.bbox.x0 - line.x1 > c.font_size * 0.25 {
+                // Insert a word space when the inter-chunk gap exceeds the
+                // word-split threshold. A real space advances ~0.25 em, so the
+                // threshold must sit *below* that (a gap of exactly 0.25 em is a
+                // space). Mirrors veraPDF-wcag-algs `SPLIT_THRESHOLD_FACTOR`
+                // (0.21) vs `WHITE_SPACE_FACTOR` (0.25); our flat 0.25 missed
+                // exactly-0.25 em spaces (e.g. "BirgitPfitzmann").
+                if c.bbox.x0 - line.x1 > c.font_size * WORD_GAP_EM {
                     line.text.push(' ');
                 }
                 line.text.push_str(&c.text);
