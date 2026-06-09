@@ -41,8 +41,15 @@ def walk(children):
             rows = [[c.get("text", "") for c in row] for row in grid]
             if rows:
                 out["tables"].append(rows)
-        # groups/pictures are skipped for these three metrics.
+        elif ref.startswith("#/groups/"):
+            # Docling nests lists (and other groupings) as `group` nodes whose
+            # children are the actual texts. Recurse, else every list item is
+            # dropped from the reference reading order — artificially lowering
+            # NID on every list-bearing doc.
+            walk(groups[idx(ref)].get("children", []))
+        # pictures are skipped for these three metrics.
 
 
+groups = d.get("groups", [])
 walk(d.get("body", {}).get("children", []))
 json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
