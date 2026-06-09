@@ -54,10 +54,14 @@ def main():
                 except (ValueError, TypeError):
                     lvl = 1
                 out["headings"].append([lvl, txt])
-        for k in node.get("kids", []) or []:
+        # ODL nests children under "kids", but `list` nodes put their entries
+        # under "list items". Recurse into both, else every list's text is
+        # silently dropped from the reference reading order — which made NID
+        # artificially low on every list-bearing doc.
+        for k in (node.get("kids", []) or []) + (node.get("list items", []) or []):
             walk(k)
 
-    for k in d.get("kids", []) or []:
+    for k in (d.get("kids", []) or []) + (d.get("list items", []) or []):
         walk(k)
     json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
 
