@@ -3,6 +3,7 @@
 //! It defines:
 //! - [`ir`] — the intermediate representation every parser produces.
 //! - [`chunk`] — RAG chunking with chunk↔source-bbox citation.
+//! - [`enhance`] — pluggable OCR/LLM boundary + per-page quality routing.
 //! - [`parser`] — the [`parser::DocumentParser`] trait that PDF/DOCX/HTML
 //!   backends implement.
 //! - [`reading_order`] — a recursive XY-cut that linearizes a page.
@@ -16,6 +17,7 @@
 //! into reading order and output without ever rasterizing.
 
 pub mod chunk;
+pub mod enhance;
 pub mod ir;
 pub mod layout;
 pub mod output;

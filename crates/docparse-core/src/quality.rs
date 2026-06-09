@@ -5,7 +5,7 @@
 //! per-page routing to pluggable OCR/LLM fallback. Here we only *produce the
 //! score*; nothing acts on it yet.
 
-use crate::ir::{Document, Element};
+use crate::ir::{Document, Element, Page};
 use serde::{Deserialize, Serialize};
 
 /// A reason the deterministic parse may be insufficient.
@@ -106,6 +106,59 @@ pub fn analyze(doc: &Document) -> QualityReport {
         garbled_ratio,
         flags,
     }
+}
+
+/// Per-page quality, used by routing (M7) to decide whether a page should be
+/// escalated to a pluggable enhancer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageAssessment {
+    pub page: usize,
+    pub chars: usize,
+    pub garbled_ratio: f32,
+    pub flags: Vec<QualityFlag>,
+    /// True when the deterministic parse looks insufficient (no text, or very
+    /// garbled) — a candidate for OCR/LLM fallback.
+    pub needs_enhancement: bool,
+}
+
+/// Assess one page: no text ⇒ likely scan; high garble ⇒ bad decode.
+pub fn assess_page(page: &Page) -> PageAssessment {
+    let mut chars = 0usize;
+    let mut garbled = 0usize;
+    let mut has_text = false;
+    for el in &page.elements {
+        if let Element::Text(t) = el {
+            for c in t.text.chars() {
+                chars += 1;
+                if is_garbled(c) {
+                    garbled += 1;
+                }
+                if !c.is_whitespace() {
+                    has_text = true;
+                }
+            }
+        }
+    }
+    let garbled_ratio = if chars == 0 { 0.0 } else { garbled as f32 / chars as f32 };
+    let mut flags = Vec::new();
+    if !has_text {
+        flags.push(QualityFlag::ScannedNoText);
+    }
+    if garbled_ratio > 0.1 {
+        flags.push(QualityFlag::HighGarble);
+    }
+    PageAssessment {
+        page: page.number,
+        chars,
+        garbled_ratio,
+        needs_enhancement: !flags.is_empty(),
+        flags,
+    }
+}
+
+/// Assess every page of a document.
+pub fn assess_pages(doc: &Document) -> Vec<PageAssessment> {
+    doc.pages.iter().map(assess_page).collect()
 }
 
 #[cfg(test)]

@@ -220,4 +220,4 @@ flowchart TD
   Q -->|供 agent/RAG 调用| E[P3: 服务化接口 + 切块溯源 + AI 可插拔增强]
 ```
 
-进度（2026-06-09）：**M1–M5 均已完成**——M1 文本保真、M2 IR 脊梁、M3 版面可读、M4 有框表格（`core::table`）、M5 多格式（`docparse-docx`/`docparse-html`，DOCX/HTML 汇入同一 IR）。当前进行中：**M6 RAG 切块 + chunk↔bbox 双向引用**（纯 core，引用是相对 Docling 的杀手锏）。里程碑细节见 [plans/beating-docling.md](plans/beating-docling.md)，devlog 见 [devlogs/](devlogs/)。
+进度（2026-06-09）：**近期执行层 M1–M7 全部完成**——M1 文本保真、M2 IR 脊梁、M3 版面可读、M4 有框表格、M5 多格式（PDF/DOCX/HTML）、M6 RAG 切块+chunk↔bbox 引用、M7 质量路由+外接边界。41 单测、clippy 零 warning、确定性逐字节。**后续为远期**：模块 9 安全预检、模块 10 服务化（REST/gRPC/MCP）、P4 小模型 ONNX、真实 enhancer 接入、born-digital 评测集回填 NID/TEDS/MHS 与 Docling 同台（§6 记分牌）。里程碑细节见 [plans/beating-docling.md](plans/beating-docling.md)，devlog 见 [devlogs/](devlogs/)。

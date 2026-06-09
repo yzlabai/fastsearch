@@ -25,6 +25,11 @@ struct Cli {
     /// Print a parse-quality report (coverage/garble/flags) as JSON to stderr.
     #[arg(long)]
     quality: bool,
+
+    /// Print the per-page enhancement routing plan (which pages a model would
+    /// be escalated to) as JSON to stderr — demonstrates how few pages are hard.
+    #[arg(long)]
+    route_plan: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -51,6 +56,17 @@ fn main() -> anyhow::Result<()> {
 
     if cli.quality {
         eprintln!("{}", docparse_core::quality::analyze(&doc).to_json());
+    }
+    if cli.route_plan {
+        // No enhancers registered in the CLI; the plan shows which pages WOULD
+        // need a model — on a digital document this is empty (cost stays low).
+        let plan = docparse_core::enhance::plan(&doc, &[]);
+        eprintln!(
+            "{{\"hard_pages\": {}, \"total_pages\": {}, \"routes\": {}}}",
+            plan.len(),
+            doc.pages.len(),
+            docparse_core::enhance::report_json(&plan)
+        );
     }
 
     let rendered = match cli.format {
