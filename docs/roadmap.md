@@ -161,7 +161,7 @@ flowchart TB
 | **P1** | 文本保真与版面可读 | 数字 PDF 文本接近无损；输出按段落/表格可读，而非逐行 | 2,3 | ✅ 已完成（M1–M3）|
 | **P2** | 语义结构 + 多格式 | 输出是**结构**（表格/列表/标题层级）而非纯文本流；覆盖 DOCX/HTML | 4,5 | ✅ 基本完成（M4 有框表格 + M5 DOCX/HTML；表格四检测器 bordered→ruled→**cluster**→borderless，确定性检出达 ODL 量级；多级表头/无框结构属 N3 神经域）|
 | **P3** | Agent 接入与 AI 增强 | 成为任意 agent 可直接调用的**完整系统**：稳定 IR 协议、引用定位、服务化接口（REST/MCP）；难例可插拔接入 OCR/LLM；质量回退、安全预检 | 1,6,7,8,9,10 | 🚧 大部完成（M2 IR 脊梁、M6 切块溯源、M7 质量路由、N1 评测、N2 服务化 REST+MCP、N5 安全预检 ✅；仅剩真实 enhancer N3——选型待决策）|
-| **P4** | 选择性模型内嵌 | 稳定小模型（页面分类/方向/轻量 OCR）以 ONNX 内嵌提速；大 VLM 仍外接 | 8 | ⬜ 远期·可选 |
+| **P4** | 选择性模型内嵌 | 稳定小模型（页面分类/方向/轻量 OCR）以 ONNX 内嵌提速；大 VLM 仍外接 | 8 | 📋 已提前选为 **N3 的首选实现路线**（RapidOCR ONNX，先 spike 纯 Rust `tract`；见 [plans/n3-real-enhancer.md](plans/n3-real-enhancer.md)）|
 
 **各阶段大致内容（高层，细节见对应 plan）：**
 

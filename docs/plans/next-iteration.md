@@ -55,7 +55,7 @@ P3 的"面向 agent 可直接调用"。**次序反转为 MCP 先行**（stdio JS
 
 ### N3 · 真实 enhancer 接入 — *模块 8* · 📋 设计已定（[plan](n3-real-enhancer.md)），实现暂缓（用户决策 2026-06-10）
 M7 只给了边界 + StubOcr。接一个真实模型证明可插拔端到端。
-> 调研 ODL hybrid + Docling OCR 层后设计已定（[refer/n3-enhancer-odl-docling-research](../refer/n3-enhancer-odl-docling-research.md)）：**N3a** tesseract CLI 子进程（抽嵌入图原字节而非渲染——不破"不光栅化"；零 Rust 新依赖，tesseract 运行时可选）→ **N3b** HTTP 后端（对齐 ODL hybrid，docling-serve 兼容，需 HTTP 客户端依赖征询）。
+> 调研 ODL hybrid + Docling OCR 层 + 引擎质量后（[refer](../refer/n3-enhancer-odl-docling-research.md)），**路线已定为 P4 优先**：ONNX 内嵌 RapidOCR/PP-OCR 模型（中文事实标准；模型外部文件 ~16MB Apache-2.0；抽嵌入图原字节而非渲染——不破"不光栅化"）。**前置 spike：`tract`（纯 Rust）能否跑通三模型**——能则身份零妥协，不能再决策 ort feature-gate vs HTTP。tesseract CLI 降级为备选；HTTP 后端（ODL hybrid 同款）留作接最强模型的远期通道。N6 与本里程碑合并。
 
 - [ ] 实现一个 `Enhancer`：外部进程（如 tesseract/PaddleOCR CLI）或 HTTP（VLM/LLM）；对扫描页/高乱码页产出文本，归一回 IR、低 confidence、记 provenance。
 - [ ] 元素级 `source` 标签（M7 遗留）：每 chunk 标注"哪个 parser/enhancer"。
@@ -97,9 +97,8 @@ M7 只给了边界 + StubOcr。接一个真实模型证明可插拔端到端。
 - [ ] **复杂度画像**（N5c，暂缓）：格式 + 页级路由信号（数字/扫描/混合/旋转/表格密度），喂给 N1 评测与路由——quality 已有雏形，待 N3 需要时扩。
 - **验收 ✅**：隐藏文本 + zip bomb 构造样例均被识别、产生可追踪错误码、不 panic 不挂起（不静默吞）。
 
-### N6 · 选择性小模型 ONNX 内嵌 — *模块 8 / P4·远期·可选*
-- [ ] 把已稳定的小模型（页面分类/方向/轻量 OCR）转 ONNX，用 `ort`/Candle 在 Rust worker 内推理，评估纯 Rust/Metal 部署；重型 VLM 仍外接。
-- **前置**：N1 评测先证明哪些难例值得、N3 外接先跑通再考虑内嵌提速。
+### N6 · 选择性小模型 ONNX 内嵌 — *模块 8 / P4* · ➡️ **已并入 N3 作为首选路线**（2026-06-10）
+- 原"N3 外接先跑通再内嵌提速"的次序已反转：调研显示 ONNX 内嵌（RapidOCR/PP-OCR + 首选 `tract` 纯 Rust 运行时）在中文质量与部署形态上都优于 tesseract 外接，直接作为 N3 的实现路线。细节见 [n3-real-enhancer.md §-1](n3-real-enhancer.md)。重型 VLM 仍外接（N3b HTTP）。
 
 ---
 
