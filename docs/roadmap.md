@@ -186,7 +186,7 @@ flowchart TB
 - **TEDS 边界须诚实标注**：roadmap §2 的"结构理解要持平"目前只在**表格检出覆盖**上接近 ODL（四检测器，召回 5/6+）；**结构精度**（多级表头/合并单元格/单元格粒度）不持平、属神经域。TEDS 聚合 **0.093（ODL）/0.180（Docling）**（2026-06-10 修了按索引配对的测量 bug——表按内容最优配对而非发射序，redp5110 0.184→0.432；仍为近似 proxy，精确 APTED 待换）。聚合仍低主因是**检出 recall**（学术无框表 ODL 13 vs 我方 4），非已检出表的结构错。
 - benchmark **不可拼榜**（报告 §5.2）：只在自建可比子集比，不把不同项目的单分拼排行。
 
-> **现状（2026-06-10，去 RTL born-digital LTR）**：vs ODL NID **0.761** / MHS **0.614**；vs Docling NID **0.832** / MHS **0.625**。**clean 子集已达 docling/ODL 水平**（`multi_page` 0.984、`code`/`picture` 0.99、`redp5110` 0.973、`2203` 0.936、`2305` 0.921）。聚合被 CJK 复杂版面（`skipped_*`/`normal_4pages`）拖低——属 N3 enhancer/版面模型领域。⚠️ 两次关键纠偏均为**评测/输出管线 bug 而非解析能力**：① 两个 GT 提取器漏算列表文本，低估 NID +0.07；② chunk 组装的页级 y-sort 毁掉双栏读序（layout 本身是对的），修复后 `2203` 0.568→0.936（[devlog](devlogs/2026-06-10-chunk-order-fix.md)）。详见 [devlogs/2026-06-10-session-summary](devlogs/2026-06-10-session-summary.md)。
+> **现状（2026-06-10，去 RTL born-digital LTR）**：vs ODL NID **0.764** / MHS **0.627** / TEDS 0.098；vs Docling NID **0.833** / MHS **0.645** / TEDS 0.187。**clean 子集已达 docling/ODL 水平**（`multi_page` 0.984、`code`/`picture` 0.99、`redp5110` 0.973、`2203` 0.945、`2305` 0.939）。聚合被 CJK 复杂版面（`skipped_*`/`normal_4pages`）拖低——属 N3 enhancer/版面模型领域。⚠️ 本会话**多次关键纠偏几乎全是评测/输出管线 bug 而非解析能力**：① GT 提取器漏算列表文本（NID +0.07）；② chunk 页级 y-sort 毁双栏读序（`2203` 0.568→0.936）；③ TEDS 按索引配对（redp5110 0.184→0.432）；④ 跑页眉漏过滤误判为标题（2305 MHS 0.488→0.647，唯一真产品 bug）。详见 [devlogs](devlogs/)（chunk-order-fix、running-header-and-teds-honesty）。
 
 **差异化记分牌（Docling 结构上无法同台）**——这才是"更好"的硬证据：
 

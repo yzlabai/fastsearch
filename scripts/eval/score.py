@@ -21,12 +21,16 @@ Usage:
   score.py pred.json gt.json        # print NID/TEDS/MHS + composite
   score.py --selftest               # run synthetic assertions
 """
-import sys, json, re
+import sys, json, re, unicodedata
 from difflib import SequenceMatcher
 
 
 def _norm(s):
-    return re.sub(r"\s+", " ", str(s).strip()).lower()
+    # NFKC folds typographic ligatures (ﬁ→fi, ﬂ→fl) and compatibility forms so
+    # a system that expands them (ours) and one that keeps the codepoint (ODL)
+    # compare equal. Applied to both sides — pure measurement hygiene.
+    s = unicodedata.normalize("NFKC", str(s))
+    return re.sub(r"\s+", " ", s.strip()).lower()
 
 
 def _words(seq):

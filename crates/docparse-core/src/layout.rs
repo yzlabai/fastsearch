@@ -118,19 +118,31 @@ pub fn reconstruct_lines(chunks: &[&TextChunk]) -> Vec<Line> {
     lines
 }
 
-/// Normalize a line's text for repeat-detection (collapse whitespace, fold
-/// digits to `#` so "Page 1"/"Page 2" and "1"/"2" page numbers match).
+/// Normalize a line's text for repeat-detection (collapse whitespace, fold each
+/// run of digits to a single `#` so page numbers of different widths match —
+/// "2 M. Lysak" and "10 M. Lysak" both become "# m. lysak", and "Page 1"/"Page
+/// 2" match). Without run-collapsing, a multi-digit page (## ) wouldn't match a
+/// single-digit one (#), and the running header would slip through as a heading.
 fn normalize_repeat(text: &str) -> String {
     let mut s = String::new();
     let mut prev_space = false;
+    let mut prev_hash = false;
     for c in text.trim().chars() {
         if c.is_whitespace() {
             if !prev_space {
                 s.push(' ');
             }
             prev_space = true;
+            prev_hash = false;
+        } else if c.is_ascii_digit() {
+            if !prev_hash {
+                s.push('#');
+            }
+            prev_hash = true;
+            prev_space = false;
         } else {
-            s.push(if c.is_ascii_digit() { '#' } else { c });
+            s.push(c);
+            prev_hash = false;
             prev_space = false;
         }
     }
@@ -169,7 +181,14 @@ pub fn detect_header_footer(pages: &[Page], lines_per_page: &[Vec<Line>]) -> Hea
         let bot = h * 0.12;
         let mut seen_on_page = std::collections::HashSet::new();
         for line in lines {
-            if line.cy >= top || line.cy <= bot {
+            // Test the line's edges, not its center: a running header sits at
+            // the very top but its center can fall a hair below the 12% band
+            // (e.g. 2305 header center 696.6 vs cutoff 697). Counting a line
+            // whose top edge reaches the top band (or bottom edge the bottom
+            // band) catches it; the cross-page repeat threshold still gates FPs.
+            let top_edge = line.cy + line.size / 2.0;
+            let bot_edge = line.cy - line.size / 2.0;
+            if top_edge >= top || bot_edge <= bot {
                 let key = normalize_repeat(&line.text);
                 if key.len() >= 2 {
                     seen_on_page.insert(key);
