@@ -75,7 +75,7 @@ A Cargo workspace with six crates:
 
 ### The content-stream interpreter (the heart of the project)
 
-This is the layer opendataloader-pdf delegates to veraPDF, implemented here in Rust: lopdf yields the parsed operator list, and [`interpreter.rs`](crates/docparse-pdf/src/interpreter.rs) maintains the graphics/text matrix stack and emits positioned chunks from text-showing operators. **Nothing is ever rasterized** — even OCR only extracts the raw bytes of the raster image *already embedded* in a scanned page.
+This is the layer opendataloader-pdf delegates to veraPDF, implemented here in Rust: lopdf yields the parsed operator list, and [`interpreter.rs`](crates/docparse-pdf/src/interpreter.rs) maintains the graphics/text matrix stack and emits positioned chunks from text-showing operators. **The main pipeline never rasterizes** (that is where the speed comes from) — OCR only extracts the raw bytes of the raster *already embedded* in a scanned page; only when a hard page is routed to a neural enhancer is that single page rendered on demand by a pure-Rust renderer (opt-in, off by default).
 
 Handled operators: `q Q cm` · `BT ET` · `Tf TL Tc Tw Tz Tr Td TD Tm T*` · `Tj ' TJ` · paths `m l re c v y h S f B n` (table-rule extraction) · `Do` (image XObjects).
 

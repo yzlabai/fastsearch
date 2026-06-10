@@ -4,7 +4,7 @@
 >
 > **代码现状永远是真源**：本文件描述的结构/不变量若与代码不符，以代码为准并回写本文件。
 
-docparse-rs 是纯 Rust 的多格式文档解析系统，走"结构提取"而非"光栅渲染"的快路径，从文档抽取带位置的结构化内容（文本/版面/阅读顺序 → JSON/Markdown/Text）。背景与里程碑见 [README.md](README.md)、[docs/phase-1-summary.md](docs/phase-1-summary.md)；怎么迭代见 [docs/iteration-guide.md](docs/iteration-guide.md)。
+docparse-rs 是纯 Rust 的多格式文档解析系统，定位"**速度快、质量好**"：主流程走"结构提取"快路径不渲染像素；难页经路由用纯 Rust 渲染器按需画页、交给神经 enhancer（默认关闭）。从文档抽取带位置的结构化内容（文本/版面/阅读顺序 → JSON/Markdown/Text）。背景与里程碑见 [README.md](README.md)、[docs/phase-1-summary.md](docs/phase-1-summary.md)；怎么迭代见 [docs/iteration-guide.md](docs/iteration-guide.md)。
 
 ## 1. 命令
 

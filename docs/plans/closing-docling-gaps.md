@@ -2,7 +2,7 @@
 
 > 依据:[refer/docling-objective-comparison.md](../refer/docling-objective-comparison.md) 的诚实清单——逐条映射成里程碑。承接 [next-iteration.md](next-iteration.md)(N1–N6 已收官)。
 >
-> **不变的边界**:四条身份约束不动(纯 Rust/不光栅化/确定性核心独立/模型可插拔)。补差距的手段分三层——**确定性可自研的直接做**(格式广度/区域 OCR/Form 流/代码块检测),**小模型沿 N3 已验证的 P4 模式内嵌**(tract + 外部 ONNX,先 spike 门控),**重模型/VLM 经 G8 语义增强面接入**(HTTP 外接先行,纯 Rust 运行时内嵌后探)。显式不追仅剩:GPU、为格式数铺长尾货。
+> **边界(2026-06-10 定位修订)**:纯 Rust/确定性核心独立/模型可插拔不动;"不光栅化"改述为"**主流程不渲染像素;难页 AI 增强可按需用纯 Rust 工具渲染该页(默认关闭)**"——以"速度快、质量好"的产品定位为准。补差距的手段分三层——**确定性可自研的直接做**(格式广度/区域 OCR/Form 流/代码块检测),**小模型沿 N3 已验证的 P4 模式内嵌**(tract + 外部 ONNX,先 spike 门控),**重模型/VLM 经 G8 语义增强面接入**(HTTP 外接先行,纯 Rust 运行时内嵌后探)。显式不追仅剩:GPU、为格式数铺长尾货。
 
 ## 0. 差距 → 里程碑映射
 
@@ -41,7 +41,7 @@
 聚合记分牌剩余 gap(CJK 信息图 0.12–0.22、复杂首页)全在这——确定性已证不可强攻,Docling 靠 DocLayNet 系模型赢的就是这层。
 
 - [x] **Spike 门控 ✅**(2026-06-10,[devlog](../devlogs/2026-06-10-g2-layout-spike.md)):DocLayout-YOLO(75MB,DocStructBench 含中文)在 `tract` 直接跑通,输出已解码框无需 NMS;CJK 难页正确识别双栏/标题/页眉脚;2.37s/页(仅难页触发)。table/formula 区域同模型可得(G3/G8c 共用)。
-- [ ] **光栅来源**:born-digital 页需真实渲染(草图已否决)——选型分析见 [refer/rasterization-options-analysis.md](../refer/rasterization-options-analysis.md)(推荐:可选 crate 包 `hayro` 纯 Rust 渲染,实测 99ms/页 CJK 完全正确;**待用户确认**身份改述+依赖)。
+- [ ] **光栅来源**:born-digital 页需真实渲染(草图已否决)——选型分析见 [refer/rasterization-options-analysis.md](../refer/rasterization-options-analysis.md)✅ **已决**(2026-06-10):`docparse-raster` crate 包 hayro(纯 Rust,99ms/页),enhancer 难页按需渲染、默认关闭;外部工具兜底链暂不做。
 - [ ] **触发**:N5c 画像已就绪——`scanned`/`mixed`/版面复杂信号页才路由(对版面模型,"难页"判据可用确定性输出的异常分:块重叠率/读序回跳),clean 页不碰模型。
 - [ ] **归一**:模型出 region(标题/正文/图/表/页眉脚)+ bbox → 重排该页读序、修正标题/表区域;经 `Enhancer` 边界,source 标 `layout:<model>`,确定性结果仍独立成立。
 - **验收**:`skipped_*` NID 0.12–0.22 → ≥0.5;`normal_4pages` ≥0.7;clean 文档零回归(回归门 ≥0.92 不破);数字 clean 页零模型。
@@ -49,7 +49,7 @@
 ### G3 · 表结构 enhancer:ONNX 表结构模型内嵌 — *模块 8 / P4 模式*
 TEDS 0.098/0.187 的主因是多级表头/合并单元格(神经域)。SLANet 系(PP-StructureV2,~9MB)输出结构 token + cell bbox,正是缺的拓扑。
 
-- [ ] **Spike 门控**:SLANet ONNX 在 `tract` 的算子覆盖;输入是表区域图——born-digital 的表没有位图,需评估**用矢量线+文本合成栅格**是否破"不光栅化"(若破,此模型仅服务扫描表,born-digital 走 G3b)。
+- [ ] **Spike 门控**:SLANet ONNX 在 `tract` 的算子覆盖;输入是表区域图——born-digital 的表没有位图,born-digital 表区域经 `docparse-raster`(hayro)按需渲染——光栅决策已解(2026-06-10)。
 - [ ] **G3b(确定性兜底)**:合并单元格/多级表头的几何推断(跨列 span 由对齐+横线覆盖推断)——P1c 教训在前,只做高置信形态,不强攻。
 - **验收**:TEDS vs Docling 0.187 → ≥0.4(含表 6 份);检出零回归。⚠️ 此里程碑**风险最高**,spike 不过即降级为 G3b + N3b 外接,不硬上。
 

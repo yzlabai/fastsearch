@@ -75,7 +75,7 @@ Cargo workspace，六个 crate：
 
 ### 内容流解释器（项目的核心）
 
-这是 opendataloader-pdf 委托给 veraPDF 的那一层，这里用 Rust 自己实现：lopdf 给出已解析的操作符列表，[`interpreter.rs`](crates/docparse-pdf/src/interpreter.rs) 维护图形/文本矩阵栈，走文本显示操作符发射带坐标的 chunk。**全程不光栅化**——连 OCR 也只是抽出扫描页里**已有的**嵌入位图原字节。
+这是 opendataloader-pdf 委托给 veraPDF 的那一层，这里用 Rust 自己实现：lopdf 给出已解析的操作符列表，[`interpreter.rs`](crates/docparse-pdf/src/interpreter.rs) 维护图形/文本矩阵栈，走文本显示操作符发射带坐标的 chunk。**主流程不光栅化**（速度的来源）——OCR 只抽扫描页里**已有的**嵌入位图原字节；唯有难页请神经 enhancer 帮忙时，才用纯 Rust 渲染器按需画那一页（opt-in，默认关闭）。
 
 已处理操作符：`q Q cm` · `BT ET` · `Tf TL Tc Tw Tz Tr Td TD Tm T*` · `Tj ' TJ` · 路径 `m l re c v y h S f B n`（表格线抽取）· `Do`（图像 XObject）。
 
