@@ -5,9 +5,11 @@
 //! `LI`, `Table`, …) are ground-truth semantics. Content links to the tree via
 //! marked-content IDs (`BDC /P <</MCID n>>` in the content stream). This
 //! module walks the tree once per document and produces, per page, a map
-//! `MCID -> (normalized role, traversal order)` that the interpreter applies
-//! to text chunks (role → `TextChunk.tag`, order → `TextChunk.group`, riding
-//! the same reading-group mechanism the layout enhancer uses).
+//! `MCID -> (normalized role, traversal order)`. The interpreter applies the
+//! ROLE to text chunks (`TextChunk.tag`); the traversal ORDER is computed but
+//! deliberately NOT applied as reading order — real-world tag trees are
+//! authored in creation order, not visual order (measured −0.15 NID on amt;
+//! see the G9a devlog).
 //!
 //! Untagged documents produce an empty map — zero behavior change.
 
@@ -120,7 +122,7 @@ fn walk(
                     .get(b"Pg")
                     .ok()
                     .and_then(|o| o.as_reference().ok())
-                    .or(page.map(|p| p));
+                    .or(page);
                 if let Ok(mcid) = d.get(b"MCID").and_then(|o| o.as_i64()) {
                     record(out, pg, page_no, mcid, role, order);
                 }
