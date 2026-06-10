@@ -166,6 +166,21 @@ pub fn detect_tables(chunks: &[&TextChunk], segments: &[Segment], page: usize) -
         rows.push(row);
     }
 
+    // Page-frame veto: a decorative full-page border plus a few rules can
+    // satisfy the grid test, swallowing the whole page into one mostly-empty
+    // "table" (seen on right_to_left_03). A real near-page-size table
+    // (bialetti) has dense cell content; a frame has rows of empty cells —
+    // discriminate by filled-cell ratio.
+    let total_cells: usize = rows.iter().map(Vec::len).sum();
+    let filled = rows
+        .iter()
+        .flatten()
+        .filter(|c| !c.text.trim().is_empty())
+        .count();
+    if total_cells > 0 && (filled as f32 / total_cells as f32) < 0.25 {
+        return Vec::new();
+    }
+
     vec![Table {
         bbox: BBox {
             x0: left,
