@@ -8,7 +8,7 @@
 
 | Docling 优势(对比文档 §1) | 应对 | 里程碑 |
 |---|---|---|
-| 格式广度 15+ vs 3 | 确定性自研:XLSX/PPTX(+顺手 CSV/Markdown) | **G1** |
+| 格式广度 15+ vs 3 | 确定性自研平齐:XLSX/PPTX/MD/CSV(G1a)+ 邮件/字幕/图片/AsciiDoc/LaTeX/XML 族(G1b) | **G1** |
 | 难版面质量上限(神经版面) | ONNX 版面模型内嵌,难页路由(P4 模式) | **G2** |
 | 表格结构精度(TableFormer) | ONNX 表结构模型内嵌(SLANet 系) | **G3** |
 | OCR 广度(区域级/方向/多语种) | 区域级 OCR + cls + 多语种字典 + Form 流 | **G4** |
@@ -19,13 +19,23 @@
 
 ## 1. 里程碑
 
-### G1 · 格式广度:XLSX + PPTX(+CSV/Markdown 顺手)— *模块 5* · 确定性自研
-广度是 Docling 被首选的第一理由;XLSX/PPTX 有显式 XML 结构,ROI 最高,M5(DOCX/HTML)的 `synth` 合成坐标直接复用。
+### G1 · 格式广度:与 Docling 平齐(含长尾)— *模块 5* · 确定性自研
+广度是 Docling 被首选的第一理由。**目标改为平齐**(用户决策 2026-06-10,撤销"不铺长尾"非目标):格式数 3 → 12+。全部走 `DocumentParser` trait + `synth` 合成坐标,每格式一个薄后端,注册表一行。
+
+**G1a 主流办公(先做)**:
 
 - [ ] `docparse-xlsx`:工作表 → `Element::Table`(每 sheet 一页),数字/公式取显示值;**依赖征询:`calamine`**(纯 Rust,事实标准)。
-- [ ] `docparse-pptx`:slide 文本框/标题/表格 → 合成版面(每 slide 一页);**依赖征询:`quick-xml`+zip 解析**(docx-rs 不覆盖 pptx;zip 预检复用 `core::limits`)。
-- [ ] CSV(std 即可)与 Markdown(**征询 `pulldown-cmark`**)作低成本顺手项,可砍。
-- **验收**:四格式经同一 IR 出 chunks 带合成 bbox;注册表各一行;零回归。格式数 3→5(+2 顺手)。
+- [ ] `docparse-pptx`:slide 文本框/标题/表格 → 合成版面(每 slide 一页);**依赖征询:`quick-xml`**(docx-rs 不覆盖 pptx;zip 预检复用 `core::limits`)。
+- [ ] Markdown(**征询 `pulldown-cmark`**)与 CSV/纯文本(std 手写,零依赖)。
+
+**G1b 长尾(对齐 Docling 后端清单)**:
+
+- [ ] **邮件 EML**:正文(text/html 部分复用 HTML 后端)+ 头部(From/Subject→标题结构)+ 附件列举;**依赖征询:`mail-parser`**(纯 Rust)。
+- [ ] **字幕 SRT/WebVTT**:时间戳→段落 metadata,文本→正文;格式简单,**std 手写零依赖**。
+- [ ] **图片即文档(PNG/JPEG/TIFF 单页)**:解码为单页全幅 ImageChunk → **直接复用 N3 OCR 路由**(我方独有优势:整条 OCR 管线已就绪);**依赖征询:`zune-png`**(JPEG 已有)。
+- [ ] **AsciiDoc / LaTeX 源码**:常用子集手写解析(标题/段落/列表/表格);完整方言显式不保证,文档化边界。
+- [ ] **XML 族(JATS 学术/METS-ALTO 档案)**:按真实需求逐个立项(quick-xml 复用);METS-ALTO 自带坐标,可出**真实 bbox**(非合成)。
+- **验收**:每格式经同一 IR 出 chunks(带合成或真实 bbox);`supports()` 按扩展名注册;每格式至少一个样例端到端 + 单测;现有格式零回归。格式数 3→12+。
 
 ### G2 · 版面 enhancer:ONNX 版面模型内嵌 — *模块 8 / P4 模式* · 🎯 质量上限的正解
 聚合记分牌剩余 gap(CJK 信息图 0.12–0.22、复杂首页)全在这——确定性已证不可强攻,Docling 靠 DocLayNet 系模型赢的就是这层。
@@ -101,7 +111,7 @@ flowchart LR
 | 里程碑 | 价值 | 风险/前置 | 新依赖(均先征询) |
 |---|---|---|---|
 | **G2 版面**(建议先做) | 聚合记分牌最大剩余 gap | spike 门控;难页判据设计 | 无(模型外部文件) |
-| G1 广度 | Docling 首选理由,确定性低风险 | 无 | calamine / quick-xml / pulldown-cmark |
+| G1 广度(a 主流+b 长尾) | Docling 首选理由,确定性低风险;图片格式可直连 OCR | AsciiDoc/LaTeX 只做子集 | calamine / quick-xml / pulldown-cmark / mail-parser / zune-png |
 | G4 OCR 长尾 | 混合页+Form 流补完 N3 | cls 模型获取 | 无 |
 | G3 表结构 | TEDS 主差距 | **最高**:tract 算子 + 可能触身份约束 | 无 |
 | G6 生态 | 可见度/采用率 | 无技术风险 | PyPI 侧 |
@@ -115,4 +125,4 @@ flowchart LR
 
 - 自研训练任何模型:增强面全部用现成模型(ONNX 内嵌或 HTTP 外接);
 - GPU 加速:与零依赖单二进制身份冲突,不做(重推理负载属 G8b 后端的职责);
-- 追格式数字面平齐(邮件/字幕/METS…):长尾格式按真实需求单独立项,不为数字好看铺货。
+(原"不追格式平齐"已撤销——见 G1b,用户决策 2026-06-10。)

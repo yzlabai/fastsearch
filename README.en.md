@@ -98,7 +98,7 @@ Show strings of embedded subset CID fonts are glyph indices — unreadable witho
 - [x] **N3 real enhancer**: ONNX-embedded OCR (PP-OCRv4 × `tract`, pure Rust) — `chinese_scan` goes from 0 text to **14/14 lines correct** with bbox citations; MCP/REST pass-through; digital pages stay model-free.
 - [x] **N4 (bulk)**: four table detectors (bordered → ruled → cluster → borderless), heading levels, word spacing.
 - [x] **N5 security & profiling**: hidden-text filtering (Tr 3/7 / off-page / tiny fonts → flagged + excluded + auditable), zip-bomb / page-count guards, per-page complexity profile (`--profile`).
-- [ ] **Phase 4 (planned)**: closing the axes where Docling clearly leads — layout/table-structure ONNX enhancers (hard-page routing), XLSX/PPTX backends, region-level OCR / form streams, semantic enrichment (code blocks / formulas / pictures / charts / full-page VLM — VLM via OpenAI-compatible services: vLLM, Ollama, etc.), LangChain/LlamaIndex integrations, corpus-scale stress testing. See the [iteration plan](docs/plans/closing-docling-gaps.md) (Chinese).
+- [ ] **Phase 4 (planned)**: closing the axes where Docling clearly leads — layout/table-structure ONNX enhancers (hard-page routing), format parity (XLSX/PPTX/email/subtitles/images-as-documents/LaTeX …), region-level OCR / form streams, semantic enrichment (code blocks / formulas / pictures / charts / full-page VLM — VLM via OpenAI-compatible services: vLLM, Ollama, etc.), LangChain/LlamaIndex integrations, corpus-scale stress testing. See the [iteration plan](docs/plans/closing-docling-gaps.md) (Chinese).
 
 ## License
 
