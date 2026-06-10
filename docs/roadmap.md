@@ -160,7 +160,7 @@ flowchart TB
 | **P0** | 纯 Rust PDF 抽取骨架 | 数字 PDF 端到端读出带坐标文本，三种输出 | 1,2,3 | ✅ 已完成 |
 | **P1** | 文本保真与版面可读 | 数字 PDF 文本接近无损；输出按段落/表格可读，而非逐行 | 2,3 | ✅ 已完成（M1–M3）|
 | **P2** | 语义结构 + 多格式 | 输出是**结构**（表格/列表/标题层级）而非纯文本流；覆盖 DOCX/HTML | 4,5 | ✅ 基本完成（M4 有框表格 + M5 DOCX/HTML；表格四检测器 bordered→ruled→**cluster**→borderless，确定性检出达 ODL 量级；多级表头/无框结构属 N3 神经域）|
-| **P3** | Agent 接入与 AI 增强 | 成为任意 agent 可直接调用的**完整系统**：稳定 IR 协议、引用定位、服务化接口（REST/MCP）；难例可插拔接入 OCR/LLM；质量回退、安全预检 | 1,6,7,8,9,10 | 🚧 大部完成（M2 IR 脊梁、M6 切块溯源、M7 质量路由、N1 评测回填、N2 服务化 REST+MCP ✅；剩安全预检 N5、真实 enhancer N3）|
+| **P3** | Agent 接入与 AI 增强 | 成为任意 agent 可直接调用的**完整系统**：稳定 IR 协议、引用定位、服务化接口（REST/MCP）；难例可插拔接入 OCR/LLM；质量回退、安全预检 | 1,6,7,8,9,10 | 🚧 大部完成（M2 IR 脊梁、M6 切块溯源、M7 质量路由、N1 评测、N2 服务化 REST+MCP、N5 安全预检 ✅；仅剩真实 enhancer N3——选型待决策）|
 | **P4** | 选择性模型内嵌 | 稳定小模型（页面分类/方向/轻量 OCR）以 ONNX 内嵌提速；大 VLM 仍外接 | 8 | ⬜ 远期·可选 |
 
 **各阶段大致内容（高层，细节见对应 plan）：**
@@ -225,4 +225,4 @@ flowchart TD
   Q -->|供 agent/RAG 调用| E[P3: 服务化接口 + 切块溯源 + AI 可插拔增强]
 ```
 
-进度（2026-06-10）：**M1–M7 与 N1（评测回填）、N2（服务化 MCP+REST）、N4 大部（表格四检测器/标题/词距）全部完成**——63 单测、clippy 零 warning、输出跨 CLI/MCP/REST 接口逐字节一致；记分牌见 §6 现状。**近期仅剩**：N3 真实 enhancer 接入（需模型选型征询）、N5 安全预检（模块 9）；远期 P4 小模型 ONNX。里程碑细节见 [plans/next-iteration.md](plans/next-iteration.md)，devlog 见 [devlogs/](devlogs/)。
+进度（2026-06-10）：**M1–M7 与 N1（评测）、N2（服务化 MCP+REST）、N4 大部（表格四检测器/标题/词距）、N5（隐藏文本过滤 + 资源守卫）全部完成**——73 单测、clippy 零 warning、输出跨 CLI/库/MCP/REST 四接口逐字节一致；记分牌见 §6 现状。**近期仅剩 N3 真实 enhancer**（部署选型待决策，已暂缓）；其余剩项属确定性天花板（CJK 版面/无框表 recall）或远期（N5c 画像、P4 ONNX、人工真值集）。里程碑细节见 [plans/next-iteration.md](plans/next-iteration.md)，devlog 见 [devlogs/](devlogs/)。

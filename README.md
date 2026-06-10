@@ -7,28 +7,20 @@
 > 该项目快，是因为它默认从不把页面渲染成像素，只解析内容流拿坐标，再逐页并行做版面分析。
 > docparse-rs 用纯 Rust 复刻这条快路径——无 JVM、无 C++ 依赖、单二进制。
 
-## 当前状态：可用的端到端骨架 ✅
+## 当前状态：完整系统,记分牌见下 ✅
 
-```
-PDF ──lopdf──▶ COS 对象 / 内容流字节 + 字体资源
-            ──字体层──▶ ToUnicode CMap 解码 + 字形宽度   (参考 veraPDF 移植)
-            ──自研解释器──▶ TextChunk{text, bbox, font_size}   (逐页 rayon 并行)
-            ──XY-cut──▶ 阅读顺序
-            ──行/词重建──▶ 按几何间距还原单词
-            ──serializer──▶ JSON / Markdown / Text
-```
+PDF/DOCX/HTML → 版本化 IR(provenance + 每 chunk 置信度)→ 版面(段落/页眉页脚/多栏阅读顺序)→ 语义层(表格四检测器/标题分级)→ JSON / Markdown / Text / **RAG chunks(chunk↔bbox 双向引用)**,经 **CLI / 库 / MCP / REST** 四个接口面输出**逐字节一致**的结果。安全预检(隐藏文本过滤防 prompt injection + zip-bomb/页数资源守卫)已内置;难例经可插拔 `Enhancer` 边界外接(数字页零模型)。
 
-**实测**（`cargo run -p docparse-cli -- <pdf> -f <fmt>`）：
+**质量记分牌**(2026-06-10,born-digital LTR,与确定性同类 ODL / 神经管线 Docling 的一致度,非人工真值):
 
-| 样例 | 结果 |
-|---|---|
-| `lorem.pdf`（嵌入子集 CID 字体） | ✅ 387 chunks，正确解码出 "Lorem Ipsum" 正文 |
-| `1901.03003.pdf`（学术论文，15 页） | ✅ 10,728 带坐标文本块，正文间距正确 |
-| `2408.02509v1.pdf`（14 页） | ✅ 14,991 chunks |
-| `issue-336-...-bialetti.pdf`（意大利财报） | ✅ 3,829 chunks，含重音字符/数字，间距完美 |
-| `chinese_scan.pdf`（扫描件） | ✅ 0 chunks（无文本层，需 OCR，符合预期） |
+| 同台 | NID 阅读顺序 | MHS 标题 | TEDS 表格 |
+|---|---|---|---|
+| vs OpenDataLoader(15 份)| **0.764** | **0.627** | 0.098 |
+| vs Docling(10 份)| **0.833** | **0.645** | 0.187 |
 
-> CID 子集字体（`lorem.pdf`）此前解码为空，已通过**参考 veraPDF 实现 ToUnicode CMap 解码**修复（见下）。
+clean 文档 0.94–1.00(与两者结构同构);聚合被 CJK 复杂版面与无框表格检出拖低(属神经/外接域,见 roadmap)。
+
+**差异化记分牌**(Docling 结构上无法同台):单二进制 **6.6MB**、运行时依赖 **0**、冷启 **<10ms**、**700 页/s**、同输入逐字节确定、chunk 引用可定位率 **100%**。
 
 ## 文档
 
@@ -37,13 +29,15 @@ PDF ──lopdf──▶ COS 对象 / 内容流字节 + 字体资源
 
 ## 架构
 
-Cargo workspace，三个 crate：
+Cargo workspace，五个 crate：
 
 | crate | 职责 | 关键依赖 |
 |---|---|---|
-| [`docparse-core`](crates/docparse-core) | 格式无关核心：IR（`Document/Page/Element/TextChunk`）、`DocumentParser` trait、XY-cut 阅读顺序、JSON/MD/Text 输出 | serde |
+| [`docparse-core`](crates/docparse-core) | 格式无关核心：版本化 IR + provenance、`DocumentParser` trait、XY-cut 阅读顺序、版面/段落/页眉页脚、表格四检测器、RAG 切块与 `locate` 反查、质量评分与 `Enhancer` 外接边界、资源守卫（`limits`）、JSON/MD/Text 输出 | serde |
 | [`docparse-pdf`](crates/docparse-pdf) | 纯 Rust PDF 后端：lopdf 解析 + **自研内容流解释器**（`matrix.rs` 仿射变换 + `interpreter.rs` 操作符状态机）+ **字体层**（`cmap.rs` ToUnicode CMap + `font.rs` 字形宽度，参考 veraPDF）+ rayon 逐页并行 | lopdf, rayon |
-| [`docparse-cli`](crates/docparse-cli) | `docparse` 命令行，含 parser 注册表（未来加 DOCX/HTML 后端的挂载点） | clap |
+| [`docparse-docx`](crates/docparse-docx) | DOCX 后端：docx-rs 结构 → 合成坐标汇入同一 IR；含 zip-bomb 预检 | docx-rs |
+| [`docparse-html`](crates/docparse-html) | HTML 后端：DOM 前序遍历 → 标题/段落/列表/表格 | scraper |
+| [`docparse-cli`](crates/docparse-cli) | `docparse` 命令行 + **MCP stdio server**（手写 JSON-RPC，零 SDK 依赖）+ **REST**（axum） | clap, axum, tokio |
 
 **为什么这样分层**：`core` 不依赖任何 PDF 库——阅读顺序和输出对所有格式通用。新增格式只需实现 `DocumentParser` trait 并在 CLI 注册表里加一行。
 
@@ -72,24 +66,26 @@ cargo build --release
 ./target/release/docparse input.pdf -f json        # 完整 IR
 ./target/release/docparse input.pdf -f markdown    # Markdown（含轻量标题启发式）
 ./target/release/docparse input.pdf -f text -o out.txt
+./target/release/docparse input.pdf -f chunks      # RAG 切块（page+bbox+标题面包屑）
+./target/release/docparse mcp                      # MCP stdio server（agent 直连）
+./target/release/docparse serve --port 8642        # REST：POST /parse + GET /healthz
 ```
 
 ```bash
-cargo test          # 单元测试（XY-cut 双列排序、矩阵乘法）
+cargo test          # 73 单测（CMap/矩阵/XY-cut/表格/切块/MCP/限额…）
 ```
 
-## 已知限制 / 路线图
+## 进度 / 路线图
 
-按优先级：
+近期里程碑全部完成（细节见 [docs/roadmap.md](docs/roadmap.md) 与 [docs/plans/next-iteration.md](docs/plans/next-iteration.md)，过程见 [docs/devlogs/](docs/devlogs/)）：
 
-- [x] **ToUnicode CMap 文本解码** —— 已参考 veraPDF 实现，CID 子集字体可读（`lorem.pdf` ✅）。
-- [x] **字形宽度** —— 已读 `Widths` / `W`/`DW`，x 坐标精确，单词按几何间距重建。
-- [x] **MediaBox 继承** —— 已沿 Pages 树向上继承（`font.rs` `resolve_resources` 同款遍历）。
-- [ ] **标准 14 字体度量（次头号）** —— 无内嵌 `Widths` 的标准字体（如论文标题）目前回退 0.5 em，导致词间距不准、连字丢失（`Recti**fi**ed`→`Rectied`）。需移植 veraPDF `StandardFontMetrics`/AFM。
-- [ ] **简单字体 Encoding/Differences** —— 无 ToUnicode 的简单字体目前 Latin-1 兜底。应支持 WinAnsi/MacRoman/Standard + `Differences` + AGL 字形名→Unicode（veraPDF `Encoding` + `AdobeGlyphList`）。
-- [ ] **图片** —— 目前只建模 `ImageChunk`（位置），未抽取像素。需要时实现 XObject 流提取。
-- [ ] **语义层** —— 表格识别、列表层级、标题分级（即 veraPDF wcag-algorithms 的等价物）。最大、最有价值、也最难的一层，建在 chunk 之上。
-- [ ] **更多格式** —— DOCX / HTML / PPTX，各实现 `DocumentParser` 汇入统一 IR。
+- [x] **M1–M7**：文本保真（AFM/Encoding/CMap/字距）、IR 脊梁（版本化+provenance+质量分）、版面可读、有框表格、DOCX/HTML、RAG 切块+引用、质量路由+外接边界。
+- [x] **N1 评测**：NID/TEDS/MHS 与 ODL/Docling 同台（上表）；差异化指标自动化。
+- [x] **N2 服务化**：MCP stdio + REST，四接口逐字节一致。
+- [x] **N4 大部**：表格四检测器（bordered→ruled→cluster→borderless）、标题分级、词距。
+- [x] **N5 安全预检**：隐藏文本过滤（Tr 3/7/页外/微字 → 标注+排除+可审计）、zip-bomb/页数资源守卫。
+- [ ] **N3 真实 enhancer**（近期仅剩）：扫描页外接 OCR/VLM 端到端——待部署选型决策。
+- [ ] 远期：复杂度画像（N5c）、小模型 ONNX 内嵌（P4）、人工真值评测集。
 
 ## 许可
 
