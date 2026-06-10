@@ -1,7 +1,7 @@
 # N3 · 真实 enhancer:**首选 P4 路线(ONNX 内嵌)**,tesseract CLI / HTTP 为备选(模块 8)
 
 > 调研依据:[refer/n3-enhancer-odl-docling-research.md](../refer/n3-enhancer-odl-docling-research.md)(ODL hybrid 架构 + Docling OCR 引擎层 + 引擎质量评估)。
-> 状态:**设计已定,实现暂缓**(用户决策 2026-06-10)。M7 已交付边界(`core::enhance` Capability/Enhancer trait/plan/apply + StubOcr);本计划是把边界接上真实引擎。
+> 状态:✅ **P4 路线已落地**(2026-06-10,devlog:[n3-onnx-ocr](../devlogs/2026-06-10-n3-onnx-ocr.md)):`docparse-ocr` crate(tract 纯 Rust 推理)+ 解释器 ImageXObject 抽取 + CLI `--ocr`。chinese_scan 14/14 行全对、数字页零模型、确定性逐字节、双记分牌零回归。tesseract 备选(§1)未做、HTTP(§2)留远期。
 
 ## -1. 路线决策(2026-06-10 更新):P4 ONNX 内嵌为首选实现
 

@@ -21,8 +21,9 @@
 //! detected): same-color-as-background text, text occluded by images.
 
 use crate::font::FontInfo;
+use crate::images::XImage;
 use crate::matrix::Matrix;
-use docparse_core::ir::{BBox, Element, Page, TextChunk};
+use docparse_core::ir::{BBox, Element, ImageChunk, ImageKind, Page, TextChunk};
 use docparse_core::table::{detect_borderless_tables, detect_ruled_tables, detect_tables, Segment};
 use docparse_core::table_cluster::detect_cluster_tables;
 use lopdf::content::Content;
@@ -38,6 +39,8 @@ pub struct PageInput {
     pub content: Vec<u8>,
     /// Font decoders keyed by resource name (e.g. "F1"), resolved up-front.
     pub fonts: HashMap<String, FontInfo>,
+    /// Image XObjects keyed by resource name (for `Do`), streams undecoded.
+    pub images: HashMap<String, XImage>,
 }
 
 #[derive(Clone)]
@@ -252,6 +255,44 @@ pub fn interpret(input: &PageInput) -> Page {
                 cur_pt = None;
                 sub_start = None;
             }
+            // XObject placement. Images are recorded with their placement bbox
+            // (CTM applied to the unit square); pixels are materialized only
+            // for page-covering images — the scanned-page shape the OCR
+            // enhancer consumes (N3) — so figure-heavy digital docs pay ~0.
+            "Do" => {
+                if let Some(img) = name_of0(ops).and_then(|n| input.images.get(&n)) {
+                    let corners = [
+                        ctm.apply(0.0, 0.0),
+                        ctm.apply(1.0, 0.0),
+                        ctm.apply(0.0, 1.0),
+                        ctm.apply(1.0, 1.0),
+                    ];
+                    let x0 = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min) as f32;
+                    let x1 = corners
+                        .iter()
+                        .map(|c| c.0)
+                        .fold(f64::NEG_INFINITY, f64::max) as f32;
+                    let y0 = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min) as f32;
+                    let y1 = corners
+                        .iter()
+                        .map(|c| c.1)
+                        .fold(f64::NEG_INFINITY, f64::max) as f32;
+                    let coverage = ((x1 - x0) * (y1 - y0)) / (input.width * input.height).max(1.0);
+                    let (kind, data) = if coverage >= SCAN_COVERAGE_MIN {
+                        img.decode()
+                    } else {
+                        (ImageKind::None, Vec::new())
+                    };
+                    elements.push(Element::Image(ImageChunk {
+                        bbox: BBox { x0, y0, x1, y1 },
+                        page: input.number,
+                        width_px: img.width,
+                        height_px: img.height,
+                        kind,
+                        data,
+                    }));
+                }
+            }
             "TJ" => {
                 if let Some(Object::Array(arr)) = ops.first() {
                     for el in arr {
@@ -332,6 +373,11 @@ fn seg(a: (f64, f64), b: (f64, f64)) -> Segment {
 /// Fallback glyph advance (em fraction) when no font decoder is available.
 const FALLBACK_ADVANCE_EM: f64 = 0.5;
 
+/// An image whose placement covers at least this fraction of the page is a
+/// scan candidate: its pixels are decoded and attached for the OCR enhancer.
+/// Smaller figures stay position-only, bounding memory on digital documents.
+const SCAN_COVERAGE_MIN: f32 = 0.5;
+
 /// Below this effective glyph height (pt) text is unreadable to a human and
 /// treated as hidden. Normal subscripts run 5–7pt; 1pt is far under legibility.
 const TINY_FONT_PT: f32 = 1.0;
@@ -404,6 +450,7 @@ fn show_text(
             confidence: 1.0,
             bold: font.map(|f| f.is_bold()).unwrap_or(false),
             hidden,
+            source: None,
         }));
     }
 
@@ -428,6 +475,10 @@ fn name_of(o: &Object) -> Option<String> {
         Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
         _ => None,
     }
+}
+
+fn name_of0(ops: &[Object]) -> Option<String> {
+    ops.first().and_then(name_of)
 }
 
 fn matrix_from(ops: &[Object]) -> Option<Matrix> {
@@ -466,6 +517,7 @@ mod tests {
             height: 792.0,
             content: content.as_bytes().to_vec(),
             fonts: HashMap::new(),
+            images: HashMap::new(),
         })
     }
 

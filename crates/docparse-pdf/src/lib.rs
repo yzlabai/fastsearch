@@ -10,6 +10,7 @@ mod cmap;
 mod encoding;
 mod encoding_tables;
 mod font;
+mod images;
 mod interpreter;
 mod matrix;
 mod stdmetrics;
@@ -52,12 +53,14 @@ impl DocumentParser for PdfParser {
             let content = doc.get_page_content(page_id).unwrap_or_default();
             let (width, height) = page_dimensions(&doc, page_id);
             let fonts = font::build_page_fonts(&doc, page_id);
+            let images = images::build_page_images(&doc, page_id);
             inputs.push(PageInput {
                 number: number as usize,
                 width,
                 height,
                 content,
                 fonts,
+                images,
             });
         }
 

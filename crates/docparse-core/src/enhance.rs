@@ -153,6 +153,7 @@ mod tests {
                 confidence: 0.5,
                 bold: false,
                 hidden: false,
+                source: None,
             })])
         }
     }
@@ -173,6 +174,7 @@ mod tests {
                 confidence: 1.0,
                 bold: false,
                 hidden: false,
+                source: None,
             })],
             None => vec![],
         };

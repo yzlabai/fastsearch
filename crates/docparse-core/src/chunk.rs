@@ -265,6 +265,7 @@ mod tests {
             confidence: 1.0,
             bold: false,
             hidden: false,
+            source: None,
         })
     }
 

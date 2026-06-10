@@ -53,14 +53,14 @@ P3 的"面向 agent 可直接调用"。**次序反转为 MCP 先行**（stdio JS
 - **验收**：一个 agent 经 MCP 上传 PDF → 拿到带 bbox 引用的 chunks → 高亮回原坐标。
 - **依赖/风险**：**新依赖**（HTTP 框架 / MCP SDK）按 CLAUDE.md §4 先征询选型。
 
-### N3 · 真实 enhancer 接入 — *模块 8* · 📋 设计已定（[plan](n3-real-enhancer.md)），实现暂缓（用户决策 2026-06-10）
+### N3 · 真实 enhancer 接入 — *模块 8* · ✅ 完成（2026-06-10，P4 路线，[devlog](../devlogs/2026-06-10-n3-onnx-ocr.md)）
 M7 只给了边界 + StubOcr。接一个真实模型证明可插拔端到端。
 > 调研 ODL hybrid + Docling OCR 层 + 引擎质量后（[refer](../refer/n3-enhancer-odl-docling-research.md)），**路线已定为 P4 优先**：ONNX 内嵌 RapidOCR/PP-OCR 模型（中文事实标准；模型外部文件 ~16MB Apache-2.0；抽嵌入图原字节而非渲染——不破"不光栅化"）。**前置 spike：`tract`（纯 Rust）能否跑通三模型**——能则身份零妥协，不能再决策 ort feature-gate vs HTTP。tesseract CLI 降级为备选；HTTP 后端（ODL hybrid 同款）留作接最强模型的远期通道。N6 与本里程碑合并。
 
-- [ ] 实现一个 `Enhancer`：外部进程（如 tesseract/PaddleOCR CLI）或 HTTP（VLM/LLM）；对扫描页/高乱码页产出文本，归一回 IR、低 confidence、记 provenance。
-- [ ] 元素级 `source` 标签（M7 遗留）：每 chunk 标注"哪个 parser/enhancer"。
-- [ ] 端到端：`chinese_scan` 经路由 → 真实 OCR → 可读文本 + 引用。
-- **验收**：扫描件从 0 文本到可检索；数字页**仍零模型**（成本不破）。
+- [x] **`docparse-ocr`**（ONNX 内嵌，非外部进程）：PP-OCRv4 det+rec 经 `tract` 纯 Rust 推理；归一回 IR、confidence 封顶 0.99、`source: ocr:ppocr-v4`。
+- [x] 元素级 `source` 标签（M7 遗留）：IR `TextChunk.source`（schema 0.4.0）。
+- [x] 端到端：`chinese_scan` 经路由 → OCR → **14/14 行全对** + bbox 引用（`--ocr`，模型外部文件 ~16MB）。
+- **验收 ✅**：扫描件 0 文本→14/14 行；数字页零路由零模型；OCR 路径确定性逐字节;79 单测、记分牌零回归。
 - **依赖/风险**：外部 OCR 引擎/服务（进程或网络），**不进纯 Rust 核心**（身份约束）；选型先征询。
 
 ### N4 · 语义层续：无框表格 / 列表 / 多栏列检测 — *模块 4* · 🚧 进行中（首增量完成）

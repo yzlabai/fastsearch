@@ -14,6 +14,7 @@ docparse-core = { path = "../docparse-core" }
 docparse-pdf = { path = "../docparse-pdf" }
 docparse-docx = { path = "../docparse-docx" }
 docparse-html = { path = "../docparse-html" }
+docparse-ocr = { path = "../docparse-ocr" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

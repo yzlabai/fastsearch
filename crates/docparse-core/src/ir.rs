@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of this IR schema. Bumped when the serialized shape changes so an
 /// agent consuming the JSON can check compatibility. Semantic versioning.
-pub const SCHEMA_VERSION: &str = "0.3.0";
+pub const SCHEMA_VERSION: &str = "0.4.0";
 
 /// Where a [`Document`] came from: which parser/version produced it, under
 /// which schema. The agent-facing trust/repro anchor (one per document; an
@@ -83,13 +83,44 @@ pub struct TextChunk {
     /// excluded from rendered outputs via [`Page::text_chunks`] (N5a).
     #[serde(default)]
     pub hidden: bool,
+    /// Which producer emitted this text: `None` = the deterministic parser;
+    /// `Some("ocr:...")` etc. = an enhancer (N3). Element-level provenance so
+    /// downstream can audit exactly which text came from a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
-/// A raster/vector image region. Position only for now (no pixel extraction yet).
+/// Pixel format of an extracted raster image payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageKind {
+    /// Recorded position-only (unsupported encoding or below the size gate).
+    #[default]
+    None,
+    /// Raw 8-bit grayscale, `width_px * height_px` bytes.
+    Gray8,
+    /// Raw 8-bit RGB, `width_px * height_px * 3` bytes.
+    Rgb8,
+    /// Undecoded JPEG file bytes (DCTDecode passthrough).
+    Jpeg,
+}
+
+/// A raster image region. `data` carries the pixel payload only for
+/// page-covering images (scan candidates, the OCR-enhancer input) so memory
+/// stays bounded on image-heavy digital documents; it is never serialized —
+/// the JSON keeps bbox/dims for audit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageChunk {
     pub bbox: BBox,
     pub page: usize,
+    #[serde(default)]
+    pub width_px: u32,
+    #[serde(default)]
+    pub height_px: u32,
+    #[serde(default)]
+    pub kind: ImageKind,
+    #[serde(skip)]
+    pub data: Vec<u8>,
 }
 
 /// One cell of a [`Table`]. MVP: single grid cell (no row/col span yet).

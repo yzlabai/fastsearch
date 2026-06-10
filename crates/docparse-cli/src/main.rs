@@ -60,6 +60,16 @@ struct Cli {
     /// be escalated to) as JSON to stderr — demonstrates how few pages are hard.
     #[arg(long)]
     route_plan: bool,
+
+    /// OCR quality-flagged pages (scans) with the embedded ONNX enhancer
+    /// (PP-OCRv4 via tract). Digital pages never touch the model. Requires
+    /// model files — see --ocr-models.
+    #[arg(long)]
+    ocr: bool,
+
+    /// Directory holding ch_PP-OCRv4_{det,rec}_infer.onnx + ppocr_keys_v1.txt.
+    #[arg(long, default_value = "models/ppocr")]
+    ocr_models: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -96,7 +106,14 @@ fn main() -> anyhow::Result<()> {
         .input
         .ok_or_else(|| anyhow::anyhow!("missing input file (see --help)"))?;
 
-    let doc = parse_path(&input)?;
+    let mut doc = parse_path(&input)?;
+
+    if cli.ocr {
+        let ocr = docparse_ocr::PpOcrEnhancer::new(&cli.ocr_models)?;
+        let (enhanced, report) = docparse_core::enhance::apply(&doc, &[&ocr]);
+        doc = enhanced;
+        eprintln!("{}", docparse_core::enhance::report_json(&report));
+    }
 
     if cli.quality {
         eprintln!("{}", docparse_core::quality::analyze(&doc).to_json());
