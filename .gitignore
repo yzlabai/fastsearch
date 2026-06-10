@@ -7,3 +7,6 @@ tmp/
 __pycache__/
 *.pyc
 /models/
+# JVM crash logs (from running the ODL reference under a broken JDK)
+hs_err_pid*.log
+replay_pid*.log
