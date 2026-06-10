@@ -259,3 +259,181 @@ mod tests {
         assert!(r.flags.contains(&QualityFlag::HighGarble));
     }
 }
+
+/// What a page fundamentally is — the complexity-profile signal (module 9,
+/// N5c) that routing and operators consume. Derived purely from the IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageKind {
+    /// Text layer present, no page-covering raster — the fast path.
+    Digital,
+    /// No text layer, a page-covering raster — OCR territory.
+    Scanned,
+    /// Both a text layer and a page-covering raster (stamped/hybrid pages).
+    Mixed,
+    /// Neither text nor images (blank or wholly unsupported content).
+    Empty,
+}
+
+/// Per-page complexity profile. Cheap to compute, explainable, serializable —
+/// feeds routing decisions and the agent-facing quality envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageProfile {
+    pub page: usize,
+    pub kind: PageKind,
+    /// Visible (non-hidden) text characters.
+    pub text_chars: usize,
+    pub image_count: usize,
+    /// Largest image's share of the page area, in [0,1].
+    pub image_coverage: f32,
+    pub tables: usize,
+    /// Text chunks produced by an enhancer (`source` set) — 0 on a pure
+    /// deterministic parse.
+    pub enhanced_chunks: usize,
+}
+
+/// A page-covering raster at or above this share of the page marks the page
+/// scan-shaped (mirrors the interpreter's pixel-attachment gate).
+const PAGE_COVERING: f32 = 0.5;
+
+/// Profile one page from its IR elements.
+pub fn profile_page(page: &Page) -> PageProfile {
+    let page_area = (page.width * page.height).max(1.0);
+    let mut text_chars = 0usize;
+    let mut image_count = 0usize;
+    let mut image_coverage = 0.0f32;
+    let mut tables = 0usize;
+    let mut enhanced_chunks = 0usize;
+    for el in &page.elements {
+        match el {
+            Element::Text(t) => {
+                if !t.hidden {
+                    text_chars += t.text.chars().filter(|c| !c.is_whitespace()).count();
+                }
+                if t.source.is_some() {
+                    enhanced_chunks += 1;
+                }
+            }
+            Element::Image(i) => {
+                image_count += 1;
+                let a = ((i.bbox.x1 - i.bbox.x0) * (i.bbox.y1 - i.bbox.y0)) / page_area;
+                image_coverage = image_coverage.max(a.clamp(0.0, 1.0));
+            }
+            Element::Table(_) => tables += 1,
+        }
+    }
+    let covered = image_coverage >= PAGE_COVERING;
+    let kind = match (text_chars > 0, covered, image_count) {
+        (true, true, _) => PageKind::Mixed,
+        (true, false, _) => PageKind::Digital,
+        (false, true, _) => PageKind::Scanned,
+        (false, false, 0) => PageKind::Empty,
+        // Images only, none page-covering (decorative/figures, no text).
+        (false, false, _) => PageKind::Scanned,
+    };
+    PageProfile {
+        page: page.number,
+        kind,
+        text_chars,
+        image_count,
+        image_coverage,
+        tables,
+        enhanced_chunks,
+    }
+}
+
+/// Profile every page of a document.
+pub fn profile(doc: &Document) -> Vec<PageProfile> {
+    doc.pages.iter().map(profile_page).collect()
+}
+
+/// Pretty-JSON profile array (CLI/observability).
+pub fn profile_json(profiles: &[PageProfile]) -> String {
+    serde_json::to_string_pretty(profiles).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::ir::{BBox, Element, ImageChunk, ImageKind, Page, TextChunk};
+
+    fn text(t: &str, source: Option<&str>) -> Element {
+        Element::Text(TextChunk {
+            text: t.into(),
+            bbox: BBox {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 10.0,
+                y1: 10.0,
+            },
+            font_size: 10.0,
+            font: None,
+            page: 1,
+            confidence: 1.0,
+            bold: false,
+            hidden: false,
+            source: source.map(Into::into),
+        })
+    }
+
+    fn image(cover: f32) -> Element {
+        Element::Image(ImageChunk {
+            bbox: BBox {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 100.0 * cover,
+                y1: 100.0,
+            },
+            page: 1,
+            width_px: 100,
+            height_px: 100,
+            kind: ImageKind::None,
+            data: Vec::new(),
+        })
+    }
+
+    fn page(elements: Vec<Element>) -> Page {
+        Page {
+            number: 1,
+            width: 100.0,
+            height: 100.0,
+            elements,
+        }
+    }
+
+    #[test]
+    fn classifies_the_four_kinds() {
+        assert_eq!(
+            profile_page(&page(vec![text("hi", None)])).kind,
+            PageKind::Digital
+        );
+        assert_eq!(
+            profile_page(&page(vec![image(0.9)])).kind,
+            PageKind::Scanned
+        );
+        assert_eq!(
+            profile_page(&page(vec![text("hi", None), image(0.9)])).kind,
+            PageKind::Mixed
+        );
+        assert_eq!(profile_page(&page(vec![])).kind, PageKind::Empty);
+        // Small figure + text stays digital; figure-only page counts scanned.
+        assert_eq!(
+            profile_page(&page(vec![text("hi", None), image(0.2)])).kind,
+            PageKind::Digital
+        );
+    }
+
+    #[test]
+    fn counts_signals() {
+        let p = profile_page(&page(vec![
+            text("abc def", None),
+            text("ocr line", Some("ocr:ppocr-v4")),
+            image(0.8),
+        ]));
+        assert_eq!(p.text_chars, 6 + 7);
+        assert_eq!(p.image_count, 1);
+        assert!((p.image_coverage - 0.8).abs() < 1e-5);
+        assert_eq!(p.enhanced_chunks, 1);
+        assert_eq!(p.kind, PageKind::Mixed);
+    }
+}

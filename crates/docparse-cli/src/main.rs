@@ -70,6 +70,11 @@ struct Cli {
     /// Directory holding ch_PP-OCRv4_{det,rec}_infer.onnx + ppocr_keys_v1.txt.
     #[arg(long, default_value = "models/ppocr")]
     ocr_models: PathBuf,
+
+    /// Print the per-page complexity profile (kind/image-coverage/tables) as
+    /// JSON to stderr — the routing signal, observable.
+    #[arg(long)]
+    profile: bool,
 }
 
 #[derive(Subcommand)]
@@ -171,6 +176,12 @@ fn main() -> anyhow::Result<()> {
 
     if cli.quality {
         eprintln!("{}", docparse_core::quality::analyze(&doc).to_json());
+    }
+    if cli.profile {
+        eprintln!(
+            "{}",
+            docparse_core::quality::profile_json(&docparse_core::quality::profile(&doc))
+        );
     }
     if cli.route_plan {
         // No enhancers registered in the CLI; the plan shows which pages WOULD

@@ -27,9 +27,9 @@
 - DOCX zip bomb:解压字节上限(docx-rs 之前预检 zip 条目声明尺寸);PDF 对象深度/页数上限早停;REST 已有 256MB body 限制。
 - 验收:构造样例被拒,产生可追踪错误码,不 panic 不挂起。
 
-### N5c · 复杂度画像(随 N1/路由演进,暂缓)
+### N5c · 复杂度画像 ✅(2026-06-10)
 
-页级信号(数字/扫描/旋转/表格密度)喂路由——quality 已有雏形,待真实 enhancer(N3)需要时再扩。
+`quality::PageProfile`:页级 kind(digital/scanned/mixed/empty,按可见文本 × 页面级图覆盖 ≥0.5 判定)+ 信号(text_chars/image_count/image_coverage/tables/enhanced_chunks)。CLI `--profile`、MCP `get_chunks` 信封新增 `profile` 字段。验收:chinese_scan → scanned(覆盖 1.0)、1901 → 15 页 digital(小图 0.006 不误判)。旋转页信号留 TODO(需版面层贯通)。
 
 ## 3. 边界
 

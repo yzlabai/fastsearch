@@ -113,7 +113,8 @@ fn tool_specs() -> Value {
             "name": "get_chunks",
             "description": "Parse a local document into retrieval chunks. Each chunk carries \
                             page + bbox (citable source location), heading breadcrumb, and \
-                            char_len; the envelope carries provenance and a quality report.",
+                            char_len; the envelope carries provenance, a quality report, and \
+                            a per-page complexity profile.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -207,6 +208,7 @@ fn tool_get_chunks(args: &Value, ocr: &crate::OcrState) -> anyhow::Result<String
     let envelope = json!({
         "provenance": serde_json::to_value(&doc.provenance)?,
         "quality": serde_json::to_value(docparse_core::quality::analyze(&doc))?,
+        "profile": serde_json::to_value(docparse_core::quality::profile(&doc))?,
         "chunks": serde_json::to_value(&chunks)?,
     });
     Ok(serde_json::to_string_pretty(&envelope)?)

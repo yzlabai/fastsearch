@@ -144,7 +144,7 @@ flowchart TB
 | 6 | **输出与 RAG** | 序列化 + 结构化切块 + chunk↔页码/bbox 双向引用定位 | ✅ JSON/MD/Text + 结构化切块 + chunk↔bbox 双向引用（M6），引用率 100% | 报告 §10.6 `document-export`/`document-chunk` |
 | 7 | **质量检测与回退** | 覆盖率/乱码率/阅读顺序异常评分，决定是否触发外接复核 | ✅ 评分（coverage/garbled）+ 按页路由（M7）；reading-order 异常分留空 | 报告 §8 / §10.8 |
 | 8 | **外部 AI 服务接入** | OCR / 大模型 / VLM 作**可选增强**：版本化 capability（格式/元素/语言/设备/版本）+ 统一边界，按页触发补难例，主流程可无之独立运行 | ✅ 边界（M7）+ 真实 enhancer：ONNX 内嵌 PP-OCRv4 经 tract 纯 Rust 推理（N3/P4），按页路由、数字页零模型 | 报告 §10.5–§10.6 `parser-plugins` |
-| 9 | **安全预检与画像** | 恶意对象/ZIP bomb 防护、隐藏文本过滤（防 prompt injection）、复杂度路由 | 🚧 隐藏文本过滤 ✅（N5a）+ 资源防护 ✅（N5b：zip-bomb 预检/页数早停，`core::limits`）；复杂度画像待做 | ODL 隐藏文本过滤 / 报告 §10.2–§10.3 |
+| 9 | **安全预检与画像** | 恶意对象/ZIP bomb 防护、隐藏文本过滤（防 prompt injection）、复杂度路由 | ✅ 隐藏文本过滤（N5a）+ 资源防护（N5b：zip-bomb 预检/页数早停）+ 复杂度画像（N5c：`PageProfile` 页级 kind/信号） | ODL 隐藏文本过滤 / 报告 §10.2–§10.3 |
 | 10 | **Agent 接入面与运行时** | 面向 agent 的消费接口：CLI（已有）/库/服务化（REST/gRPC/MCP）+ 调度/优先级队列/阶段缓存/可观测 | ✅ CLI/库/MCP（stdio）/REST（axum）四接口，输出跨接口逐字节一致（N2）；调度/阶段缓存按需后议 | 报告 §10.6 `document-runtime`/`server` |
 
 > 模块即未来的 crate 边界，但**按需拆分**——不为架构整齐提前建空 crate（反 MVP，见 AI_AGENT_DEV_SPEC §3）。
