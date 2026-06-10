@@ -158,6 +158,7 @@ pub fn annotate_pictures(
                         hidden: false,
                         source: Some(format!("vlm:{}", client.model())),
                         group: None,
+                        tag: None,
                     }));
                     annotated += 1;
                 }

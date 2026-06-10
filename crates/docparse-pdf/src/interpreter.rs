@@ -43,6 +43,8 @@ pub struct PageInput {
     pub images: HashMap<String, XImage>,
     /// Form XObjects keyed by resource name, with their own resources.
     pub forms: HashMap<String, FormX>,
+    /// Tagged-PDF marked-content map: MCID → (role, reading order) (G9a).
+    pub tags: crate::structure::PageTags,
 }
 
 /// Per-content-stream execution context: the resource set in scope. Forms
@@ -51,6 +53,7 @@ struct Ctx<'a> {
     fonts: &'a HashMap<String, FontInfo>,
     images: &'a HashMap<String, XImage>,
     forms: &'a HashMap<String, FormX>,
+    tags: &'a crate::structure::PageTags,
     page_no: usize,
     page_size: (f32, f32),
 }
@@ -97,6 +100,7 @@ pub fn interpret(input: &PageInput) -> Page {
         fonts: &input.fonts,
         images: &input.images,
         forms: &input.forms,
+        tags: &input.tags,
         page_no: input.number,
         page_size: (input.width, input.height),
     };
@@ -171,6 +175,10 @@ fn exec_content(
     let mut sub_start: Option<(f64, f64)> = None;
     let mut path: Vec<Segment> = Vec::new();
 
+    // Marked-content nesting (tagged PDFs): innermost MCID wins.
+    let mut mc_stack: Vec<Option<u32>> = Vec::new();
+    let mut cur_mcid: Option<u32> = None;
+
     for op in &content.operations {
         let ops = &op.operands;
         match op.operator.as_str() {
@@ -218,6 +226,27 @@ fn exec_content(
                     ts.render_mode = v as i64;
                 }
             }
+            // Marked content: `BDC /Tag <</MCID n>>` opens a tagged region
+            // (inline property dicts only; named /Properties TODO), `BMC` an
+            // untagged one, `EMC` closes the innermost.
+            "BDC" => {
+                let mcid = ops.get(1).and_then(|o| o.as_dict().ok()).and_then(|d| {
+                    d.get(b"MCID")
+                        .ok()
+                        .and_then(|m| m.as_i64().ok())
+                        .and_then(|m| u32::try_from(m).ok())
+                });
+                mc_stack.push(mcid);
+                cur_mcid = mc_stack.iter().rev().find_map(|m| *m);
+            }
+            "BMC" => {
+                mc_stack.push(None);
+                cur_mcid = mc_stack.iter().rev().find_map(|m| *m);
+            }
+            "EMC" => {
+                mc_stack.pop();
+                cur_mcid = mc_stack.iter().rev().find_map(|m| *m);
+            }
             "Td" => {
                 if let (Some(tx), Some(ty)) = (num0(ops, 0), num0(ops, 1)) {
                     ts.tlm = Matrix::translate(tx, ty).mul(&ts.tlm);
@@ -243,14 +272,14 @@ fn exec_content(
             }
             "Tj" => {
                 if let Some(Object::String(bytes, _)) = ops.first() {
-                    show_text(bytes, &mut ts, &ctm, elements, ctx, depth > 0);
+                    show_text(bytes, &mut ts, &ctm, elements, ctx, depth > 0, cur_mcid);
                 }
             }
             "'" => {
                 ts.tlm = Matrix::translate(0.0, -ts.leading).mul(&ts.tlm);
                 ts.tm = ts.tlm;
                 if let Some(Object::String(bytes, _)) = ops.first() {
-                    show_text(bytes, &mut ts, &ctm, elements, ctx, depth > 0);
+                    show_text(bytes, &mut ts, &ctm, elements, ctx, depth > 0, cur_mcid);
                 }
             }
             // ---- path construction (for table ruling lines) ----
@@ -350,6 +379,7 @@ fn exec_content(
                             fonts: &form.fonts,
                             images: &form.images,
                             forms: &form.forms,
+                            tags: ctx.tags,
                             page_no: ctx.page_no,
                             page_size: ctx.page_size,
                         };
@@ -369,7 +399,7 @@ fn exec_content(
                     for el in arr {
                         match el {
                             Object::String(bytes, _) => {
-                                show_text(bytes, &mut ts, &ctm, elements, ctx, depth > 0)
+                                show_text(bytes, &mut ts, &ctm, elements, ctx, depth > 0, cur_mcid)
                             }
                             _ => {
                                 if let Some(adj) = num(el) {
@@ -408,6 +438,7 @@ const SCAN_COVERAGE_MIN: f32 = 0.5;
 /// treated as hidden. Normal subscripts run 5–7pt; 1pt is far under legibility.
 const TINY_FONT_PT: f32 = 1.0;
 
+#[allow(clippy::too_many_arguments)]
 fn show_text(
     bytes: &[u8],
     ts: &mut TextState,
@@ -415,6 +446,7 @@ fn show_text(
     out: &mut Vec<Element>,
     ctx: &Ctx,
     in_form: bool,
+    mcid: Option<u32>,
 ) {
     let page = ctx.page_no;
     let page_size = ctx.page_size;
@@ -485,6 +517,11 @@ fn show_text(
             // stamp content, and layout must not classify it as headings.
             source: in_form.then(|| "form".to_string()),
             group: None,
+            // Tagged PDF (G9a): author-declared role. NOTE: the structure
+            // tree's traversal ORDER proved unreliable in the wild (amt:
+            // authoring order != visual order; measured -0.15 NID) — roles
+            // are kept, order is NOT applied. See the G9a devlog.
+            tag: mcid.and_then(|m| ctx.tags.get(&m)).map(|(r, _)| r.clone()),
         }));
     }
 
@@ -553,6 +590,7 @@ mod tests {
             fonts: HashMap::new(),
             images: HashMap::new(),
             forms: HashMap::new(),
+            tags: Default::default(),
         })
     }
 

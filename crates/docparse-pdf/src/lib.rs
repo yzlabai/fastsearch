@@ -14,6 +14,7 @@ mod images;
 mod interpreter;
 mod matrix;
 mod stdmetrics;
+mod structure;
 
 use docparse_core::ir::{Document, Provenance};
 use docparse_core::parser::DocumentParser;
@@ -47,6 +48,10 @@ impl DocumentParser for PdfParser {
         let pages_map = doc.get_pages();
         docparse_core::limits::check_page_count(pages_map.len())?;
 
+        // Tagged-PDF structure tree (G9a): author-declared roles + reading
+        // order, applied via MCIDs; empty on untagged documents.
+        let mut page_tags = structure::build_page_tags(&doc);
+
         // 1) Collect per-page inputs sequentially (I/O + decompression).
         let mut inputs: Vec<PageInput> = Vec::new();
         for (number, page_id) in pages_map {
@@ -55,6 +60,7 @@ impl DocumentParser for PdfParser {
             let fonts = font::build_page_fonts(&doc, page_id);
             let images = images::build_page_images(&doc, page_id);
             let forms = images::build_page_forms(&doc, page_id);
+            let tags = page_tags.remove(&(number as usize)).unwrap_or_default();
             inputs.push(PageInput {
                 number: number as usize,
                 width,
@@ -63,6 +69,7 @@ impl DocumentParser for PdfParser {
                 fonts,
                 images,
                 forms,
+                tags,
             });
         }
 

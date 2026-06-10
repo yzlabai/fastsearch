@@ -136,6 +136,7 @@ pub fn assign_groups(page: &Page, regions: &[Region]) -> Option<Vec<Element>> {
             hidden: false,
             source: None,
             group: None,
+            tag: None,
         })
         .collect();
     let refs: Vec<&TextChunk> = synthetic.iter().collect();
@@ -313,6 +314,7 @@ mod tests {
             hidden: false,
             source: None,
             group: None,
+            tag: None,
         })
     }
 

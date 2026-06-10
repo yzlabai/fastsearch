@@ -222,6 +222,7 @@ mod tests {
                 hidden: false,
                 source: None,
                 group: None,
+                tag: None,
             })]
         };
         Page {
@@ -388,6 +389,7 @@ mod profile_tests {
             hidden: false,
             source: source.map(Into::into),
             group: None,
+            tag: None,
         })
     }
 

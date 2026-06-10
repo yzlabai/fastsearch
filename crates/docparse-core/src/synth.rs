@@ -102,6 +102,7 @@ impl PageBuilder {
             hidden: false,
             source: None,
             group: None,
+            tag: None,
         }));
         self.y -= lh;
     }

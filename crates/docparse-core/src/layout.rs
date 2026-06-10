@@ -32,6 +32,12 @@ fn is_vertical(c: &TextChunk) -> bool {
 /// families (Courier/…Mono/Menlo/Consolas/Monaco) plus TeX typewriter (cmtt)
 /// and "Typewriter" faces. TODO: the FontDescriptor FixedPitch flag would be
 /// authoritative; name-based covers the fonts seen in practice.
+/// "H" or "H1".."H6" — a tagged-PDF heading role.
+fn is_heading_tag(tag: Option<&str>) -> bool {
+    matches!(tag, Some(t) if t.len() <= 2 && t.starts_with('H')
+        && t[1..].chars().all(|c| c.is_ascii_digit()))
+}
+
 fn is_mono_font(name: Option<&str>) -> bool {
     let Some(n) = name else { return false };
     let l = n.to_ascii_lowercase();
@@ -71,6 +77,9 @@ pub struct Line {
     /// True when the line came from a Form XObject (figure/stamp content —
     /// excluded from heading classification).
     pub form: bool,
+    /// True when the line carries an H1..H6 structure tag (tagged PDF) —
+    /// author-declared heading, overrides the geometric heuristics.
+    pub tagged_heading: bool,
 }
 
 /// A body block: a paragraph or a heading, after grouping lines. Carries page +
@@ -144,6 +153,7 @@ fn reconstruct_lines_inner(chunks: &[&TextChunk]) -> Vec<Line> {
                 line.bold = line.bold && c.bold;
                 line.mono = line.mono && is_mono_font(c.font.as_deref());
                 line.form = line.form && c.source.as_deref() == Some("form");
+                line.tagged_heading = line.tagged_heading || is_heading_tag(c.tag.as_deref());
             }
             _ => {
                 if let Some(line) = cur.take() {
@@ -159,6 +169,7 @@ fn reconstruct_lines_inner(chunks: &[&TextChunk]) -> Vec<Line> {
                     bold: c.bold,
                     mono: is_mono_font(c.font.as_deref()),
                     form: c.source.as_deref() == Some("form"),
+                    tagged_heading: is_heading_tag(c.tag.as_deref()),
                 });
             }
         }
@@ -294,6 +305,7 @@ struct Acc {
     bold: bool,
     mono: bool,
     form: bool,
+    tagged_heading: bool,
     /// Per-line (x0, text) — kept for code blocks, whose reassembly needs
     /// line breaks and geometric indentation instead of paragraph joining.
     raw: Vec<(f32, String)>,
@@ -317,6 +329,7 @@ impl Acc {
             bold: line.bold,
             mono: line.mono,
             form: line.form,
+            tagged_heading: line.tagged_heading,
             raw: vec![(line.x0, text2)],
         }
     }
@@ -347,6 +360,7 @@ impl Acc {
         self.bold = self.bold && line.bold;
         self.mono = self.mono && line.mono;
         self.form = self.form && line.form;
+        self.tagged_heading = self.tagged_heading || line.tagged_heading;
         self.raw.push((line.x0, text.to_string()));
         self.x0_min = self.x0_min.min(line.x0);
         self.x1_max = self.x1_max.max(line.x1);
@@ -499,13 +513,15 @@ fn make_block(a: Acc, body_size: f32) -> Block {
     // short fully-bold line (title-case subsection at body size) — and never a
     // code/data line.
     let short = a.text.chars().count() <= 60;
-    let heading = a.lines == 1
-        && !looks_like_code(&a.text)
-        && !a.mono
-        && !a.form
-        && ((body_size > 0.0 && a.size > body_size * 1.25)
-            || is_heading_text(&a.text)
-            || (a.bold && short));
+    // Author-declared headings (tagged PDFs) override the geometric rules.
+    let heading = a.tagged_heading
+        || (a.lines == 1
+            && !looks_like_code(&a.text)
+            && !a.mono
+            && !a.form
+            && ((body_size > 0.0 && a.size > body_size * 1.25)
+                || is_heading_text(&a.text)
+                || (a.bold && short)));
     Block {
         text: a.text,
         size: a.size,
@@ -639,6 +655,7 @@ mod tests {
             bold: false,
             mono: false,
             form: false,
+            tagged_heading: false,
         }
     }
 
@@ -677,6 +694,7 @@ mod tests {
             hidden: false,
             source: None,
             group: Some(1),
+            tag: None,
         };
         let mut b = a.clone();
         b.text = "B".into();
@@ -711,6 +729,7 @@ mod tests {
             bold: false,
             mono: true,
             form: false,
+            tagged_heading: false,
         };
         let lines = vec![
             mk("fn main() {", 100.0, 0.0),
@@ -745,6 +764,7 @@ mod tests {
             hidden: false,
             source: None,
             group: None,
+            tag: None,
         };
         let stamp = TextChunk {
             text: "arXiv:1234".into(),
@@ -762,6 +782,7 @@ mod tests {
             hidden: false,
             source: None,
             group: None,
+            tag: None,
         };
         let lines = reconstruct_lines(&[&normal, &stamp]);
         assert_eq!(lines.len(), 1);
@@ -853,6 +874,7 @@ mod tests {
                     hidden: false,
                     source: None,
                     group: None,
+                    tag: None,
                 })
             })
             .collect();

@@ -296,6 +296,7 @@ impl Enhancer for PpOcrEnhancer {
                 hidden: false,
                 source: Some("ocr:ppocr-v4".into()),
                 group: None,
+                tag: None,
             }));
         }
         Some(elements)

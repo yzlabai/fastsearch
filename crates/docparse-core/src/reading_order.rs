@@ -155,6 +155,7 @@ mod tests {
             hidden: false,
             source: None,
             group: None,
+            tag: None,
         }
     }
 

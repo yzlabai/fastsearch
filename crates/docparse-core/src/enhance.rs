@@ -157,6 +157,7 @@ mod tests {
                 hidden: false,
                 source: None,
                 group: None,
+                tag: None,
             })])
         }
     }
@@ -179,6 +180,7 @@ mod tests {
                 hidden: false,
                 source: None,
                 group: None,
+                tag: None,
             })],
             None => vec![],
         };
