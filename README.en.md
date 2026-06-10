@@ -38,6 +38,7 @@ cargo build --release
 ./target/release/docparse input.pdf -f chunks      # RAG chunks (page + bbox + breadcrumbs)
 ./target/release/docparse scan.pdf --ocr           # OCR scans (needs models/ppocr; free for digital pages)
 ./target/release/docparse hard.pdf --layout        # layout-model macro reading order (needs models/layout, opt-in)
+./target/release/docparse doc.pdf --vlm-describe --vlm-url http://127.0.0.1:11434 --vlm-model qwen2.5vl   # VLM figure captions
 ./target/release/docparse input.pdf --quality --profile --route-plan   # quality / per-page profile / routing (JSON on stderr)
 
 ./target/release/docparse mcp                      # MCP stdio server (direct agent integration)
@@ -61,7 +62,7 @@ cargo test          # 82 unit tests (CMap / matrix / XY-cut / tables / chunking 
 
 ## Architecture
 
-A Cargo workspace with seven crates:
+A Cargo workspace with eight crates:
 
 | crate | Responsibility | Key deps |
 |---|---|---|
@@ -71,6 +72,7 @@ A Cargo workspace with seven crates:
 | [`docparse-html`](crates/docparse-html) | HTML backend: DOM pre-order walk → headings / paragraphs / lists / tables | scraper |
 | [`docparse-ocr`](crates/docparse-ocr) | ONNX-embedded enhancers: OCR (PP-OCRv4 det+rec, self-built DBNet post-processing / CTC decoding) and layout (DocLayout-YOLO regions → reading groups), both on `tract` pure-Rust inference | tract-onnx, zune-jpeg |
 | [`docparse-raster`](crates/docparse-raster) | On-demand hard-page rendering (pure-Rust `hayro`, ~100ms/page) — the main pipeline never renders; enhancer-routed pages only, opt-in, with a broken-render guard | hayro |
+| [`docparse-vlm`](crates/docparse-vlm) | VLM enhancer: picture description & friends over OpenAI-compatible services (vLLM/Ollama/LM Studio), minimal built-in PNG encoder, graceful degradation | ureq, base64 |
 | [`docparse-cli`](crates/docparse-cli) | The `docparse` CLI + an **MCP stdio server** (hand-written JSON-RPC, no SDK dependency) + **REST** (axum) | clap, axum, tokio |
 
 **Why this layering**: `core` depends on no PDF library — reading order and output are format-agnostic. Adding a format means implementing the `DocumentParser` trait plus one registry line in the CLI; models never enter the core and attach per page through the `Enhancer` boundary.

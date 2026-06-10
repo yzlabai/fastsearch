@@ -7,6 +7,7 @@ members = [
     "crates/docparse-html",
     "crates/docparse-ocr",
     "crates/docparse-raster",
+    "crates/docparse-vlm",
     "crates/docparse-cli",
 ]
 
@@ -36,6 +37,9 @@ zune-jpeg = "0.4"
 # On-demand page rasterization for neural enhancers (user-approved 2026-06-10):
 # the main pipeline never renders; routed hard pages may, pure Rust, opt-in.
 hayro = "0.7"
+# VLM enhancer over OpenAI-compatible services (G8b, user-approved 2026-06-10).
+ureq = { version = "2", features = ["json"] }
+base64 = "0.22"
 
 [profile.release]
 lto = "thin"

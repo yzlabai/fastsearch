@@ -84,6 +84,25 @@ struct Cli {
     /// Path to the DocLayout-YOLO ONNX model.
     #[arg(long, default_value = "models/layout/doclayout_yolo.onnx")]
     layout_model: PathBuf,
+
+    /// Caption sizable figures with a VLM (renders figure regions on demand;
+    /// PDF only). Requires --vlm-url and --vlm-model. Captions are injected
+    /// as positioned text with source "vlm:<model>".
+    #[arg(long)]
+    vlm_describe: bool,
+
+    /// OpenAI-compatible service base URL (vLLM / Ollama / LM Studio / cloud),
+    /// e.g. http://127.0.0.1:11434
+    #[arg(long)]
+    vlm_url: Option<String>,
+
+    /// Vision model name as the service knows it (e.g. qwen2.5vl, llava).
+    #[arg(long)]
+    vlm_model: Option<String>,
+
+    /// Bearer token, if the service requires one.
+    #[arg(long)]
+    vlm_api_key: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -200,6 +219,29 @@ fn main() -> anyhow::Result<()> {
             eprintln!("{{\"layout_enhanced_pages\": {n}}}");
         } else {
             eprintln!("--layout currently supports PDF inputs only; skipped");
+        }
+    }
+
+    if cli.vlm_describe {
+        let is_pdf = input
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pdf"))
+            .unwrap_or(false);
+        if !is_pdf {
+            eprintln!("--vlm-describe currently supports PDF inputs only; skipped");
+        } else {
+            let (url, model) = match (cli.vlm_url.clone(), cli.vlm_model.clone()) {
+                (Some(u), Some(m)) => (u, m),
+                _ => anyhow::bail!("--vlm-describe requires --vlm-url and --vlm-model"),
+            };
+            let client = docparse_vlm::VlmClient::new(docparse_vlm::VlmConfig {
+                url,
+                model,
+                api_key: cli.vlm_api_key.clone(),
+            });
+            let n = docparse_vlm::annotate_pictures(&mut doc, std::fs::read(&input)?, &client)?;
+            eprintln!("{{\"vlm_described_figures\": {n}}}");
         }
     }
 

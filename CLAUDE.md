@@ -34,7 +34,7 @@ done
 
 ## 2. 架构与改动落点
 
-Cargo workspace，七个 crate（core/pdf/docx/html/ocr/raster/cli）。**`core` 不依赖任何 PDF 库**——阅读顺序与输出对所有格式通用，加格式只需实现 `DocumentParser` trait 并在 CLI 注册表加一行。
+Cargo workspace，八个 crate（core/pdf/docx/html/ocr/raster/vlm/cli）。**`core` 不依赖任何 PDF 库**——阅读顺序与输出对所有格式通用，加格式只需实现 `DocumentParser` trait 并在 CLI 注册表加一行。
 
 | 想做的事 | 改哪 |
 |---|---|
@@ -47,6 +47,7 @@ Cargo workspace，七个 crate（core/pdf/docx/html/ocr/raster/cli）。**`core`
 | 加 CLI 选项 | [cli/main.rs](crates/docparse-cli/src/main.rs) 的 `Cli` struct（clap derive） |
 | 加 MCP tool / REST 路由 | [cli/mcp.rs](crates/docparse-cli/src/mcp.rs)（手写 JSON-RPC）/ [cli/server.rs](crates/docparse-cli/src/server.rs)（axum）；共用 `main.rs::parse_path` |
 | OCR / enhancer | [crates/docparse-ocr/src/lib.rs](crates/docparse-ocr/src/lib.rs)（tract 推理管线）；边界在 [core/enhance.rs](crates/docparse-core/src/enhance.rs)；图抽取在 [pdf/images.rs](crates/docparse-pdf/src/images.rs) |
+| VLM 任务 / 服务接入 | [crates/docparse-vlm/src/lib.rs](crates/docparse-vlm/src/lib.rs)（OpenAI 兼容协议 + 图片描述;协议变更先改 mock 单测） |
 | 版面模型 / 阅读组 / 按需渲染 | [ocr/layout.rs](crates/docparse-ocr/src/layout.rs)（区域→`TextChunk.group`）；渲染在 [docparse-raster](crates/docparse-raster/src/lib.rs)（hayro，仅难页 opt-in）；分组重排在 [core/layout.rs](crates/docparse-core/src/layout.rs) `reconstruct_lines` |
 
 ## 3. 关键不变量（跨格式后端都要守）

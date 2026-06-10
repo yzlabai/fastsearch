@@ -38,6 +38,7 @@ cargo build --release
 ./target/release/docparse input.pdf -f chunks      # RAG 切块（page+bbox+标题面包屑）
 ./target/release/docparse scan.pdf --ocr           # 扫描件 OCR（需 models/ppocr，数字页零成本）
 ./target/release/docparse hard.pdf --layout        # 版面模型重排宏观读序（需 models/layout，opt-in）
+./target/release/docparse doc.pdf --vlm-describe --vlm-url http://127.0.0.1:11434 --vlm-model qwen2.5vl   # VLM 图片描述
 ./target/release/docparse input.pdf --quality --profile --route-plan   # 质量分/页级画像/路由计划（stderr JSON）
 
 ./target/release/docparse mcp                      # MCP stdio server（agent 直连）
@@ -61,7 +62,7 @@ cargo test          # 82 单测（CMap/矩阵/XY-cut/表格/切块/MCP/限额/OC
 
 ## 架构
 
-Cargo workspace，七个 crate：
+Cargo workspace，八个 crate：
 
 | crate | 职责 | 关键依赖 |
 |---|---|---|
@@ -71,6 +72,7 @@ Cargo workspace，七个 crate：
 | [`docparse-html`](crates/docparse-html) | HTML 后端：DOM 前序遍历 → 标题/段落/列表/表格 | scraper |
 | [`docparse-ocr`](crates/docparse-ocr) | ONNX 内嵌 enhancer：OCR（PP-OCRv4 det+rec，DBNet 后处理/CTC 解码自研）+ 版面（DocLayout-YOLO 区域→阅读组），均经 `tract` 纯 Rust 推理 | tract-onnx, zune-jpeg |
 | [`docparse-raster`](crates/docparse-raster) | 难页按需渲染（纯 Rust `hayro`，~100ms/页）——主流程永不渲染；仅 enhancer 路由页 opt-in，含坏渲染守卫 | hayro |
+| [`docparse-vlm`](crates/docparse-vlm) | VLM enhancer：OpenAI 兼容服务（vLLM/Ollama/LM Studio）图片描述等任务，自带最小 PNG 编码器，服务失败优雅降级 | ureq, base64 |
 | [`docparse-cli`](crates/docparse-cli) | `docparse` 命令行 + **MCP stdio server**（手写 JSON-RPC，零 SDK 依赖）+ **REST**（axum） | clap, axum, tokio |
 
 **为什么这样分层**：`core` 不依赖任何 PDF 库——阅读顺序和输出对所有格式通用。新增格式只需实现 `DocumentParser` trait 并在 CLI 注册表里加一行；模型永不进核心，经 `Enhancer` 边界按页外接。
