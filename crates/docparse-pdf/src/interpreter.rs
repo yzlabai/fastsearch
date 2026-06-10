@@ -445,7 +445,11 @@ fn show_text(
             text,
             bbox: BBox { x0, y0, x1, y1 },
             font_size: height as f32,
-            font: ts.font.clone(),
+            // Prefer the PostScript name (meaningful to layout: bold/mono
+            // detection); fall back to the resource name.
+            font: font
+                .and_then(|f| f.base_font().map(str::to_owned))
+                .or_else(|| ts.font.clone()),
             page,
             confidence: 1.0,
             bold: font.map(|f| f.is_bold()).unwrap_or(false),

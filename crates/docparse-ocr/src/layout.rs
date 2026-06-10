@@ -23,6 +23,10 @@ const SIDE: usize = 1024;
 const SCORE_MIN: f32 = 0.25;
 /// Skip enhancement when fewer regions than this (nothing to reorder).
 const MIN_REGIONS: usize = 2;
+/// Require at least this fraction of text chunks to land in a region before
+/// grouping takes effect: partial coverage would push the uncovered majority
+/// behind the covered minority and scramble the page.
+const MIN_COVERAGE: f32 = 0.7;
 /// A render whose pixels are mostly dark is assumed broken (document pages
 /// are predominantly light). Sampled, cheap, conservative.
 const BROKEN_RENDER_DARK_MAX: f32 = 0.4;
@@ -142,18 +146,27 @@ pub fn assign_groups(page: &Page, regions: &[Region]) -> Option<Vec<Element>> {
         rank[idx] = pos as u32;
     }
 
-    let elements = page
+    let mut covered = 0usize;
+    let mut total = 0usize;
+    let elements: Vec<Element> = page
         .elements
         .iter()
         .map(|e| match e {
             Element::Text(t) => {
                 let mut t = t.clone();
                 t.group = best_region(&t.bbox, regions).map(|i| rank[i]);
+                total += 1;
+                if t.group.is_some() {
+                    covered += 1;
+                }
                 Element::Text(t)
             }
             other => other.clone(),
         })
         .collect();
+    if total == 0 || (covered as f32 / total as f32) < MIN_COVERAGE {
+        return None; // partial coverage scrambles more than it fixes
+    }
     Some(elements)
 }
 

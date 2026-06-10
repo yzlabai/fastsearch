@@ -65,7 +65,30 @@ pub struct Block {
 /// Group chunks into lines (shared baseline) and words (by gap). A horizontal
 /// gap wider than ~0.25 em starts a new word. Callers pass the chunks to use
 /// (e.g. with table content already excluded).
+///
+/// Reading groups (G2 layout enhancer): when chunks carry `group`, a layout
+/// model has dictated the macro order — each group is reconstructed
+/// separately, in group order, with the usual XY-cut geometry *inside* it.
+/// Ungrouped chunks (if mixed in) sort after all groups.
 pub fn reconstruct_lines(chunks: &[&TextChunk]) -> Vec<Line> {
+    if chunks.iter().any(|c| c.group.is_some()) {
+        let mut groups: std::collections::BTreeMap<u32, Vec<&TextChunk>> =
+            std::collections::BTreeMap::new();
+        for c in chunks {
+            groups
+                .entry(c.group.unwrap_or(u32::MAX))
+                .or_default()
+                .push(c);
+        }
+        return groups
+            .into_values()
+            .flat_map(|g| reconstruct_lines_inner(&g))
+            .collect();
+    }
+    reconstruct_lines_inner(chunks)
+}
+
+fn reconstruct_lines_inner(chunks: &[&TextChunk]) -> Vec<Line> {
     // Drop vertical/rotated marginalia (e.g. the sideways arXiv stamp): a
     // multi-char chunk whose box is much taller than wide. It otherwise
     // pollutes reading order and gets misread as a heading.
@@ -555,6 +578,45 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].text, "First line of para second line continues");
         assert_eq!(blocks[1].text, "A new paragraph");
+    }
+
+    #[test]
+    fn reading_groups_override_macro_order() {
+        // Two chunks; geometry says A (top) before B, groups say B first.
+        let mut a = TextChunk {
+            text: "A".into(),
+            bbox: BBox {
+                x0: 0.0,
+                y0: 90.0,
+                x1: 20.0,
+                y1: 100.0,
+            },
+            font_size: 10.0,
+            font: None,
+            page: 1,
+            confidence: 1.0,
+            bold: false,
+            hidden: false,
+            source: None,
+            group: Some(1),
+        };
+        let mut b = a.clone();
+        b.text = "B".into();
+        b.bbox = BBox {
+            x0: 0.0,
+            y0: 10.0,
+            x1: 20.0,
+            y1: 20.0,
+        };
+        b.group = Some(0);
+        let lines = reconstruct_lines(&[&a, &b]);
+        assert_eq!(lines[0].text, "B", "group 0 must come first");
+        assert_eq!(lines[1].text, "A");
+        // Without groups, geometry wins.
+        a.group = None;
+        b.group = None;
+        let lines = reconstruct_lines(&[&a, &b]);
+        assert_eq!(lines[0].text, "A");
     }
 
     #[test]

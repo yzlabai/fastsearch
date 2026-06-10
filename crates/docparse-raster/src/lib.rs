@@ -42,6 +42,9 @@ impl Rasterizer {
         let settings = RenderSettings {
             x_scale: scale,
             y_scale: scale,
+            // hayro defaults to a TRANSPARENT background; premultiplied alpha
+            // then reads as black in an RGB view. Documents read on white.
+            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
             ..Default::default()
         };
         let cache = RenderCache::new();

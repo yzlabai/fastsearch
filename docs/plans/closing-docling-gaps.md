@@ -44,7 +44,7 @@
 - [ ] **光栅来源**:born-digital 页需真实渲染(草图已否决)——选型分析见 [refer/rasterization-options-analysis.md](../refer/rasterization-options-analysis.md)✅ **已决**(2026-06-10):`docparse-raster` crate 包 hayro(纯 Rust,99ms/页),enhancer 难页按需渲染、默认关闭;外部工具兜底链暂不做。
 - [ ] **触发**:N5c 画像已就绪——`scanned`/`mixed`/版面复杂信号页才路由(对版面模型,"难页"判据可用确定性输出的异常分:块重叠率/读序回跳),clean 页不碰模型。
 - [ ] **归一**:模型出 region(标题/正文/图/表/页眉脚)+ bbox → 重排该页读序、修正标题/表区域;经 `Enhancer` 边界,source 标 `layout:<model>`,确定性结果仍独立成立。
-- **验收 → 实测否决(2026-06-10,[devlog](../devlogs/2026-06-10-g2-layout-enhancer.md))**:基建全部落地(docparse-raster/阅读组 IR 0.5.0/layout 模块/`--layout`),但 CJK 文档 NID 一字不动——gap 在**区域内微观序**(label-value 行列序),区域级版面模型原理上救不了;且 hayro 对部分 PDF(2206)渲染损坏 → 外部工具兜底提级为必做。基建保留(零回归、默认关、G3/G8 共用底座);CJK gap 改由 G8b 整页 VLM 攻。
+- **验收 → 两轮更正后的真实状态(2026-06-10,[devlog](../devlogs/2026-06-10-g2-layout-enhancer.md) + [重大更正](../devlogs/2026-06-10-g2-correction.md))**:初版"负结果"系两个自家 bug(透明背景致黑渲染、分组替换静默失败)所致,修正后 enhancement 真实点火:**设计感版面大赢**(amt +0.180、normal_4pages +0.128),**clean 学术双栏倒退**(2203 −0.289)——版面模型与确定性几何各有禁区。`--layout` 保持手动 opt-in(记分牌默认不开,零回归);**剩余项=自动路由判据**(读序歧义分/区域分布,行填充率已试败),做成后按页自动取两者之优。
 
 ### G3 · 表结构 enhancer:ONNX 表结构模型内嵌 — *模块 8 / P4 模式*
 TEDS 0.098/0.187 的主因是多级表头/合并单元格(神经域)。SLANet 系(PP-StructureV2,~9MB)输出结构 token + cell bbox,正是缺的拓扑。

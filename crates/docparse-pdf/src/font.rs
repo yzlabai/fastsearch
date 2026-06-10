@@ -38,6 +38,8 @@ pub struct FontInfo {
     afm_widths: Option<&'static HashMap<String, f64>>,
     /// Whether this font is bold (from the BaseFont name or descriptor flags).
     bold: bool,
+    /// PostScript base font name (e.g. "DejaVuSansMono"), subset prefix kept.
+    base_font: Option<String>,
 }
 
 /// Default advance when a glyph width is unknown (0.5 em, in 1/1000 units).
@@ -153,6 +155,12 @@ impl FontInfo {
     pub fn is_bold(&self) -> bool {
         self.bold
     }
+
+    /// PostScript base font name, if declared (closes the resource-name TODO:
+    /// downstream sees "NimbusMonoPS-Regular", not "F7").
+    pub fn base_font(&self) -> Option<&str> {
+        self.base_font.as_deref()
+    }
 }
 
 /// Detect bold from the BaseFont name or the FontDescriptor (Type0 fonts carry
@@ -263,6 +271,7 @@ fn build_font(doc: &PdfDocument, fd: &Dictionary) -> FontInfo {
         encoding,
         afm_widths,
         bold: font_is_bold(doc, fd),
+        base_font: name_of(fd, b"BaseFont"),
     }
 }
 
