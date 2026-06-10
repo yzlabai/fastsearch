@@ -72,13 +72,26 @@ def teds(pred, gt):
     pts, gts = pred.get("tables", []), gt.get("tables", [])
     if not pts and not gts:
         return 1.0
+    # Match tables by best content overlap, NOT by emission index: two systems
+    # emit tables in different orders and detect different subsets, so index
+    # pairing compares unrelated tables and understates a correct extraction
+    # (e.g. redp5110: we extract the right "Special register"/"Global variable"
+    # tables but at shifted indices). Greedy max-similarity assignment; each
+    # table used once; unmatched predicted/gt tables score 0 (spurious/missed),
+    # keeping detection recall honest. Denominator = max count.
+    pairs = sorted(
+        ((_teds_one(p, g), i, j) for i, p in enumerate(pts) for j, g in enumerate(gts)),
+        reverse=True,
+    )
+    used_p, used_g, matched = set(), set(), 0.0
+    for s, i, j in pairs:
+        if i in used_p or j in used_g:
+            continue
+        used_p.add(i)
+        used_g.add(j)
+        matched += s
     n = max(len(pts), len(gts))
-    scores = []
-    for i in range(n):
-        p = pts[i] if i < len(pts) else []
-        g = gts[i] if i < len(gts) else []
-        scores.append(_teds_one(p, g))
-    return sum(scores) / n if scores else 1.0
+    return matched / n if n else 1.0
 
 
 def mhs(pred, gt):
