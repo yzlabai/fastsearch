@@ -86,13 +86,13 @@ M7 只给了边界 + StubOcr。接一个真实模型证明可插拔端到端。
 
 **进展（2026-06-09，聚类表格 P1a/P1b 已落地）**：深挖 + 重写见 [refer/opendataloader-verapdf-analysis.md](../refer/opendataloader-verapdf-analysis.md) 与 [plans/cluster-table-recognizer-rust.md](cluster-table-recognizer-rust.md)。P1b 已把 `ClusterTableConsumer` 的"按列喂入 + header 锚定 + 吸引级联"做出来，**零回归**下找到真实宽数值表。但仍用**数值/≥3列**保守内容门兜精度 → 非数值/2 列表走不到，2203 仍 4 vs ODL 13。**剩余 gap 由 P1c 关闭**：实现 gap 图 + `mergeClustersByMinGaps` 列碎片合并 + 真 `Table.validate`，用结构校验替代内容启发式，方能在保精度下放开更多表型逼近 ODL 覆盖。
 
-### N5 · 安全预检与复杂度画像 — *模块 9* · 🚧 N5a 完成（[plan](n5-security-precheck.md)）
+### N5 · 安全预检与复杂度画像 — *模块 9* · 🚧 N5a+N5b 完成（[plan](n5-security-precheck.md)）
 接入面的治理层，面向 agent/RAG 的安全底线。
 
 - [x] **隐藏文本过滤**（防 prompt injection，2026-06-10）：`Tr 3/7`/超小字号(<1pt)/页外 → `TextChunk.hidden`，渲染输出全链路排除、IR JSON 保留可审计、quality 计数+flag；schema 0.3.0。同色文本显式 TODO（需填充色跟踪）。devlog：[n5a-hidden-text](../devlogs/2026-06-10-n5a-hidden-text.md)。
-- [ ] **资源防护**：ZIP bomb（DOCX/解压上限）、恶意/超深对象、超大页数早停。
-- [ ] **复杂度画像**：格式 + 页级路由信号（数字/扫描/混合/旋转/表格密度），喂给 N1 评测与路由。
-- **验收**：构造隐藏文本/zip bomb 样例被识别且不 panic、产生可追踪错误码（不静默吞）。
+- [x] **资源防护**（2026-06-10）：`core::limits` 手写 ZIP 中央目录预检（绝对 2GiB + 压缩比 250x，不解压）+ 页数早停（50000）；接入 docx/pdf parser，可追踪错误不 panic。devlog：[n5b-resource-guards](../devlogs/2026-06-10-n5b-resource-guards.md)。
+- [ ] **复杂度画像**（N5c，暂缓）：格式 + 页级路由信号（数字/扫描/混合/旋转/表格密度），喂给 N1 评测与路由——quality 已有雏形，待 N3 需要时扩。
+- **验收 ✅**：隐藏文本 + zip bomb 构造样例均被识别、产生可追踪错误码、不 panic 不挂起（不静默吞）。
 
 ### N6 · 选择性小模型 ONNX 内嵌 — *模块 8 / P4·远期·可选*
 - [ ] 把已稳定的小模型（页面分类/方向/轻量 OCR）转 ONNX，用 `ort`/Candle 在 Rust worker 内推理，评估纯 Rust/Metal 部署；重型 VLM 仍外接。

@@ -11,6 +11,8 @@
 //! - [`output`] — JSON / Markdown / plain-text serializers.
 //! - [`table`] — bordered-table detection from ruling lines (semantic layer).
 //! - [`quality`] — format-agnostic parse-quality scoring (coverage/garble).
+//! - [`limits`] — resource guards (page count, zip-bomb pre-check) for the
+//!   agent-facing entry points.
 //!
 //! The design mirrors the "structure extractor, not renderer" approach of
 //! opendataloader-pdf: parsers emit positioned chunks; this crate turns them
@@ -20,6 +22,7 @@ pub mod chunk;
 pub mod enhance;
 pub mod ir;
 pub mod layout;
+pub mod limits;
 pub mod output;
 pub mod parser;
 pub mod quality;

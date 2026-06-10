@@ -41,9 +41,14 @@ impl DocumentParser for PdfParser {
     fn parse(&self, path: &Path) -> anyhow::Result<Document> {
         let doc = PdfDocument::load(path)?;
 
+        // Resource guard (N5b): refuse a pathological page count before doing
+        // any per-page work.
+        let pages_map = doc.get_pages();
+        docparse_core::limits::check_page_count(pages_map.len())?;
+
         // 1) Collect per-page inputs sequentially (I/O + decompression).
         let mut inputs: Vec<PageInput> = Vec::new();
-        for (number, page_id) in doc.get_pages() {
+        for (number, page_id) in pages_map {
             let content = doc.get_page_content(page_id).unwrap_or_default();
             let (width, height) = page_dimensions(&doc, page_id);
             let fonts = font::build_page_fonts(&doc, page_id);

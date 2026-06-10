@@ -39,6 +39,9 @@ impl DocumentParser for DocxParser {
 
 /// Parse DOCX bytes into a [`Document`].
 pub fn parse_bytes(buf: &[u8]) -> anyhow::Result<Document> {
+    // Resource guard (N5b): refuse zip-bomb-shaped archives by reading only the
+    // central directory — before docx-rs decompresses anything.
+    docparse_core::limits::check_zip_bomb(buf)?;
     let docx = docx_rs::read_docx(buf).map_err(|e| anyhow::anyhow!("docx parse: {e}"))?;
     let mut b = PageBuilder::letter();
 
