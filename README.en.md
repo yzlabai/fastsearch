@@ -8,7 +8,7 @@ A fast, pure-Rust **multi-format document parsing system**: extracts **positione
 
 ## Highlights
 
-- **19.1 MB single binary, zero runtime dependencies**: <10 ms warm parse, 700 pages/s, byte-identical output for identical input;
+- **23.5 MB single binary, zero runtime dependencies** (incl. two pure-Rust inference stacks + on-demand renderer): <10 ms warm parse, 700 pages/s, byte-identical output for identical input;
 - **Four faces, one output**: CLI / library / MCP (stdio, direct agent integration) / REST — **byte-identical across interfaces**, OCR path included;
 - **RAG as a first-class citizen**: structured chunks with page + bbox + heading breadcrumbs, `locate(x, y)` reverse lookup, 100% citation coverage;
 - **Security pre-checks built in**: hidden-text filtering (anti prompt-injection — flagged and auditable, never silently dropped), zip-bomb / page-count resource guards, per-page complexity profiling;
@@ -37,6 +37,7 @@ cargo build --release
 ./target/release/docparse input.pdf -f text -o out.txt
 ./target/release/docparse input.pdf -f chunks      # RAG chunks (page + bbox + breadcrumbs)
 ./target/release/docparse scan.pdf --ocr           # OCR scans (needs models/ppocr; free for digital pages)
+./target/release/docparse hard.pdf --layout        # layout-model macro reading order (needs models/layout, opt-in)
 ./target/release/docparse input.pdf --quality --profile --route-plan   # quality / per-page profile / routing (JSON on stderr)
 
 ./target/release/docparse mcp                      # MCP stdio server (direct agent integration)
@@ -60,7 +61,7 @@ cargo test          # 82 unit tests (CMap / matrix / XY-cut / tables / chunking 
 
 ## Architecture
 
-A Cargo workspace with six crates:
+A Cargo workspace with seven crates:
 
 | crate | Responsibility | Key deps |
 |---|---|---|
@@ -68,7 +69,8 @@ A Cargo workspace with six crates:
 | [`docparse-pdf`](crates/docparse-pdf) | Pure-Rust PDF backend: lopdf parsing + a **self-built content-stream interpreter** (matrix stack + operator state machine + hidden-text detection + image-XObject extraction) + a **font layer** (ToUnicode CMap / AFM / Encoding, independently implemented with veraPDF as the algorithmic reference) + per-page rayon parallelism | lopdf, rayon |
 | [`docparse-docx`](crates/docparse-docx) | DOCX backend: docx-rs structure → synthetic coordinates into the same IR; zip-bomb pre-check | docx-rs |
 | [`docparse-html`](crates/docparse-html) | HTML backend: DOM pre-order walk → headings / paragraphs / lists / tables | scraper |
-| [`docparse-ocr`](crates/docparse-ocr) | ONNX-embedded OCR enhancer: PP-OCRv4 det+rec on `tract`, pure-Rust inference (DBNet post-processing / CTC decoding self-built), implementing `core::enhance::Enhancer` | tract-onnx, zune-jpeg |
+| [`docparse-ocr`](crates/docparse-ocr) | ONNX-embedded enhancers: OCR (PP-OCRv4 det+rec, self-built DBNet post-processing / CTC decoding) and layout (DocLayout-YOLO regions → reading groups), both on `tract` pure-Rust inference | tract-onnx, zune-jpeg |
+| [`docparse-raster`](crates/docparse-raster) | On-demand hard-page rendering (pure-Rust `hayro`, ~100ms/page) — the main pipeline never renders; enhancer-routed pages only, opt-in, with a broken-render guard | hayro |
 | [`docparse-cli`](crates/docparse-cli) | The `docparse` CLI + an **MCP stdio server** (hand-written JSON-RPC, no SDK dependency) + **REST** (axum) | clap, axum, tokio |
 
 **Why this layering**: `core` depends on no PDF library — reading order and output are format-agnostic. Adding a format means implementing the `DocumentParser` trait plus one registry line in the CLI; models never enter the core and attach per page through the `Enhancer` boundary.

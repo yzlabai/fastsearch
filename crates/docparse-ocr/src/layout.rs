@@ -23,6 +23,9 @@ const SIDE: usize = 1024;
 const SCORE_MIN: f32 = 0.25;
 /// Skip enhancement when fewer regions than this (nothing to reorder).
 const MIN_REGIONS: usize = 2;
+/// A render whose pixels are mostly dark is assumed broken (document pages
+/// are predominantly light). Sampled, cheap, conservative.
+const BROKEN_RENDER_DARK_MAX: f32 = 0.4;
 
 /// A detected layout region in PDF user-space coordinates.
 #[derive(Debug, Clone)]
@@ -174,6 +177,27 @@ fn best_region(b: &BBox, regions: &[Region]) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
+/// Fraction of sampled pixels darker than mid-gray.
+fn dark_fraction(rgb: &[u8]) -> f32 {
+    let mut dark = 0usize;
+    let mut total = 0usize;
+    // Sample every 97th pixel — plenty for a whole-page statistic.
+    let mut i = 0;
+    while i + 3 <= rgb.len() {
+        let lum = rgb[i] as u32 + rgb[i + 1] as u32 + rgb[i + 2] as u32;
+        if lum < 3 * 96 {
+            dark += 1;
+        }
+        total += 1;
+        i += 97 * 3;
+    }
+    if total == 0 {
+        1.0
+    } else {
+        dark as f32 / total as f32
+    }
+}
+
 fn resize_nn(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
     let mut out = vec![0u8; dw * dh * 3];
     for y in 0..dh {
@@ -209,6 +233,17 @@ pub fn enhance_document(
                 continue;
             }
         };
+        // Broken-render guard: hayro (WIP upstream) occasionally produces a
+        // mostly-black canvas (e.g. transparency-group bugs). Real document
+        // pages are predominantly light; feeding a broken render to the model
+        // yields garbage regions, so skip the page instead.
+        if dark_fraction(&rgb) > BROKEN_RENDER_DARK_MAX {
+            eprintln!(
+                "layout: render of page {} looks broken (mostly dark) — skipping enhancement",
+                page.number
+            );
+            continue;
+        }
         let regions = match model.detect(&rgb, w as usize, h as usize, scale, page.height) {
             Ok(r) => r,
             Err(e) => {
@@ -305,5 +340,20 @@ mod tests {
             elements: vec![text_at(0.0, 0.0, 10.0, 10.0)],
         };
         assert!(assign_groups(&page, &[region(0.0, 0.0, 100.0, 100.0)]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::dark_fraction;
+
+    #[test]
+    fn white_page_is_not_broken() {
+        assert!(dark_fraction(&vec![250u8; 3000]) < 0.01);
+    }
+
+    #[test]
+    fn black_canvas_is_broken() {
+        assert!(dark_fraction(&vec![5u8; 3000]) > 0.9);
     }
 }

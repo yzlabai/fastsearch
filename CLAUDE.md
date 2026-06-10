@@ -18,6 +18,7 @@ cargo build --release            # 优化构建（lto=thin, codegen-units=1）
 ./target/release/docparse mcp                # MCP stdio server（agent 直连）
 ./target/release/docparse serve --port 8642  # REST（绑 127.0.0.1）
 ./target/release/docparse <scan.pdf> --ocr    # 扫描件 OCR（需 models/ppocr，数字页零模型）
+./target/release/docparse <hard.pdf> --layout # 版面模型重排（需 models/layout，opt-in）
 ```
 
 **跨真实样例回归**（字体/解码/输出改动必跑）：
@@ -33,7 +34,7 @@ done
 
 ## 2. 架构与改动落点
 
-Cargo workspace，六个 crate（core/pdf/docx/html/ocr/cli）。**`core` 不依赖任何 PDF 库**——阅读顺序与输出对所有格式通用，加格式只需实现 `DocumentParser` trait 并在 CLI 注册表加一行。
+Cargo workspace，七个 crate（core/pdf/docx/html/ocr/raster/cli）。**`core` 不依赖任何 PDF 库**——阅读顺序与输出对所有格式通用，加格式只需实现 `DocumentParser` trait 并在 CLI 注册表加一行。
 
 | 想做的事 | 改哪 |
 |---|---|
@@ -46,6 +47,7 @@ Cargo workspace，六个 crate（core/pdf/docx/html/ocr/cli）。**`core` 不依
 | 加 CLI 选项 | [cli/main.rs](crates/docparse-cli/src/main.rs) 的 `Cli` struct（clap derive） |
 | 加 MCP tool / REST 路由 | [cli/mcp.rs](crates/docparse-cli/src/mcp.rs)（手写 JSON-RPC）/ [cli/server.rs](crates/docparse-cli/src/server.rs)（axum）；共用 `main.rs::parse_path` |
 | OCR / enhancer | [crates/docparse-ocr/src/lib.rs](crates/docparse-ocr/src/lib.rs)（tract 推理管线）；边界在 [core/enhance.rs](crates/docparse-core/src/enhance.rs)；图抽取在 [pdf/images.rs](crates/docparse-pdf/src/images.rs) |
+| 版面模型 / 阅读组 / 按需渲染 | [ocr/layout.rs](crates/docparse-ocr/src/layout.rs)（区域→`TextChunk.group`）；渲染在 [docparse-raster](crates/docparse-raster/src/lib.rs)（hayro，仅难页 opt-in）；分组重排在 [core/layout.rs](crates/docparse-core/src/layout.rs) `reconstruct_lines` |
 
 ## 3. 关键不变量（跨格式后端都要守）
 

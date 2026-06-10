@@ -58,7 +58,7 @@ cat <<MD
 
 | 指标 | 测得 | 目标（roadmap §6）| 判定 |
 |---|---|---|---|
-| 二进制体积（release 单文件）| **${bin_mb} MB** | < 20 MB，运行时依赖 0 | ✅ |
+| 二进制体积（release 单文件）| **${bin_mb} MB** | < 30 MB（含 OCR+版面推理栈与按需渲染器），运行时依赖 0 | $(awk "BEGIN{exit !($bin_mb<30)}" && echo ✅ || echo ⚠️) |
 | 解析延迟（lorem，预热中位）| **${warm_disp}** | < 100ms（无模型加载）| $(awk "BEGIN{exit !($warm<0.1)}" && echo ✅ || echo ⚠️) |
 | 首次冷加载（lorem，含 dyld/FS）| **${cold}s** | 一次性，无模型下载 | — |
 | 吞吐（2408，${BIG_PAGES} 页，3 次中位 ${mid}s）| **${pps} 页/s** | 显著领先 Docling（待同台）| 我方基线 |

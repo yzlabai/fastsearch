@@ -21,7 +21,7 @@
 
 | 指标 | docparse-rs 实测 | 对照 | 判定 |
 |---|---|---|---|
-| 二进制体积 | **19.12 MB** 单文件(含 OCR 推理栈 ~12.5MB) | Docling:Python 环境 + 数百 MB 模型下载;ODL:JVM | ✅ <20MB 门 |
+| 二进制体积 | **23.46 MB** 单文件(OCR+版面推理栈 + 按需渲染器) | Docling:Python 环境 + 数百 MB 模型下载;ODL:JVM | ✅ <30MB 门(2026-06-10 上调,见 roadmap §6) |
 | 运行时依赖 | **0**(OCR 模型为可选外部文件 ~16MB) | Docling 需 Python/torch;ODL 需 JVM | ✅ |
 | 解析延迟(预热) | **<10ms** | Docling 冷启动需加载模型(秒级) | ✅ |
 | 吞吐(born-digital) | **700 页/s**(14 页文档,3 次中位) | ODL 宣称 0.02s/页≈50 页/s;Docling CPU 典型 ~1 页/s 量级(其报告) | **~14×/~700×**(宣称值口径) |

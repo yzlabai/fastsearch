@@ -192,7 +192,7 @@ flowchart TB
 
 | 指标 | 测法 | 目标 |
 |---|---|---|
-| 二进制体积 / 运行时依赖 | `ls -la target/release/docparse` | 单文件 < 20MB，运行时依赖 0 |
+| 二进制体积 / 运行时依赖 | `ls -la target/release/docparse` | 单文件 < 30MB（2026-06-10 由 20MB 上调：含 OCR+版面两套推理栈与按需渲染器；单文件零运行时依赖不变），运行时依赖 0 |
 | 冷启动到首字节 | `time docparse small.pdf` | < 100ms（无模型加载） |
 | 确定性 | 同文件跑 100 次 diff | 逐字节一致 |
 | 吞吐（born-digital） | 页/秒 vs Docling 标准管线 | 显著领先（目标 ≥10×，待测） |
