@@ -8,6 +8,10 @@ members = [
     "crates/docparse-ocr",
     "crates/docparse-raster",
     "crates/docparse-vlm",
+    "crates/docparse-xlsx",
+    "crates/docparse-pptx",
+    "crates/docparse-md",
+    "crates/docparse-csv",
     "crates/docparse-cli",
 ]
 
@@ -40,6 +44,11 @@ hayro = "0.7"
 # VLM enhancer over OpenAI-compatible services (G8b, user-approved 2026-06-10).
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
+# Format breadth (G1a, user-approved 2026-06-10): XLSX/PPTX/Markdown backends.
+calamine = "0.26"
+quick-xml = "0.37"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+pulldown-cmark = { version = "0.12", default-features = false }
 
 [profile.release]
 lto = "thin"

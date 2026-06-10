@@ -6,9 +6,13 @@ mod server;
 use clap::{Parser, Subcommand, ValueEnum};
 use docparse_core::output;
 use docparse_core::parser::DocumentParser;
+use docparse_csv::CsvParser;
 use docparse_docx::DocxParser;
 use docparse_html::HtmlParser;
+use docparse_md::MarkdownParser;
 use docparse_pdf::PdfParser;
+use docparse_pptx::PptxParser;
+use docparse_xlsx::XlsxParser;
 use std::path::PathBuf;
 
 /// Parser registry — one line per format backend. Shared by the CLI path, the
@@ -18,6 +22,10 @@ pub(crate) fn parsers() -> Vec<Box<dyn DocumentParser>> {
         Box::new(PdfParser),
         Box::new(DocxParser),
         Box::new(HtmlParser),
+        Box::new(XlsxParser),
+        Box::new(PptxParser),
+        Box::new(MarkdownParser),
+        Box::new(CsvParser),
     ]
 }
 

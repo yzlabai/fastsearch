@@ -16,6 +16,10 @@ docparse-docx = { path = "../docparse-docx" }
 docparse-html = { path = "../docparse-html" }
 docparse-ocr = { path = "../docparse-ocr" }
 docparse-vlm = { path = "../docparse-vlm" }
+docparse-xlsx = { path = "../docparse-xlsx" }
+docparse-pptx = { path = "../docparse-pptx" }
+docparse-md = { path = "../docparse-md" }
+docparse-csv = { path = "../docparse-csv" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

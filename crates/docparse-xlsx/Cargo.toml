@@ -1,0 +1,12 @@
+[package]
+name = "docparse-xlsx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "XLSX backend for docparse-rs"
+
+[dependencies]
+docparse-core = { path = "../docparse-core" }
+anyhow.workspace = true
+calamine.workspace = true

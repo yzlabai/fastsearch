@@ -24,9 +24,7 @@
 
 **G1a 主流办公(先做)**:
 
-- [ ] `docparse-xlsx`:工作表 → `Element::Table`(每 sheet 一页),数字/公式取显示值;**依赖征询:`calamine`**(纯 Rust,事实标准)。
-- [ ] `docparse-pptx`:slide 文本框/标题/表格 → 合成版面(每 slide 一页);**依赖征询:`quick-xml`**(docx-rs 不覆盖 pptx;zip 预检复用 `core::limits`)。
-- [ ] Markdown(**征询 `pulldown-cmark`**)与 CSV/纯文本(std 手写,零依赖)。
+- [x] **G1a 全部完成 ✅**(2026-06-10,[devlog](../devlogs/2026-06-10-g1a-format-breadth.md)):docparse-xlsx(calamine)/ docparse-pptx(zip+quick-xml,每 slide 一页)/ docparse-md(pulldown-cmark)/ docparse-csv(零依赖手写)——格式数 3→7,97 单测,零回归。
 
 **G1b 长尾(对齐 Docling 后端清单)**:
 

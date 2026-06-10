@@ -61,6 +61,14 @@ impl PageBuilder {
         self.y = self.height - self.margin;
     }
 
+    /// Force a page break (e.g. one slide per page for presentations). No-op
+    /// on a still-empty page.
+    pub fn page_break(&mut self) {
+        if !self.cur.is_empty() {
+            self.flush_page();
+        }
+    }
+
     /// Estimated text width (avg glyph ≈ 0.5 em), capped to the content width.
     fn text_width(&self, text: &str, size: f32) -> f32 {
         (text.chars().count() as f32 * size * 0.5).min(self.width - 2.0 * self.margin)
