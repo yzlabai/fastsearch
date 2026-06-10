@@ -80,7 +80,12 @@ pub fn to_markdown(doc: &Document) -> String {
                 continue;
             }
             if block.heading {
-                md.push_str("## ");
+                // Level 1 → "## " (single # reserved for a document title),
+                // deeper levels nest accordingly.
+                for _ in 0..(block.level.clamp(1, 4) + 1) {
+                    md.push('#');
+                }
+                md.push(' ');
             }
             md.push_str(t);
             md.push_str("\n\n");

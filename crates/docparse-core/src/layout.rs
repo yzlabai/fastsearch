@@ -32,10 +32,42 @@ fn is_vertical(c: &TextChunk) -> bool {
 /// families (Courier/…Mono/Menlo/Consolas/Monaco) plus TeX typewriter (cmtt)
 /// and "Typewriter" faces. TODO: the FontDescriptor FixedPitch flag would be
 /// authoritative; name-based covers the fonts seen in practice.
-/// "H" or "H1".."H6" — a tagged-PDF heading role.
-fn is_heading_tag(tag: Option<&str>) -> bool {
-    matches!(tag, Some(t) if t.len() <= 2 && t.starts_with('H')
-        && t[1..].chars().all(|c| c.is_ascii_digit()))
+/// "H" → level 1, "H1".."H6" → that level; `None` for non-heading roles.
+fn heading_tag_level(tag: Option<&str>) -> Option<u8> {
+    let t = tag?;
+    if !t.starts_with('H') || t.len() > 2 {
+        return None;
+    }
+    match t[1..].parse::<u8>() {
+        Ok(n) if (1..=6).contains(&n) => Some(n),
+        _ if t == "H" => Some(1),
+        _ => None,
+    }
+}
+
+/// Roles that are author-declared NOT-headings (paragraphs, figures,
+/// captions, table/list content). Containers like Span/Div carry no signal.
+fn is_nonheading_tag(tag: Option<&str>) -> bool {
+    matches!(
+        tag,
+        Some(
+            "P" | "Figure"
+                | "Caption"
+                | "Table"
+                | "TR"
+                | "TD"
+                | "TH"
+                | "L"
+                | "LI"
+                | "LBody"
+                | "Lbl"
+                | "TOC"
+                | "TOCI"
+                | "Note"
+                | "Code"
+                | "Formula"
+        )
+    )
 }
 
 fn is_mono_font(name: Option<&str>) -> bool {
@@ -77,9 +109,12 @@ pub struct Line {
     /// True when the line came from a Form XObject (figure/stamp content —
     /// excluded from heading classification).
     pub form: bool,
-    /// True when the line carries an H1..H6 structure tag (tagged PDF) —
-    /// author-declared heading, overrides the geometric heuristics.
-    pub tagged_heading: bool,
+    /// H1..H6 structure-tag level (tagged PDF) — author-declared heading,
+    /// overrides the geometric heuristics.
+    pub tag_level: Option<u8>,
+    /// True when the line carries an author-declared NOT-heading role
+    /// (P/Figure/Caption/…) — vetoes the geometric heading heuristics.
+    pub tagged_body: bool,
 }
 
 /// A body block: a paragraph or a heading, after grouping lines. Carries page +
@@ -88,6 +123,9 @@ pub struct Block {
     pub text: String,
     pub size: f32,
     pub heading: bool,
+    /// Heading level (1 = top). 0 on body/code blocks. Tagged PDFs supply it
+    /// directly; otherwise document-wide font-size tiers assign it (G9c).
+    pub level: u8,
     /// A monospace code block (≥2 mono lines); `text` preserves line breaks
     /// and geometric indentation. Renders fenced in Markdown.
     pub code: bool,
@@ -153,7 +191,8 @@ fn reconstruct_lines_inner(chunks: &[&TextChunk]) -> Vec<Line> {
                 line.bold = line.bold && c.bold;
                 line.mono = line.mono && is_mono_font(c.font.as_deref());
                 line.form = line.form && c.source.as_deref() == Some("form");
-                line.tagged_heading = line.tagged_heading || is_heading_tag(c.tag.as_deref());
+                line.tag_level = line.tag_level.or(heading_tag_level(c.tag.as_deref()));
+                line.tagged_body = line.tagged_body || is_nonheading_tag(c.tag.as_deref());
             }
             _ => {
                 if let Some(line) = cur.take() {
@@ -169,7 +208,8 @@ fn reconstruct_lines_inner(chunks: &[&TextChunk]) -> Vec<Line> {
                     bold: c.bold,
                     mono: is_mono_font(c.font.as_deref()),
                     form: c.source.as_deref() == Some("form"),
-                    tagged_heading: is_heading_tag(c.tag.as_deref()),
+                    tag_level: heading_tag_level(c.tag.as_deref()),
+                    tagged_body: is_nonheading_tag(c.tag.as_deref()),
                 });
             }
         }
@@ -305,7 +345,8 @@ struct Acc {
     bold: bool,
     mono: bool,
     form: bool,
-    tagged_heading: bool,
+    tag_level: Option<u8>,
+    tagged_body: bool,
     /// Per-line (x0, text) — kept for code blocks, whose reassembly needs
     /// line breaks and geometric indentation instead of paragraph joining.
     raw: Vec<(f32, String)>,
@@ -329,7 +370,8 @@ impl Acc {
             bold: line.bold,
             mono: line.mono,
             form: line.form,
-            tagged_heading: line.tagged_heading,
+            tag_level: line.tag_level,
+            tagged_body: line.tagged_body,
             raw: vec![(line.x0, text2)],
         }
     }
@@ -360,7 +402,8 @@ impl Acc {
         self.bold = self.bold && line.bold;
         self.mono = self.mono && line.mono;
         self.form = self.form && line.form;
-        self.tagged_heading = self.tagged_heading || line.tagged_heading;
+        self.tag_level = self.tag_level.or(line.tag_level);
+        self.tagged_body = self.tagged_body || line.tagged_body;
         self.raw.push((line.x0, text.to_string()));
         self.x0_min = self.x0_min.min(line.x0);
         self.x1_max = self.x1_max.max(line.x1);
@@ -436,7 +479,10 @@ fn demote_heading_runs(blocks: &mut [Block]) {
         }
         if i - start >= MAX_RUN {
             for b in &mut blocks[start + 1..i] {
-                b.heading = false;
+                // Author-declared (tagged) headings are never demoted.
+                if b.level == 0 {
+                    b.heading = false;
+                }
             }
         }
     }
@@ -498,6 +544,7 @@ fn make_block(a: Acc, body_size: f32) -> Block {
             text,
             size: a.size,
             heading: false,
+            level: 0,
             code: true,
             page: a.page,
             bbox: BBox {
@@ -513,9 +560,11 @@ fn make_block(a: Acc, body_size: f32) -> Block {
     // short fully-bold line (title-case subsection at body size) — and never a
     // code/data line.
     let short = a.text.chars().count() <= 60;
-    // Author-declared headings (tagged PDFs) override the geometric rules.
-    let heading = a.tagged_heading
-        || (a.lines == 1
+    // Author-declared semantics (tagged PDFs) override the geometric rules:
+    // H1..H6 forces a heading, P/Figure/Caption/… vetoes one.
+    let heading = a.tag_level.is_some()
+        || (!a.tagged_body
+            && a.lines == 1
             && !looks_like_code(&a.text)
             && !a.mono
             && !a.form
@@ -526,6 +575,8 @@ fn make_block(a: Acc, body_size: f32) -> Block {
         text: a.text,
         size: a.size,
         heading,
+        // Tagged level now; geometric tiers are assigned document-wide later.
+        level: if heading { a.tag_level.unwrap_or(0) } else { 0 },
         code: false,
         page: a.page,
         bbox: BBox {
@@ -573,7 +624,7 @@ pub fn page_blocks(doc: &Document) -> Vec<Vec<Block>> {
     let hf = detect_header_footer(&doc.pages, &lines_per_page);
     let body = body_font_size(doc);
 
-    lines_per_page
+    let mut pages_blocks: Vec<Vec<Block>> = lines_per_page
         .into_iter()
         .zip(&doc.pages)
         .map(|(lines, page)| {
@@ -582,7 +633,30 @@ pub fn page_blocks(doc: &Document) -> Vec<Vec<Block>> {
             let fill_x = right - page.width.max(1.0) * 0.05;
             dehyphenate_blocks(group_blocks(&body_lines, body, fill_x))
         })
-        .collect()
+        .collect();
+    assign_heading_levels(&mut pages_blocks);
+    pages_blocks
+}
+
+/// Assign heading levels document-wide (G9c): tagged levels are kept; the
+/// remaining headings get tiers by font size — distinct sizes (0.5pt buckets)
+/// sorted descending map to levels 1..=3 (deeper tiers all become 3).
+fn assign_heading_levels(pages: &mut [Vec<Block>]) {
+    let mut sizes: Vec<i32> = pages
+        .iter()
+        .flatten()
+        .filter(|b| b.heading && b.level == 0)
+        .map(|b| (b.size * 2.0).round() as i32)
+        .collect();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    sizes.dedup();
+    for b in pages.iter_mut().flatten() {
+        if b.heading && b.level == 0 {
+            let key = (b.size * 2.0).round() as i32;
+            let tier = sizes.iter().position(|&s| s == key).unwrap_or(0);
+            b.level = (tier as u8 + 1).min(3);
+        }
+    }
 }
 
 /// Join consecutive blocks across a soft line-break hyphen, even when they did
@@ -655,7 +729,8 @@ mod tests {
             bold: false,
             mono: false,
             form: false,
-            tagged_heading: false,
+            tag_level: None,
+            tagged_body: false,
         }
     }
 
@@ -729,7 +804,8 @@ mod tests {
             bold: false,
             mono: true,
             form: false,
-            tagged_heading: false,
+            tag_level: None,
+            tagged_body: false,
         };
         let lines = vec![
             mk("fn main() {", 100.0, 0.0),
@@ -917,5 +993,41 @@ mod tests {
             .collect();
         let hf = detect_header_footer(&pages, &lpp);
         assert!(!hf.is_running(&line("Footer", 10.0, 10.0)));
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    fn hblock(text: &str, size: f32, level: u8) -> Block {
+        Block {
+            text: text.into(),
+            size,
+            heading: true,
+            level,
+            code: false,
+            page: 1,
+            bbox: BBox {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 10.0,
+                y1: 10.0,
+            },
+        }
+    }
+
+    #[test]
+    fn size_tiers_become_levels_and_tags_are_kept() {
+        let mut pages = vec![vec![
+            hblock("Chapter", 20.0, 0),
+            hblock("Section", 16.0, 0),
+            hblock("Sub", 13.0, 0),
+            hblock("Deep", 11.0, 0),
+            hblock("Tagged", 11.0, 2), // author-declared level survives
+        ]];
+        assign_heading_levels(&mut pages);
+        let levels: Vec<u8> = pages[0].iter().map(|b| b.level).collect();
+        assert_eq!(levels, vec![1, 2, 3, 3, 2], "tiers cap at 3, tags kept");
     }
 }
