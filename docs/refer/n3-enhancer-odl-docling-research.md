@@ -44,3 +44,11 @@ df = pd.read_csv(StringIO(output.stdout.decode()), sep="\t", quoting=QUOTE_NONE)
 | ODL hybrid HTTP 后端 | N3b:docling-serve 兼容 HTTP enhancer(需 HTTP 客户端依赖,届时征询) |
 
 **验收样例就用现成的 `chinese_scan.pdf`**:从 0 文本到可检索带 bbox 引用;数字页(1901/2408)仍零模型零外呼。
+
+## 4. 引擎质量补充(2026-06-10 调研):tesseract 中文是短板,预期要设对
+
+- **tesseract 5.x(LSTM)**:干净印刷体拉丁文 300DPI 可达 95–99%,CPU、~10MB、快;但对版面复杂度敏感(复杂版面 30–60%)。
+- **中文(`chi_sim`)明显弱**:官方模型在真实文档表现差(社区报告复杂场景极低、复合字常整字错),LSTM 有"字符间插空格"已知 bug 需后处理;有社区重训包(gumblex/tessdata_chi)替代官方。调优后(tessdata_best+300DPI+psm)清晰简体约 80–90% 字符级,与中文事实标准差距明显。
+- **中文事实最优是 PaddleOCR**(PP-OCRv5 2025-05;PaddleOCR-VL-1.5 2026-01 文档解析 94.5%),代价 Python/Paddle 运行时;**RapidOCR**(PP-OCR 的 ONNX 移植,onnxruntime,无 Python)与我方 **P4(`ort` 内嵌)天然契合**——"纯 Rust 部署 + 中文质量"的潜在两全。
+- Docling/ODL 默认引擎也是 EasyOCR 而非 tesseract;tesseract 是它们的零依赖兜底——与 N3a 给它的定位一致。
+- **对计划的修正**:N3a 验收定为"边界端到端正确"(0 文本→大致可检索+bbox+provenance),**不以中文字符准确率为硬门**;中文质量正解在 N3b(HTTP 外接 Paddle 服务)或 P4(RapidOCR ONNX 经 ort 内嵌)。

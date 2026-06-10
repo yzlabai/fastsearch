@@ -16,8 +16,8 @@
   - 像素 bbox 经图片放置 CTM 折回 PDF 用户空间;每词一个 `TextChunk`,confidence=conf/100。
 - **元素级 `source` 标签**(M7 遗留,本里程碑一并做):IR 元素标 `source: "pdf" | "ocr:tesseract"`,chunk 信封透传——下游可审计哪段文本来自模型。
 - **CLI**:`--ocr`(默认关,数字页永不触发)+ `--ocr-lang`;触发条件复用 M7 路由(仅 `scanned_no_text`/高乱码页)。
-- **验收**:
-  - `chinese_scan.pdf`:0 文本 → 可检索中文文本 + bbox 引用 + `source: ocr:tesseract` + 低 confidence;
+- **验收**(注意:tesseract 中文质量弱——见 refer §4——故验收只验**边界端到端正确**,不以中文字符准确率为硬门;中文质量正解在 N3b/P4):
+  - `chinese_scan.pdf`:0 文本 → 大致可检索中文文本 + bbox 引用 + `source: ocr:tesseract` + 低 confidence;
   - 数字页(三件套/1901/2408)**零模型零子进程**(单测钉死 plan 为空);
   - tesseract 不在 PATH:行为与今日完全一致(优雅缺省);
   - 双记分牌零回归;clippy 零 warning。
