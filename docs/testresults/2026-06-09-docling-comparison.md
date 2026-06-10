@@ -1,6 +1,6 @@
 # 测试结果 · 与 Docling 同台（born-digital）
 
-> 日期：2026-06-09 · 来源：`scripts/eval/compare_docling.py` · 数据：Docling 自带 born-digital 测试集（tmp/refer/docling/tests/data，其 groundtruth = Docling 自身输出）
+> 日期：2026-06-10（chunk 栏序修复后） · 来源：`scripts/eval/compare_docling.py` · 数据：Docling 自带 born-digital 测试集（tmp/refer/docling/tests/data，其 groundtruth = Docling 自身输出）
 
 > **测的是与 Docling 的一致度**，非人工真值准确率：高一致 = 我方 born-digital 结构接近 Docling；差异不必然 = 更差。NID=阅读顺序(词级 difflib ratio)，TEDS=表格结构代理，MHS=标题文本集 F1。
 
@@ -8,16 +8,16 @@
 
 | 文档 | NID | TEDS | MHS | 备注 |
 |---|---|---|---|---|
-| 2203.01017v2 | 0.526 | 0.040 | 0.694 | 表格 我方3/Docling6 |
-| 2206.01062 | 0.529 | 0.384 | 0.429 | 表格 我方6/Docling5 |
+| 2203.01017v2 | 0.927 | 0.096 | 0.652 | 表格 我方4/Docling6 |
+| 2206.01062 | 0.814 | 0.384 | 0.462 | 表格 我方6/Docling5 |
 | 2305.03393v1-pg9 | 0.867 | 0.060 | 1.000 | 表格 我方1/Docling1 |
-| 2305.03393v1 | 0.814 | 0.088 | 0.686 | 表格 我方2/Docling2 |
-| amt_handbook_sample | 0.526 | 1.000 | 0.000 |  |
+| 2305.03393v1 | 0.915 | 0.088 | 0.686 | 表格 我方2/Docling2 |
+| amt_handbook_sample | 0.529 | 1.000 | 0.000 |  |
 | code_and_formula | 0.993 | 1.000 | 1.000 |  |
-| multi_page | 0.593 | 1.000 | 1.000 |  |
-| normal_4pages | 0.480 | 0.000 | 0.000 | 表格 我方0/Docling1 |
+| multi_page | 0.951 | 1.000 | 1.000 |  |
+| normal_4pages | 0.601 | 0.000 | 0.000 | 表格 我方0/Docling1 |
 | picture_classification | 0.986 | 1.000 | 1.000 |  |
-| redp5110_sampled | 0.655 | 0.036 | 0.296 | 表格 我方5/Docling6 |
+| redp5110_sampled | 0.735 | 0.036 | 0.451 | 表格 我方5/Docling6 |
 | right_to_left_01 | 0.048 | 1.000 | 0.000 | RTL（我方 LTR，超范围） |
 | right_to_left_02 | 0.000 | 0.000 | 1.000 | RTL（我方 LTR，超范围） |
 | right_to_left_03 | 0.000 | 0.000 | 0.000 | RTL（我方 LTR，超范围） |
@@ -26,8 +26,8 @@
 
 | 切片 | 文档数 | NID | TEDS | MHS |
 |---|---|---|---|---|
-| **born-digital LTR**（去 RTL）| 10 | **0.697** | — | **0.610** |
-| 含表格子集（TEDS 仅在有表文档有意义）| 6 | — | **0.101** | — |
+| **born-digital LTR**（去 RTL）| 10 | **0.832** | — | **0.625** |
+| 含表格子集（TEDS 仅在有表文档有意义）| 6 | — | **0.110** | — |
 | RTL（超范围，仅记录）| 3 | 0.016 | — | — |
 
 - **表格检出召回**（Docling 有表的 LTR 文档中我方也检出 ≥1 表）：5/6。我方 M4 只做**有框**表格，学术论文多为**无框**（booktabs）→ 多数 TEDS=0，已知限制（→ N4 无框表格）。

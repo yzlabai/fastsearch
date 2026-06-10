@@ -65,15 +65,6 @@ enum Item<'a> {
     Table(&'a Table),
 }
 
-impl Item<'_> {
-    fn y_top(&self) -> f32 {
-        match self {
-            Item::Block(b) => b.bbox.y1,
-            Item::Table(t) => t.bbox.y1,
-        }
-    }
-}
-
 pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
     let blocks_per_page = layout::page_blocks(doc);
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -109,13 +100,31 @@ pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
             })
             .collect();
 
-        // Interleave blocks + tables by vertical position (top → bottom).
-        let mut items: Vec<Item> = blocks
-            .iter()
-            .map(Item::Block)
-            .chain(tables.iter().map(|t| Item::Table(t)))
-            .collect();
-        items.sort_by(|a, b| b.y_top().partial_cmp(&a.y_top()).unwrap_or(std::cmp::Ordering::Equal));
+        // Blocks arrive in reading order from layout (column-aware XY-cut). A
+        // page-wide y-sort here would re-interleave two-column pages (left and
+        // right columns share y ranges), so keep block order and splice each
+        // table in before the first block that follows it within its own
+        // column: horizontal overlap + top edge below the table's. Tables are
+        // processed bottom-up so ones sharing an anchor end up top-to-bottom.
+        let mut items: Vec<Item> = blocks.iter().map(Item::Block).collect();
+        let mut tables_by_y = tables.clone();
+        tables_by_y.sort_by(|a, b| {
+            a.bbox.y1.partial_cmp(&b.bbox.y1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for t in tables_by_y {
+            let pos = items
+                .iter()
+                .position(|it| match it {
+                    Item::Block(b) => {
+                        b.bbox.x0 < t.bbox.x1
+                            && t.bbox.x0 < b.bbox.x1
+                            && b.bbox.y1 < t.bbox.y1
+                    }
+                    Item::Table(prev) => prev.bbox.y1 < t.bbox.y1,
+                })
+                .unwrap_or(items.len());
+            items.insert(pos, Item::Table(t));
+        }
 
         for item in items {
             match item {

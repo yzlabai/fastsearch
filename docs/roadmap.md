@@ -186,7 +186,7 @@ flowchart TB
 - **TEDS 边界须诚实标注**：roadmap §2 的"结构理解要持平"目前只在**表格检出覆盖**上接近 ODL（四检测器，召回 5/6+）；**结构精度**（多级表头/合并单元格/单元格粒度，TEDS 0.044/0.110）不持平、属神经域。且当前 TEDS 为近似实现（精确 APTED 待换），数字偏保守。
 - benchmark **不可拼榜**（报告 §5.2）：只在自建可比子集比，不把不同项目的单分拼排行。
 
-> **现状（2026-06-10，去 RTL born-digital LTR）**：vs ODL NID **0.722** / MHS **0.614**；vs Docling NID **0.763** / MHS **0.625**。**clean 子集已达 docling/ODL 水平**（`multi_page` 0.984、`code`/`picture` 0.99、`redp5110` 0.972、`2305` 0.921）。聚合被两类**确定性天花板**拖低——CJK 复杂版面（`skipped_*`/`normal_4pages`）与最难双栏论文首页（`2203`/`2206`）——属 N3 enhancer/版面模型领域。⚠️ 关键纠偏：曾有两个 GT 提取器漏算列表文本，**一直低估** NID（修复后我方产出未变即 +0.07）。详见 [devlogs/2026-06-10-session-summary](devlogs/2026-06-10-session-summary.md)。
+> **现状（2026-06-10，去 RTL born-digital LTR）**：vs ODL NID **0.761** / MHS **0.614**；vs Docling NID **0.832** / MHS **0.625**。**clean 子集已达 docling/ODL 水平**（`multi_page` 0.984、`code`/`picture` 0.99、`redp5110` 0.973、`2203` 0.936、`2305` 0.921）。聚合被 CJK 复杂版面（`skipped_*`/`normal_4pages`）拖低——属 N3 enhancer/版面模型领域。⚠️ 两次关键纠偏均为**评测/输出管线 bug 而非解析能力**：① 两个 GT 提取器漏算列表文本，低估 NID +0.07；② chunk 组装的页级 y-sort 毁掉双栏读序（layout 本身是对的），修复后 `2203` 0.568→0.936（[devlog](devlogs/2026-06-10-chunk-order-fix.md)）。详见 [devlogs/2026-06-10-session-summary](devlogs/2026-06-10-session-summary.md)。
 
 **差异化记分牌（Docling 结构上无法同台）**——这才是"更好"的硬证据：
 
