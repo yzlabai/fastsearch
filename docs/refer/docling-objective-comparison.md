@@ -44,7 +44,7 @@
 | 复杂版面/扫描混合语料、表结构要全保真 | **Docling** | 神经版面 + TableFormer 是质量上限 |
 | 格式杂(PPTX/XLSX/邮件/图片)、要公式/图表/图片理解 | **Docling** | 广度与增强面无可替代 |
 | 已在 Python ML 生态、要 LangChain/LlamaIndex 现成接入 | **Docling** | 生态成熟度 |
-| 两者混合:快路径自托管 + 难例升级 | **docparse-rs 路由 + 外接** | 我方 `Enhancer` 边界/ODL hybrid 同款思路,N3b HTTP 通道预留 |
+| 两者混合:快路径自托管 + 难例升级 | **docparse-rs 路由 + 外接** | 我方 `Enhancer` 边界/ODL hybrid 同款思路;VLM 经 OpenAI 兼容服务(vLLM/Ollama)接入(Phase 4 G8b) |
 
 ## 5. 给本仓库文档的措辞约束(回写)
 
