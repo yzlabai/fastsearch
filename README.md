@@ -98,7 +98,7 @@ Cargo workspace，六个 crate：
 - [x] **N3 真实 enhancer**：ONNX 内嵌 OCR（PP-OCRv4 × `tract` 纯 Rust）——`chinese_scan` 0 文本→14/14 行全对带 bbox 引用；MCP/REST 透传；数字页零模型。
 - [x] **N4 大部**：表格四检测器（bordered→ruled→cluster→borderless）、标题分级、词距。
 - [x] **N5 安全预检与画像**：隐藏文本过滤（Tr 3/7/页外/微字 → 标注+排除+可审计）、zip-bomb/页数资源守卫、页级复杂度画像（`--profile`）。
-- [ ] **Phase 4（进行中规划）**：补齐 Docling 占优轴——版面/表结构 ONNX enhancer（难页路由）、XLSX/PPTX、区域级 OCR/Form 流、LangChain/LlamaIndex 接入、千份语料压测。见 [迭代计划](docs/plans/closing-docling-gaps.md)。
+- [ ] **Phase 4（进行中规划）**：补齐 Docling 占优轴——版面/表结构 ONNX enhancer（难页路由）、XLSX/PPTX、区域级 OCR/Form 流、语义增强面（代码块/公式/图片/图表/整页 VLM，确定性→HTTP→内嵌三层）、LangChain/LlamaIndex 接入、千份语料压测。见 [迭代计划](docs/plans/closing-docling-gaps.md)。
 
 ## 许可
 

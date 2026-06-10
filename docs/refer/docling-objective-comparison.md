@@ -11,7 +11,7 @@
 | **格式广度** | 15+ 后端:PDF(三代解析引擎)/DOCX/**PPTX/XLSX**/HTML/Markdown/AsciiDoc/LaTeX/CSV/邮件/图片/METS/WebVTT 字幕… | 我方 3 种(PDF/DOCX/HTML),PPTX/XLSX 未做 |
 | **难版面质量上限** | 神经版面模型(DocLayNet 系)对 CJK 信息图/旋转页/海报式排版有效——正是我方 0.12–0.22 的那批文档 | 确定性 XY-cut 的天花板,已实验证明不可强攻 |
 | **表格结构精度** | TableFormer 真正求解**多级表头/合并单元格/无线表**,输出完整 cell 拓扑 | 我方四检测器只到"检出+简单网格",TEDS 0.098/0.187 即此差距的度量 |
-| **内容增强** | 公式→LaTeX、代码块识别、图片分类/描述(VLM)、图表数据抽取、整页 VLM 管线(SmolDocling) | 我方全部没有,也不规划自研(外接域) |
+| **内容增强** | 公式→LaTeX、代码块识别、图片分类/描述(VLM)、图表数据抽取、整页 VLM 管线(SmolDocling) | 我方当前全部没有;已规划 [Phase 4 G8](../plans/closing-docling-gaps.md) 三层补齐(确定性代码块→HTTP 外接→纯 Rust VLM spike) |
 | **OCR 广度** | 7 引擎可换(EasyOCR/Tesseract×2/RapidOCR/ocrmac/远程)、80+ 语言、方向检测、**区域级 OCR**(混合页只 OCR 位图区) | 我方单模型组(中英)、无方向分类、无 JBIG2/CCITT、整页粒度、Form 流不解释 |
 | **RTL** | 支持 | 我方明确不支持(0 分记录在案) |
 | **生态与成熟度** | LangChain/LlamaIndex 等官方集成、`DoclingDocument` 事实标准、IBM 开源/LF AI & Data 托管、大社区、海量真实语料锤炼;tokenizer 感知的 HybridChunker | 我方 0 集成、0 社区;鲁棒性仅在 ~20 份样例 + 三件套上验证,长尾(加密 PDF/XFA/损坏文件)未经大规模检验 |
