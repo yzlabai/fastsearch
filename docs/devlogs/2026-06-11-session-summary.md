@@ -31,3 +31,29 @@
 - **真实服务验收**:`--vlm-describe`/`--vlm-tables` 对 Ollama(qwen2.5-vl 级)实测回填;
 - **G7 加强**:fuzz 24h 长跑(排期)、arXiv 千份原版口径(网络/存储);
 - **按需立项**:AsciiDoc、JATS/METS-ALTO、RTL(G5)、MCP/REST 新能力透传(--layout/--vlm-*/图片 base64 模式)。
+
+---
+
+## 第二部分(同日下午—晚):VLM 调研 → UniRec 当日全链落地(九个提交)
+
+上半场收完 Phase 4 可自主项后,用户两个问题驱动了下半场的完整弧线:
+
+**"哪些地方需要 Ollama 服务驱动?"** → 调研文档([vlm-service-driven-capabilities](../refer/vlm-service-driven-capabilities.md)):七处,2 已实现候验收、5 规划——其中表结构/公式/整页转写三项当时只能走 7B VLM 服务。
+
+**"考虑用 OpenOCR 0.1B?"** → 当天走完 调研→双 spike→立项→三连落地→服务透传→IR 收尾:
+
+| 提交 | 内容 |
+|---|---|
+| 2adcda4/40ac1c6/5843b59 | VLM 服务调研 + OpenOCR 评估 + **spike 双门全过**(质量:pg9 合并格完美 HTML;速度:tract 0.23 实测 169 tok/s ≈2.5s/表,0.21 仅 10 tok/s——版本代差即性能特性) |
+| f23a4bc | **R1 · tract 0.21→0.23**(API 迁移,OCR/YOLO/三件套/双记分牌回归全过) |
+| 177c584 | **R2+R3 · `--table-model`**:UniRec 推理管线(Rust 宿主驱动自回归+KV-cache,绕开杀死 SLANet 的 ONNX Loop)+ HTML 子集解析(rowspan 悬挂网格展开)。pg9 端到端 10×8 语义全对,3.4s 纯 Rust。**诚实记录**:flag-on 一致度 TEDS 反降(两个参照系都压扁子行,LaTeX 源 \multirow 证实模型才对)——定位同 --layout,产品增强不进记分牌 |
+| 9c4967e | **`--formula-model`**(G8c 收口):YOLO formula 区 + UniRec 出 LaTeX。验收样例:基线 "2a + 8 = 12"(上标漂移)→ `\[a^{2}+8=12\]` ✓ |
+| e87bfe4 | **MCP/REST 全增强透传**(G8b 余项):EnhanceState/Opts 两面共用,UniRec 服务级懒加载一次;两面活进程 e2e 双过 |
+| f8705f7 | **IR 0.7.0**:`Cell.row_span/col_span/merged`(平铺+标注,默认输出逐字节兼容)+ 图片 base64 内嵌三面(`--image-embed`/`images=embedded`),补齐 ODL image_output 三态 |
+
+**战略结果**:原计划要 Ollama/vLLM 才能兜的表结构与公式两类语义,现在是**进程内纯 Rust**(0.1B 模型,~700MB 外置文件,零服务依赖)——身份约束(单二进制+可选模型文件)完整保留,VLM 服务域收窄为图片描述/页型判官/整页转写。
+
+**新增经验**:
+- **依赖版本本身可以是性能特性**(tract 0.21→0.23 = 17× 解码提速)——慢先查内核代差;
+- **参照系口径会反噬更忠实的输出**(span 结构 vs 压扁网格)——一致度记分牌测的是一致度,产品价值用语义样例验收;
+- 用户的一个链接到产品能力的当日闭环,靠的是 spike 门控把"要不要做"变成数字。

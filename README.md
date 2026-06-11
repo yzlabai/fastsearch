@@ -114,7 +114,7 @@ Cargo workspace，十六个 crate：
 - [x] **N4 大部**：表格四检测器（bordered→ruled→cluster→borderless）、标题分级、词距。
 - [x] **N5 安全预检与画像**：隐藏文本过滤（Tr 3/7/页外/微字 → 标注+排除+可审计）、zip-bomb/页数资源守卫、页级复杂度画像（`--profile`）。
 - [x] **Phase 4 · G2 基建**：版面 enhancer 全链路（按需渲染/区域检测/阅读组）落地 opt-in；其"修 CJK 序"假设实测否决（gap 在区域内微观序），CJK 改由 VLM 路线攻——诚实记录见 [devlog](docs/devlogs/2026-06-10-g2-layout-enhancer.md)。
-- [x] **Phase 4 主体**（2026-06-11）：格式平齐 3→11（XLSX/PPTX/MD/CSV/SRT·VTT/LaTeX/EML/PNG·JPEG 图片即文档）、G9 结构层全部（Tagged PDF/列表/标题分级/表结构重建，TEDS 验收门过）、`--vlm-tables` 表重抽与图片描述（OpenAI 兼容协议：vLLM/Ollama）、`--image-dir` 图片导出、Python 客户端 + LangChain/LlamaIndex loader（五行验收实测）、压测+fuzz（1847 输入 + ~1020 万次执行零 panic）。见 [迭代计划](docs/plans/closing-docling-gaps.md)。
+- [x] **Phase 4 主体**（2026-06-11）：格式平齐 3→11（XLSX/PPTX/MD/CSV/SRT·VTT/LaTeX/EML/PNG·JPEG 图片即文档）、G9 结构层全部（Tagged PDF/列表/标题分级/表结构重建，TEDS 验收门过）、**内嵌表结构/公式模型**（`--table-model`/`--formula-model`，UniRec-0.1B×tract，进程内合并格语义与公式→LaTeX）、VLM 服务接入（`--vlm-describe/--vlm-tables`，OpenAI 兼容：vLLM/Ollama）、图片导出/内嵌（`--image-dir`/`--image-embed`）、MCP/REST 全增强透传、Python 客户端 + LangChain/LlamaIndex loader（五行验收实测）、压测+fuzz（1847 输入 + ~1020 万次执行零 panic）、IR 0.7.0（Cell span 语义）。见 [迭代计划](docs/plans/closing-docling-gaps.md)。
 - [ ] **候外部输入**：PyPI/crates.io 发布、Ollama 真实服务验收、arXiv 千份压测/fuzz 24h、AsciiDoc/JATS/RTL（按需）。
 
 ## 许可
