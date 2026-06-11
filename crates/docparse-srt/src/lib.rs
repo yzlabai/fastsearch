@@ -102,11 +102,7 @@ fn parse_cues(text: &str) -> Vec<Cue> {
 /// VTT may omit hours; pad so all cues align. Unparseable input passes
 /// through as-is rather than being dropped (the cue text still matters).
 fn normalize_timestamp(raw: &str) -> String {
-    let no_ms = raw
-        .split(|c| c == ',' || c == '.')
-        .next()
-        .unwrap_or(raw)
-        .trim();
+    let no_ms = raw.split([',', '.']).next().unwrap_or(raw).trim();
     match no_ms.split(':').count() {
         2 => format!("00:{no_ms}"),
         _ => no_ms.to_string(),
