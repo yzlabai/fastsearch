@@ -13,6 +13,7 @@ members = [
     "crates/docparse-md",
     "crates/docparse-csv",
     "crates/docparse-srt",
+    "crates/docparse-tex",
     "crates/docparse-cli",
 ]
 

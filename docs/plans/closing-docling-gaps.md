@@ -32,7 +32,7 @@
 - [ ] **邮件 EML**:正文(text/html 部分复用 HTML 后端)+ 头部(From/Subject→标题结构)+ 附件列举;**依赖征询:`mail-parser`**(纯 Rust)。
 - [x] **字幕 SRT/WebVTT ✅**(2026-06-11,[devlog](../devlogs/2026-06-11-srt-vtt-subtitles.md)):docparse-srt(零依赖手写),每 cue 一段 `[hh:mm:ss] 文本`(时间戳=可引用性,保留);VTT 头部/NOTE/STYLE 跳过、`<v 说话人>`→前缀、行内标签剥除。顺带修了 synth 段距 bug(所有 synth 后端段落被 1.8em 合并门错并——影响 docx/html/md 文本输出)。
 - [ ] **图片即文档(PNG/JPEG/TIFF 单页)**:解码为单页全幅 ImageChunk → **直接复用 N3 OCR 路由**(我方独有优势:整条 OCR 管线已就绪);**依赖征询:`zune-png`**(JPEG 已有)。
-- [ ] **AsciiDoc / LaTeX 源码**:常用子集手写解析(标题/段落/列表/表格);完整方言显式不保证,文档化边界。
+- [~] **AsciiDoc / LaTeX 源码**:**LaTeX 子集 ✅**(2026-06-11,[devlog](../devlogs/2026-06-11-latex-backend.md)):docparse-tex(零依赖行导向)——title/author/maketitle、section 三级、abstract、itemize/enumerate(LI 标签)、tabular→真 Table、figure/table 取 caption、数学环境原样保留、注释/转义/跨行声明配平;7 份真实 arXiv 源码全过(含 OTSL/Attention 论文),边界文档化(\input 不追、自定义宏不展开)。AsciiDoc 待立项。
 - [ ] **XML 族(JATS 学术/METS-ALTO 档案)**:按真实需求逐个立项(quick-xml 复用);METS-ALTO 自带坐标,可出**真实 bbox**(非合成)。
 - **验收**:每格式经同一 IR 出 chunks(带合成或真实 bbox);`supports()` 按扩展名注册;每格式至少一个样例端到端 + 单测;现有格式零回归。格式数 3→12+。
 

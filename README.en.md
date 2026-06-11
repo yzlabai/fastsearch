@@ -2,7 +2,7 @@
 
 [中文](README.md) | **English**
 
-A fast, pure-Rust **multi-format document parsing system**: extracts **positioned, structured content** from PDF/DOCX/HTML/XLSX/PPTX/Markdown/CSV/SRT·VTT (text / layout / reading order / tables → unified IR → JSON / Markdown / Text / RAG chunks) via the "structure extraction, not rasterization" fast path. Built for agents and RAG: results are **deterministic, reproducible, and citable** (every chunk carries page + bbox, with bidirectional lookup).
+A fast, pure-Rust **multi-format document parsing system**: extracts **positioned, structured content** from PDF/DOCX/HTML/XLSX/PPTX/Markdown/CSV/SRT·VTT/LaTeX (text / layout / reading order / tables → unified IR → JSON / Markdown / Text / RAG chunks) via the "structure extraction, not rasterization" fast path. Built for agents and RAG: results are **deterministic, reproducible, and citable** (every chunk carries page + bbox, with bidirectional lookup).
 
 > The design was motivated by an architecture analysis of [opendataloader-pdf](https://github.com/opendataloader-project/opendataloader-pdf): it is fast because it never renders pages to pixels — it interprets content streams for coordinates and runs layout analysis per page in parallel. docparse-rs re-implements and extends that fast path in pure Rust — no JVM, no C++, no Python, one binary.
 
@@ -64,7 +64,7 @@ cargo test          # 82 unit tests (CMap / matrix / XY-cut / tables / chunking 
 
 ## Architecture
 
-A Cargo workspace with eight crates:
+A Cargo workspace with fourteen crates:
 
 | crate | Responsibility | Key deps |
 |---|---|---|
@@ -72,7 +72,7 @@ A Cargo workspace with eight crates:
 | [`docparse-pdf`](crates/docparse-pdf) | Pure-Rust PDF backend: lopdf parsing + a **self-built content-stream interpreter** (matrix stack + operator state machine + hidden-text detection + image-XObject extraction) + a **font layer** (ToUnicode CMap / AFM / Encoding, independently implemented with veraPDF as the algorithmic reference) + per-page rayon parallelism | lopdf, rayon |
 | [`docparse-docx`](crates/docparse-docx) | DOCX backend: docx-rs structure → synthetic coordinates into the same IR; zip-bomb pre-check | docx-rs |
 | [`docparse-html`](crates/docparse-html) | HTML backend: DOM pre-order walk → headings / paragraphs / lists / tables | scraper |
-| `docparse-{xlsx,pptx,md,csv,srt}` | Thin backends: XLSX (calamine) / PPTX (one page per slide) / Markdown / CSV (hand-rolled RFC-4180 subset) / SRT·WebVTT subtitles (one timestamped paragraph per cue) — all flow into the same IR via the synthetic layout | calamine, quick-xml, pulldown-cmark |
+| `docparse-{xlsx,pptx,md,csv,srt,tex}` | Thin backends: XLSX (calamine) / PPTX (one page per slide) / Markdown / CSV (hand-rolled RFC-4180 subset) / SRT·WebVTT subtitles (one timestamped paragraph per cue) / LaTeX source subset (sections/lists/tabular→Table) — all flow into the same IR via the synthetic layout | calamine, quick-xml, pulldown-cmark |
 | [`docparse-ocr`](crates/docparse-ocr) | ONNX-embedded enhancers: OCR (PP-OCRv4 det+rec, self-built DBNet post-processing / CTC decoding) and layout (DocLayout-YOLO regions → reading groups), both on `tract` pure-Rust inference | tract-onnx, zune-jpeg |
 | [`docparse-raster`](crates/docparse-raster) | On-demand hard-page rendering (pure-Rust `hayro`, ~100ms/page) — the main pipeline never renders; enhancer-routed pages only, opt-in, with a broken-render guard | hayro |
 | [`docparse-vlm`](crates/docparse-vlm) | VLM enhancer: picture description & friends over OpenAI-compatible services (vLLM/Ollama/LM Studio), minimal built-in PNG encoder, graceful degradation | ureq, base64 |

@@ -85,6 +85,19 @@ impl PageBuilder {
     /// Add a paragraph (or heading — just use a larger `size`). Empty text is
     /// skipped. One chunk per block; the output layer reconstructs paragraphs.
     pub fn paragraph(&mut self, text: impl Into<String>, size: f32) {
+        self.push_text(text, size, None);
+    }
+
+    /// Add a list item (marker included in `text`, e.g. `"• alpha"` /
+    /// `"1. one"`). Tagged `LI` so the structured-format backend's knowledge
+    /// overrides geometric reclassification — without it, an ordinal item
+    /// like "1. First item" reads as a numbered section heading downstream
+    /// (the geometric rule cannot tell them apart; the author can).
+    pub fn list_item(&mut self, text: impl Into<String>, size: f32) {
+        self.push_text(text, size, Some("LI".to_string()));
+    }
+
+    fn push_text(&mut self, text: impl Into<String>, size: f32, tag: Option<String>) {
         let text = text.into();
         if text.trim().is_empty() {
             return;
@@ -110,7 +123,7 @@ impl PageBuilder {
             hidden: false,
             source: None,
             group: None,
-            tag: None,
+            tag,
         }));
         self.y -= lh + Self::PARA_SPACING * size;
     }

@@ -21,6 +21,7 @@ docparse-pptx = { path = "../docparse-pptx" }
 docparse-md = { path = "../docparse-md" }
 docparse-csv = { path = "../docparse-csv" }
 docparse-srt = { path = "../docparse-srt" }
+docparse-tex = { path = "../docparse-tex" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
