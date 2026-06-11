@@ -386,6 +386,8 @@ struct Acc {
     cy: f32,
     /// Right edge of the most recent line (does it reach the column edge?).
     x1: f32,
+    /// This block's column continuation edge (from the starting line).
+    fill_x: f32,
     numeric: bool,
     lines: usize,
     page: usize,
@@ -405,13 +407,14 @@ struct Acc {
 }
 
 impl Acc {
-    fn start(line: &Line, text: String, numeric: bool) -> Self {
+    fn start(line: &Line, text: String, numeric: bool, fill_x: f32) -> Self {
         let text2 = text.clone();
         Self {
             text,
             size: line.size,
             cy: line.cy,
             x1: line.x1,
+            fill_x,
             numeric,
             lines: 1,
             page: line.page,
@@ -472,13 +475,78 @@ impl Acc {
 /// This conservatism keeps tables/lists (short or numeric lines) one-per-line
 /// instead of mashing them into a blob.
 ///
-/// TODO: left columns in multi-column pages don't reach the page-wide `fill_x`,
-/// so their prose isn't reflowed yet — needs per-column edges (M4).
-pub fn group_blocks(lines: &[Line], body_size: f32, fill_x: f32) -> Vec<Block> {
+/// Per-line continuation edge ("fill_x") accounting for columns (M3/H4). On a
+/// single-column page every line shares one page-derived edge — byte-identical
+/// to the old single-`fill_x` behavior. Only when a clear vertical gutter
+/// splits the body into two columns does each line get ITS column's right
+/// edge, so left-column prose finally reaches its fill_x and reflows.
+///
+/// The gutter test is deliberately strict (substantial text on both sides, an
+/// almost-uncrossed band in the page middle) so ordinary single-column or
+/// figure-heavy pages never trip it and keep their exact prior grouping.
+fn column_fill_edges(lines: &[Line], page_width: f32) -> Vec<f32> {
+    let n = lines.len();
+    let margin = page_width.max(1.0) * 0.05;
+    let global_right = lines.iter().map(|l| l.x1).fold(0.0f32, f32::max);
+    let default = global_right - margin;
+    if n < 6 {
+        return vec![default; n];
+    }
+    let cx = |l: &Line| (l.x0 + l.x1) * 0.5;
+    let (lo, hi) = (page_width * 0.30, page_width * 0.70);
+    // Candidate gutters: line left edges in the page middle; pick the one
+    // crossed by the fewest lines, requiring ≥25% of lines on each side and a
+    // crossing rate under 12% (a real two-column gutter is nearly uncrossed).
+    let mut cands: Vec<f32> = lines.iter().map(|l| l.x0).filter(|&x| x > lo && x < hi).collect();
+    cands.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    cands.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+    let mut best: Option<(f32, usize)> = None;
+    for &mid in &cands {
+        let cross = lines.iter().filter(|l| l.x0 < mid - 1.0 && l.x1 > mid + 1.0).count();
+        let left = lines.iter().filter(|l| cx(l) < mid).count();
+        let right = n - left;
+        if (cross as f32) <= 0.12 * n as f32
+            && left >= n / 4
+            && right >= n / 4
+            && best.is_none_or(|(_, bc)| cross < bc)
+        {
+            best = Some((mid, cross));
+        }
+    }
+    let Some((mid, _)) = best else {
+        return vec![default; n];
+    };
+    let col_right = |left_side: bool| {
+        lines
+            .iter()
+            .filter(|l| (cx(l) < mid) == left_side)
+            .map(|l| l.x1)
+            .fold(0.0f32, f32::max)
+            - margin
+    };
+    let (left_edge, right_edge) = (col_right(true), col_right(false));
+    lines
+        .iter()
+        .map(|l| {
+            // A full-width line spanning the gutter keeps the global edge.
+            if l.x0 < mid - 1.0 && l.x1 > mid + 1.0 {
+                default
+            } else if cx(l) < mid {
+                left_edge
+            } else {
+                right_edge
+            }
+        })
+        .collect()
+}
+
+/// Group body lines into paragraphs/headings. `fill_edges[i]` is line `i`'s
+/// column-aware continuation edge (see [`column_fill_edges`]).
+pub fn group_blocks(lines: &[Line], body_size: f32, fill_edges: &[f32]) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut cur: Option<Acc> = None;
 
-    for line in lines {
+    for (i, line) in lines.iter().enumerate() {
         let t = line.text.trim();
         if t.is_empty() {
             continue;
@@ -495,7 +563,8 @@ pub fn group_blocks(lines: &[Line], body_size: f32, fill_x: f32) -> Vec<Block> {
                 if a.mono && line.mono {
                     return gap_ok && size_ok;
                 }
-                gap_ok && size_ok && a.x1 >= fill_x && !a.numeric && !numeric
+                // The PREVIOUS line must have reached its own column's edge.
+                gap_ok && size_ok && a.x1 >= a.fill_x && !a.numeric && !numeric
             });
 
         match cur.as_mut() {
@@ -504,7 +573,8 @@ pub fn group_blocks(lines: &[Line], body_size: f32, fill_x: f32) -> Vec<Block> {
                 if let Some(a) = cur.take() {
                     blocks.push(make_block(a, body_size));
                 }
-                cur = Some(Acc::start(line, t.to_string(), numeric));
+                let edge = fill_edges.get(i).copied().unwrap_or(f32::MAX);
+                cur = Some(Acc::start(line, t.to_string(), numeric, edge));
             }
         }
     }
@@ -686,9 +756,8 @@ pub fn page_blocks(doc: &Document) -> Vec<Vec<Block>> {
         .zip(&doc.pages)
         .map(|(lines, page)| {
             let body_lines: Vec<Line> = lines.into_iter().filter(|l| !hf.is_running(l)).collect();
-            let right = body_lines.iter().map(|l| l.x1).fold(0.0f32, f32::max);
-            let fill_x = right - page.width.max(1.0) * 0.05;
-            dehyphenate_blocks(group_blocks(&body_lines, body, fill_x))
+            let fill_edges = column_fill_edges(&body_lines, page.width);
+            dehyphenate_blocks(group_blocks(&body_lines, body, &fill_edges))
         })
         .collect();
     assign_heading_levels(&mut pages_blocks);
@@ -794,6 +863,65 @@ mod tests {
 
     // fill_x = 90: lines reaching x1≈100 count as wrapped prose.
     const FILL: f32 = 90.0;
+
+    /// Single-column test helper: every line shares one continuation edge.
+    fn group_blocks(lines: &[Line], body_size: f32, fill_x: f32) -> Vec<Block> {
+        super::group_blocks(lines, body_size, &vec![fill_x; lines.len()])
+    }
+
+    fn col_line(text: &str, cy: f32, x0: f32, x1: f32) -> Line {
+        Line {
+            text: text.into(),
+            size: 10.0,
+            cy,
+            x0,
+            x1,
+            page: 1,
+            bold: false,
+            mono: false,
+            form: false,
+            tag_level: None,
+            tagged_body: false,
+            tag_list: false,
+        }
+    }
+
+    #[test]
+    fn two_column_left_prose_reflows_via_per_column_edge() {
+        // 612pt page, gutter ~300. Left column x∈[40,290], right x∈[320,570].
+        // Left lines reach the LEFT column edge (290), not the page-wide right
+        // edge (570) — the old single fill_x left them one-per-block.
+        let page_w = 612.0;
+        let lines = vec![
+            col_line("left prose line one", 700.0, 40.0, 288.0),
+            col_line("left prose line two", 688.0, 40.0, 285.0),
+            col_line("left prose line three", 676.0, 40.0, 250.0),
+            col_line("right prose line one", 700.0, 320.0, 568.0),
+            col_line("right prose line two", 688.0, 320.0, 560.0),
+            col_line("right prose line three", 676.0, 320.0, 540.0),
+        ];
+        let edges = column_fill_edges(&lines, page_w);
+        // Two distinct edges discovered: left ≈ 288-margin, right ≈ 568-margin.
+        assert!(edges[0] < edges[3], "left edge {} < right edge {}", edges[0], edges[3]);
+        let blocks = super::group_blocks(&lines, 10.0, &edges);
+        // Left column's three lines reflow into ONE paragraph (the bug: they
+        // stayed three blocks because they never reached the page-wide edge).
+        assert!(
+            blocks.iter().any(|b| b.text.contains("one") && b.text.contains("three")),
+            "left column did not reflow: {:?}",
+            blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn single_column_keeps_one_global_edge() {
+        // No gutter → every line shares the page-derived edge (zero regression).
+        let lines: Vec<Line> = (0..8)
+            .map(|i| col_line("a single column line of body text", 700.0 - i as f32 * 12.0, 40.0, 560.0))
+            .collect();
+        let edges = column_fill_edges(&lines, 612.0);
+        assert!(edges.iter().all(|&e| (e - edges[0]).abs() < 1e-6), "edges differ: {edges:?}");
+    }
 
     #[test]
     fn paragraph_merges_close_lines_breaks_on_gap() {
@@ -1128,7 +1256,7 @@ mod list_tests {
             tag_list: false,
         };
         let lines = vec![mk("• first item", 100.0), mk("• second item", 88.0)];
-        let blocks = group_blocks(&lines, 10.0, 90.0);
+        let blocks = group_blocks(&lines, 10.0, &vec![90.0; lines.len()]);
         assert_eq!(blocks.len(), 2, "each marker starts its own block");
         assert!(blocks.iter().all(|b| b.list_item && !b.heading));
     }
