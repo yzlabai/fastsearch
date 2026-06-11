@@ -375,6 +375,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chardetng"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14b8f0b65b7b08ae3c8187e8d77174de20cb6777864c6b832d8ad365999cf1ea"
+dependencies = [
+ "cfg-if",
+ "encoding_rs",
+ "memchr",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -641,7 +652,9 @@ dependencies = [
  "docparse-core",
  "docparse-csv",
  "docparse-docx",
+ "docparse-eml",
  "docparse-html",
+ "docparse-img",
  "docparse-md",
  "docparse-ocr",
  "docparse-pdf",
@@ -659,6 +672,8 @@ name = "docparse-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chardetng",
+ "encoding_rs",
  "serde",
  "serde_json",
 ]
@@ -681,6 +696,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "docparse-eml"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "docparse-core",
+ "mail-parser",
+]
+
+[[package]]
 name = "docparse-html"
 version = "0.1.0"
 dependencies = [
@@ -688,6 +712,16 @@ dependencies = [
  "docparse-core",
  "ego-tree",
  "scraper",
+]
+
+[[package]]
+name = "docparse-img"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "docparse-core",
+ "zune-jpeg 0.4.21",
+ "zune-png",
 ]
 
 [[package]]
@@ -1767,6 +1801,15 @@ name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
+
+[[package]]
+name = "mail-parser"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93c3b9e5d8b17faf573330bbc43b37d6e918c0a3bf8a88e7d0a220ebc84af9fc"
+dependencies = [
+ "encoding_rs",
+]
 
 [[package]]
 name = "maplit"
@@ -4000,6 +4043,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9"
 
 [[package]]
+name = "zune-inflate"
+version = "0.2.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
+dependencies = [
+ "simd-adler32",
+]
+
+[[package]]
 name = "zune-jpeg"
 version = "0.4.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4015,4 +4067,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core 0.5.1",
+]
+
+[[package]]
+name = "zune-png"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29c085769c6f29effea890f093120ac019375fdc789d2a496ba8ba96c77509"
+dependencies = [
+ "zune-core 0.4.12",
+ "zune-inflate",
 ]

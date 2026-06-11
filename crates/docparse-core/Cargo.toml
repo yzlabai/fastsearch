@@ -9,3 +9,5 @@ description = "Core IR, parser trait, reading-order and output for docparse-rs"
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true

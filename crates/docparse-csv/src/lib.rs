@@ -22,7 +22,7 @@ impl DocumentParser for CsvParser {
     }
 
     fn parse(&self, path: &Path) -> anyhow::Result<Document> {
-        let text = std::fs::read_to_string(path)?;
+        let text = docparse_core::textio::read_text(path)?;
         let mut doc = parse_str(&text);
         doc.source = path.display().to_string();
         Ok(doc)

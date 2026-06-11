@@ -8,7 +8,9 @@ use docparse_core::output;
 use docparse_core::parser::DocumentParser;
 use docparse_csv::CsvParser;
 use docparse_docx::DocxParser;
+use docparse_eml::EmlParser;
 use docparse_html::HtmlParser;
+use docparse_img::ImageParser;
 use docparse_md::MarkdownParser;
 use docparse_pdf::PdfParser;
 use docparse_pptx::PptxParser;
@@ -31,6 +33,8 @@ pub(crate) fn parsers_with(decode_images: bool) -> Vec<Box<dyn DocumentParser>> 
         Box::new(CsvParser),
         Box::new(SrtParser),
         Box::new(TexParser),
+        Box::new(EmlParser),
+        Box::new(ImageParser),
     ]
 }
 

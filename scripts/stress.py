@@ -14,7 +14,7 @@ from pathlib import Path
 
 BIN = Path("target/release/docparse")
 ROOTS = [Path(".."), Path("tmp")]
-EXTS = ["pdf", "docx", "xlsx", "pptx", "html", "md", "csv", "srt", "vtt", "tex"]
+EXTS = ["pdf", "docx", "xlsx", "pptx", "html", "md", "csv", "srt", "vtt", "tex", "eml", "png", "jpg", "jpeg"]
 SKIP_DIRS = {"target", "node_modules", ".git"}
 TIMEOUT = 120  # generous: stress is about crashes, not speed gates
 

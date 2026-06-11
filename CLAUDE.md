@@ -34,7 +34,7 @@ done
 
 ## 2. 架构与改动落点
 
-Cargo workspace，十四个 crate（core/pdf/docx/html/ocr/raster/vlm/xlsx/pptx/md/csv/srt/tex/cli）。**`core` 不依赖任何 PDF 库**——阅读顺序与输出对所有格式通用，加格式只需实现 `DocumentParser` trait 并在 CLI 注册表加一行。
+Cargo workspace，十六个 crate（core/pdf/docx/html/ocr/raster/vlm/xlsx/pptx/md/csv/srt/tex/eml/img/cli）。**`core` 不依赖任何 PDF 库**——阅读顺序与输出对所有格式通用，加格式只需实现 `DocumentParser` trait 并在 CLI 注册表加一行。
 
 | 想做的事 | 改哪 |
 |---|---|

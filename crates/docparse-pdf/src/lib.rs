@@ -48,7 +48,20 @@ impl DocumentParser for PdfParser {
 
     fn parse(&self, path: &Path) -> anyhow::Result<Document> {
         let doc = PdfDocument::load(path)?;
+        let mut out = self.parse_document(doc)?;
+        out.source = path.display().to_string();
+        Ok(out)
+    }
+}
 
+impl PdfParser {
+    /// Parse an in-memory PDF (REST uploads, fuzzing) — same pipeline as the
+    /// path-based entry, minus the file read.
+    pub fn parse_bytes(&self, bytes: &[u8]) -> anyhow::Result<Document> {
+        self.parse_document(PdfDocument::load_mem(bytes)?)
+    }
+
+    fn parse_document(&self, doc: PdfDocument) -> anyhow::Result<Document> {
         // Resource guard (N5b): refuse a pathological page count before doing
         // any per-page work.
         let pages_map = doc.get_pages();
@@ -85,7 +98,7 @@ impl DocumentParser for PdfParser {
         pages.sort_by_key(|p| p.number);
 
         Ok(Document {
-            source: path.display().to_string(),
+            source: "<pdf>".to_string(),
             provenance: Some(Provenance::new("pdf", env!("CARGO_PKG_VERSION"))),
             pages,
         })

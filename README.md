@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-高效、纯 Rust 的**多格式文档解析系统**：从 PDF/DOCX/HTML/XLSX/PPTX/Markdown/CSV/SRT·VTT/LaTeX 抽取**带位置的结构化内容**（文本/版面/阅读顺序/表格 → 统一 IR → JSON / Markdown / Text / RAG chunks），走"结构提取"而非"光栅渲染"的快路径。面向 Agent / RAG：结果**确定、可复现、可引用**（每个 chunk 带 page+bbox 双向溯源）。
+高效、纯 Rust 的**多格式文档解析系统**：从 PDF/DOCX/HTML/XLSX/PPTX/Markdown/CSV/SRT·VTT/LaTeX/EML/PNG·JPEG 抽取**带位置的结构化内容**（文本/版面/阅读顺序/表格 → 统一 IR → JSON / Markdown / Text / RAG chunks），走"结构提取"而非"光栅渲染"的快路径。面向 Agent / RAG：结果**确定、可复现、可引用**（每个 chunk 带 page+bbox 双向溯源）。
 
 > 设计动机来自对 [opendataloader-pdf](https://github.com/opendataloader-project/opendataloader-pdf) 的架构分析：它快，是因为默认从不把页面渲染成像素，只解析内容流拿坐标，再逐页并行做版面分析。docparse-rs 用纯 Rust 复刻并延伸这条快路径——无 JVM、无 C++、无 Python，单二进制。
 
@@ -68,7 +68,7 @@ cargo test          # 82 单测（CMap/矩阵/XY-cut/表格/切块/MCP/限额/OC
 
 ## 架构
 
-Cargo workspace，十四个 crate：
+Cargo workspace，十六个 crate：
 
 | crate | 职责 | 关键依赖 |
 |---|---|---|
@@ -76,7 +76,7 @@ Cargo workspace，十四个 crate：
 | [`docparse-pdf`](crates/docparse-pdf) | 纯 Rust PDF 后端：lopdf 解析 + **自研内容流解释器**（矩阵栈 + 操作符状态机 + 隐藏文本检测 + 图像 XObject 抽取）+ **字体层**（ToUnicode CMap/AFM/Encoding，参考 veraPDF 独立实现）+ rayon 逐页并行 | lopdf, rayon |
 | [`docparse-docx`](crates/docparse-docx) | DOCX 后端：docx-rs 结构 → 合成坐标汇入同一 IR；含 zip-bomb 预检 | docx-rs |
 | [`docparse-html`](crates/docparse-html) | HTML 后端：DOM 前序遍历 → 标题/段落/列表/表格 | scraper |
-| `docparse-{xlsx,pptx,md,csv,srt,tex}` | 薄后端：XLSX（calamine）/ PPTX（每 slide 一页）/ Markdown / CSV（手写 RFC-4180 子集）/ SRT·WebVTT 字幕（每 cue 一段带时间戳）/ LaTeX 源码子集（章节/列表/tabular→表）——同一合成布局汇入 IR | calamine, quick-xml, pulldown-cmark |
+| `docparse-{xlsx,pptx,md,csv,srt,tex}` | 薄后端：XLSX（calamine）/ PPTX（每 slide 一页）/ Markdown / CSV（手写 RFC-4180 子集）/ SRT·WebVTT 字幕（每 cue 一段带时间戳）/ LaTeX 源码子集（章节/列表/tabular→表）/ EML 邮件（头部/正文/附件列举）/ PNG·JPEG 图片即文档（走 OCR 路由）——同一合成布局汇入 IR | calamine, quick-xml, pulldown-cmark, mail-parser, zune-png |
 | [`docparse-ocr`](crates/docparse-ocr) | ONNX 内嵌 enhancer：OCR（PP-OCRv4 det+rec，DBNet 后处理/CTC 解码自研）+ 版面（DocLayout-YOLO 区域→阅读组），均经 `tract` 纯 Rust 推理 | tract-onnx, zune-jpeg |
 | [`docparse-raster`](crates/docparse-raster) | 难页按需渲染（纯 Rust `hayro`，~100ms/页）——主流程永不渲染；仅 enhancer 路由页 opt-in，含坏渲染守卫 | hayro |
 | [`docparse-vlm`](crates/docparse-vlm) | VLM enhancer：OpenAI 兼容服务（vLLM/Ollama/LM Studio）图片描述等任务，自带最小 PNG 编码器，服务失败优雅降级 | ureq, base64 |

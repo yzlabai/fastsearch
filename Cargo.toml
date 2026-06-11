@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]
 members = [
     "crates/docparse-core",
     "crates/docparse-pdf",
@@ -14,6 +15,8 @@ members = [
     "crates/docparse-csv",
     "crates/docparse-srt",
     "crates/docparse-tex",
+    "crates/docparse-eml",
+    "crates/docparse-img",
     "crates/docparse-cli",
 ]
 
@@ -40,6 +43,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 # OCR enhancer (N3, P4 route): pure-Rust ONNX inference + JPEG decode.
 tract-onnx = "0.21"
 zune-jpeg = "0.4"
+zune-png = "0.4"
+mail-parser = "0.9"
+encoding_rs = "0.8"
+chardetng = "0.1"
 # On-demand page rasterization for neural enhancers (user-approved 2026-06-10):
 # the main pipeline never renders; routed hard pages may, pure Rust, opt-in.
 hayro = "0.7"

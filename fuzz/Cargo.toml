@@ -1,0 +1,42 @@
+[package]
+name = "docparse-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+docparse-core = { path = "../crates/docparse-core" }
+docparse-pdf = { path = "../crates/docparse-pdf" }
+docparse-eml = { path = "../crates/docparse-eml" }
+docparse-img = { path = "../crates/docparse-img" }
+docparse-srt = { path = "../crates/docparse-srt" }
+docparse-tex = { path = "../crates/docparse-tex" }
+docparse-csv = { path = "../crates/docparse-csv" }
+
+[[bin]]
+name = "pdf_parse"
+path = "fuzz_targets/pdf_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "eml_parse"
+path = "fuzz_targets/eml_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "img_parse"
+path = "fuzz_targets/img_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "text_formats"
+path = "fuzz_targets/text_formats.rs"
+test = false
+doc = false
