@@ -58,11 +58,11 @@
 - [x] `TEDS_X` 与 proxy `TEDS` 并行出列,composite 仍走 proxy(历史可比);差异最大的 4 例逐个核对、双向都有信号差(见 testresults);
 - **验收 ✅**:`TEDS_X` 上线(ODL 含表 7 份 0.419→0.477、Docling 6 份 0.474→0.526),proxy 保留对照、历史聚合数字未变;span 输出(`--table-model`)在精确尺下结构对齐获得奖励(修好"尺子不奖励 span");selftest +4 断言全过;数据见 [testresults/2026-06-11-h5-exact-teds.md](../testresults/2026-06-11-h5-exact-teds.md)。⚠️ 副产发现:`--table-model` 在 2305-pg9 上把每物理行拆成两行(行切分 bug,G3-R 模型侧噪声),记按需池。
 
-### H6 · 隐藏文本检测盲区 — *模块 9 / N5a 余项* ⏸ 白底版回退,需背景/z-order 基建(2026-06-12)
-- [x] 同色文本(白底假设版)实现 + 合成注入验证 → **回退**:反白文本(深底白字,bialetti/2305 表头)被误杀,ODL MHS 0.687→0.636,违反零误杀。区分"白底白字隐藏"与"深底白字可见"必须有背景模型,白底假设做不到。
-- [ ] **正确解(余项)**:背景矩形模型——追踪 `re`+`f` 填充矩形 bbox+色,文本背景取最近覆盖矩形色;同色 = `|fill−bg|` 小。白底注入与反白标题都正确;
-- [ ] 图像遮挡:文本 bbox 被其后绘制的不透明图像覆盖——与同色检测共用 z-order"某点最终可见物"能力,一起做;
-- **验收(不变)**:合成注入被拦且可审计;真实文档零误杀(全语料 MHS/hidden 计数无异常)。本轮发现见 devlog [2026-06-12-h6-hidden-text-attempt.md](../devlogs/2026-06-12-h6-hidden-text-attempt.md)。
+### H6 · 隐藏文本检测盲区 — *模块 9 / N5a* ❌ 架构边界:不做(2026-06-12)
+两轮实现 + 回退,结论是**架构边界**而非工作量:
+- [x] 白底假设版 → 回退(反白文本误杀,MHS 0.687→0.636);
+- [x] **完整局部背景模型版**(device 色块 + 图像 + 非设备填充 + 渐变 sh,逐层覆盖)→ 修好 bialetti(误杀 313→0),但 normal_4pages 韩文封面(标题在 Form XObject、背景 banner 在主流跨上下文不可见 + 渐变 + 3 图)仍误杀 7 个标题,MHS 仍掉 → **回退**;
+- **结论**:同色文本/图像遮挡的可见性判定本质需要"某点最终渲染色/覆盖物",即渲染,与"结构提取不渲染像素"核心身份根本冲突;背景来源长尾无尽(块/图/渐变/form 隔离/clip/Pattern)。隐藏注入主流手法(`Tr 3/7` 不可见 render mode、off-page、tiny)已被现有检测覆盖;同色/遮挡若确有需求,归 docparse-raster 按需渲染域,不进确定性核心。详见 devlog [2026-06-12-h6-background-model-architectural-limit.md](../devlogs/2026-06-12-h6-background-model-architectural-limit.md)。
 
 ### H7 · 打磨篮子(小 TODO 清偿)— *横切*
 逐项小步,各自带回归:
