@@ -225,4 +225,4 @@ flowchart TD
   Q -->|供 agent/RAG 调用| E[P3: 服务化接口 + 切块溯源 + AI 可插拔增强]
 ```
 
-进度（2026-06-10）：**M1–M7、N1–N5、Phase 4 主体（G1a/G2/G4/G8a/G8b 首增量/G9 全部）完成**——100+ 单测、clippy 零 warning、输出跨 CLI/库/MCP/REST 四接口逐字节一致；记分牌见 §6 现状。G9d 收官（表结构：通道列+规则线分带+二分重试，TEDS 0.129→0.419，验收门 ≥0.2 过）。**剩余池**：G1b 长尾格式、G7 压测、G8b 真实服务 e2e（候 Ollama）、`--vlm-tables`、合并单元格语义（远期）。里程碑细节见 [plans/next-iteration.md](plans/next-iteration.md) 与 [plans/closing-docling-gaps.md](plans/closing-docling-gaps.md)；devlog 见 [devlogs/](devlogs/)。
+进度（2026-06-10）：**M1–M7、N1–N5、Phase 4 主体（G1a/G2/G4/G8a/G8b 首增量/G9 全部）完成**——100+ 单测、clippy 零 warning、输出跨 CLI/库/MCP/REST 四接口逐字节一致；记分牌见 §6 现状。G9d 收官（表结构：通道列+规则线分带+二分重试，TEDS 0.129→0.419，验收门 ≥0.2 过）。**剩余池**：G1b 余项（EML/图片即文档，候依赖征询）、G7 加强项（arXiv 千份/cargo-fuzz，候决策）、G8b 真实服务 e2e（候 Ollama）、`--vlm-tables`、合并单元格语义（远期）。里程碑细节见 [plans/next-iteration.md](plans/next-iteration.md) 与 [plans/closing-docling-gaps.md](plans/closing-docling-gaps.md)；devlog 见 [devlogs/](devlogs/)。
