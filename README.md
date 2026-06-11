@@ -86,7 +86,15 @@ curl -F "file=@doc.pdf" "http://127.0.0.1:8642/parse?format=chunks&ocr=true&tabl
 #   docs = DocparseLoader("paper.pdf").load()   # 每 chunk 一个 Document，metadata 带 page+bbox
 ```
 
-OCR 模型（可选，三个文件 ~16MB，Apache-2.0）放 `models/ppocr/`：`ch_PP-OCRv4_det_infer.onnx` + `ch_PP-OCRv4_rec_infer.onnx`（HuggingFace `SWHL/RapidOCR`）+ `ppocr_keys_v1.txt`（PaddleOCR 仓库）。表结构模型（可选，~700MB，Apache-2.0）放 `models/unirec/`：`huggingface-cli download topdu/unirec_0_1b_onnx --local-dir models/unirec`。
+可选模型文件（全部 Apache-2.0，外部分发，不进二进制）：
+
+| 目录 | 模型 | 来源 | 驱动的功能 |
+|---|---|---|---|
+| `models/ppocr/`（~16MB） | PP-OCRv4 det+rec + 字典 | PaddleOCR（HuggingFace `SWHL/RapidOCR` 转换件） | `--ocr` 扫描件文字 |
+| `models/layout/`（~75MB） | DocLayout-YOLO | [opendatalab/DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO)（DocStructBench） | `--layout` 版面区域、公式区检出 |
+| `models/unirec/`（~700MB） | **UniRec-0.1B**（统一文本/公式/表格识别） | [OpenOCR](https://github.com/Topdu/OpenOCR)（FVL Lab；[论文 arXiv 2512.21095](https://arxiv.org/abs/2512.21095)）——其 **OpenDoc-0.1B** 文档解析系统的识别器，官方 ONNX：`huggingface-cli download topdu/unirec_0_1b_onnx --local-dir models/unirec` | `--table-model` 合并格表结构 / `--formula-model` 公式→LaTeX / `--transcribe-model` 整页转写（中英） |
+
+> UniRec 接入方式：我们用 `tract` 纯 Rust 运行其官方 encoder/decoder ONNX，自回归循环与 KV-cache 在 Rust 宿主侧驱动——OpenOCR 的 OpenDoc 管线本身是 Python/ONNX Runtime,我们复用其模型与 tokenizer 映射、独立实现推理与 HTML/LaTeX 结果解析（选型与 spike 实测见 [docs/refer/openocr-0.1b-evaluation.md](docs/refer/openocr-0.1b-evaluation.md)）。
 
 ```bash
 cargo test          # 116 单测（CMap/矩阵/XY-cut/表格/切块/MCP/限额/OCR 解码/各格式后端…）
@@ -141,4 +149,4 @@ Cargo workspace，十七个 crate：
 
 ## 许可
 
-Apache-2.0。本项目为独立实现，不包含 veraPDF 代码（veraPDF 为 GPLv3+/MPLv2，仅参考其算法并在源码注明出处）。OCR 模型（PP-OCR）为 Apache-2.0，作为外部文件分发。
+Apache-2.0。本项目为独立实现，不包含 veraPDF 代码（veraPDF 为 GPLv3+/MPLv2，仅参考其算法并在源码注明出处）。外部模型文件均为 Apache-2.0：PP-OCR（PaddleOCR）、DocLayout-YOLO（opendatalab）、UniRec-0.1B（[OpenOCR](https://github.com/Topdu/OpenOCR)/FVL Lab——感谢其开源 OpenDoc-0.1B 文档解析系统与官方 ONNX 导出）。

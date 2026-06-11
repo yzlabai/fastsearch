@@ -86,7 +86,15 @@ curl -F "file=@doc.pdf" "http://127.0.0.1:8642/parse?format=chunks&ocr=true&tabl
 #   docs = DocparseLoader("paper.pdf").load()   # one Document per chunk, page+bbox metadata
 ```
 
-OCR models (optional, three files, ~16 MB, Apache-2.0) go in `models/ppocr/`: `ch_PP-OCRv4_det_infer.onnx` + `ch_PP-OCRv4_rec_infer.onnx` (HuggingFace `SWHL/RapidOCR`) + `ppocr_keys_v1.txt` (PaddleOCR repo). Table-structure model (optional, ~700 MB, Apache-2.0) goes in `models/unirec/`: `huggingface-cli download topdu/unirec_0_1b_onnx --local-dir models/unirec`.
+Optional model files (all Apache-2.0, shipped as external files, never baked into the binary):
+
+| Directory | Model | Origin | Powers |
+|---|---|---|---|
+| `models/ppocr/` (~16 MB) | PP-OCRv4 det+rec + dict | PaddleOCR (HuggingFace `SWHL/RapidOCR` conversions) | `--ocr` scanned text |
+| `models/layout/` (~75 MB) | DocLayout-YOLO | [opendatalab/DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO) (DocStructBench) | `--layout` regions, formula-region detection |
+| `models/unirec/` (~700 MB) | **UniRec-0.1B** (unified text/formula/table recognition) | [OpenOCR](https://github.com/Topdu/OpenOCR) (FVL Lab; [paper arXiv 2512.21095](https://arxiv.org/abs/2512.21095)) — the recognizer of their **OpenDoc-0.1B** document-parsing system; official ONNX: `huggingface-cli download topdu/unirec_0_1b_onnx --local-dir models/unirec` | `--table-model` merged-cell tables / `--formula-model` formula→LaTeX / `--transcribe-model` full-page transcription (zh/en) |
+
+> How UniRec is integrated: we run its official encoder/decoder ONNX on pure-Rust `tract`, driving the autoregressive loop and KV cache on the Rust host — OpenOCR's own OpenDoc pipeline is Python/ONNX Runtime; we reuse the models and tokenizer mapping and independently implement inference plus HTML/LaTeX result parsing (selection rationale and spike measurements: [docs/refer/openocr-0.1b-evaluation.md](docs/refer/openocr-0.1b-evaluation.md), Chinese).
 
 ```bash
 cargo test          # 116 unit tests (CMap / matrix / XY-cut / tables / chunking / MCP / limits / OCR decode / format backends …)
@@ -140,4 +148,4 @@ Show strings of embedded subset CID fonts are glyph indices — unreadable witho
 
 ## License
 
-Apache-2.0. This is an independent implementation containing no veraPDF code (veraPDF is GPLv3+/MPLv2; its algorithms are referenced with attribution in the sources). The OCR models (PP-OCR) are Apache-2.0 and distributed as external files.
+Apache-2.0. This is an independent implementation containing no veraPDF code (veraPDF is GPLv3+/MPLv2; its algorithms are referenced with attribution in the sources). All external model files are Apache-2.0: PP-OCR (PaddleOCR), DocLayout-YOLO (opendatalab), and UniRec-0.1B ([OpenOCR](https://github.com/Topdu/OpenOCR) / FVL Lab — with thanks for open-sourcing the OpenDoc-0.1B document-parsing system and the official ONNX export).
