@@ -2,7 +2,7 @@
 
 **中文** | [English](README.en.md)
 
-高效、纯 Rust 的**多格式文档解析系统**：从 PDF/DOCX/HTML/XLSX/PPTX/Markdown/CSV/SRT·VTT/LaTeX/EML/PNG·JPEG 抽取**带位置的结构化内容**（文本/版面/阅读顺序/表格 → 统一 IR → JSON / Markdown / Text / RAG chunks），走"结构提取"而非"光栅渲染"的快路径。面向 Agent / RAG：结果**确定、可复现、可引用**（每个 chunk 带 page+bbox 双向溯源）。
+高效、纯 Rust 的**多格式文档解析系统**：从 PDF/DOCX/HTML/XLSX/PPTX/Markdown/CSV/SRT·VTT/LaTeX/EML/PNG·JPEG/AsciiDoc 抽取**带位置的结构化内容**（文本/版面/阅读顺序/表格 → 统一 IR → JSON / Markdown / Text / RAG chunks），走"结构提取"而非"光栅渲染"的快路径。面向 Agent / RAG：结果**确定、可复现、可引用**（每个 chunk 带 page+bbox 双向溯源）。
 
 > 设计动机来自对 [opendataloader-pdf](https://github.com/opendataloader-project/opendataloader-pdf) 的架构分析：它快，是因为默认从不把页面渲染成像素，只解析内容流拿坐标，再逐页并行做版面分析。docparse-rs 用纯 Rust 复刻并延伸这条快路径——无 JVM、无 C++、无 Python，单二进制。
 
@@ -13,7 +13,8 @@
 - **RAG 一等公民**：结构化切块带 page+bbox+标题面包屑，`locate(x,y)` 坐标反查 chunk，引用可定位率 100%;
 - **安全预检内置**：隐藏文本过滤（防 prompt injection，标注可审计而非静默删除）、zip-bomb/页数资源守卫、页级复杂度画像;
 - **扫描件 OCR 不破纯 Rust 身份**：`--ocr` 走进程内 `tract` ONNX 推理（PP-OCRv4，中文事实标准模型，~16MB 外部模型文件），抽嵌入图原字节而非渲染;按页路由,数字页**零模型零成本**;
-- **可插拔 AI 边界**：确定性主流程独立成立,模型只在质量评分判定难例时按页触发,产出带 `source` 标签与降级置信度。
+- **内嵌语义模型（opt-in，无服务依赖）**：表结构（合并格/多级表头 → rowspan/colspan 入 IR）、公式→LaTeX、整页转写，UniRec-0.1B 经 `tract` 进程内推理（~700MB 外部模型文件）;
+- **可插拔 AI 边界**：确定性主流程独立成立,模型只在质量评分判定难例时按页触发,产出带 `source` 标签与降级置信度（进程内 tract 或 OpenAI 兼容服务外接均可）。
 
 ## 当前状态与记分牌
 
@@ -27,6 +28,26 @@
 | vs Docling（神经管线，13 份） | **0.822** | **0.643** | **0.474** |
 
 clean 文档 0.94–1.00（与两者结构同构）；聚合被 CJK 复杂版面与图内嵌表 recall 拖低——逐轴对比、口径与边界详见 [综合测评](docs/testresults/2026-06-10-benchmark-roundup.md)。
+
+## 与同类产品对比
+
+> 诚实口径：各家定位不同，下表按"agent/RAG 消费文档"的视角对齐维度；对方占优处照写。详细分析见 [docs/refer/docling-objective-comparison.md](docs/refer/docling-objective-comparison.md)。
+
+| 维度 | **docparse-rs** | Docling | OpenDataLoader-PDF | MarkItDown |
+|---|---|---|---|---|
+| 实现/部署 | **纯 Rust 单二进制 ~26.5MB，零运行时依赖** | Python + 神经模型（GB 级环境，冷启动） | Java/JVM（veraPDF 系） | Python，轻量 |
+| 确定性/可复现 | **默认路径同输入逐字节确定** | 神经管线非严格确定 | 确定 | 确定 |
+| 引用定位 | **page+bbox 双向（chunk↔坐标 `locate`），引用率 100%** | 元素级 provenance | 元素坐标 | 无坐标（markdown-first） |
+| 格式数 | 12 | **15+** | PDF 专注 | **20+** |
+| 表结构（合并格） | 确定性四检测器 + **内嵌 0.1B 模型**（rowspan/colspan 入 IR，opt-in） | TableFormer（神经，内置） | 确定性（平铺网格） | 基础 |
+| 公式→LaTeX | `--formula-model`（内嵌） | 有（模型） | — | — |
+| OCR | 进程内 `tract`（PP-OCR），**数字页零模型零成本**；整页转写高质量档 | 多引擎集成（全页跑模型） | hybrid 模式外接 | 插件 |
+| VLM/LLM 增强 | OpenAI 兼容外接（vLLM/Ollama），任务级 opt-in | 内置 + serve 生态 | hybrid（docling 后端） | LLM 图片描述可选 |
+| Agent 接口 | **CLI/库/MCP/REST 四面字节一致** + Python 客户端 + LangChain/LlamaIndex loader | SDK + 生态成熟 | CLI/Java/Python 包 | CLI/库 |
+| born-digital 速度 | **<10ms 暖解析，~700 页/s** | 秒级/页 | 快 | 快 |
+| 许可 | Apache-2.0（含模型文件） | MIT（个别模型许可另议） | Apache-2.0 | MIT |
+
+**对方仍占优、我们不回避的**：Docling 的神经版面在最难版面上质量上限更高、格式广度与社区生态更成熟；MarkItDown 的长尾格式数更多；我方显式不做 GPU 管线，RTL 与韩文等多语种暂未覆盖（评测里如实计 0）。上表的"一致度记分牌"测的是与参照系统的一致度而非人工真值——口径与边界见[综合测评](docs/testresults/2026-06-10-benchmark-roundup.md)。
 
 ## 用法
 
@@ -42,6 +63,7 @@ cargo build --release
 ./target/release/docparse doc.pdf --vlm-tables --vlm-url http://127.0.0.1:11434 --vlm-model qwen2.5vl     # VLM 重抽表结构（合并格/多级表头），失败保底确定性网格
 ./target/release/docparse doc.pdf --table-model models/unirec   # 内嵌 UniRec-0.1B 重抽表结构（合并格/多级表头），进程内无服务
 ./target/release/docparse doc.pdf --formula-model models/unirec # 公式→LaTeX（YOLO 找公式区 + UniRec 识别，需 models/layout）
+./target/release/docparse doc.pdf --transcribe-model models/unirec # 整页转写（中英难版面/扫描件高质量档，区域级定位）
 ./target/release/docparse doc.pdf --image-dir imgs/   # 导出嵌入图片（JPEG/PNG），JSON 带 file、Markdown 带 ![]() 引用
 ./target/release/docparse doc.pdf --image-embed       # 图片以 base64 内嵌进 JSON（data_base64 + data_media_type）
 ./target/release/docparse input.pdf --quality --profile --route-plan   # 质量分/页级画像/路由计划（stderr JSON）
@@ -72,7 +94,7 @@ cargo test          # 116 单测（CMap/矩阵/XY-cut/表格/切块/MCP/限额/O
 
 ## 架构
 
-Cargo workspace，十六个 crate：
+Cargo workspace，十七个 crate：
 
 | crate | 职责 | 关键依赖 |
 |---|---|---|
@@ -80,7 +102,7 @@ Cargo workspace，十六个 crate：
 | [`docparse-pdf`](crates/docparse-pdf) | 纯 Rust PDF 后端：lopdf 解析 + **自研内容流解释器**（矩阵栈 + 操作符状态机 + 隐藏文本检测 + 图像 XObject 抽取）+ **字体层**（ToUnicode CMap/AFM/Encoding，参考 veraPDF 独立实现）+ rayon 逐页并行 | lopdf, rayon |
 | [`docparse-docx`](crates/docparse-docx) | DOCX 后端：docx-rs 结构 → 合成坐标汇入同一 IR；含 zip-bomb 预检 | docx-rs |
 | [`docparse-html`](crates/docparse-html) | HTML 后端：DOM 前序遍历 → 标题/段落/列表/表格 | scraper |
-| `docparse-{xlsx,pptx,md,csv,srt,tex}` | 薄后端：XLSX（calamine）/ PPTX（每 slide 一页）/ Markdown / CSV（手写 RFC-4180 子集）/ SRT·WebVTT 字幕（每 cue 一段带时间戳）/ LaTeX 源码子集（章节/列表/tabular→表）/ EML 邮件（头部/正文/附件列举）/ PNG·JPEG 图片即文档（走 OCR 路由）——同一合成布局汇入 IR | calamine, quick-xml, pulldown-cmark, mail-parser, zune-png |
+| `docparse-{xlsx,pptx,md,csv,srt,tex}` | 薄后端：XLSX（calamine）/ PPTX（每 slide 一页）/ Markdown / CSV（手写 RFC-4180 子集）/ SRT·WebVTT 字幕（每 cue 一段带时间戳）/ LaTeX 源码子集（章节/列表/tabular→表）/ EML 邮件（头部/正文/附件列举）/ PNG·JPEG 图片即文档（走 OCR 路由）/ AsciiDoc 子集——同一合成布局汇入 IR | calamine, quick-xml, pulldown-cmark, mail-parser, zune-png |
 | [`docparse-ocr`](crates/docparse-ocr) | ONNX 内嵌 enhancer：OCR（PP-OCRv4 det+rec，DBNet 后处理/CTC 解码自研）+ 版面（DocLayout-YOLO 区域→阅读组），均经 `tract` 纯 Rust 推理 | tract-onnx, zune-jpeg |
 | [`docparse-raster`](crates/docparse-raster) | 难页按需渲染（纯 Rust `hayro`，~100ms/页）——主流程永不渲染；仅 enhancer 路由页 opt-in，含坏渲染守卫 | hayro |
 | [`docparse-vlm`](crates/docparse-vlm) | VLM enhancer：OpenAI 兼容服务（vLLM/Ollama/LM Studio）图片描述等任务，自带最小 PNG 编码器，服务失败优雅降级 | ureq, base64 |

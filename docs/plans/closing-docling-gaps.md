@@ -32,7 +32,7 @@
 - [x] **邮件 EML ✅**(2026-06-11,依赖已批,[devlog](../devlogs/2026-06-11-g1b-eml-img-encoding.md)):docparse-eml(mail-parser 0.9)——Subject→标题、From/To/Date 元数据行、首个文本体→段落(HTML-only 邮件自动转文本、RFC2047 主题解码、quoted-printable/base64 由库承担)、附件列举 `[attachment] 名 (字节)`;docling 真实样例 2 份全过。嵌套 rfc822 不下钻(边界)。
 - [x] **字幕 SRT/WebVTT ✅**(2026-06-11,[devlog](../devlogs/2026-06-11-srt-vtt-subtitles.md)):docparse-srt(零依赖手写),每 cue 一段 `[hh:mm:ss] 文本`(时间戳=可引用性,保留);VTT 头部/NOTE/STYLE 跳过、`<v 说话人>`→前缀、行内标签剥除。顺带修了 synth 段距 bug(所有 synth 后端段落被 1.8em 合并门错并——影响 docx/html/md 文本输出)。
 - [x] **图片即文档(PNG/JPEG)✅**(2026-06-11,依赖已批,同 devlog):docparse-img(zune-png/zune-jpeg)——单页全幅 ImageChunk(1px=1pt,JPEG 原字节零转码、PNG 解到 Gray8/Rgb8)→ `scanned_no_text` 路由 → `--ocr` 全管线复用;**往返验收**:chinese_scan PDF 经 `--image-dir` 抽出 PNG、独立 OCR 出中文全文正确。TIFF/16-bit PNG 不支持(干净报错)。
-- [~] **AsciiDoc / LaTeX 源码**:**LaTeX 子集 ✅**(2026-06-11,[devlog](../devlogs/2026-06-11-latex-backend.md)):docparse-tex(零依赖行导向)——title/author/maketitle、section 三级、abstract、itemize/enumerate(LI 标签)、tabular→真 Table、figure/table 取 caption、数学环境原样保留、注释/转义/跨行声明配平;7 份真实 arXiv 源码全过(含 OTSL/Attention 论文),边界文档化(\input 不追、自定义宏不展开)。AsciiDoc 待立项。
+- [~] **AsciiDoc / LaTeX 源码**:**LaTeX 子集 ✅**(2026-06-11,[devlog](../devlogs/2026-06-11-latex-backend.md)):docparse-tex(零依赖行导向)——title/author/maketitle、section 三级、abstract、itemize/enumerate(LI 标签)、tabular→真 Table、figure/table 取 caption、数学环境原样保留、注释/转义/跨行声明配平;7 份真实 arXiv 源码全过(含 OTSL/Attention 论文),边界文档化(\input 不追、自定义宏不展开)。**AsciiDoc ✅**(2026-06-11,docparse-adoc 零依赖行导向:文档标题/分节/列表/`----` 代码块/`|===` 表/注释与属性行,格式数 11→12)。
 - [ ] **XML 族(JATS 学术/METS-ALTO 档案)**:按真实需求逐个立项(quick-xml 复用);METS-ALTO 自带坐标,可出**真实 bbox**(非合成)。
 - **验收**:每格式经同一 IR 出 chunks(带合成或真实 bbox);`supports()` 按扩展名注册;每格式至少一个样例端到端 + 单测;现有格式零回归。格式数 3→12+。
 

@@ -34,7 +34,7 @@ done
 
 ## 2. 架构与改动落点
 
-Cargo workspace，十六个 crate（core/pdf/docx/html/ocr/raster/vlm/xlsx/pptx/md/csv/srt/tex/eml/img/cli）。**`core` 不依赖任何 PDF 库**——阅读顺序与输出对所有格式通用，加格式只需实现 `DocumentParser` trait 并在 CLI 注册表加一行。
+Cargo workspace，十七个 crate（core/pdf/docx/html/ocr/raster/vlm/xlsx/pptx/md/csv/srt/tex/eml/img/adoc/cli）。**`core` 不依赖任何 PDF 库**——阅读顺序与输出对所有格式通用，加格式只需实现 `DocumentParser` trait 并在 CLI 注册表加一行。
 
 | 想做的事 | 改哪 |
 |---|---|
@@ -89,4 +89,4 @@ Cargo workspace，十六个 crate（core/pdf/docx/html/ocr/raster/vlm/xlsx/pptx/
 
 ## 8. 路线图
 
-战略见 [docs/roadmap.md](docs/roadmap.md)；近期里程碑 N1–N6 见 [docs/plans/next-iteration.md](docs/plans/next-iteration.md)（M1–M7 历史见 [docs/plans/beating-docling.md](docs/plans/beating-docling.md)）。**全部完成**（截至 2026-06-11，见 docs/devlogs/ 双部会话总结）：M1–M7、N1–N5、Phase 4 可自主项——G1 格式 3→11、G2/G4/G8a、G3-R（`--table-model` 内嵌 UniRec-0.1B×tract 0.23 重抽表结构，合并格语义端到端正确）、G6（Python 客户端+LangChain 验收）、G7（压测 1847 输入 + fuzz ~1020 万次零 panic）、G8b/G8c（`--vlm-describe/--vlm-tables` mock 验收、`--formula-model` 公式→LaTeX、MCP/REST 全增强透传）、G9 全部（G9d TEDS 验收门过）；IR 0.7.0（Cell span 语义 + 图片 base64 内嵌）。**记分牌**（born-digital LTR，默认确定性路径）：vs ODL NID 0.792/MHS 0.685/TEDS 0.419；vs Docling NID 0.822/MHS 0.643/TEDS 0.474。**待办**：候外部输入——PyPI/crates.io/MCP-registry 发布（账号）、Ollama 真实服务验收（VLM 域：图片描述/页型判官/整页转写）、arXiv 千份压测与 fuzz 24h（资源/排期）；候设计/按需——UniRec OCR 档、行内公式、G3b 确定性 span 推断、AsciiDoc/JATS/RTL、Markdown-span 输出。详见 [docs/plans/closing-docling-gaps.md](docs/plans/closing-docling-gaps.md)。⚠️ 经验：①记分牌大跳几乎全是评测/输出管线 bug——分数可疑先怀疑管线；②参照系口径会反噬更忠实的输出（span vs 压扁），产品价值用语义样例验收；③依赖版本本身可以是性能特性（tract 0.21→0.23=17×）；④管道退出码会掩盖失败；⑤新格式 e2e 是共享层的免费测试矩阵。
+战略见 [docs/roadmap.md](docs/roadmap.md)；近期里程碑 N1–N6 见 [docs/plans/next-iteration.md](docs/plans/next-iteration.md)（M1–M7 历史见 [docs/plans/beating-docling.md](docs/plans/beating-docling.md)）。**全部完成**（截至 2026-06-11，见 docs/devlogs/ 双部会话总结）：M1–M7、N1–N5、Phase 4 可自主项——G1 格式 3→12（含 AsciiDoc）、G2/G4/G8a、G3-R（`--table-model` 内嵌 UniRec-0.1B×tract 0.23 重抽表结构，合并格语义端到端正确）、G6（Python 客户端+LangChain 验收）、G7（压测 1847 输入 + fuzz ~1020 万次零 panic）、G8b/G8c（`--vlm-describe/--vlm-tables` mock 验收、`--formula-model` 公式→LaTeX、`--transcribe-model` 整页转写（中英域；韩文域外被退化守卫安全拦截）、MCP/REST 全增强透传）、G9 全部（G9d TEDS 验收门过）；IR 0.7.0（Cell span 语义 + 图片 base64 内嵌）。**记分牌**（born-digital LTR，默认确定性路径）：vs ODL NID 0.792/MHS 0.685/TEDS 0.419；vs Docling NID 0.822/MHS 0.643/TEDS 0.474。**待办**：候外部输入——PyPI/crates.io/MCP-registry 发布（账号）、Ollama 真实服务验收（VLM 域：图片描述/页型判官/整页转写）、arXiv 千份压测与 fuzz 24h（资源/排期）；候设计/按需——行内公式、G3b 确定性 span 推断、JATS/METS-ALTO、RTL（韩文 CJK 缺口属 VLM 服务域）、Markdown-span 输出。（OCR 档已定案=--transcribe-model；AsciiDoc 已落地。）详见 [docs/plans/closing-docling-gaps.md](docs/plans/closing-docling-gaps.md)。⚠️ 经验：①记分牌大跳几乎全是评测/输出管线 bug——分数可疑先怀疑管线；②参照系口径会反噬更忠实的输出（span vs 压扁），产品价值用语义样例验收；③依赖版本本身可以是性能特性（tract 0.21→0.23=17×）；④管道退出码会掩盖失败；⑤新格式 e2e 是共享层的免费测试矩阵。

@@ -4,6 +4,7 @@ mod mcp;
 mod server;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use docparse_adoc::AdocParser;
 use docparse_core::output;
 use docparse_core::parser::DocumentParser;
 use docparse_csv::CsvParser;
@@ -35,6 +36,7 @@ pub(crate) fn parsers_with(decode_images: bool) -> Vec<Box<dyn DocumentParser>> 
         Box::new(TexParser),
         Box::new(EmlParser),
         Box::new(ImageParser),
+        Box::new(AdocParser),
     ]
 }
 

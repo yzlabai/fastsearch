@@ -225,4 +225,4 @@ flowchart TD
   Q -->|供 agent/RAG 调用| E[P3: 服务化接口 + 切块溯源 + AI 可插拔增强]
 ```
 
-进度（2026-06-11 晚）：**M1–M7、N1–N5、Phase 4 可自主项全部完成**——含 G3-R 复活（`--table-model` 内嵌 UniRec-0.1B 表结构重抽）、`--formula-model`（公式→LaTeX）、MCP/REST 全增强透传、IR 0.7.0（span 语义+图片 base64）；125 单测、clippy 零 warning、四接口任意开关组合字节一致；记分牌见 §6。**待办**：发布（PyPI/crates.io，候账号）、Ollama 真实服务验收（VLM 域）、arXiv 千份/fuzz 24h（资源/排期）、UniRec-OCR 档/行内公式/AsciiDoc/JATS/RTL（按需/待设计）。里程碑细节见 [plans/closing-docling-gaps.md](plans/closing-docling-gaps.md)；devlog 见 [devlogs/](devlogs/)。
+进度（2026-06-11 晚）：**M1–M7、N1–N5、Phase 4 可自主项全部完成**——含 G3-R 复活（`--table-model` 内嵌 UniRec-0.1B 表结构重抽）、`--formula-model`（公式→LaTeX）、MCP/REST 全增强透传、IR 0.7.0（span 语义+图片 base64）；125 单测、clippy 零 warning、四接口任意开关组合字节一致；记分牌见 §6。**待办**：发布（PyPI/crates.io，候账号）、Ollama 真实服务验收（VLM 域）、arXiv 千份/fuzz 24h（资源/排期）、行内公式/JATS/RTL-韩文（VLM 域）（按需/待设计；OCR 档=--transcribe-model、AsciiDoc 已落地 2026-06-11）。里程碑细节见 [plans/closing-docling-gaps.md](plans/closing-docling-gaps.md)；devlog 见 [devlogs/](devlogs/)。

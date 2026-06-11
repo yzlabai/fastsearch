@@ -640,6 +640,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "docparse-adoc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "docparse-core",
+]
+
+[[package]]
 name = "docparse-cli"
 version = "0.1.0"
 dependencies = [
@@ -647,6 +655,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "docparse-adoc",
  "docparse-core",
  "docparse-csv",
  "docparse-docx",

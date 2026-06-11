@@ -2,7 +2,7 @@
 
 [中文](README.md) | **English**
 
-A fast, pure-Rust **multi-format document parsing system**: extracts **positioned, structured content** from PDF/DOCX/HTML/XLSX/PPTX/Markdown/CSV/SRT·VTT/LaTeX/EML/PNG·JPEG (text / layout / reading order / tables → unified IR → JSON / Markdown / Text / RAG chunks) via the "structure extraction, not rasterization" fast path. Built for agents and RAG: results are **deterministic, reproducible, and citable** (every chunk carries page + bbox, with bidirectional lookup).
+A fast, pure-Rust **multi-format document parsing system**: extracts **positioned, structured content** from PDF/DOCX/HTML/XLSX/PPTX/Markdown/CSV/SRT·VTT/LaTeX/EML/PNG·JPEG/AsciiDoc (text / layout / reading order / tables → unified IR → JSON / Markdown / Text / RAG chunks) via the "structure extraction, not rasterization" fast path. Built for agents and RAG: results are **deterministic, reproducible, and citable** (every chunk carries page + bbox, with bidirectional lookup).
 
 > The design was motivated by an architecture analysis of [opendataloader-pdf](https://github.com/opendataloader-project/opendataloader-pdf): it is fast because it never renders pages to pixels — it interprets content streams for coordinates and runs layout analysis per page in parallel. docparse-rs re-implements and extends that fast path in pure Rust — no JVM, no C++, no Python, one binary.
 
@@ -13,7 +13,8 @@ A fast, pure-Rust **multi-format document parsing system**: extracts **positione
 - **RAG as a first-class citizen**: structured chunks with page + bbox + heading breadcrumbs, `locate(x, y)` reverse lookup, 100% citation coverage;
 - **Security pre-checks built in**: hidden-text filtering (anti prompt-injection — flagged and auditable, never silently dropped), zip-bomb / page-count resource guards, per-page complexity profiling;
 - **Scanned-document OCR without breaking the pure-Rust identity**: `--ocr` runs in-process ONNX inference on `tract` (PP-OCRv4, the de-facto standard models for Chinese; ~16 MB external model files). The page image is the embedded raster's *original bytes* — nothing is rendered. Quality-routed per page: digital pages never touch the model;
-- **Pluggable AI boundary**: the deterministic pipeline stands alone; models trigger only on pages the quality score flags as hard, and their output carries a `source` tag and capped confidence.
+- **Embedded semantic models (opt-in, no service)**: table structure (merged cells / multi-row headers → rowspan/colspan in the IR), formula→LaTeX, and full-page transcription — UniRec-0.1B on in-process `tract` inference (~700MB external model files);
+- **Pluggable AI boundary**: the deterministic pipeline stands alone; models trigger only on pages the quality score flags as hard, and their output carries a `source` tag and capped confidence (in-process tract or an OpenAI-compatible service).
 
 ## Status & scoreboards
 
@@ -27,6 +28,26 @@ All ten roadmap modules are closed (IR / PDF / layout / semantics / multi-format
 | vs Docling (neural pipeline, 13 docs) | **0.822** | **0.643** | **0.474** |
 
 Clean documents score 0.94–1.00 (structurally isomorphic with both references); the aggregate is pulled down by complex CJK layouts and figure-embedded-table recall. Axis-by-axis comparison, methodology, and honest caveats: [benchmark roundup](docs/testresults/2026-06-10-benchmark-roundup.md).
+
+## Comparison with related tools
+
+> Honest framing: these tools have different missions; the table aligns them on the "agent/RAG consuming documents" axis, and credits where others win. Detailed analysis: [docs/refer/docling-objective-comparison.md](docs/refer/docling-objective-comparison.md) (Chinese).
+
+| Dimension | **docparse-rs** | Docling | OpenDataLoader-PDF | MarkItDown |
+|---|---|---|---|---|
+| Implementation / deploy | **pure-Rust single ~26.5MB binary, zero runtime deps** | Python + neural models (GB-scale env, cold start) | Java/JVM (veraPDF lineage) | Python, lightweight |
+| Determinism | **default path byte-identical for identical input** | neural pipeline not strictly deterministic | deterministic | deterministic |
+| Citations | **page+bbox both ways (chunk↔coordinate `locate`), 100% coverage** | element-level provenance | element coordinates | none (markdown-first) |
+| Formats | 12 | **15+** | PDF-focused | **20+** |
+| Table structure (merged cells) | four deterministic detectors + **embedded 0.1B model** (rowspan/colspan in the IR, opt-in) | TableFormer (neural, built-in) | deterministic (flat grid) | basic |
+| Formula → LaTeX | `--formula-model` (embedded) | yes (model) | — | — |
+| OCR | in-process `tract` (PP-OCR), **zero model cost on digital pages**; full-page transcription tier | multi-engine, model on every page | hybrid mode (external) | plugin |
+| VLM/LLM enrichment | OpenAI-compatible services (vLLM/Ollama), per-task opt-in | built-in + serve ecosystem | hybrid (docling backend) | optional LLM captions |
+| Agent surfaces | **CLI/lib/MCP/REST byte-identical** + Python client + LangChain/LlamaIndex loaders | SDK + mature ecosystem | CLI/Java/Python | CLI/lib |
+| Born-digital speed | **<10ms warm parse, ~700 pages/s** | seconds/page | fast | fast |
+| License | Apache-2.0 (models included) | MIT (some model licenses separate) | Apache-2.0 | MIT |
+
+**Where others still win — stated plainly**: Docling's neural layout has a higher quality ceiling on the hardest layouts, broader formats, and a more mature ecosystem; MarkItDown covers more long-tail formats; we deliberately ship no GPU pipeline, and RTL / Korean (and other non-zh/en OCR domains) are not covered yet (scored as 0 in our eval, honestly). The scoreboard above measures agreement with reference systems, not human ground truth — see the [benchmark roundup](docs/testresults/2026-06-10-benchmark-roundup.md).
 
 ## Usage
 
@@ -42,6 +63,7 @@ cargo build --release
 ./target/release/docparse doc.pdf --vlm-tables --vlm-url http://127.0.0.1:11434 --vlm-model qwen2.5vl     # VLM table re-extraction (merged cells / multi-row headers); failures keep the deterministic grid
 ./target/release/docparse doc.pdf --table-model models/unirec   # embedded UniRec-0.1B table re-extraction (merged cells), in-process, no service
 ./target/release/docparse doc.pdf --formula-model models/unirec # formula -> LaTeX (YOLO finds formula regions + UniRec reads them; needs models/layout)
+./target/release/docparse doc.pdf --transcribe-model models/unirec # full-page transcription (high-quality tier for zh/en hard layouts & scans; region-level positions)
 ./target/release/docparse doc.pdf --image-dir imgs/   # export embedded images (JPEG/PNG); JSON gains "file", Markdown gains ![]() refs
 ./target/release/docparse doc.pdf --image-embed       # embed images as base64 in JSON (data_base64 + data_media_type)
 ./target/release/docparse input.pdf --quality --profile --route-plan   # quality / per-page profile / routing (JSON on stderr)
@@ -72,7 +94,7 @@ cargo test          # 116 unit tests (CMap / matrix / XY-cut / tables / chunking
 
 ## Architecture
 
-A Cargo workspace with sixteen crates:
+A Cargo workspace with seventeen crates:
 
 | crate | Responsibility | Key deps |
 |---|---|---|
@@ -80,7 +102,7 @@ A Cargo workspace with sixteen crates:
 | [`docparse-pdf`](crates/docparse-pdf) | Pure-Rust PDF backend: lopdf parsing + a **self-built content-stream interpreter** (matrix stack + operator state machine + hidden-text detection + image-XObject extraction) + a **font layer** (ToUnicode CMap / AFM / Encoding, independently implemented with veraPDF as the algorithmic reference) + per-page rayon parallelism | lopdf, rayon |
 | [`docparse-docx`](crates/docparse-docx) | DOCX backend: docx-rs structure → synthetic coordinates into the same IR; zip-bomb pre-check | docx-rs |
 | [`docparse-html`](crates/docparse-html) | HTML backend: DOM pre-order walk → headings / paragraphs / lists / tables | scraper |
-| `docparse-{xlsx,pptx,md,csv,srt,tex}` | Thin backends: XLSX (calamine) / PPTX (one page per slide) / Markdown / CSV (hand-rolled RFC-4180 subset) / SRT·WebVTT subtitles (one timestamped paragraph per cue) / LaTeX source subset (sections/lists/tabular→Table) / EML email (headers/body/attachment listing) / PNG·JPEG images-as-documents (riding the OCR route) — all flow into the same IR via the synthetic layout | calamine, quick-xml, pulldown-cmark, mail-parser, zune-png |
+| `docparse-{xlsx,pptx,md,csv,srt,tex}` | Thin backends: XLSX (calamine) / PPTX (one page per slide) / Markdown / CSV (hand-rolled RFC-4180 subset) / SRT·WebVTT subtitles (one timestamped paragraph per cue) / LaTeX source subset (sections/lists/tabular→Table) / EML email (headers/body/attachment listing) / PNG·JPEG images-as-documents (riding the OCR route) / AsciiDoc subset — all flow into the same IR via the synthetic layout | calamine, quick-xml, pulldown-cmark, mail-parser, zune-png |
 | [`docparse-ocr`](crates/docparse-ocr) | ONNX-embedded enhancers: OCR (PP-OCRv4 det+rec, self-built DBNet post-processing / CTC decoding) and layout (DocLayout-YOLO regions → reading groups), both on `tract` pure-Rust inference | tract-onnx, zune-jpeg |
 | [`docparse-raster`](crates/docparse-raster) | On-demand hard-page rendering (pure-Rust `hayro`, ~100ms/page) — the main pipeline never renders; enhancer-routed pages only, opt-in, with a broken-render guard | hayro |
 | [`docparse-vlm`](crates/docparse-vlm) | VLM enhancer: picture description & friends over OpenAI-compatible services (vLLM/Ollama/LM Studio), minimal built-in PNG encoder, graceful degradation | ureq, base64 |

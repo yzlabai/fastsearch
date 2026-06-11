@@ -17,6 +17,7 @@ members = [
     "crates/docparse-tex",
     "crates/docparse-eml",
     "crates/docparse-img",
+    "crates/docparse-adoc",
     "crates/docparse-cli",
 ]
 
