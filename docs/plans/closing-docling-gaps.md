@@ -45,12 +45,17 @@
 - [ ] **归一**:模型出 region(标题/正文/图/表/页眉脚)+ bbox → 重排该页读序、修正标题/表区域;经 `Enhancer` 边界,source 标 `layout:<model>`,确定性结果仍独立成立。
 - **验收 → 两轮更正后的真实状态(2026-06-10,[devlog](../devlogs/2026-06-10-g2-layout-enhancer.md) + [重大更正](../devlogs/2026-06-10-g2-correction.md))**:初版"负结果"系两个自家 bug(透明背景致黑渲染、分组替换静默失败)所致,修正后 enhancement 真实点火:**设计感版面大赢**(amt +0.180、normal_4pages +0.128),**clean 学术双栏倒退**(2203 −0.289)——版面模型与确定性几何各有禁区。`--layout` 保持手动 opt-in(记分牌默认不开,零回归);**剩余项=自动路由判据**(读序歧义分/区域分布,行填充率已试败),做成后按页自动取两者之优。
 
-### G3 · 表结构 enhancer:ONNX 表结构模型内嵌 — *模块 8 / P4 模式*
-TEDS 0.098/0.187 的主因是多级表头/合并单元格(神经域)。SLANet 系(PP-StructureV2,~9MB)输出结构 token + cell bbox,正是缺的拓扑。
+### G3 · 表结构 enhancer:ONNX 表结构模型内嵌 — *模块 8 / P4 模式* · 🔄 复活(2026-06-11)
+初版死因:SLANet 死于 ONNX `Loop`(tract 未实现)、TATR 死于导出(见 g3-spike devlog)。**复活依据:[OpenOCR UniRec-0.1B spike 双门全过](../refer/openocr-0.1b-evaluation.md)**(用户提议,2026-06-11)——官方 ONNX 现成(KV-cache 接口)、tract parse/typecheck/optimize 全过、贪心解码与 ORT 逐 token 相同、合并格样本输出完美 HTML(rowspan/colspan)、tract 0.23 实测 169 tok/s ≈2.5s/表(≤5s 门过)。
 
-- [ ] **Spike 门控**:SLANet ONNX 在 `tract` 的算子覆盖;输入是表区域图——born-digital 的表没有位图,born-digital 表区域经 `docparse-raster`(hayro)按需渲染——光栅决策已解(2026-06-10)。
-- [ ] **G3b(确定性兜底)**:合并单元格/多级表头的几何推断(跨列 span 由对齐+横线覆盖推断)——P1c 教训在前,只做高置信形态,不强攻。
-- **验收**:TEDS vs Docling 0.187 → ≥0.4(含表 6 份);检出零回归。⚠️ 此里程碑**风险最高**,spike 不过即降级为 G3b + N3b 外接,不硬上。
+**G3-R 实施计划**(2026-06-11 立项):
+
+- [ ] **R1 · tract 0.21→0.23 升级**(前置):workspace 版本提升 + API 迁移(`to_array_view` 移除等,spike 已踩);**回归门**:PP-OCR(chinese_scan 14/14 行)、DocLayout-YOLO(--layout amt 增益不变)、三件套、双记分牌逐字不变;
+- [ ] **R2 · UniRec 推理管线**(docparse-ocr 新模块):`find_file` 模式加载 encoder/decoder/tokenizer 映射(models/unirec/,~700MB 外置);预处理(≤960×1408 等比 /64 对齐,(x/255−0.5)/0.5)→ encoder 一次 → Rust 贪心 KV-cache 解码循环 → detokenize;
+- [ ] **R3 · 表任务接线**:`--table-model <dir>` 对已检出表渲染区域(复用 raster+crop 栈)→ UniRec 出 HTML → 手写子集解析(`<table>/<tr>/<td rowspan/colspan>`)→ 跨格按"值复制到所有跨位"展开回 `Table.rows`(与 eval/ODL 口径一致),`source: "table:unirec-0.1b"`;失败保底确定性网格(同 `--vlm-tables` 纪律);
+- [ ] **验收**:合并格样例(2305-pg9)端到端 HTML 语义正确;TEDS 双记分牌不降(展开口径下应升);默认路径(不带旗标)零变化;单测:tokenizer 解码/HTML 子集解析/预处理尺寸。
+- 后续(顺带能力,另行小项):公式→LaTeX(同模型,G8c 主路径)、高质量 OCR 档、rowspan/colspan 语义入 IR(远期)。
+- [ ] **G3b(确定性兜底)**:保留原描述,优先级降(模型路径已通)。
 
 ### G4 · OCR 长尾 — *模块 8 续*
 - [x] **区域级 OCR ✅**(2026-06-10):`MixedTextAndScan` flag 路由混合页,OCR 结果与数字文本空间去重(数字层赢);合成混合页端到端验收。
