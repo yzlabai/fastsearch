@@ -276,6 +276,9 @@ fn grid_cells(grid: &[Vec<String>], bbox: &BBox) -> Vec<Vec<Cell>> {
                         x1: bbox.x0 + tw * (ci as f32 + 1.0) / nc,
                         y1: bbox.y1 - th * ri as f32 / nr,
                     },
+                    row_span: 1,
+                    col_span: 1,
+                    merged: false,
                 })
                 .collect()
         })

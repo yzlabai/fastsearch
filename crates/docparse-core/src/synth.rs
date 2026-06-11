@@ -156,6 +156,9 @@ impl PageBuilder {
                         x1: x0 + col_w,
                         y1: y_top,
                     },
+                    row_span: 1,
+                    col_span: 1,
+                    merged: false,
                 });
             }
             out_rows.push(cells);

@@ -60,8 +60,10 @@ async fn parse(
 ) -> Response {
     let format = q.get("format").cloned().unwrap_or_else(|| "json".into());
     let flag = |k: &str| matches!(q.get(k).map(String::as_str), Some("1") | Some("true"));
+    let images_embedded = q.get("images").map(String::as_str) == Some("embedded");
     let opts = crate::EnhanceOpts {
         ocr: flag("ocr"),
+        images_embedded,
         layout: flag("layout"),
         table_model: flag("table_model"),
         formula_model: flag("formula_model"),
@@ -140,7 +142,7 @@ fn render(
     opts: crate::EnhanceOpts,
     state: &crate::EnhanceState,
 ) -> anyhow::Result<(String, &'static str)> {
-    let doc = crate::parse_path(path)?;
+    let doc = crate::parse_path_with(path, opts.images_embedded)?;
     let mut doc = state.apply(doc, path, opts)?;
     doc.source = source_name.to_string();
     Ok(match format {
@@ -206,7 +208,7 @@ mod tests {
         // Clients see the uploaded name, never the staging temp path.
         assert!(a.contains("up.html") && !a.contains("docparse-rest-test"));
         // Same rendering the CLI does — lockstep modulo the source name.
-        let mut doc = crate::parse_path(&path).unwrap();
+        let mut doc = crate::parse_path_with(&path, false).unwrap();
         doc.source = "up.html".into();
         assert_eq!(a, output::to_markdown(&doc));
     }

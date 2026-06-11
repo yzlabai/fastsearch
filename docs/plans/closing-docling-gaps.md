@@ -54,7 +54,7 @@
 - [x] **R2 · UniRec 推理管线 ✅**(2026-06-11,ocr/unirec.rs):按计划实现;实测 pg9 表 3.4s 出完美 HTML(含 span),纯 Rust 全程(双线性缩放足够,无需 bicubic)。
 - [x] **R3 · 表任务接线 ✅**(2026-06-11,ocr/table_model.rs):按计划实现,含 rowspan 悬挂网格的正确展开(pending 机制);6 个新单测(含 pg9 真实形状)。
 - [x] **验收**:pg9 端到端 10×8 语义正确(rowspan/colspan 准确展开)✅;默认路径零变化(记分牌逐字不变)✅;单测齐 ✅。⚠️ **诚实记录**:flag-on 的一致度 TEDS 反而降(pg9 0.804→0.39、2206 0.421→0.115)——ODL 与 Docling 真值都用**压扁口径**(子行并、跨格合写),模型的忠实结构与之约定冲突,"一致度≠准确度"再添一例(LaTeX 源 \multirow 证实模型才是对的)。定位同 --layout:产品质量增强、手动 opt-in、不进记分牌。真正出口是 rowspan/colspan 语义入 IR(远期)。
-- 后续:公式→LaTeX ✅(2026-06-11,`--formula-model`,见 G8c)、高质量 OCR 档(待设计)、rowspan/colspan 语义入 IR(远期)。
+- 后续:公式→LaTeX ✅(2026-06-11,`--formula-model`,见 G8c)、**rowspan/colspan 语义入 IR ✅**(2026-06-11,[devlog](../devlogs/2026-06-11-spans-and-embedded-images.md):`Cell.row_span/col_span/merged`,IR 0.7.0——锚格带跨度、覆盖位标 merged,网格平铺口径不破,eval/默认输出零变化;模型路径填真实 span,确定性路径恒 1×1)、高质量 OCR 档(待设计)。
 - [ ] **G3b(确定性兜底)**:保留原描述,优先级降(模型路径已通)。
 
 ### G4 · OCR 长尾 — *模块 8 续*

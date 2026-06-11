@@ -161,6 +161,9 @@ pub fn detect_tables(chunks: &[&TextChunk], segments: &[Segment], page: usize) -
                     x1: x_right,
                     y1: y_top,
                 },
+                row_span: 1,
+                col_span: 1,
+                merged: false,
             });
         }
         rows.push(row);
@@ -401,6 +404,9 @@ fn build_borderless(rows: &[Row], region: &[usize], cols: &[f32]) -> Option<Tabl
                     x1,
                     y1: row.cy + half,
                 },
+                row_span: 1,
+                col_span: 1,
+                merged: false,
             });
         }
         out_rows.push(cell_row);
@@ -814,6 +820,9 @@ fn build_grid(
                         x1: spans[ci].1,
                         y1: y_top,
                     },
+                    row_span: 1,
+                    col_span: 1,
+                    merged: false,
                 }
             })
             .collect();

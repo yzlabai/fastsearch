@@ -355,6 +355,9 @@ mod tests {
                         x1: 300.0,
                         y1: 500.0,
                     },
+                    row_span: 1,
+                    col_span: 1,
+                    merged: false,
                 },
                 Cell {
                     text: "B".into(),
@@ -364,6 +367,9 @@ mod tests {
                         x1: 540.0,
                         y1: 500.0,
                     },
+                    row_span: 1,
+                    col_span: 1,
+                    merged: false,
                 },
             ]],
         });

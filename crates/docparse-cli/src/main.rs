@@ -39,10 +39,6 @@ pub(crate) fn parsers_with(decode_images: bool) -> Vec<Box<dyn DocumentParser>> 
 }
 
 /// Pick the backend by path and parse — the shared entry for all interfaces.
-pub(crate) fn parse_path(path: &std::path::Path) -> anyhow::Result<docparse_core::ir::Document> {
-    parse_path_with(path, false)
-}
-
 pub(crate) fn parse_path_with(
     path: &std::path::Path,
     decode_images: bool,
@@ -152,6 +148,12 @@ struct Cli {
     /// "formula:unirec-0.1b". Value: UniRec model directory.
     #[arg(long, value_name = "DIR")]
     formula_model: Option<PathBuf>,
+
+    /// Embed image payloads as base64 in JSON output (data_base64 +
+    /// data_media_type on each image element) — ODL's "embedded" mode.
+    /// Decodes all embedded images ≥16px a side (PDF) or the input image.
+    #[arg(long)]
+    image_embed: bool,
 
     /// Export embedded raster images (≥16px a side) to this directory as
     /// JPEG/PNG files; JSON image elements gain a "file" path and Markdown
@@ -265,6 +267,9 @@ fn vlm_config(
 #[derive(Default, Clone, Copy)]
 pub(crate) struct EnhanceOpts {
     pub ocr: bool,
+    /// Embed image payloads as base64 in the JSON output (serving counterpart
+    /// of --image-dir; ODL's image_output="embedded").
+    pub images_embedded: bool,
     pub layout: bool,
     pub table_model: bool,
     pub formula_model: bool,
@@ -340,6 +345,9 @@ impl EnhanceState {
                 .get()
                 .map_err(|e| anyhow::anyhow!("ocr models unavailable: {e}"))?;
             doc = apply_ocr(doc, enhancer);
+        }
+        if o.images_embedded {
+            embed_images(&mut doc);
         }
         let is_pdf = path
             .extension()
@@ -427,6 +435,44 @@ fn export_images(
     Ok(written)
 }
 
+/// Fill `data_base64`/`data_media_type` on every image that carries pixels
+/// (JPEG passthrough as-is; raw bitmaps re-encoded as PNG) — the embedded
+/// counterpart of `--image-dir` (ODL `image_output="embedded"`). Returns the
+/// number of images embedded.
+pub(crate) fn embed_images(doc: &mut docparse_core::ir::Document) -> usize {
+    use base64::Engine;
+    use docparse_core::ir::{Element, ImageKind};
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut n = 0usize;
+    for page in &mut doc.pages {
+        for el in &mut page.elements {
+            let Element::Image(img) = el else { continue };
+            if img.data.is_empty() {
+                continue;
+            }
+            let (mime, bytes) = match img.kind {
+                ImageKind::Jpeg => ("image/jpeg", img.data.clone()),
+                ImageKind::Rgb8 => (
+                    "image/png",
+                    docparse_vlm::encode_png_rgb(&img.data, img.width_px, img.height_px),
+                ),
+                ImageKind::Gray8 => {
+                    let rgb: Vec<u8> = img.data.iter().flat_map(|&g| [g, g, g]).collect();
+                    (
+                        "image/png",
+                        docparse_vlm::encode_png_rgb(&rgb, img.width_px, img.height_px),
+                    )
+                }
+                ImageKind::None => continue,
+            };
+            img.data_base64 = Some(b64.encode(bytes));
+            img.data_media_type = Some(mime.to_string());
+            n += 1;
+        }
+    }
+    n
+}
+
 #[derive(Clone, ValueEnum)]
 enum Format {
     Json,
@@ -480,11 +526,15 @@ fn main() -> anyhow::Result<()> {
         .input
         .ok_or_else(|| anyhow::anyhow!("missing input file (see --help)"))?;
 
-    let mut doc = parse_path_with(&input, cli.image_dir.is_some())?;
+    let mut doc = parse_path_with(&input, cli.image_dir.is_some() || cli.image_embed)?;
 
     if let Some(dir) = &cli.image_dir {
         let n = export_images(&mut doc, dir)?;
         eprintln!("{{\"images_exported\": {n}}}");
+    }
+    if cli.image_embed {
+        let n = embed_images(&mut doc);
+        eprintln!("{{\"images_embedded\": {n}}}");
     }
 
     if cli.ocr {

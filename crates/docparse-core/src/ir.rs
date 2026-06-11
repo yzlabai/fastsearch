@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of this IR schema. Bumped when the serialized shape changes so an
 /// agent consuming the JSON can check compatibility. Semantic versioning.
-pub const SCHEMA_VERSION: &str = "0.6.0";
+pub const SCHEMA_VERSION: &str = "0.7.0";
 
 /// Where a [`Document`] came from: which parser/version produced it, under
 /// which schema. The agent-facing trust/repro anchor (one per document; an
@@ -137,13 +137,46 @@ pub struct ImageChunk {
     /// Path the image was exported to (`--image-dir`), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// Base64 payload when embedded output was requested (`--image-embed` /
+    /// `images=embedded`); [`ImageChunk::data_media_type`] names the format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    /// MIME type of `data_base64` (`image/jpeg` passthrough or `image/png`
+    /// for re-encoded raw bitmaps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_media_type: Option<String>,
 }
 
-/// One cell of a [`Table`]. MVP: single grid cell (no row/col span yet).
+/// One cell of a [`Table`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cell {
     pub text: String,
     pub bbox: BBox,
+    /// Span semantics (G3-R follow-up): the ANCHOR cell (top-left) of a
+    /// merged region carries its spans; covered positions stay materialized
+    /// in the grid (flat row-major indexing remains valid — the eval/ODL
+    /// convention) and are marked [`Cell::merged`]. Deterministic detectors
+    /// emit plain 1×1 cells; only the table model produces real spans.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub row_span: u32,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub col_span: u32,
+    /// True for a grid position covered by an earlier anchor's span (its
+    /// text is the replicated anchor text).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub merged: bool,
+}
+
+fn one() -> u32 {
+    1
+}
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde requires &T
+fn is_one(v: &u32) -> bool {
+    *v == 1
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// A detected table: a grid of cells bounded by ruling lines. Built by the

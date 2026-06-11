@@ -43,6 +43,7 @@ cargo build --release
 ./target/release/docparse doc.pdf --table-model models/unirec   # embedded UniRec-0.1B table re-extraction (merged cells), in-process, no service
 ./target/release/docparse doc.pdf --formula-model models/unirec # formula -> LaTeX (YOLO finds formula regions + UniRec reads them; needs models/layout)
 ./target/release/docparse doc.pdf --image-dir imgs/   # export embedded images (JPEG/PNG); JSON gains "file", Markdown gains ![]() refs
+./target/release/docparse doc.pdf --image-embed       # embed images as base64 in JSON (data_base64 + data_media_type)
 ./target/release/docparse input.pdf --quality --profile --route-plan   # quality / per-page profile / routing (JSON on stderr)
 
 ./target/release/docparse mcp                      # MCP stdio server (direct agent integration)

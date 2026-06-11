@@ -676,6 +676,9 @@ fn make_cell(chunks: &[&TextChunk]) -> Cell {
     Cell {
         text,
         bbox: BBox { x0, y0, x1, y1 },
+        row_span: 1,
+        col_span: 1,
+        merged: false,
     }
 }
 

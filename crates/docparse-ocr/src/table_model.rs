@@ -95,12 +95,23 @@ pub(crate) fn crop_region(
     Some((cw, ch, out))
 }
 
+/// A parsed grid position: the anchor of a merged region carries its spans;
+/// covered positions replicate the text and are marked `merged` (flat
+/// row-major indexing stays valid — the eval/ODL convention).
+#[derive(Clone, Debug)]
+pub struct ParsedCell {
+    pub text: String,
+    pub row_span: u32,
+    pub col_span: u32,
+    pub merged: bool,
+}
+
 /// Parse the model's HTML table subset (`<table>/<tr>/<td rowspan colspan>`,
-/// `<th>` accepted) into a rectangular text grid with spans EXPANDED — the
-/// spanned value is replicated into every covered position. Returns `None`
-/// unless the result is a real ≥2×2 grid with some content (a prose answer
-/// must never replace a detected table).
-pub fn parse_html_table(text: &str) -> Option<Vec<Vec<String>>> {
+/// `<th>` accepted) into a rectangular grid with spans EXPANDED — the
+/// spanned value is replicated into every covered position, anchors keep
+/// their span counts. Returns `None` unless the result is a real ≥2×2 grid
+/// with some content (a prose answer must never replace a detected table).
+pub fn parse_html_table(text: &str) -> Option<Vec<Vec<ParsedCell>>> {
     let start = text.find("<table")?;
     let body = &text[start..];
     let end = body.find("</table>").map(|i| i + 8).unwrap_or(body.len());
@@ -108,18 +119,25 @@ pub fn parse_html_table(text: &str) -> Option<Vec<Vec<String>>> {
 
     // Row-major construction with a pending-rowspan grid: pending[c] holds
     // (remaining_rows, text) for cells spanning down into the current row.
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut rows: Vec<Vec<ParsedCell>> = Vec::new();
     let mut pending: Vec<(usize, String)> = Vec::new();
+    let covered = |text: &str| ParsedCell {
+        text: text.to_string(),
+        row_span: 1,
+        col_span: 1,
+        merged: true,
+    };
 
     for tr in split_tags(body, "tr") {
-        let mut row: Vec<String> = Vec::new();
+        let mut row: Vec<ParsedCell> = Vec::new();
         let mut col = 0usize;
         let mut cells = split_cells(&tr).into_iter();
         loop {
             // Fill positions owed to earlier rowspans first.
             if let Some((left, t)) = pending.get_mut(col).filter(|(l, _)| *l > 0) {
                 *left -= 1;
-                row.push(t.clone());
+                let t = t.clone();
+                row.push(covered(&t));
                 col += 1;
                 continue;
             }
@@ -129,12 +147,21 @@ pub fn parse_html_table(text: &str) -> Option<Vec<Vec<String>>> {
             let rs = attr_usize(&attrs, "rowspan").max(1);
             let cs = attr_usize(&attrs, "colspan").max(1);
             let text = strip_tags(&content);
-            for _ in 0..cs {
+            for k in 0..cs {
                 if pending.len() <= col {
                     pending.resize(col + 1, (0, String::new()));
                 }
                 pending[col] = (rs - 1, text.clone());
-                row.push(text.clone());
+                row.push(if k == 0 {
+                    ParsedCell {
+                        text: text.clone(),
+                        row_span: rs as u32,
+                        col_span: cs as u32,
+                        merged: false,
+                    }
+                } else {
+                    covered(&text)
+                });
                 col += 1;
             }
         }
@@ -142,7 +169,8 @@ pub fn parse_html_table(text: &str) -> Option<Vec<Vec<String>>> {
         while col < pending.len() {
             if pending[col].0 > 0 {
                 pending[col].0 -= 1;
-                row.push(pending[col].1.clone());
+                let t = pending[col].1.clone();
+                row.push(covered(&t));
             }
             col += 1;
         }
@@ -155,11 +183,17 @@ pub fn parse_html_table(text: &str) -> Option<Vec<Vec<String>>> {
     if rows.len() < 2 || ncols < 2 {
         return None;
     }
-    if !rows.iter().flatten().any(|c| !c.trim().is_empty()) {
+    if !rows.iter().flatten().any(|c| !c.text.trim().is_empty()) {
         return None;
     }
+    let pad = ParsedCell {
+        text: String::new(),
+        row_span: 1,
+        col_span: 1,
+        merged: false,
+    };
     for r in &mut rows {
-        r.resize(ncols, String::new());
+        r.resize(ncols, pad.clone());
     }
     Some(rows)
 }
@@ -240,8 +274,9 @@ fn strip_tags(s: &str) -> String {
 }
 
 /// Even synthetic cell bboxes over the (real) table region — the model
-/// returns no geometry; same honest approximation as the VLM task.
-fn grid_cells(grid: &[Vec<String>], bbox: &BBox) -> Vec<Vec<Cell>> {
+/// returns no geometry; same honest approximation as the VLM task. Span
+/// semantics ride through from the parsed grid.
+fn grid_cells(grid: &[Vec<ParsedCell>], bbox: &BBox) -> Vec<Vec<Cell>> {
     let nr = grid.len() as f32;
     let nc = grid.first().map(Vec::len).unwrap_or(0) as f32;
     let (tw, th) = (bbox.x1 - bbox.x0, bbox.y1 - bbox.y0);
@@ -250,14 +285,17 @@ fn grid_cells(grid: &[Vec<String>], bbox: &BBox) -> Vec<Vec<Cell>> {
         .map(|(ri, row)| {
             row.iter()
                 .enumerate()
-                .map(|(ci, text)| Cell {
-                    text: text.clone(),
+                .map(|(ci, pc)| Cell {
+                    text: pc.text.clone(),
                     bbox: BBox {
                         x0: bbox.x0 + tw * ci as f32 / nc,
                         y0: bbox.y1 - th * (ri as f32 + 1.0) / nr,
                         x1: bbox.x0 + tw * (ci as f32 + 1.0) / nc,
                         y1: bbox.y1 - th * ri as f32 / nr,
                     },
+                    row_span: pc.row_span,
+                    col_span: pc.col_span,
+                    merged: pc.merged,
                 })
                 .collect()
         })
@@ -279,16 +317,30 @@ mod tests {
 </table>"#;
         let g = parse_html_table(html).unwrap();
         assert_eq!(g.len(), 2);
-        assert_eq!(g[0], vec!["A", "B", "B"]);
-        assert_eq!(g[1], vec!["A", "c", "d"]);
+        let texts: Vec<Vec<&str>> = g
+            .iter()
+            .map(|r| r.iter().map(|c| c.text.as_str()).collect())
+            .collect();
+        assert_eq!(texts, vec![vec!["A", "B", "B"], vec!["A", "c", "d"]]);
+        // Anchor spans + covered marks.
+        assert_eq!(
+            (g[0][0].row_span, g[0][0].col_span, g[0][0].merged),
+            (2, 1, false)
+        );
+        assert_eq!((g[0][1].col_span, g[0][1].merged), (2, false));
+        assert!(g[0][2].merged, "colspan-covered position");
+        assert!(g[1][0].merged, "rowspan-covered position");
+        assert!(!g[1][1].merged);
     }
 
     #[test]
     fn th_and_inline_tags_and_padding() {
         let html = "<table><tr><th>H<b>1</b></th><th>H2</th><th>H3</th></tr><tr><td>1</td><td>2</td></tr></table>";
         let g = parse_html_table(html).unwrap();
-        assert_eq!(g[0], vec!["H1", "H2", "H3"]);
-        assert_eq!(g[1], vec!["1", "2", ""]); // padded to widest
+        let r0: Vec<&str> = g[0].iter().map(|c| c.text.as_str()).collect();
+        let r1: Vec<&str> = g[1].iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(r0, vec!["H1", "H2", "H3"]);
+        assert_eq!(r1, vec!["1", "2", ""]); // padded to widest
     }
 
     #[test]
@@ -313,10 +365,13 @@ mod tests {
         let g = parse_html_table(html).unwrap();
         assert_eq!(g.len(), 4);
         assert_eq!(g[0].len(), 8);
-        assert_eq!(g[1][0], "# enc-layers"); // rowspan replicated down
-        assert_eq!(g[1][3], "simple");
-        assert_eq!(g[0][4], "TEDs"); // colspan replicated across
-        assert_eq!(g[3][0], "6"); // data rowspan
-        assert_eq!(g[3][2], "HTML");
+        assert_eq!(g[1][0].text, "# enc-layers"); // rowspan replicated down
+        assert!(g[1][0].merged);
+        assert_eq!(g[1][3].text, "simple");
+        assert_eq!(g[0][3].col_span, 3); // TEDs anchor
+        assert_eq!(g[0][4].text, "TEDs"); // colspan replicated across
+        assert!(g[0][4].merged);
+        assert_eq!(g[3][0].text, "6"); // data rowspan
+        assert_eq!(g[3][2].text, "HTML");
     }
 }

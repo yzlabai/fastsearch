@@ -407,6 +407,8 @@ mod profile_tests {
             kind: ImageKind::None,
             data: Vec::new(),
             file: None,
+            data_base64: None,
+            data_media_type: None,
         })
     }
 

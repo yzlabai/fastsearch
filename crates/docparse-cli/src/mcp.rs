@@ -115,7 +115,9 @@ fn tool_specs() -> Value {
                     "vlm_describe": { "type": "boolean",
                                       "description": "Caption figures via the configured VLM service (PDF only; needs server --vlm-url/--vlm-model)" },
                     "vlm_tables": { "type": "boolean",
-                                    "description": "Re-extract tables via the configured VLM service (PDF only)" }
+                                    "description": "Re-extract tables via the configured VLM service (PDF only)" },
+                    "images": { "type": "string", "enum": ["embedded"],
+                                "description": "\"embedded\" adds data_base64 + data_media_type to image elements (json format)" }
                 },
                 "required": ["path"]
             }
@@ -198,10 +200,12 @@ fn parse_enhanced(
     state: &crate::EnhanceState,
 ) -> anyhow::Result<docparse_core::ir::Document> {
     let path = std::path::Path::new(str_arg(args, "path")?);
-    let doc = crate::parse_path(path)?;
+    let images_embedded = args.get("images").and_then(Value::as_str) == Some("embedded");
+    let doc = crate::parse_path_with(path, images_embedded)?;
     let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
     let opts = crate::EnhanceOpts {
         ocr: flag("ocr"),
+        images_embedded,
         layout: flag("layout"),
         table_model: flag("table_model"),
         formula_model: flag("formula_model"),
