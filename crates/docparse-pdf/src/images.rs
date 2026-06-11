@@ -72,6 +72,13 @@ impl XImage {
         // a DCT behind ASCII85/Flate pre-filters is rare; TODO if ever seen.
         if filters.last().map(String::as_str) == Some("DCTDecode") {
             if filters.len() == 1 {
+                // CMYK/YCCK JPEG (4 components) decoded as RGB downstream comes
+                // out color-wrong (and Adobe APP14 often inverts it); record
+                // position-only rather than emit a wrong-color image (H7).
+                // TODO: decode + APP14-aware CMYK→RGB conversion.
+                if jpeg_components(&self.stream.content) == Some(4) {
+                    return (ImageKind::None, Vec::new());
+                }
                 return (ImageKind::Jpeg, self.stream.content.clone());
             }
             return (ImageKind::None, Vec::new());
@@ -237,6 +244,32 @@ impl hayro_jbig2::Decoder for Gray8Sink {
             .extend(std::iter::repeat_n(byte, chunk_count as usize * 8));
     }
     fn next_line(&mut self) {}
+}
+
+/// Number of color components in a JPEG, from its SOF marker (3 = YCbCr/RGB,
+/// 4 = CMYK/YCCK, 1 = grayscale). `None` if no SOF is found.
+fn jpeg_components(data: &[u8]) -> Option<u8> {
+    let mut i = 2; // skip SOI (FFD8)
+    while i + 9 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = data[i + 1];
+        // Start-of-frame markers carry the component count; exclude the
+        // non-SOF markers in the C0..=CF range (DHT C4, JPG C8, DAC CC).
+        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            return data.get(i + 9).copied(); // FF M len(2) prec h(2) w(2) comps
+        }
+        // Standalone markers (RSTn, SOI, EOI, TEM) have no length field.
+        if matches!(marker, 0xD0..=0xD9 | 0x01) {
+            i += 2;
+            continue;
+        }
+        let len = ((data[i + 2] as usize) << 8) | data[i + 3] as usize;
+        i += 2 + len.max(2);
+    }
+    None
 }
 
 /// Resolve image XObjects from a page's resources, keyed by `Do` name.
@@ -524,5 +557,25 @@ mod tests {
         let img = ximg(8, 1, vec![0xF0], true);
         let (_, px) = img.decode();
         assert_eq!(&px[..], &[0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn jpeg_component_count_from_sof() {
+        // Minimal SOI + SOF0(len 17, 8-bit, 16×16) with N components.
+        let sof = |n: u8| {
+            let mut j = vec![
+                0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, n,
+            ];
+            j.extend_from_slice(&[0u8; 12]);
+            j
+        };
+        assert_eq!(jpeg_components(&sof(4)), Some(4)); // CMYK
+        assert_eq!(jpeg_components(&sof(3)), Some(3)); // YCbCr
+        assert_eq!(jpeg_components(&sof(1)), Some(1)); // grayscale
+                                                       // SOF reached after an APP0 segment is skipped by length.
+        let mut with_app0 = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x06, 1, 2, 3, 4];
+        with_app0.extend_from_slice(&sof(4)[2..]);
+        assert_eq!(jpeg_components(&with_app0), Some(4));
+        assert_eq!(jpeg_components(&[0xFF, 0xD8]), None);
     }
 }

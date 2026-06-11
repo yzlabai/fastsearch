@@ -64,13 +64,14 @@
 - [x] **完整局部背景模型版**(device 色块 + 图像 + 非设备填充 + 渐变 sh,逐层覆盖)→ 修好 bialetti(误杀 313→0),但 normal_4pages 韩文封面(标题在 Form XObject、背景 banner 在主流跨上下文不可见 + 渐变 + 3 图)仍误杀 7 个标题,MHS 仍掉 → **回退**;
 - **结论**:同色文本/图像遮挡的可见性判定本质需要"某点最终渲染色/覆盖物",即渲染,与"结构提取不渲染像素"核心身份根本冲突;背景来源长尾无尽(块/图/渐变/form 隔离/clip/Pattern)。隐藏注入主流手法(`Tr 3/7` 不可见 render mode、off-page、tiny)已被现有检测覆盖;同色/遮挡若确有需求,归 docparse-raster 按需渲染域,不进确定性核心。详见 devlog [2026-06-12-h6-background-model-architectural-limit.md](../devlogs/2026-06-12-h6-background-model-architectural-limit.md)。
 
-### H7 · 打磨篮子(小 TODO 清偿)— *横切*
+### H7 · 打磨篮子(小 TODO 清偿)— *横切* 🟡 部分完成(2026-06-12)
 逐项小步,各自带回归:
 - [x] MediaBox 继承(Pages 树向上回溯,替换 US Letter 兜底)——H2a 顺带完成(2026-06-11,`inherited_attr` 与 /Rotate 共用);
-- [ ] HTML charset(textio 探测接入 html 后端,meta charset 优先);
-- [ ] CMYK JPEG(`--image-dir`/`--image-embed` 直通件转 RGB 或文档化);
-- [ ] 转写区域重叠去重(相邻重复行);
-- [ ] v5-mobile 自转(paddle2onnx 一次性工序,产出放 models/ 说明)。
+- [x] **HTML charset**:`textio::decode_html` 嗅探 `<meta charset>`(前 1024 字节,HTML5 算法)优先于 chardetng,html 后端复用;GBK HTML e2e 正确解析(旧 `read_to_string` 直接失败);+3 单测;
+- [x] **CMYK JPEG**:JPEG SOF 嗅探组件数,4 通道(CMYK/YCCK)记位置占位(避免下游误读成 RGB 偏色),TODO 留 APP14-aware 转 RGB;正常 3/1 通道透传不回归;+1 单测;
+- [ ] 转写区域重叠去重(相邻重复行)——需 `models/unirec`(~700MB)整页转写验证,留下轮;
+- [ ] v5-mobile 自转——⛔ **外部环境阻塞**:`models/ppocr-v5/` 现存的是 **server 模型**(84+81MB≈172MB),mobile 需 `paddle2onnx` 离线 Python+paddle 环境自转(本环境无法执行);现役 v4-mobile(16MB)+ 可选 v5-server 已满足,见 [paddleocr-v5-evaluation.md](../refer/paddleocr-v5-evaluation.md)。
+- devlog [2026-06-12-h7-polish.md](../devlogs/2026-06-12-h7-polish.md)。
 
 **2026-06-11 H1/H2 自审遗留**(review 确认、本轮未修,候 H7/按需):
 - [ ] 归一化页 × 下游栅格增强器组合(`--ocr --layout/--transcribe/--vlm-*` 同开于旋转纯扫描页):hayro 渲染只认 /Rotate 不认 OCR 检出的 dturns,区域映射会错帧——加"归一化页跳过栅格增强"守卫或让栅格路径读归一化标记;

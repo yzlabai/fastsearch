@@ -497,12 +497,19 @@ fn column_fill_edges(lines: &[Line], page_width: f32) -> Vec<f32> {
     // Candidate gutters: line left edges in the page middle; pick the one
     // crossed by the fewest lines, requiring ≥25% of lines on each side and a
     // crossing rate under 12% (a real two-column gutter is nearly uncrossed).
-    let mut cands: Vec<f32> = lines.iter().map(|l| l.x0).filter(|&x| x > lo && x < hi).collect();
+    let mut cands: Vec<f32> = lines
+        .iter()
+        .map(|l| l.x0)
+        .filter(|&x| x > lo && x < hi)
+        .collect();
     cands.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     cands.dedup_by(|a, b| (*a - *b).abs() < 1.0);
     let mut best: Option<(f32, usize)> = None;
     for &mid in &cands {
-        let cross = lines.iter().filter(|l| l.x0 < mid - 1.0 && l.x1 > mid + 1.0).count();
+        let cross = lines
+            .iter()
+            .filter(|l| l.x0 < mid - 1.0 && l.x1 > mid + 1.0)
+            .count();
         let left = lines.iter().filter(|l| cx(l) < mid).count();
         let right = n - left;
         if (cross as f32) <= 0.12 * n as f32
@@ -902,12 +909,19 @@ mod tests {
         ];
         let edges = column_fill_edges(&lines, page_w);
         // Two distinct edges discovered: left ≈ 288-margin, right ≈ 568-margin.
-        assert!(edges[0] < edges[3], "left edge {} < right edge {}", edges[0], edges[3]);
+        assert!(
+            edges[0] < edges[3],
+            "left edge {} < right edge {}",
+            edges[0],
+            edges[3]
+        );
         let blocks = super::group_blocks(&lines, 10.0, &edges);
         // Left column's three lines reflow into ONE paragraph (the bug: they
         // stayed three blocks because they never reached the page-wide edge).
         assert!(
-            blocks.iter().any(|b| b.text.contains("one") && b.text.contains("three")),
+            blocks
+                .iter()
+                .any(|b| b.text.contains("one") && b.text.contains("three")),
             "left column did not reflow: {:?}",
             blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
         );
@@ -917,10 +931,20 @@ mod tests {
     fn single_column_keeps_one_global_edge() {
         // No gutter → every line shares the page-derived edge (zero regression).
         let lines: Vec<Line> = (0..8)
-            .map(|i| col_line("a single column line of body text", 700.0 - i as f32 * 12.0, 40.0, 560.0))
+            .map(|i| {
+                col_line(
+                    "a single column line of body text",
+                    700.0 - i as f32 * 12.0,
+                    40.0,
+                    560.0,
+                )
+            })
             .collect();
         let edges = column_fill_edges(&lines, 612.0);
-        assert!(edges.iter().all(|&e| (e - edges[0]).abs() < 1e-6), "edges differ: {edges:?}");
+        assert!(
+            edges.iter().all(|&e| (e - edges[0]).abs() < 1e-6),
+            "edges differ: {edges:?}"
+        );
     }
 
     #[test]

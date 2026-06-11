@@ -507,7 +507,12 @@ mod profile_tests {
         // A 10pt-tall, full-width line at the given top (PDF y-up).
         Element::Text(TextChunk {
             text: "line".into(),
-            bbox: BBox { x0: 0.0, y0: y_top - 10.0, x1: 100.0, y1: y_top },
+            bbox: BBox {
+                x0: 0.0,
+                y0: y_top - 10.0,
+                x1: 100.0,
+                y1: y_top,
+            },
             font_size: 10.0,
             font: None,
             page: 1,
@@ -529,7 +534,12 @@ mod profile_tests {
         // page — single OR multi-column — that XY-cut linearizes correctly
         // scores exactly 0; real fragmented pages score small positives
         // (e.g. arXiv 2203 ≈ 0.03), evidenced in the H3 devlog, not here.
-        let p = profile_page(&page(vec![block(90.0), block(70.0), block(50.0), block(30.0)]));
+        let p = profile_page(&page(vec![
+            block(90.0),
+            block(70.0),
+            block(50.0),
+            block(30.0),
+        ]));
         assert_eq!(p.reading_order_anomaly, 0.0);
         // Fewer than 3 blocks: undefined → 0.
         assert_eq!(

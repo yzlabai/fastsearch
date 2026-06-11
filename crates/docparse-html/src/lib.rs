@@ -32,7 +32,9 @@ impl DocumentParser for HtmlParser {
     }
 
     fn parse(&self, path: &Path) -> anyhow::Result<Document> {
-        let content = std::fs::read_to_string(path)?;
+        // Decode honoring <meta charset> (H7) — `read_to_string` would reject
+        // any non-UTF-8 page outright (legacy GBK/Shift-JIS/Windows-1252).
+        let content = docparse_core::textio::decode_html(&std::fs::read(path)?);
         let mut doc = parse_str(&content);
         doc.source = path.display().to_string();
         Ok(doc)
