@@ -41,7 +41,8 @@ scraper = "0.21"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 # OCR enhancer (N3, P4 route): pure-Rust ONNX inference + JPEG decode.
-tract-onnx = "0.21"
+tract-onnx = "0.23"
+tract-linalg = { version = "0.23", features = ["multithread-mm"] }
 zune-jpeg = "0.4"
 zune-png = "0.4"
 mail-parser = "0.9"

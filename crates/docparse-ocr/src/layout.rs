@@ -15,7 +15,7 @@ use docparse_core::reading_order::reading_order;
 use std::path::Path;
 use tract_onnx::prelude::*;
 
-type Runnable = TypedRunnableModel<TypedModel>;
+type Runnable = std::sync::Arc<TypedRunnableModel>;
 
 /// Detection canvas (DocLayout-YOLO contract).
 const SIDE: usize = 1024;
@@ -72,7 +72,8 @@ impl LayoutModel {
         let (ox, oy) = ((SIDE - sw) / 2, (SIDE - sh) / 2);
         let mut t = Tensor::zero::<f32>(&[1, 3, SIDE, SIDE])?;
         {
-            let s = t.as_slice_mut::<f32>()?;
+            let mut view = t.to_plain_array_view_mut::<f32>()?;
+            let s = view.as_slice_mut().context("contiguous tensor")?;
             s.fill(114.0 / 255.0);
             for c in 0..3 {
                 for y in 0..sh {
@@ -84,7 +85,7 @@ impl LayoutModel {
             }
         }
         let out = self.model.run(tvec!(t.into()))?;
-        let det = out[0].to_array_view::<f32>()?;
+        let det = out[0].to_plain_array_view::<f32>()?;
         let shape = det.shape().to_vec();
         let (n, k) = (shape[1], shape[2]);
         let d = det.as_slice().context("det slice")?;

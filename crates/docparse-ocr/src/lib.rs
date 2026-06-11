@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use tract_onnx::prelude::*;
 
-type Runnable = TypedRunnableModel<TypedModel>;
+type Runnable = std::sync::Arc<TypedRunnableModel>;
 
 /// Detection canvas side: keep-ratio resize into a fixed square so the det
 /// model is optimized exactly once. 960 is RapidOCR's default max side.
@@ -107,7 +107,8 @@ impl PpOcrEnhancer {
         let std = [0.229f32, 0.224, 0.225];
         let mut t = Tensor::zero::<f32>(&[1, 3, DET_SIDE, DET_SIDE])?;
         {
-            let s = t.as_slice_mut::<f32>()?;
+            let mut view = t.to_plain_array_view_mut::<f32>()?;
+            let s = view.as_slice_mut().context("contiguous tensor")?;
             for c in 0..3 {
                 for y in 0..sh {
                     for x in 0..sw {
@@ -119,7 +120,7 @@ impl PpOcrEnhancer {
             // Padding stays 0 — below threshold after normalization for det.
         }
         let out = self.det.run(tvec!(t.into()))?;
-        let prob = out[0].to_array_view::<f32>()?;
+        let prob = out[0].to_plain_array_view::<f32>()?;
         let map = prob.as_slice().context("det prob map")?;
 
         // ---- boxes from the thresholded map (within the valid sw×sh region) ----
@@ -191,7 +192,8 @@ impl PpOcrEnhancer {
 
         let mut t = Tensor::zero::<f32>(&[1, 3, REC_HEIGHT, bucket])?;
         {
-            let s = t.as_slice_mut::<f32>()?;
+            let mut view = t.to_plain_array_view_mut::<f32>()?;
+            let s = view.as_slice_mut().context("contiguous tensor")?;
             for c in 0..3 {
                 for y in 0..REC_HEIGHT {
                     for x in 0..rw {
@@ -202,7 +204,7 @@ impl PpOcrEnhancer {
             }
         }
         let out = model.run(tvec!(t.into()))?;
-        let logits = out[0].to_array_view::<f32>()?;
+        let logits = out[0].to_plain_array_view::<f32>()?;
         let shape = logits.shape().to_vec();
         let (steps, classes) = (shape[1], shape[2]);
         Ok(Some(ctc_greedy(
