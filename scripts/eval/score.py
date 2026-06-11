@@ -133,6 +133,165 @@ def teds(pred, gt):
     return matched / n if n else 1.0
 
 
+# ---------------------------------------------------------------------------
+# Exact TEDS (H5): true tree-edit distance over <table><tr><td> trees with the
+# PubTabNet cost model — insert/delete = 1; renaming a <td> with EQUAL spans
+# costs the normalized text difference, anything else costs 1. The distance is
+# computed exactly with the Zhang-Shasha algorithm (the same distance APTED
+# computes; ZS is ~80 lines of stdlib Python, so no eval-side dependency).
+# Input: per-table cell lists `{"rows": R, "cols": C, "cells": [[r, c, rs, cs,
+# text], ...]}` (ANCHORS only — covered span positions are not repeated), so
+# span structure is finally scored instead of being flattened away.
+# ---------------------------------------------------------------------------
+
+
+class _N:
+    __slots__ = ("label", "text", "children")
+
+    def __init__(self, label, text=""):
+        self.label, self.text, self.children = label, text, []
+
+
+def _table_tree(tc):
+    """Cells table → tree: table → tr per row index → td:{rs}x{cs} leaves."""
+    rows = {}
+    for r, c, rs, cs, txt in tc.get("cells", []):
+        rows.setdefault(r, []).append((c, rs, cs, txt))
+    root = _N("table")
+    for r in sorted(rows):
+        tr = _N("tr")
+        for c, rs, cs, txt in sorted(rows[r]):
+            tr.children.append(_N(f"td:{rs}x{cs}", _norm(txt)))
+        root.children.append(tr)
+    return root
+
+
+def _postorder(root):
+    """Post-order node list + leftmost-leaf-descendant index per node."""
+    nodes, lld = [], []
+
+    def go(n):
+        first = None
+        for ch in n.children:
+            f = go(ch)
+            if first is None:
+                first = f
+        nodes.append(n)
+        i = len(nodes) - 1
+        lld.append(i if first is None else first)
+        return lld[i]
+
+    go(root)
+    return nodes, lld
+
+
+def _keyroots(lld):
+    seen, roots = set(), []
+    for i in range(len(lld) - 1, -1, -1):
+        if lld[i] not in seen:
+            roots.append(i)
+            seen.add(lld[i])
+    return sorted(roots)
+
+
+def _sub_cost(a, b):
+    if a.label != b.label:
+        return 1.0
+    if a.label.startswith("td") and (a.text or b.text):
+        return 1.0 - SequenceMatcher(None, a.text, b.text, autojunk=False).ratio()
+    return 0.0
+
+
+def _tree_edit_distance(t1, t2):
+    """Zhang & Shasha 1989: exact TED, unit insert/delete + _sub_cost rename."""
+    n1, l1 = _postorder(t1)
+    n2, l2 = _postorder(t2)
+    td = [[0.0] * len(n2) for _ in range(len(n1))]
+    for i in _keyroots(l1):
+        for j in _keyroots(l2):
+            li, lj = l1[i], l2[j]
+            m, n = i - li + 2, j - lj + 2
+            fd = [[0.0] * n for _ in range(m)]
+            for x in range(1, m):
+                fd[x][0] = fd[x - 1][0] + 1
+            for y in range(1, n):
+                fd[0][y] = fd[0][y - 1] + 1
+            for x in range(1, m):
+                for y in range(1, n):
+                    if l1[li + x - 1] == li and l2[lj + y - 1] == lj:
+                        fd[x][y] = min(
+                            fd[x - 1][y] + 1,
+                            fd[x][y - 1] + 1,
+                            fd[x - 1][y - 1] + _sub_cost(n1[li + x - 1], n2[lj + y - 1]),
+                        )
+                        td[li + x - 1][lj + y - 1] = fd[x][y]
+                    else:
+                        px = l1[li + x - 1] - li
+                        py = l2[lj + y - 1] - lj
+                        fd[x][y] = min(
+                            fd[x - 1][y] + 1,
+                            fd[x][y - 1] + 1,
+                            fd[px][py] + td[li + x - 1][lj + y - 1],
+                        )
+    return td[len(n1) - 1][len(n2) - 1]
+
+
+def _cells_from_grid(grid):
+    """Fallback for span-less sources: every grid position is a 1×1 cell."""
+    return {
+        "rows": len(grid),
+        "cols": max((len(r) for r in grid), default=0),
+        "cells": [
+            [r, c, 1, 1, str(t)] for r, row in enumerate(grid) for c, t in enumerate(row)
+        ],
+    }
+
+
+def _materialize(tc):
+    """Cells → replicated grid (to reuse the shared degenerate-table filter)."""
+    rows, cols = tc.get("rows", 0), tc.get("cols", 0)
+    g = [["" for _ in range(cols)] for _ in range(rows)]
+    for r, c, rs, cs, txt in tc.get("cells", []):
+        for dr in range(rs):
+            for dc in range(cs):
+                if r + dr < rows and c + dc < cols:
+                    g[r + dr][c + dc] = txt
+    return g
+
+
+def _teds_x_one(pt, gt_):
+    a, b = _table_tree(pt), _table_tree(gt_)
+    na, _ = _postorder(a)
+    nb, _ = _postorder(b)
+    return 1.0 - _tree_edit_distance(a, b) / max(len(na), len(nb), 1)
+
+
+def teds_x(pred, gt):
+    """Exact-TED TEDS over span-aware tables. Sources without `tables_cells`
+    fall back to 1×1 cells per grid position (same table, no span credit).
+    Same greedy best-match pairing and degenerate filter as the proxy."""
+    pts = pred.get("tables_cells") or [_cells_from_grid(t) for t in pred.get("tables", [])]
+    gts = gt.get("tables_cells") or [_cells_from_grid(t) for t in gt.get("tables", [])]
+    pts = [t for t in pts if _is_table(_materialize(t))]
+    gts = [t for t in gts if _is_table(_materialize(t))]
+    if not pts and not gts:
+        return 1.0
+    pairs = sorted(
+        ((_teds_x_one(p, g), i, j) for i, p in enumerate(pts) for j, g in enumerate(gts)),
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    used_p, used_g, matched = set(), set(), 0.0
+    for s, i, j in pairs:
+        if i in used_p or j in used_g:
+            continue
+        used_p.add(i)
+        used_g.add(j)
+        matched += s
+    n = max(len(pts), len(gts))
+    return matched / n if n else 1.0
+
+
 def mhs(pred, gt):
     """Heading-hierarchy agreement: F1 over normalized heading TEXT. Level
     numbers are ignored — two systems number levels differently, so we measure
@@ -150,7 +309,10 @@ def mhs(pred, gt):
 
 def score_doc(pred, gt):
     s = {"NID": nid(pred, gt), "TEDS": teds(pred, gt), "MHS": mhs(pred, gt)}
+    # composite stays on the proxy column during the transition so historical
+    # scoreboards remain comparable; TEDS_X is reported alongside (H5).
     s["composite"] = sum(s.values()) / 3
+    s["TEDS_X"] = teds_x(pred, gt)
     return s
 
 
@@ -171,6 +333,24 @@ def selftest():
     assert abs(mhs(d, a) - (2 * 1 * 0.5 / 1.5)) < 1e-9, "half headings → F1"
     empty = {}
     assert score_doc(empty, empty)["composite"] == 1.0, "empty == empty"
+    # --- exact TEDS (H5) ---
+    span_gt = {"tables_cells": [{"rows": 2, "cols": 2,
+                                 "cells": [[0, 0, 1, 2, "head"],
+                                           [1, 0, 1, 1, "a"], [1, 1, 1, 1, "b"]]}]}
+    assert teds_x(span_gt, span_gt) == 1.0, "identical spans → 1.0"
+    flat = {"tables_cells": [{"rows": 2, "cols": 2,
+                              "cells": [[0, 0, 1, 1, "head"], [0, 1, 1, 1, "head"],
+                                        [1, 0, 1, 1, "a"], [1, 1, 1, 1, "b"]]}]}
+    fx = teds_x(flat, span_gt)
+    assert 0.0 < fx < 1.0, "flattened span must lose credit"
+    grid_only = {"tables": [[["head", "head"], ["a", "b"]]]}
+    assert abs(teds_x(grid_only, span_gt) - fx) < 1e-9, "grid fallback = 1×1 cells"
+    wrong = {"tables_cells": [{"rows": 2, "cols": 2,
+                               "cells": [[0, 0, 1, 2, "head"],
+                                         [1, 0, 1, 1, "a"], [1, 1, 1, 1, "ZZZ"]]}]}
+    wx = teds_x(wrong, span_gt)
+    assert fx < wx < 1.0, "right structure + one wrong cell beats flattened"
+    assert teds_x(a, a) == 1.0, "grid-vs-grid identical → 1.0"
     print("selftest OK")
 
 

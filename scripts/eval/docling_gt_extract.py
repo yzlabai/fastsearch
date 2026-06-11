@@ -17,11 +17,30 @@ READABLE = {"title", "section_header", "text", "paragraph", "list_item",
 d = json.load(open(sys.argv[1]))
 texts = d.get("texts", [])
 tables = d.get("tables", [])
-out = {"reading_order": [], "tables": [], "headings": []}
+out = {"reading_order": [], "tables": [], "headings": [], "tables_cells": []}
 
 
 def idx(ref):
     return int(ref.split("/")[-1])
+
+
+def table_cells(grid):
+    """Span-aware anchors for TEDS_X (H5): Docling's grid replicates a merged
+    cell across every covered position; the anchor is where the start offsets
+    equal the position itself."""
+    cells = []
+    for r, row in enumerate(grid):
+        for c, cell in enumerate(row):
+            if cell.get("start_row_offset_idx", r) != r or cell.get("start_col_offset_idx", c) != c:
+                continue
+            cells.append([r, c,
+                          cell.get("row_span", 1), cell.get("col_span", 1),
+                          cell.get("text", "")])
+    return {
+        "rows": len(grid),
+        "cols": max((len(r) for r in grid), default=0),
+        "cells": cells,
+    }
 
 
 def walk(children):
@@ -41,6 +60,7 @@ def walk(children):
             rows = [[c.get("text", "") for c in row] for row in grid]
             if rows:
                 out["tables"].append(rows)
+                out["tables_cells"].append(table_cells(grid))
         elif ref.startswith("#/groups/"):
             # Docling nests lists (and other groupings) as `group` nodes whose
             # children are the actual texts. Recurse, else every list item is

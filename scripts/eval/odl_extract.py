@@ -15,9 +15,11 @@ READ = {"paragraph", "heading", "caption", "text", "title", "list", "list item",
 
 
 def table_grid(node):
+    """Returns (replicated grid, span-aware anchor cells for TEDS_X / H5)."""
     nr = node.get("number of rows", 0) or 0
     nc = node.get("number of columns", 0) or 0
     grid = [["" for _ in range(nc)] for _ in range(nr)]
+    cells = []
     for row in node.get("rows", []) or []:
         for cell in row.get("cells", []) or []:
             r = (cell.get("row number", 1) or 1) - 1
@@ -27,23 +29,26 @@ def table_grid(node):
             txt = " ".join(
                 k.get("content") or k.get("text","") for k in (cell.get("kids", []) or []) if (k.get("content") or k.get("text"))
             ).strip()
+            if 0 <= r < nr and 0 <= c < nc:
+                cells.append([r, c, rs, cs, txt])
             for dr in range(rs):
                 for dc in range(cs):
                     if 0 <= r + dr < nr and 0 <= c + dc < nc:
                         grid[r + dr][c + dc] = txt
-    return grid
+    return grid, {"rows": nr, "cols": nc, "cells": cells}
 
 
 def main():
     d = json.load(open(sys.argv[1]))
-    out = {"reading_order": [], "tables": [], "headings": []}
+    out = {"reading_order": [], "tables": [], "headings": [], "tables_cells": []}
 
     def walk(node):
         t = node.get("type")
         if t == "table":
-            g = table_grid(node)
+            g, tc = table_grid(node)
             if g:
                 out["tables"].append(g)
+                out["tables_cells"].append(tc)
             return
         txt = node.get("content") or node.get("text")
         if t in READ and txt and txt.strip():

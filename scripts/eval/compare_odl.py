@@ -26,7 +26,22 @@ def our_pred(pdf):
     r = run([BIN, pdf, "-f", "chunks"])
     if r.returncode != 0 or not r.stdout.strip():
         return None
-    return json.loads(run(["python3", f"{here}/extract.py"], stdin=r.stdout).stdout)
+    # Second pass for span-aware tables (TEDS_X / H5): -f json keeps Cell
+    # row_span/col_span that the flat chunks rendering throws away.
+    import tempfile
+    args = []
+    rj = run([BIN, pdf, "-f", "json"])
+    tmp = None
+    if rj.returncode == 0 and rj.stdout.strip():
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        tmp.write(rj.stdout)
+        tmp.close()
+        args = [tmp.name]
+    try:
+        return json.loads(run(["python3", f"{here}/extract.py", *args], stdin=r.stdout).stdout)
+    finally:
+        if tmp:
+            os.unlink(tmp.name)
 
 
 def odl_ref(j):
@@ -60,17 +75,17 @@ print("# 测试结果 · 与 OpenDataLoader (ODL) 同台（born-digital）\n")
 print(f"> 日期：2026-06-09 · 来源：`scripts/eval/compare_odl.py` · 参照：ODL JSON 输出（{ODLDIR}）\n")
 print("> ODL 是**确定性**结构抽取器（Java/veraPDF wcag-algs），与本项目同类——其水平**确定性可达**。"
       "NID=阅读顺序(词级)，TEDS=表格结构代理，MHS=标题文本集 F1。\n")
-print("| 文档 | NID | TEDS | MHS | 备注 |")
-print("|---|---|---|---|---|")
+print("| 文档 | NID | TEDS | TEDS_X | MHS | 备注 |")
+print("|---|---|---|---|---|---|")
 for r in rows:
     s = r["s"]
     note = "RTL" if r["rtl"] else (f"表 我方{r['pred_tables']}/ODL{r['ref_tables']}" if r["ref_tables"] else "")
     if s is None:
-        print(f"| {r['name']} | — | — | — | 解析失败 {note} |")
+        print(f"| {r['name']} | — | — | — | — | 解析失败 {note} |")
     else:
-        print(f"| {r['name']} | {s['NID']:.3f} | {s['TEDS']:.3f} | {s['MHS']:.3f} | {note} |")
+        print(f"| {r['name']} | {s['NID']:.3f} | {s['TEDS']:.3f} | {s['TEDS_X']:.3f} | {s['MHS']:.3f} | {note} |")
 
 print("\n## 汇总（去 RTL）\n")
 print(f"- LTR {len(ltr)} 份：NID **{mean(r['s']['NID'] for r in ltr):.3f}**、MHS **{mean(r['s']['MHS'] for r in ltr):.3f}**")
-print(f"- 含表 {len(tabled)} 份：TEDS **{mean(r['s']['TEDS'] for r in tabled):.3f}**")
+print(f"- 含表 {len(tabled)} 份：TEDS **{mean(r['s']['TEDS'] for r in tabled):.3f}**、TEDS_X **{mean(r['s']['TEDS_X'] for r in tabled):.3f}**（精确树编辑距离，H5）")
 print(f"- 评测 {len(rows)} 份（有 ODL 输出者）。")

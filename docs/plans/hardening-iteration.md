@@ -51,12 +51,12 @@
 - [ ] ⚠️ 高风险回归面(改动核心分组):三件套+双记分牌+全 e2e 必跑,单测覆盖单栏/双栏/表格混排;
 - **验收**:2203/2305 左列段落聚合(肉眼+chunk 数下降);NID 双记分牌不降。
 
-### H5 · TEDS 换精确 APTED — *评测尺子 / N4 余项*
+### H5 · TEDS 换精确 APTED — *评测尺子 / N4 余项* ✅ 2026-06-11
 当前 proxy(形状+行对齐 DP)已两次掩盖真实变化;span 入 IR 后只有树编辑距离能正确计分 span 结构。
 
-- [ ] scripts/eval:树构造(table→行→格,span 折叠)+ APTED(纯 Python 实现或 `apted` 包,评测侧依赖不进产物);
-- [ ] 与 proxy 并行输出一个过渡期,差异大的文档逐个核对(尺子换轨必须可解释);
-- **验收**:APTED 列上线、proxy 保留对照;span 输出(--table-model)在 APTED 下不再被压扁口径反噬,数据记入 testresults。
+- [x] scripts/eval:树构造(table→tr→td:rs×cs)+ **Zhang-Shasha 精确树编辑距离**(PubTabNet 代价模型,纯标准库 ~80 行,评测侧零依赖——比 `apted` 包更轻且无新依赖);三个 extractor(我方 `-f json`、docling GT、ODL)透传 span 锚点 `tables_cells`;
+- [x] `TEDS_X` 与 proxy `TEDS` 并行出列,composite 仍走 proxy(历史可比);差异最大的 4 例逐个核对、双向都有信号差(见 testresults);
+- **验收 ✅**:`TEDS_X` 上线(ODL 含表 7 份 0.419→0.477、Docling 6 份 0.474→0.526),proxy 保留对照、历史聚合数字未变;span 输出(`--table-model`)在精确尺下结构对齐获得奖励(修好"尺子不奖励 span");selftest +4 断言全过;数据见 [testresults/2026-06-11-h5-exact-teds.md](../testresults/2026-06-11-h5-exact-teds.md)。⚠️ 副产发现:`--table-model` 在 2305-pg9 上把每物理行拆成两行(行切分 bug,G3-R 模型侧噪声),记按需池。
 
 ### H6 · 隐藏文本检测盲区 — *模块 9 / N5a 余项*
 - [ ] 同色文本:fill 色与背景色同(需追踪 `rg/g/sc` 填色态 + 页面底色启发);
@@ -98,6 +98,7 @@ flowchart LR
 ## 3. 按需池(不排期,候触发)
 
 - 行内公式(无区域信号,需行内检测器)/ G3b 确定性 span 推断(模型路径已通,低优);
+- `--table-model` 行切分:2305-pg9 上把每物理行拆成两行(H5 副产发现,G3-R 模型侧噪声);
 - JATS / METS-ALTO(真实 bbox)/ TIFF;RTL 与韩文等多语种(需多语种模型,按需外接 OpenAI 兼容服务或换模型);
 - Markdown/HTML 输出利用 span;人工真值评测集(用户决策);
 - 发布族:PyPI / crates.io / MCP registry(用户暂缓);arXiv 千份压测、fuzz 24h(资源/排期)。

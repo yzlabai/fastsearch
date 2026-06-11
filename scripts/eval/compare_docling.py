@@ -27,8 +27,22 @@ def our_pred(pdf):
     r = run([BIN, pdf, "-f", "chunks"])
     if r.returncode != 0 or not r.stdout.strip():
         return None
-    r2 = run(["python3", f"{here}/extract.py"], stdin=r.stdout)
-    return json.loads(r2.stdout)
+    # Second pass for span-aware tables (TEDS_X / H5): -f json keeps Cell
+    # row_span/col_span that the flat chunks rendering throws away.
+    import tempfile
+    args = []
+    rj = run([BIN, pdf, "-f", "json"])
+    tmp = None
+    if rj.returncode == 0 and rj.stdout.strip():
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        tmp.write(rj.stdout)
+        tmp.close()
+        args = [tmp.name]
+    try:
+        return json.loads(run(["python3", f"{here}/extract.py", *args], stdin=r.stdout).stdout)
+    finally:
+        if tmp:
+            os.unlink(tmp.name)
 
 
 def docling_ref(gt):
@@ -66,22 +80,22 @@ print("> **测的是与 Docling 的一致度**，非人工真值准确率：高�
       "差异不必然 = 更差。NID=阅读顺序(词级 difflib ratio)，TEDS=表格结构代理，MHS=标题文本集 F1。\n")
 
 print("## 逐文档\n")
-print("| 文档 | NID | TEDS | MHS | 备注 |")
-print("|---|---|---|---|---|")
+print("| 文档 | NID | TEDS | TEDS_X | MHS | 备注 |")
+print("|---|---|---|---|---|---|")
 for r in rows:
     s = r["s"]
     note = "RTL（我方 LTR，超范围）" if r["rtl"] else (
         f"表格 我方{r['pred_tables']}/Docling{r['ref_tables']}" if r["ref_tables"] else "")
     if s is None:
-        print(f"| {r['name']} | — | — | — | 解析失败 {note} |")
+        print(f"| {r['name']} | — | — | — | — | 解析失败 {note} |")
     else:
-        print(f"| {r['name']} | {s['NID']:.3f} | {s['TEDS']:.3f} | {s['MHS']:.3f} | {note} |")
+        print(f"| {r['name']} | {s['NID']:.3f} | {s['TEDS']:.3f} | {s['TEDS_X']:.3f} | {s['MHS']:.3f} | {note} |")
 
 print("\n## 汇总（诚实分层）\n")
 print("| 切片 | 文档数 | NID | TEDS | MHS |")
 print("|---|---|---|---|---|")
 print(f"| **born-digital LTR**（去 RTL）| {len(ltr)} | **{mean(r['s']['NID'] for r in ltr):.3f}** | — | **{mean(r['s']['MHS'] for r in ltr):.3f}** |")
-print(f"| 含表格子集（TEDS 仅在有表文档有意义）| {len(tabled)} | — | **{mean(r['s']['TEDS'] for r in tabled):.3f}** | — |")
+print(f"| 含表格子集（TEDS 仅在有表文档有意义）| {len(tabled)} | — | **{mean(r['s']['TEDS'] for r in tabled):.3f}**（TEDS_X 精确 **{mean(r['s']['TEDS_X'] for r in tabled):.3f}**） | — |")
 print(f"| RTL（超范围，仅记录）| {len(rtl_rows)} | {mean(r['s']['NID'] for r in rtl_rows):.3f} | — | — |")
 
 rec_den = [r for r in rows if not r["rtl"] and r["ref_tables"] > 0]
