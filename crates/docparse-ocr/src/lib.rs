@@ -14,8 +14,16 @@
 //!
 //! Model files (see docs/plans/n3-real-enhancer.md): ch_PP-OCRv4_det_infer.onnx,
 //! ch_PP-OCRv4_rec_infer.onnx, ppocr_keys_v1.txt. paddle2onnx dim names contain
-//! dots tract can't parse — sanitized in-memory at load. TODO: orientation
-//! (cls) model — upright scans assumed.
+//! dots tract can't parse — sanitized in-memory at load.
+//!
+//! Orientation (H2): the scan buffer is first rotated to viewing orientation
+//! (`ImageChunk::turns`, recorded by the PDF backend from /Rotate or a rotated
+//! CTM), then page-level text rotation is detected and undone — 90/270 via the
+//! det-box aspect vote (vertical line strips), 180 via the PP-OCR cls model
+//! (optional file `*cls*.onnx`, 0/180 line classifier). Without cls ALL
+//! rotation correction is disabled — a 90° fix that can't be disambiguated
+//! from 270° is a coin flip, worse than declining. Emitted bboxes are mapped
+//! back to viewing space so citations stay viewer-faithful.
 
 pub mod formula;
 pub mod layout;
@@ -47,12 +55,21 @@ const REC_HEIGHT: usize = 48;
 const REC_BUCKETS: [usize; 6] = [80, 160, 320, 480, 640, 960];
 /// Drop rec results below this mean CTC probability (noise crops).
 const MIN_CONFIDENCE: f32 = 0.35;
+/// cls model input (PP-OCR text-line orientation classifier contract).
+const CLS_HEIGHT: usize = 48;
+const CLS_WIDTH: usize = 192;
+/// A line crop votes "180°" only above this cls probability.
+const CLS_THRESHOLD: f32 = 0.6;
+/// How many line crops vote on the page's 180° orientation.
+const CLS_SAMPLES: usize = 8;
 
 pub struct PpOcrEnhancer {
     det: Runnable,
     rec_bytes: Vec<u8>,
     rec_cache: Mutex<HashMap<usize, Runnable>>,
     dict: Vec<String>,
+    /// Optional 0/180 line-orientation classifier (`*cls*.onnx`).
+    cls: Option<Runnable>,
 }
 
 impl PpOcrEnhancer {
@@ -89,17 +106,39 @@ impl PpOcrEnhancer {
             .with_input_fact(0, f32::fact([1, 3, DET_SIDE, DET_SIDE]).into())?
             .into_optimized()?
             .into_runnable()?;
+        // Orientation classifier is optional: rotation correction degrades
+        // gracefully (no 180° detection) when the file isn't there.
+        let cls = find_file(
+            model_dir,
+            &["ch_ppocr_mobile_v2.0_cls_infer.onnx"],
+            "cls",
+            ".onnx",
+        )
+        .ok()
+        .and_then(|p| std::fs::read(&p).ok())
+        .and_then(|bytes| {
+            let bytes = sanitize_dims(&bytes);
+            tract_onnx::onnx()
+                .model_for_read(&mut &bytes[..])
+                .ok()?
+                .with_input_fact(0, f32::fact([1, 3, CLS_HEIGHT, CLS_WIDTH]).into())
+                .ok()?
+                .into_optimized()
+                .ok()?
+                .into_runnable()
+                .ok()
+        });
         Ok(Self {
             det,
             rec_bytes,
             rec_cache: Mutex::new(HashMap::new()),
             dict,
+            cls,
         })
     }
 
-    /// OCR one RGB image; returns (text, bbox-in-pixels, confidence) per line.
-    /// Pixel bboxes are (x0, y0_top, x1, y1_bottom) in image coordinates.
-    fn ocr_rgb(&self, rgb: &[u8], w: usize, h: usize) -> Result<Vec<(String, [usize; 4], f32)>> {
+    /// Text-line detection: boxes in original pixel coordinates.
+    fn det_boxes(&self, rgb: &[u8], w: usize, h: usize) -> Result<Vec<[usize; 4]>> {
         // ---- det: keep-ratio resize into the fixed canvas, imagenet norm ----
         let ratio = (DET_SIDE as f32 / w.max(h) as f32).min(1.0);
         let (sw, sh) = (
@@ -137,17 +176,35 @@ impl PpOcrEnhancer {
             );
         }
 
-        // ---- rec each box (top-to-bottom; layout re-orders downstream) ----
+        // Unclip and scale back to original pixel coords. ALL edges are
+        // clamped — the canvas floor (`.max(32)`) can stretch `inv` so a
+        // canvas-valid box maps past the image, and downstream consumers
+        // (orient's aspect vote, rotate_box) rely on x0<=x1<=w / y0<=y1<=h.
+        let inv = 1.0 / ratio;
+        Ok(boxes
+            .into_iter()
+            .map(|b| {
+                let [bx0, by0, bx1, by1] = unclip(b, sw, sh);
+                [
+                    ((bx0 as f32 * inv) as usize).min(w),
+                    ((by0 as f32 * inv) as usize).min(h),
+                    ((bx1 as f32 * inv) as usize).min(w),
+                    ((by1 as f32 * inv) as usize).min(h),
+                ]
+            })
+            .collect())
+    }
+
+    /// Recognize each detected box (top-to-bottom; layout re-orders downstream).
+    fn ocr_boxes(
+        &self,
+        rgb: &[u8],
+        w: usize,
+        _h: usize,
+        boxes: &[[usize; 4]],
+    ) -> Result<Vec<(String, [usize; 4], f32)>> {
         let mut results = Vec::new();
-        for b in boxes {
-            let [bx0, by0, bx1, by1] = unclip(b, sw, sh);
-            // Back to original pixel coords.
-            let inv = 1.0 / ratio;
-            let (ox0, oy0) = ((bx0 as f32 * inv) as usize, (by0 as f32 * inv) as usize);
-            let (ox1, oy1) = (
-                ((bx1 as f32 * inv) as usize).min(w),
-                ((by1 as f32 * inv) as usize).min(h),
-            );
+        for &[ox0, oy0, ox1, oy1] in boxes {
             let (cw, ch) = (ox1.saturating_sub(ox0), oy1.saturating_sub(oy0));
             if cw < 4 || ch < 4 {
                 continue;
@@ -170,6 +227,112 @@ impl PpOcrEnhancer {
             }
         }
         Ok(results)
+    }
+
+    /// Detect and undo page-level text rotation: 90/270 by det-box aspect
+    /// vote (a rotated page's text lines detect as tall vertical strips),
+    /// then 180 by cls vote — which also disambiguates 90 from 270. Returns
+    /// the upright buffer, its dims, det boxes on it, and the CW quarter-turns
+    /// applied (so callers can map bboxes back).
+    #[allow(clippy::type_complexity)]
+    fn orient(
+        &self,
+        rgb: Vec<u8>,
+        w: usize,
+        h: usize,
+    ) -> Result<(Vec<u8>, usize, usize, Vec<[usize; 4]>, u8)> {
+        let mut boxes = self.det_boxes(&rgb, w, h)?;
+        let (mut buf, mut bw, mut bh, mut turns) = (rgb, w, h, 0u8);
+        let tall = boxes
+            .iter()
+            .filter(|b| b[3].saturating_sub(b[1]) as f32 > 1.5 * b[2].saturating_sub(b[0]) as f32)
+            .count();
+        let wide = boxes
+            .iter()
+            .filter(|b| b[2].saturating_sub(b[0]) as f32 > 1.5 * b[3].saturating_sub(b[1]) as f32)
+            .count();
+        // The 90° fix is gated on cls being available: without it, 90 vs 270
+        // is a coin flip, and rotating the wrong way replaces the page with
+        // upside-down garbage — strictly worse than leaving it (2026-06-11
+        // review). Without cls the page stays as-is (pre-H2 behavior).
+        if self.cls.is_some() && tall >= 2 && tall > wide {
+            buf = rotate_rgb(&buf, bw, bh, 1);
+            (bw, bh) = (bh, bw);
+            turns = 1;
+            // Det boxes on vertical text are coarser than on horizontal text;
+            // redo det on the upright image for clean line boxes.
+            boxes = self.det_boxes(&buf, bw, bh)?;
+        }
+        if self.upside_down(&buf, bw, bh, &boxes)? {
+            buf = rotate_rgb(&buf, bw, bh, 2);
+            boxes = boxes.iter().map(|&b| rotate_box(b, bw, bh, 2)).collect();
+            turns = (turns + 2) % 4;
+        }
+        if std::env::var_os("DOCPARSE_OCR_DEBUG").is_some() && turns != 0 {
+            eprintln!("ocr-debug: orientation corrected by {}°", turns as u32 * 90);
+        }
+        Ok((buf, bw, bh, boxes, turns))
+    }
+
+    /// Majority cls vote over the widest line crops. `false` when the cls
+    /// model is absent or there are too few proper line boxes to trust a vote
+    /// (a wrong 180° flip is worse than the status quo).
+    fn upside_down(&self, rgb: &[u8], w: usize, _h: usize, boxes: &[[usize; 4]]) -> Result<bool> {
+        let Some(cls) = &self.cls else {
+            return Ok(false);
+        };
+        let mut lines: Vec<[usize; 4]> = boxes
+            .iter()
+            .copied()
+            .filter(|b| {
+                let (bw, bh) = (b[2].saturating_sub(b[0]), b[3].saturating_sub(b[1]));
+                bw >= 2 * bh && bh >= 8
+            })
+            .collect();
+        lines.sort_by_key(|b| std::cmp::Reverse((b[2] - b[0]) * (b[3] - b[1])));
+        lines.truncate(CLS_SAMPLES);
+        if lines.len() < 2 {
+            return Ok(false);
+        }
+        // Majority threshold; exit early once the outcome is decided either way.
+        let need = lines.len() / 2 + 1;
+        let mut votes = 0usize;
+        for (i, &[x0, y0, x1, y1]) in lines.iter().enumerate() {
+            if votes >= need || votes + (lines.len() - i) < need {
+                break;
+            }
+            let (cw, ch) = (x1 - x0, y1 - y0);
+            let mut crop = vec![0u8; cw * ch * 3];
+            for y in 0..ch {
+                let src = ((y0 + y) * w + x0) * 3;
+                crop[y * cw * 3..(y + 1) * cw * 3].copy_from_slice(&rgb[src..src + cw * 3]);
+            }
+            // cls contract: resize h=48, keep ratio capped at w=192, pad black,
+            // normalize (x/255 - 0.5)/0.5 — same scheme as rec.
+            let rw = ((cw as f32 * (CLS_HEIGHT as f32 / ch as f32)) as usize).clamp(16, CLS_WIDTH);
+            let resized = resize_bilinear(&crop, cw, ch, rw, CLS_HEIGHT);
+            let mut t = Tensor::zero::<f32>(&[1, 3, CLS_HEIGHT, CLS_WIDTH])?;
+            {
+                let mut view = t.to_plain_array_view_mut::<f32>()?;
+                let s = view.as_slice_mut().context("contiguous tensor")?;
+                for c in 0..3 {
+                    for y in 0..CLS_HEIGHT {
+                        for x in 0..rw {
+                            let v = resized[(y * rw + x) * 3 + c] as f32 / 255.0;
+                            s[c * CLS_HEIGHT * CLS_WIDTH + y * CLS_WIDTH + x] = (v - 0.5) / 0.5;
+                        }
+                    }
+                }
+            }
+            let out = cls.run(tvec!(t.into()))?;
+            let probs = out[0].to_plain_array_view::<f32>()?;
+            let p = probs.as_slice().context("cls probs")?;
+            // Output is [1, 2] softmax over labels ["0", "180"].
+            if p.len() >= 2 && p[1] > CLS_THRESHOLD {
+                votes += 1;
+            }
+        }
+        Ok(votes >= need)
     }
 
     /// Run the recognizer on one cropped line image.
@@ -231,9 +394,10 @@ impl Enhancer for PpOcrEnhancer {
     }
 
     /// OCR the page's scan image (the page-covering `ImageChunk` the PDF
-    /// backend attached pixels to). Returns the original elements plus one
-    /// `TextChunk` per recognized line, or `None` when there's nothing usable.
-    fn enhance_page(&self, page: &Page) -> Option<Vec<Element>> {
+    /// backend attached pixels to). Returns the page with one `TextChunk` per
+    /// recognized line appended — orientation-normalized when the scan was
+    /// rotated — or `None` when there's nothing usable.
+    fn enhance_page(&self, page: &Page) -> Option<Page> {
         let img = page
             .elements
             .iter()
@@ -249,16 +413,43 @@ impl Enhancer for PpOcrEnhancer {
 
         let (w, h) = (img.width_px as usize, img.height_px as usize);
         let rgb = to_rgb(img)?;
+        // Bring the buffer to viewing orientation first (page /Rotate or a
+        // rotated placement, recorded as `ImageChunk::turns`), then detect and
+        // undo page-level text rotation — one mechanism covers both a
+        // /Rotate'd upright scan and a physically rotated one.
+        let vturns = img.turns % 4;
+        let (vbuf, vw, vh) = match vturns {
+            0 => (rgb, w, h),
+            t => {
+                let b = rotate_rgb(&rgb, w, h, t);
+                drop(rgb); // scan buffers are ~100MB; don't hold both copies
+                if t == 2 {
+                    (b, w, h)
+                } else {
+                    (b, h, w)
+                }
+            }
+        };
         // Surface inference errors instead of silently declining (they mean a
         // broken model/setup, not a hard page) — then decline so the
         // deterministic result still stands.
-        let lines = match self.ocr_rgb(&rgb, w, h) {
+        let fail = |e: anyhow::Error| {
+            eprintln!(
+                "ppocr-onnx: inference failed on page {}: {e:#}",
+                page.number
+            );
+        };
+        let (ubuf, uw, uh, boxes, dturns) = match self.orient(vbuf, vw, vh) {
+            Ok(v) => v,
+            Err(e) => {
+                fail(e);
+                return None;
+            }
+        };
+        let lines = match self.ocr_boxes(&ubuf, uw, uh, &boxes) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!(
-                    "ppocr-onnx: inference failed on page {}: {e:#}",
-                    page.number
-                );
+                fail(e);
                 return None;
             }
         };
@@ -277,14 +468,61 @@ impl Enhancer for PpOcrEnhancer {
                 _ => None,
             })
             .collect();
-        let mut elements = page.elements.clone();
-        let (bw, bh) = (img.bbox.x1 - img.bbox.x0, img.bbox.y1 - img.bbox.y0);
-        for (text, [px0, py0, px1, py1], conf) in lines {
-            let x0 = img.bbox.x0 + px0 as f32 / w as f32 * bw;
-            let x1 = img.bbox.x0 + px1 as f32 / w as f32 * bw;
+
+        // A pure scan page that needed rotation is orientation-NORMALIZED:
+        // the output page is the upright content (Docling's convention) —
+        // reading order and citations refer to the corrected page, and for
+        // 90/270 the page dimensions swap. Mixed pages stay viewer-faithful
+        // (the deterministic text anchors the viewing frame there).
+        let normalize = dturns != 0 && existing.is_empty();
+        let (page_w, page_h) = if normalize && dturns % 2 == 1 {
+            (page.height, page.width)
+        } else {
+            (page.width, page.height)
+        };
+        let mut elements: Vec<Element> = if normalize {
+            page.elements
+                .iter()
+                .cloned()
+                .map(|mut e| {
+                    match &mut e {
+                        Element::Text(t) => {
+                            t.bbox = rotate_pdf_bbox(t.bbox, page.width, page.height, dturns)
+                        }
+                        Element::Image(i) => {
+                            i.bbox = rotate_pdf_bbox(i.bbox, page.width, page.height, dturns);
+                            i.turns = (i.turns + dturns) % 4;
+                        }
+                        Element::Table(t) => {
+                            t.bbox = rotate_pdf_bbox(t.bbox, page.width, page.height, dturns)
+                        }
+                    }
+                    e
+                })
+                .collect()
+        } else {
+            page.elements.clone()
+        };
+        let ibox = if normalize {
+            rotate_pdf_bbox(img.bbox, page.width, page.height, dturns)
+        } else {
+            img.bbox
+        };
+        let (bw, bh) = (ibox.x1 - ibox.x0, ibox.y1 - ibox.y0);
+        // Normalized output keeps boxes in the upright OCR frame; otherwise
+        // map them back to the viewing frame (where the placement bbox lives).
+        let (back, fw, fh) = if normalize {
+            (0, uw, uh)
+        } else {
+            ((4 - dturns) % 4, vw, vh)
+        };
+        for (text, pbox, conf) in lines {
+            let [px0, py0, px1, py1] = rotate_box(pbox, uw, uh, back);
+            let x0 = ibox.x0 + px0 as f32 / fw as f32 * bw;
+            let x1 = ibox.x0 + px1 as f32 / fw as f32 * bw;
             // Pixel y runs top-down; PDF y runs bottom-up.
-            let y1 = img.bbox.y1 - py0 as f32 / h as f32 * bh;
-            let y0 = img.bbox.y1 - py1 as f32 / h as f32 * bh;
+            let y1 = ibox.y1 - py0 as f32 / fh as f32 * bh;
+            let y0 = ibox.y1 - py1 as f32 / fh as f32 * bh;
             let ocr_box = BBox { x0, y0, x1, y1 };
             if overlaps_existing(&ocr_box, &existing) {
                 continue;
@@ -305,8 +543,82 @@ impl Enhancer for PpOcrEnhancer {
                 tag: None,
             }));
         }
-        Some(elements)
+        Some(Page {
+            number: page.number,
+            width: page_w,
+            height: page_h,
+            elements,
+        })
     }
+}
+
+/// Rotate a PDF-space bbox (y up) by CW quarter-turns of the page: one turn
+/// maps a point (x, y) on a (w, h) page to (y, w − x) on an (h, w) page.
+fn rotate_pdf_bbox(b: BBox, w: f32, h: f32, turns: u8) -> BBox {
+    let (mut b, mut w, mut h) = (b, w, h);
+    for _ in 0..(turns % 4) {
+        b = BBox {
+            x0: b.y0,
+            y0: w - b.x1,
+            x1: b.y1,
+            y1: w - b.x0,
+        };
+        std::mem::swap(&mut w, &mut h);
+    }
+    let _ = h;
+    b
+}
+
+/// Rotate an RGB buffer by CW quarter-turns. 1 and 3 swap the dimensions.
+pub(crate) fn rotate_rgb(src: &[u8], w: usize, h: usize, turns: u8) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    match turns % 4 {
+        0 => dst.copy_from_slice(src),
+        2 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let s = (y * w + x) * 3;
+                    let t = ((h - 1 - y) * w + (w - 1 - x)) * 3;
+                    dst[t..t + 3].copy_from_slice(&src[s..s + 3]);
+                }
+            }
+        }
+        // 90 CW: dst is (h, w); src (x, y) lands at (h-1-y, x).
+        1 => {
+            let dw = h;
+            for y in 0..h {
+                for x in 0..w {
+                    let s = (y * w + x) * 3;
+                    let t = (x * dw + (h - 1 - y)) * 3;
+                    dst[t..t + 3].copy_from_slice(&src[s..s + 3]);
+                }
+            }
+        }
+        // 270 CW (= 90 CCW): dst is (h, w); src (x, y) lands at (y, w-1-x).
+        _ => {
+            let dw = h;
+            for y in 0..h {
+                for x in 0..w {
+                    let s = (y * w + x) * 3;
+                    let t = ((w - 1 - x) * dw + y) * 3;
+                    dst[t..t + 3].copy_from_slice(&src[s..s + 3]);
+                }
+            }
+        }
+    }
+    dst
+}
+
+/// Map a pixel box (x0, y0, x1, y1; max-exclusive edges) from a (w, h) frame
+/// into the frame rotated `turns` quarter-turns clockwise.
+pub(crate) fn rotate_box(b: [usize; 4], w: usize, h: usize, turns: u8) -> [usize; 4] {
+    let (mut b, mut w, mut h) = (b, w, h);
+    for _ in 0..(turns % 4) {
+        b = [h - b[3], b[0], h - b[1], b[2]];
+        std::mem::swap(&mut w, &mut h);
+    }
+    let _ = (w, h);
+    b
 }
 
 /// Whether more than half of `b`'s area is covered by any existing text box.
@@ -614,6 +926,32 @@ mod tests {
         let out = sanitize_dims(&input);
         assert_eq!(out.len(), input.len());
         assert!(!out.windows(21).any(|w| w == b"p2o.DynamicDimension."));
+    }
+
+    #[test]
+    fn rotate_rgb_quarter_turns() {
+        // 2x1 image: [A, B] (A=red, B=green).
+        let src = [255, 0, 0, 0, 255, 0];
+        // 90 CW → 1x2: A on top? src(0,0)→dst(0,0): A top, B bottom.
+        let r1 = rotate_rgb(&src, 2, 1, 1);
+        assert_eq!(&r1[..3], &[255, 0, 0]);
+        assert_eq!(&r1[3..], &[0, 255, 0]);
+        // 180 → [B, A].
+        let r2 = rotate_rgb(&src, 2, 1, 2);
+        assert_eq!(&r2[..3], &[0, 255, 0]);
+        // Four single turns compose to identity.
+        let back = rotate_rgb(&rotate_rgb(&r1, 1, 2, 1), 2, 1, 2);
+        assert_eq!(&back[..], &src[..]);
+    }
+
+    #[test]
+    fn rotate_box_round_trips() {
+        let b = [10, 20, 110, 40]; // in a 200x100 frame
+        let r = rotate_box(b, 200, 100, 1); // frame becomes 100x200
+        assert_eq!(r, [60, 10, 80, 110]);
+        // Inverse turn count restores the original.
+        assert_eq!(rotate_box(r, 100, 200, 3), b);
+        assert_eq!(rotate_box(rotate_box(b, 200, 100, 2), 200, 100, 2), b);
     }
 }
 

@@ -759,6 +759,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "docparse-core",
+ "hayro-ccitt",
+ "hayro-jbig2",
  "lopdf",
  "rayon",
 ]
@@ -1270,6 +1272,7 @@ checksum = "69374b3668dd45aeb3d3145cda68f2c7b4f223aaa2511e67d076f1c7d741388d"
 dependencies = [
  "fearless_simd",
  "hayro-ccitt",
+ "image",
 ]
 
 [[package]]

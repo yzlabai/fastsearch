@@ -77,6 +77,7 @@ pub fn parse_bytes(bytes: &[u8], ext: &str) -> anyhow::Result<Document> {
             },
             page: 1,
             width_px: width,
+            turns: 0,
             height_px: height,
             kind,
             data,

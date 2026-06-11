@@ -130,6 +130,11 @@ pub struct ImageChunk {
     pub width_px: u32,
     #[serde(default)]
     pub height_px: u32,
+    /// Quarter-turns (90° clockwise) the pixel buffer must be rotated to
+    /// match the on-page (viewing) orientation of `bbox` — non-zero when the
+    /// page carries /Rotate or the image is placed with a rotated CTM (H2a).
+    #[serde(default, skip_serializing_if = "u8_is_zero")]
+    pub turns: u8,
     #[serde(default)]
     pub kind: ImageKind,
     #[serde(skip)]
@@ -177,6 +182,10 @@ fn is_one(v: &u32) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(v: &bool) -> bool {
     !*v
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn u8_is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 /// A detected table: a grid of cells bounded by ruling lines. Built by the

@@ -75,7 +75,8 @@ impl PdfParser {
         let mut inputs: Vec<PageInput> = Vec::new();
         for (number, page_id) in pages_map {
             let content = doc.get_page_content(page_id).unwrap_or_default();
-            let (width, height) = page_dimensions(&doc, page_id);
+            let (origin_x, origin_y, width, height) = page_box(&doc, page_id);
+            let rotate = page_rotation(&doc, page_id);
             let fonts = font::build_page_fonts(&doc, page_id);
             let images = images::build_page_images(&doc, page_id);
             let forms = images::build_page_forms(&doc, page_id);
@@ -84,6 +85,8 @@ impl PdfParser {
                 number: number as usize,
                 width,
                 height,
+                origin: (origin_x, origin_y),
+                rotate,
                 content,
                 fonts,
                 images,
@@ -105,23 +108,62 @@ impl PdfParser {
     }
 }
 
-/// Resolve a page's MediaBox to (width, height). TODO: walk the Pages tree for
-/// inherited MediaBox; for now fall back to US Letter when absent on the page.
-fn page_dimensions(doc: &PdfDocument, page_id: ObjectId) -> (f32, f32) {
-    if let Ok(dict) = doc.get_dictionary(page_id) {
-        if let Ok(Object::Array(mb)) = dict.get(b"MediaBox") {
-            let v: Vec<f32> = mb
-                .iter()
-                .map(|o| match o {
-                    Object::Integer(i) => *i as f32,
-                    Object::Real(r) => *r,
-                    _ => 0.0,
-                })
-                .collect();
-            if v.len() == 4 {
-                return ((v[2] - v[0]).abs(), (v[3] - v[1]).abs());
-            }
+/// Resolve a page attribute, walking the Pages tree upward — MediaBox and
+/// Rotate are inheritable (PDF 32000-1 §7.7.3.4). Depth-capped against
+/// malformed Parent cycles; the returned object is already dereferenced.
+fn inherited_attr(doc: &PdfDocument, page_id: ObjectId, key: &[u8]) -> Option<Object> {
+    let mut id = page_id;
+    for _ in 0..32 {
+        let dict = doc.get_dictionary(id).ok()?;
+        if let Ok(v) = dict.get(key) {
+            return doc.dereference(v).ok().map(|(_, o)| o.clone());
+        }
+        match dict.get(b"Parent") {
+            Ok(Object::Reference(p)) => id = *p,
+            _ => return None,
         }
     }
-    DEFAULT_PAGE
+    None
+}
+
+/// Resolve a page's MediaBox (inherited) to (origin_x, origin_y, width,
+/// height); US Letter at origin 0 when absent — a fallback, not data
+/// (flagged here rather than silently sized).
+fn page_box(doc: &PdfDocument, page_id: ObjectId) -> (f32, f32, f32, f32) {
+    if let Some(Object::Array(mb)) = inherited_attr(doc, page_id, b"MediaBox") {
+        let v: Vec<f32> = mb
+            .iter()
+            .map(|o| match o {
+                Object::Integer(i) => *i as f32,
+                Object::Real(r) => *r,
+                _ => 0.0,
+            })
+            .collect();
+        if v.len() == 4 {
+            return (
+                v[0].min(v[2]),
+                v[1].min(v[3]),
+                (v[2] - v[0]).abs(),
+                (v[3] - v[1]).abs(),
+            );
+        }
+    }
+    (0.0, 0.0, DEFAULT_PAGE.0, DEFAULT_PAGE.1)
+}
+
+/// A page's /Rotate (inherited) as quarter-turns clockwise (0..=3). The spec
+/// requires an integer multiple of 90, but Real values occur in the wild;
+/// anything else is ignored.
+fn page_rotation(doc: &PdfDocument, page_id: ObjectId) -> u8 {
+    let r = match inherited_attr(doc, page_id, b"Rotate") {
+        Some(Object::Integer(r)) => r,
+        Some(Object::Real(r)) => r as i64,
+        _ => return 0,
+    };
+    let r = ((r % 360) + 360) % 360;
+    if r % 90 == 0 {
+        (r / 90) as u8
+    } else {
+        0
+    }
 }

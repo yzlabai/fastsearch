@@ -52,6 +52,10 @@ chardetng = "0.1"
 # On-demand page rasterization for neural enhancers (user-approved 2026-06-10):
 # the main pipeline never renders; routed hard pages may, pure Rust, opt-in.
 hayro = "0.7"
+# H1 (2026-06-11): 1-bit scan decode (CCITT G3/G4, JBIG2) for the OCR path.
+# Both were already transitive deps via hayro — zero new supply-chain surface.
+hayro-ccitt = "0.3"
+hayro-jbig2 = "0.3"
 # VLM enhancer over OpenAI-compatible services (G8b, user-approved 2026-06-10).
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"

@@ -12,7 +12,7 @@ A fast, pure-Rust **multi-format document parsing system**: extracts **positione
 - **Four faces, one output**: CLI / library / MCP (stdio, direct agent integration) / REST — **byte-identical across interfaces**, OCR path included;
 - **RAG as a first-class citizen**: structured chunks with page + bbox + heading breadcrumbs, `locate(x, y)` reverse lookup, 100% citation coverage;
 - **Security pre-checks built in**: hidden-text filtering (anti prompt-injection — flagged and auditable, never silently dropped), zip-bomb / page-count resource guards, per-page complexity profiling;
-- **Scanned-document OCR without breaking the pure-Rust identity**: `--ocr` runs in-process ONNX inference on `tract` (PP-OCRv4, the de-facto standard models for Chinese; ~16 MB external model files). The page image is the embedded raster's *original bytes* — nothing is rendered. Quality-routed per page: digital pages never touch the model;
+- **Scanned-document OCR without breaking the pure-Rust identity**: `--ocr` runs in-process ONNX inference on `tract` (PP-OCRv4, the de-facto standard models for Chinese; ~16 MB external model files). The page image is the embedded raster's *original bytes* — nothing is rendered. Scan encodings covered: JPEG/Flate/**CCITT G3·G4 fax/JBIG2** (JPX is position-only for now). Quality-routed per page: digital pages never touch the model;
 - **Embedded semantic models (opt-in, no service)**: table structure (merged cells / multi-row headers → rowspan/colspan in the IR), formula→LaTeX, and full-page transcription — UniRec-0.1B on in-process `tract` inference (~700MB external model files);
 - **Pluggable AI boundary**: the deterministic pipeline stands alone; models trigger only on pages the quality score flags as hard, and their output carries a `source` tag and capped confidence (in-process tract or an OpenAI-compatible service).
 
@@ -90,7 +90,7 @@ Optional model files (all Apache-2.0, shipped as external files, never baked int
 
 | Directory | Model | Origin | Powers |
 |---|---|---|---|
-| `models/ppocr/` (~16 MB) | PP-OCRv4 det+rec + dict | PaddleOCR (HuggingFace `SWHL/RapidOCR` conversions) | `--ocr` scanned text |
+| `models/ppocr/` (~16 MB) | PP-OCRv4 det+rec + dict; optional cls orientation classifier (~0.6 MB; absent → rotation correction disabled) | PaddleOCR (HuggingFace `SWHL/RapidOCR` conversions; cls at `PP-OCRv1/ch_ppocr_mobile_v2.0_cls_infer.onnx`) | `--ocr` scanned text + auto-deskew of rotated scans (0/90/180/270) |
 | `models/layout/` (~75 MB) | DocLayout-YOLO | [opendatalab/DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO) (DocStructBench) | `--layout` regions, formula-region detection |
 | `models/unirec/` (~700 MB) | **UniRec-0.1B** (unified text/formula/table recognition) | [OpenOCR](https://github.com/Topdu/OpenOCR) (FVL Lab; [paper arXiv 2512.21095](https://arxiv.org/abs/2512.21095)) — the recognizer of their **OpenDoc-0.1B** document-parsing system; official ONNX: `huggingface-cli download topdu/unirec_0_1b_onnx --local-dir models/unirec` | `--table-model` merged-cell tables / `--formula-model` formula→LaTeX / `--transcribe-model` full-page transcription (zh/en) |
 

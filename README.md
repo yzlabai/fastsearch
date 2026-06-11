@@ -12,7 +12,7 @@
 - **四接口一份输出**：CLI / 库 / MCP（stdio，agent 直连）/ REST，跨接口**逐字节一致**（含 OCR 路径）;
 - **RAG 一等公民**：结构化切块带 page+bbox+标题面包屑，`locate(x,y)` 坐标反查 chunk，引用可定位率 100%;
 - **安全预检内置**：隐藏文本过滤（防 prompt injection，标注可审计而非静默删除）、zip-bomb/页数资源守卫、页级复杂度画像;
-- **扫描件 OCR 不破纯 Rust 身份**：`--ocr` 走进程内 `tract` ONNX 推理（PP-OCRv4，中文事实标准模型，~16MB 外部模型文件），抽嵌入图原字节而非渲染;按页路由,数字页**零模型零成本**;
+- **扫描件 OCR 不破纯 Rust 身份**：`--ocr` 走进程内 `tract` ONNX 推理（PP-OCRv4，中文事实标准模型，~16MB 外部模型文件），抽嵌入图原字节而非渲染;扫描编码覆盖 JPEG/Flate/**CCITT G3·G4 传真压缩/JBIG2**（JPX 暂只记位置）;按页路由,数字页**零模型零成本**;
 - **内嵌语义模型（opt-in，无服务依赖）**：表结构（合并格/多级表头 → rowspan/colspan 入 IR）、公式→LaTeX、整页转写，UniRec-0.1B 经 `tract` 进程内推理（~700MB 外部模型文件）;
 - **可插拔 AI 边界**：确定性主流程独立成立,模型只在质量评分判定难例时按页触发,产出带 `source` 标签与降级置信度（进程内 tract 或 OpenAI 兼容服务外接均可）。
 
@@ -90,7 +90,7 @@ curl -F "file=@doc.pdf" "http://127.0.0.1:8642/parse?format=chunks&ocr=true&tabl
 
 | 目录 | 模型 | 来源 | 驱动的功能 |
 |---|---|---|---|
-| `models/ppocr/`（~16MB） | PP-OCRv4 det+rec + 字典 | PaddleOCR（HuggingFace `SWHL/RapidOCR` 转换件） | `--ocr` 扫描件文字 |
+| `models/ppocr/`（~16MB） | PP-OCRv4 det+rec + 字典；可选 cls 方向分类（~0.6MB，缺失则禁用旋转校正） | PaddleOCR（HuggingFace `SWHL/RapidOCR` 转换件；cls 在其 `PP-OCRv1/ch_ppocr_mobile_v2.0_cls_infer.onnx`） | `--ocr` 扫描件文字 + 旋转扫描自动转正（0/90/180/270） |
 | `models/layout/`（~75MB） | DocLayout-YOLO | [opendatalab/DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO)（DocStructBench） | `--layout` 版面区域、公式区检出 |
 | `models/unirec/`（~700MB） | **UniRec-0.1B**（统一文本/公式/表格识别） | [OpenOCR](https://github.com/Topdu/OpenOCR)（FVL Lab；[论文 arXiv 2512.21095](https://arxiv.org/abs/2512.21095)）——其 **OpenDoc-0.1B** 文档解析系统的识别器，官方 ONNX：`huggingface-cli download topdu/unirec_0_1b_onnx --local-dir models/unirec` | `--table-model` 合并格表结构 / `--formula-model` 公式→LaTeX / `--transcribe-model` 整页转写（中英） |
 

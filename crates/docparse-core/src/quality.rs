@@ -403,6 +403,7 @@ mod profile_tests {
             },
             page: 1,
             width_px: 100,
+            turns: 0,
             height_px: 100,
             kind: ImageKind::None,
             data: Vec::new(),

@@ -9,7 +9,7 @@
 //! to a capable enhancer and merges its output back into the same IR (with
 //! lowered confidence so downstream can tell deterministic from model output).
 
-use crate::ir::{Document, Element, Page};
+use crate::ir::{Document, Page};
 use crate::quality::{self, PageAssessment, QualityFlag};
 use serde::{Deserialize, Serialize};
 
@@ -44,9 +44,12 @@ impl Capability {
 /// live outside the deterministic core and are injected by the caller.
 pub trait Enhancer: Send + Sync {
     fn capability(&self) -> Capability;
-    /// Process one flagged page, returning replacement elements, or `None` to
-    /// decline. Implementors should set `confidence < 1.0` on produced text.
-    fn enhance_page(&self, page: &Page) -> Option<Vec<Element>>;
+    /// Process one flagged page, returning the replacement page, or `None`
+    /// to decline. Implementors should set `confidence < 1.0` on produced
+    /// text. Returning a whole `Page` (not just elements) lets an enhancer
+    /// correct page geometry as well — e.g. orientation-normalizing a rotated
+    /// scan (H2) swaps width/height; `number` must be kept.
+    fn enhance_page(&self, page: &Page) -> Option<Page>;
 }
 
 /// The routing decision for one page.
@@ -108,8 +111,8 @@ pub fn apply(doc: &Document, enhancers: &[&dyn Enhancer]) -> (Document, Vec<Page
                 continue;
             }
             route.enhancer = Some(cap.name.clone());
-            if let Some(elements) = e.enhance_page(page) {
-                page.elements = elements;
+            if let Some(enhanced) = e.enhance_page(page) {
+                *page = enhanced;
                 route.applied = true;
                 break;
             }
@@ -140,25 +143,30 @@ mod tests {
                 handles_garbled: false,
             }
         }
-        fn enhance_page(&self, page: &Page) -> Option<Vec<Element>> {
-            Some(vec![Element::Text(TextChunk {
-                text: "[ocr] recovered text".into(),
-                bbox: BBox {
-                    x0: 0.0,
-                    y0: 0.0,
-                    x1: page.width,
-                    y1: 20.0,
-                },
-                font_size: 10.0,
-                font: None,
-                page: page.number,
-                confidence: 0.5,
-                bold: false,
-                hidden: false,
-                source: None,
-                group: None,
-                tag: None,
-            })])
+        fn enhance_page(&self, page: &Page) -> Option<Page> {
+            Some(Page {
+                number: page.number,
+                width: page.width,
+                height: page.height,
+                elements: vec![Element::Text(TextChunk {
+                    text: "[ocr] recovered text".into(),
+                    bbox: BBox {
+                        x0: 0.0,
+                        y0: 0.0,
+                        x1: page.width,
+                        y1: 20.0,
+                    },
+                    font_size: 10.0,
+                    font: None,
+                    page: page.number,
+                    confidence: 0.5,
+                    bold: false,
+                    hidden: false,
+                    source: None,
+                    group: None,
+                    tag: None,
+                })],
+            })
         }
     }
 

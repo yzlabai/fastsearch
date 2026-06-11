@@ -34,8 +34,16 @@ use std::collections::HashMap;
 /// a worker thread without touching the shared `lopdf::Document`.
 pub struct PageInput {
     pub number: usize,
+    /// MediaBox dimensions in PDF user space (pre-/Rotate).
     pub width: f32,
     pub height: f32,
+    /// MediaBox lower-left corner. Folded into the base CTM for rotated pages
+    /// (the rotation pivot must be the page box, not the user-space origin);
+    /// TODO: unrotated pages still ignore it — pre-existing simplification.
+    pub origin: (f32, f32),
+    /// /Rotate as quarter-turns clockwise (0..=3) — baked into the base CTM
+    /// so all emitted coordinates are in viewing space (what a viewer shows).
+    pub rotate: u8,
     pub content: Vec<u8>,
     /// Font decoders keyed by resource name (e.g. "F1"), resolved up-front.
     pub fonts: HashMap<String, FontInfo>,
@@ -100,23 +108,69 @@ pub fn interpret(input: &PageInput) -> Page {
     let mut elements: Vec<Element> = Vec::new();
     let mut segments: Vec<Segment> = Vec::new();
 
+    // /Rotate honored by baking the rotation into the base CTM (the way
+    // renderers set the device transform): all coordinates come out in
+    // viewing space, and born-digital sideways content reads horizontally.
+    let (uw, uh) = (input.width as f64, input.height as f64);
+    let (rot, vw, vh) = match input.rotate {
+        1 => (
+            Matrix {
+                a: 0.0,
+                b: -1.0,
+                c: 1.0,
+                d: 0.0,
+                e: 0.0,
+                f: uw,
+            },
+            input.height,
+            input.width,
+        ),
+        2 => (
+            Matrix {
+                a: -1.0,
+                b: 0.0,
+                c: 0.0,
+                d: -1.0,
+                e: uw,
+                f: uh,
+            },
+            input.width,
+            input.height,
+        ),
+        3 => (
+            Matrix {
+                a: 0.0,
+                b: 1.0,
+                c: -1.0,
+                d: 0.0,
+                e: uh,
+                f: 0.0,
+            },
+            input.height,
+            input.width,
+        ),
+        _ => (Matrix::identity(), input.width, input.height),
+    };
+    // Rotation pivots on the page box: shift a non-zero MediaBox origin to
+    // (0,0) first, or every viewing-space coordinate is off by the origin
+    // (and the off-page hidden check would misfire). Unrotated pages keep
+    // the legacy no-translation behavior (see PageInput::origin TODO).
+    let base = if input.rotate.is_multiple_of(4) {
+        rot
+    } else {
+        Matrix::translate(-input.origin.0 as f64, -input.origin.1 as f64).mul(&rot)
+    };
+
     let ctx = Ctx {
         fonts: &input.fonts,
         images: &input.images,
         forms: &input.forms,
         tags: &input.tags,
         page_no: input.number,
-        page_size: (input.width, input.height),
+        page_size: (vw, vh),
         decode_images: input.decode_images,
     };
-    exec_content(
-        &input.content,
-        &ctx,
-        Matrix::identity(),
-        0,
-        &mut elements,
-        &mut segments,
-    );
+    exec_content(&input.content, &ctx, base, 0, &mut elements, &mut segments);
 
     // Semantic layer: detect bordered tables from ruling lines + text, then
     // append them as elements (the output layer skips text inside table bboxes).
@@ -150,8 +204,8 @@ pub fn interpret(input: &PageInput) -> Page {
 
     Page {
         number: input.number,
-        width: input.width,
-        height: input.height,
+        width: vw,
+        height: vh,
         elements,
     }
 }
@@ -374,11 +428,29 @@ fn exec_content(
                     } else {
                         (docparse_core::ir::ImageKind::None, Vec::new())
                     };
+                    // Placement rotation, snapped to the nearest quarter-turn
+                    // (page /Rotate baked into the CTM, or a rotated `cm`):
+                    // how many 90° CW turns take the upright pixel buffer to
+                    // viewing orientation. Mirrors/shears aren't tracked —
+                    // 180 requires BOTH axes negated so a pure mirror
+                    // (a<0, d>0) stays at 0 instead of being "corrected".
+                    let turns = if ctm.b.abs() > ctm.a.abs() {
+                        if ctm.b < 0.0 {
+                            1
+                        } else {
+                            3
+                        }
+                    } else if ctm.a < 0.0 && ctm.d < 0.0 {
+                        2
+                    } else {
+                        0
+                    };
                     elements.push(Element::Image(ImageChunk {
                         bbox: BBox { x0, y0, x1, y1 },
                         page: ctx.page_no,
                         width_px: img.width,
                         height_px: img.height,
+                        turns,
                         kind,
                         data,
                         file: None,
@@ -599,6 +671,8 @@ mod tests {
             number: 1,
             width: 612.0,
             height: 792.0,
+            origin: (0.0, 0.0),
+            rotate: 0,
             content: content.as_bytes().to_vec(),
             fonts: HashMap::new(),
             images: HashMap::new(),
@@ -616,6 +690,30 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn page_rotate_maps_to_viewing_space() {
+        // /Rotate 90 (one CW quarter-turn): dims swap and a chunk near the
+        // top-left of user space lands near the top-right of viewing space.
+        let p = interpret(&PageInput {
+            number: 1,
+            width: 612.0,
+            height: 792.0,
+            origin: (0.0, 0.0),
+            rotate: 1,
+            content: b"BT /F1 12 Tf 100 700 Td (r) Tj ET".to_vec(),
+            fonts: HashMap::new(),
+            images: HashMap::new(),
+            forms: HashMap::new(),
+            tags: Default::default(),
+            decode_images: false,
+        });
+        assert_eq!((p.width, p.height), (792.0, 612.0));
+        let t = &p.text_chunks()[0];
+        // User (100, 700) → viewing (y, w - x) = (700, 512).
+        assert!((t.bbox.x0 - 700.0).abs() < 1.0, "x0 = {}", t.bbox.x0);
+        assert!((t.bbox.y1 - 512.0).abs() < 13.0, "y1 = {}", t.bbox.y1);
     }
 
     #[test]
