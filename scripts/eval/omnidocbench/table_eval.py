@@ -136,9 +136,12 @@ def recognize(image_path, poly):
 
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 30
+    doctype = os.environ.get("OMNIDOC_DOCTYPE")  # e.g. academic_literature
     data = json.load(open(JSON))
     tasks = []
     for page in data:
+        if doctype and (page["page_info"].get("page_attribute", {}) or {}).get("data_source") != doctype:
+            continue
         ip = page["page_info"]["image_path"]
         for det in page["layout_dets"]:
             if det["category_type"] == "table" and det.get("html"):

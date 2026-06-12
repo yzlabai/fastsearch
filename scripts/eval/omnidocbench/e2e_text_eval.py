@@ -21,6 +21,7 @@ from e2e_table_eval import wrap_pdf
 from table_eval import JSON
 
 BIN = os.path.join(ROOT, "target/release/docparse")
+import os as _os  # ROOT used above
 
 # Body categories worth comparing (exclude furniture: headers/footers/page
 # numbers/captions/figures/tables/equations/masks/abandon).
@@ -42,8 +43,10 @@ def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
     data = json.load(open(JSON))
     # pages with a meaningful amount of body text
-    cand = [p for p in data if sum(len(d.get("text", "")) for d in p["layout_dets"]
-                                   if d["category_type"] in READABLE) > 200]
+    doctype = os.environ.get("OMNIDOC_DOCTYPE")
+    cand = [p for p in data
+            if (not doctype or (p["page_info"].get("page_attribute", {}) or {}).get("data_source") == doctype)
+            and sum(len(d.get("text", "")) for d in p["layout_dets"] if d["category_type"] in READABLE) > 200]
     cand = cand[:n]
     scores = []
     for i, page in enumerate(cand):
@@ -52,8 +55,11 @@ def main():
         pdf = wrap_pdf(ip)
         if not pdf or not gt:
             continue
-        r = subprocess.run([BIN, pdf, "--ocr", "--layout", "-f", "text"],
-                           capture_output=True, text=True)
+        mode = os.environ.get("OMNIDOC_TEXT_MODE", "ocr")
+        args = ([BIN, pdf, "--transcribe-model", os.path.join(ROOT, "models/unirec"), "-f", "text"]
+                if mode == "transcribe"
+                else [BIN, pdf, "--ocr", "--layout", "-f", "text"])
+        r = subprocess.run(args, capture_output=True, text=True)
         ours = norm(r.stdout)
         # CHARACTER-level similarity: CJK has no spaces, so word-level split()
         # collapses a whole Chinese page into one token and breaks the metric.

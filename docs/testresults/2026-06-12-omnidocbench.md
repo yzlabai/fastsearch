@@ -31,6 +31,38 @@
 
 表分布(80 表):满分 4、0.9–1.0 共 33、0.7–0.9 共 24、0.4–0.7 共 14、<0.4 失败 5——**中位数 0.895 即一半的表近乎完美**,均值被少数难表/AR 退化拉低。
 
+## 3b. 按文档类型:学术论文子集
+
+OmniDocBench 按 10 类文档分别报分;**学术论文**(`academic_literature`,215 页:表 123 / 公式 591 / 文本块 1375)是公式最密、版面最规整的一类。用 `OMNIDOC_DOCTYPE=academic_literature` 过滤跑(脚本支持环境变量):
+
+| 维度 | 论文子集 | 全集对照 | 解读 |
+|---|---|---|---|
+| 公式(LaTeX-sim) | **0.874** | 0.708 | 论文公式规整标准,UniRec 强项 |
+| 表(TEDS_X) | **0.517** | 0.810 | 论文学术表最难(多级表头/密集数字/含 LaTeX),全集被书报简单表抬高 |
+| 文本 `--transcribe-model`(UniRec) | **0.630** | — | UniRec 整页转写 |
+| 文本 `--ocr`(PP-OCRv4 mobile) | 0.440 | 0.423 | 轻量档,作对照 |
+
+**文本两档的差距是重点**:`--ocr`(16MB mobile)0.44 vs `--transcribe-model`(UniRec)0.63——和 OpenDoc-0.1B 同源的 UniRec 文本路径显著更强,这才是对标 leaderboard 的公平基准。
+
+## 3c. 官方端到端 Overall(参考基准)
+
+OmniDocBench 官方 leaderboard 的端到端 **Overall**(0–100,越高越好)= `((1−text_edit)·100 + table_TEDS + formula_CDM)/3`:
+
+| 系统 | 类型 | Overall |
+|---|---|---|
+| MinerU2.5-Pro | 专用 VLM | 95.75 |
+| GLM-OCR / PaddleOCR-VL | 专用 VLM | 95.2 / 94.9 |
+| **OpenDoc-0.1B**(=我们用的 UniRec) | 专用 VLM | **90.67** |
+| GPT-4o | 通用 VLM | 86.59 |
+| GOT-OCR | 专家视觉 | 86.52 |
+| Docling | 管线工具 | ~80–85 |
+| Marker | 管线工具 | 78.44 |
+
+**我们的粗略量级**(论文子集,套官方公式;⚠️ **口径示意非官方端到端分**——分维度相似度代理 + 小子集 + 表/公式为单模块、文本为 transcribe 整页,**不可与上表逐位比**):
+`(text 63.0 + table 51.7 + formula 87.4) / 3 ≈ **67**`。
+
+诚实定位:**公式接近论文级(0.87),文本用 UniRec 也不弱(0.63),整体被论文难表(0.52)与管线损耗拉到 ~67 量级,低于 leaderboard 顶部(90+)**。差距来源清楚:① 我们 ≠ OpenDoc 完整系统(它 PP-DocLayoutV2 检测 + UniRec 全栈端到端;我们 DocLayout-YOLO + 分任务重抽 + 自写拼接);② 我们是 **born-digital 优先**,图像文档是补充域;③ 论文学术表是公认最难项。**要逼近 leaderboard 需要端到端 VLM 式管线**(可插拔域),非确定性核心的目标。
+
 ## 4. 决定性结论
 
 **① 换尺子见真章(本次立项的核心)** — 同一个 UniRec 表识别,只换真值口径:
