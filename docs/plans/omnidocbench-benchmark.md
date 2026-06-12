@@ -31,7 +31,7 @@
 - [x] 抽 `category_type=table` 块(poly + GT html);
 - [x] **关键调整**:`--table-model` 是"重抽确定性检测的表",图像上检测失效(`refined: 0`)→ 改用 GT poly 裁表区**直接喂 `UniRec::recognize`**(新 eval-only example [`odb_recognize`](../../crates/docparse-ocr/examples/odb_recognize.rs)),测模型纯能力(benchmark 单模块标准做法);
 - [x] HTML→span 树→复用 `teds_x`(数学定界符归一化),脚本 [`table_eval.py`](../../scripts/eval/omnidocbench/table_eval.py);
-- **验收 ✅**:**25 表 mean TEDS_X 0.812**(80 表稳健均值跑批中)——**同一 UniRec,vs Docling 压扁口径 0.526 → OmniDocBench span 口径 0.812**,坐实"换尺子见真章"。单表样例 0.995 逐格一致。
+- **验收 ✅**:**80 表 mean TEDS_X 0.810、median 0.895**——**同一 UniRec,vs Docling 压扁口径 0.526 → OmniDocBench span 口径 0.810**,坐实"换尺子见真章"。单表样例 0.995 逐格一致;中位数 0.895 即一半的表近乎完美。
 - **副产发现**(记入 testresults):图像文档端到端要发挥模型,需把 `--layout`(YOLO)表区接进 `--table-model`(当前 `--layout` 不产生 Table 元素)。
 
 ### 阶段 2 · 端到端(整页 markdown)
