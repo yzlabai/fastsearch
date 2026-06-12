@@ -6,6 +6,7 @@
 > - 已完成工作的验证与设计回顾见 [phase-1-summary.md](phase-1-summary.md)。
 > - 大格局背景（开源工具全景、平台架构、Rust 取舍）见 [refer/document-parsing-open-source-tools-research-2026.md](refer/document-parsing-open-source-tools-research-2026.md)。
 > - 协作约定见 [../CLAUDE.md](../CLAUDE.md) 与 [../AI_AGENT_DEV_SPEC.md](../AI_AGENT_DEV_SPEC.md)。
+> - 当前状态/记分牌/待办/经验见 [status.md](status.md)；**接入 Agent/RAG 系统**见 [agent-integration.md](agent-integration.md)。
 
 ---
 
@@ -225,4 +226,4 @@ flowchart TD
   Q -->|供 agent/RAG 调用| E[P3: 服务化接口 + 切块溯源 + AI 可插拔增强]
 ```
 
-进度（2026-06-11 晚）：**M1–M7、N1–N5、Phase 4 可自主项全部完成**——含 G3-R 复活（`--table-model` 内嵌 UniRec-0.1B 表结构重抽）、`--formula-model`（公式→LaTeX）、MCP/REST 全增强透传、IR 0.7.0（span 语义+图片 base64）；125 单测、clippy 零 warning、四接口任意开关组合字节一致；记分牌见 §6。**待办**：发布（PyPI/crates.io，候账号）、arXiv 千份/fuzz 24h（资源/排期）、行内公式/JATS/RTL-韩文（VLM 域）（按需/待设计；OCR 档=--transcribe-model、AsciiDoc 已落地 2026-06-11）。里程碑细节见 [plans/closing-docling-gaps.md](plans/closing-docling-gaps.md)；**下一阶段** Phase 5（健壮性纵深 H1–H7）见 [plans/hardening-iteration.md](plans/hardening-iteration.md)；devlog 见 [devlogs/](devlogs/)。
+进度（2026-06-12）：**M1–M7、N1–N5、Phase 4（G1–G9）、Phase 5（H1–H7）、Phase 6（B1–B5）全部下结论**——含 G3-R（`--table-model` 内嵌 UniRec-0.1B 表结构重抽）、`--formula-model`、`--transcribe-model`、MCP/REST 全增强透传、IR 0.7.0（span 语义+图片 base64）；Phase 5 = CCITT/JBIG2 扫描解码、cls 旋转校正、双栏左列重排、精确 TEDS、隐藏文本/读序异常分（两项负结论=架构边界）；Phase 6 = OmniDocBench 提分探查（**主负结论**：学术表 0.52 是 UniRec-0.1B 固定输入的真实天花板，便宜/保速旋钮无解；落地 B1 评测对称 + B2 退化抢救零回归）。clippy 零 warning、四接口任意开关组合字节一致；记分牌见 §6 与 [status.md](status.md)。**待办**：发布（PyPI/crates.io，候账号）、arXiv 千份/fuzz 24h（资源/排期）、行内公式/JATS/RTL-韩文（VLM 域）；难表真杠杆=更大表模型或 `--vlm-tables` 服务（内嵌+保速域外）。详见 [status.md](status.md)；阶段计划见 [plans/](plans/)；devlog 见 [devlogs/](devlogs/)。

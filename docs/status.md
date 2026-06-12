@@ -1,7 +1,8 @@
 # docparse-rs · 项目状态 / 记分牌 / 经验
 
 > 当前进度、记分牌、待办与跨阶段经验教训的**单一真源**。CLAUDE.md §8 只留指针指向本文件。
-> 战略见 [roadmap.md](roadmap.md)；执行里程碑历史见 [plans/](plans/) 下各计划 + [devlogs/](devlogs/)。
+> 战略见 [roadmap.md](roadmap.md)；执行里程碑历史见 [plans/](plans/) 下各计划 + [devlogs/](devlogs/)；
+> **接入 Agent/RAG** 见 [agent-integration.md](agent-integration.md)（CLI/MCP/REST/库 + chunk schema + 引用/增强模式）。
 
 ## 1. 完成里程碑
 
