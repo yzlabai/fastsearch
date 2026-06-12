@@ -20,16 +20,46 @@
 
 十大功能模块全部闭合（IR/PDF/版面/语义/多格式/输出 RAG/质量路由/AI 外接/安全/服务化）。
 
-**质量记分牌**（2026-06-12，born-digital LTR，与参照系统的**一致度**，非人工真值）：
+### OmniDocBench 测评（人工真值）
 
-| 同台 | NID 阅读顺序 | MHS 标题 | TEDS 代理 | TEDS_X 精确 |
-|---|---|---|---|---|
-| vs OpenDataLoader（确定性同类，15 份） | **0.792** | **0.687** | 0.419 | **0.477** |
-| vs Docling（神经管线，13 份） | **0.822** | **0.645** | 0.474 | **0.526** |
+[OmniDocBench](https://github.com/opendatalab/OmniDocBench)（CVPR 2025，opendatalab）对**人工标注**真值打分——表格为 HTML/LaTeX 含真实合并格 span、公式为 LaTeX、文本与阅读顺序。它正是 **OpenDoc-0.1B / UniRec（我们内嵌的模型）自报 90.57% 的 benchmark**。我们用自有指标在数据子集上评分（表用精确树编辑距离 TEDS_X、公式用 LaTeX 字符相似度、文本用字符级相似度——中文无词间空格）：
 
-`TEDS_X` 是 span 感知表树上的精确 Zhang-Shasha 树编辑距离（Phase 5/H5）——奖励代理列压扁掉的合并格结构,代理列保留对照。clean 文档 0.94–1.00（与两者结构同构）；聚合被 CJK 复杂版面与图内嵌表 recall 拖低——逐轴对比、口径与边界详见 [综合测评](docs/testresults/2026-06-10-benchmark-roundup.md)。
+| 维度 | 路径 | 分数 |
+|---|---|---|
+| **文本识别** | `--transcribe-model`（UniRec），学术论文 | **0.872** |
+| **公式 → LaTeX** | UniRec，学术论文（全集 0.708） | **0.874** |
+| **表结构** | UniRec 单模块，80 表 | **0.810**（median **0.895**） |
+| 表，端到端 | 检测 + 识别，单表页 | 0.827 |
+| 表，端到端 | 学术论文（最难类） | 0.517 |
+| 文本，轻量档 | `--ocr` PP-OCRv4 mobile（16MB） | 0.42–0.44 |
 
-**第二记分牌——人工真值（OmniDocBench,模型路径）。** 上面的一致度记分牌与压扁口径的参照输出比,反噬模型真实的合并格结构。在 [OmniDocBench](https://github.com/opendatalab/OmniDocBench)（CVPR 2025,人工 HTML 真值含真实 span——正是 OpenDoc-0.1B/UniRec 报 90.57% 的 benchmark）上,我们内嵌的 UniRec 表识别 **mean TEDS_X 0.810 / median 0.895**（80 表）。同一个模型在 Docling 压扁口径下只读到 0.526——0.526 是口径假象,0.810 才是真实表识别能力。详见 [OmniDocBench 综合测评](docs/testresults/2026-06-12-omnidocbench.md)。
+**直白读法：**
+- **强项** —— 用内嵌 UniRec 模型，**文本与公式都达 ~0.87（接近论文级）**；clean 表区 **0.810，一半的表近乎完美（median 0.895）**。
+- **弱项** —— **学术难表是最大缺口**（端到端 0.52：多级表头 + 密集数字 + 含 LaTeX）。轻量 `--ocr` 档（mobile，16MB）只有 ~0.44——它定位"数字页零成本、扫描补充"，非重型图像 OCR；要质量请用 `--transcribe-model`。
+
+**整体落位。** 把论文子集分数套进 OmniDocBench 官方 Overall 公式 `((1−text_edit)·100 + table_TEDS + formula_CDM)/3` 得 **≈75**——这是粗略代理（自有指标、子集、表/公式为单模块），**不可与下表官方分逐位比**：
+
+| 系统 | 类型 | Overall |
+|---|---|---|
+| MinerU2.5-Pro / GLM-OCR | 专用 VLM | ~95 |
+| **OpenDoc-0.1B**（我们内嵌的 UniRec） | 专用 VLM | **90.67** |
+| GPT-4o / GOT-OCR | 通用 / 专家 VLM | ~86 |
+| Docling | 管线工具 | ~80–85 |
+| Marker | 管线工具 | 78.44 |
+| **docparse-rs**（论文子集，代理） | 管线工具 | **~75** |
+
+诚实定位：**文本与公式已不是短板（各 ~0.87）；与 leaderboard 顶部（90+）的差距主要在难学术表 + 端到端管线打磨。** 我们内嵌 UniRec，但 ≠ 完整 OpenDoc 系统（它 PP-DocLayoutV2 + UniRec 端到端；我们 DocLayout-YOLO + 分任务重抽 + 自写拼接），且 **born-digital 优先**——图像文档是补充域。完整方法与边界：[OmniDocBench 测评](docs/testresults/2026-06-12-omnidocbench.md)。
+
+### 一致度记分牌（vs ODL / Docling，born-digital）
+
+第二个互补参照：与同类系统输出在 born-digital 文档上的**一致度**——非人工真值。它跟踪确定性快路径，但与**压扁口径**表真值比，会反噬真实合并格结构（同一个 UniRec 表在这里读 0.526，在 OmniDocBench 的 span 真值下读 0.810）：
+
+| 同台 | NID 阅读顺序 | MHS 标题 | TEDS_X |
+|---|---|---|---|
+| vs OpenDataLoader（15 份） | 0.792 | 0.687 | 0.477 |
+| vs Docling（13 份） | 0.822 | 0.645 | 0.526 |
+
+详见 [综合测评](docs/testresults/2026-06-10-benchmark-roundup.md)。
 
 ## 与同类产品对比
 

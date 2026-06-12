@@ -20,16 +20,46 @@ A fast, pure-Rust **multi-format document parsing system**: extracts **positione
 
 All ten roadmap modules are closed (IR / PDF / layout / semantics / multi-format / RAG output / quality routing / AI boundary / security / serving).
 
-**Quality scoreboard** (2026-06-12, born-digital LTR; **agreement** with the reference systems, not human-ground-truth accuracy):
+### Quality on OmniDocBench (human ground truth)
 
-| Reference | NID (reading order) | MHS (headings) | TEDS (proxy) | TEDS_X (exact) |
-|---|---|---|---|---|
-| vs OpenDataLoader (deterministic peer, 15 docs) | **0.792** | **0.687** | 0.419 | **0.477** |
-| vs Docling (neural pipeline, 13 docs) | **0.822** | **0.645** | 0.474 | **0.526** |
+[OmniDocBench](https://github.com/opendatalab/OmniDocBench) (CVPR 2025, opendatalab) scores against **human-annotated** truth — tables as HTML/LaTeX with real merged-cell spans, formulas as LaTeX, text and reading order. It is the benchmark **OpenDoc-0.1B / UniRec — the model we embed — reports 90.57% on**. We score it with our own metrics on data subsets (exact-tree-edit TEDS_X for tables, LaTeX char-similarity for formulas, char-level similarity for text — Chinese has no word spaces):
 
-`TEDS_X` is exact Zhang-Shasha tree-edit distance over span-aware table trees (Phase 5/H5) — it rewards merged-cell structure the proxy column flattens; the proxy is kept for continuity. Clean documents score 0.94–1.00 (structurally isomorphic with both references); the aggregate is pulled down by complex CJK layouts and figure-embedded-table recall. Axis-by-axis comparison, methodology, and honest caveats: [benchmark roundup](docs/testresults/2026-06-10-benchmark-roundup.md).
+| Dimension | Path | Score |
+|---|---|---|
+| **Text recognition** | `--transcribe-model` (UniRec), academic papers | **0.872** |
+| **Formula → LaTeX** | UniRec, academic papers (full set 0.708) | **0.874** |
+| **Table structure** | UniRec single-module, 80 tables | **0.810** (median **0.895**) |
+| Table, end-to-end | detect + recognize, single-table pages | 0.827 |
+| Table, end-to-end | academic papers (hardest class) | 0.517 |
+| Text, light tier | `--ocr` PP-OCRv4 mobile (16 MB) | 0.42–0.44 |
 
-**Second scoreboard — human ground truth (OmniDocBench, model path).** The agreement scoreboard above compares against flattened-口径 reference output, which penalizes the model's true merged-cell structure. On [OmniDocBench](https://github.com/opendatalab/OmniDocBench) (CVPR 2025; human HTML truth with real spans — the benchmark OpenDoc-0.1B/UniRec reports 90.57% on), our embedded UniRec table recognition scores **mean TEDS_X 0.810 / median 0.895** (80 tables). The *same* model reads 0.526 against Docling's flattened truth — 0.526 is a口径 artifact, 0.810 is the real ability. Details: [OmniDocBench eval](docs/testresults/2026-06-12-omnidocbench.md).
+**Read plainly:**
+- **Strong** — with the embedded UniRec models, **text and formula both reach ~0.87 (near paper-level)**; clean table regions score **0.810, with half the tables near-perfect (median 0.895)**.
+- **Weak** — **academic tables are the biggest gap** (0.52 end-to-end: multi-row headers + dense numbers + embedded LaTeX). The light `--ocr` tier (mobile, 16 MB) is only ~0.44 — built for "zero cost on digital pages, scan fallback", not heavy image OCR; use `--transcribe-model` when quality matters.
+
+**Where we land overall.** Plugging the paper-subset scores into OmniDocBench's official Overall formula `((1−text_edit)·100 + table_TEDS + formula_CDM)/3` gives **≈75** — a rough proxy (our own metrics, subsets, single-module table/formula), **not directly comparable** to the official numbers below:
+
+| System | Type | Overall |
+|---|---|---|
+| MinerU2.5-Pro / GLM-OCR | dedicated VLM | ~95 |
+| **OpenDoc-0.1B** (the UniRec we embed) | dedicated VLM | **90.67** |
+| GPT-4o / GOT-OCR | general / expert VLM | ~86 |
+| Docling | pipeline tool | ~80–85 |
+| Marker | pipeline tool | 78.44 |
+| **docparse-rs** (paper subset, proxy) | pipeline tool | **~75** |
+
+Honest positioning: **text and formula are no longer the bottleneck (~0.87 each); we trail the leaderboard top (90+) mainly on hard academic tables plus end-to-end pipeline polish.** We embed UniRec but are not the full OpenDoc system (it runs PP-DocLayoutV2 + UniRec end-to-end; we use DocLayout-YOLO + per-task re-extraction + our own stitching), and we are **born-digital first** — image documents are a complementary domain. Full method and caveats: [OmniDocBench eval](docs/testresults/2026-06-12-omnidocbench.md).
+
+### Agreement scoreboard (vs ODL / Docling, born-digital)
+
+A second, complementary reference: **agreement** with peer systems' output on born-digital docs — not human truth. It tracks the deterministic fast path, but compares against *flattened* table truth, which penalizes real merged-cell structure (the same UniRec table reads 0.526 here vs 0.810 on OmniDocBench's span truth):
+
+| Reference | NID (reading order) | MHS (headings) | TEDS_X |
+|---|---|---|---|
+| vs OpenDataLoader (15 docs) | 0.792 | 0.687 | 0.477 |
+| vs Docling (13 docs) | 0.822 | 0.645 | 0.526 |
+
+Details: [benchmark roundup](docs/testresults/2026-06-10-benchmark-roundup.md).
 
 ## Comparison with related tools
 
