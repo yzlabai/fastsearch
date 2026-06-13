@@ -61,6 +61,9 @@ async fn parse(
     let format = q.get("format").cloned().unwrap_or_else(|| "json".into());
     let flag = |k: &str| matches!(q.get(k).map(String::as_str), Some("1") | Some("true"));
     let images_embedded = q.get("images").map(String::as_str) == Some("embedded");
+    // chunks 专用：?envelope=true 把裸 chunk 数组包成 {provenance,quality,profile,chunks}
+    // （同 MCP get_chunks），让 RAG 消费方据 quality.flags 决定是否开 OCR/layout。
+    let envelope = flag("envelope");
     let opts = crate::EnhanceOpts {
         ocr: flag("ocr"),
         images_embedded,
@@ -100,7 +103,7 @@ async fn parse(
     let rendered = tokio::task::spawn_blocking(move || {
         // Model load (first enhanced request only) and inference are both
         // CPU-bound — they belong on the blocking pool with the parse.
-        render(&task_path, &task_name, &format, opts, &state)
+        render(&task_path, &task_name, &format, opts, envelope, &state)
     })
     .await;
     let elapsed_ms = started.elapsed().as_millis().to_string();
@@ -129,17 +132,19 @@ fn err(status: StatusCode, msg: &str) -> Response {
     (status, msg.to_string()).into_response()
 }
 
-/// Parse + render one document. Must stay in lockstep with the CLI's format
-/// match so REST output is byte-identical to `docparse <name> -f <format>`
-/// run on the same file. `source_name` replaces the staging temp path in the
-/// document's source annotation — clients sent the file, they should see its
-/// name, not our temp dir (which would also leak server paths and make
-/// responses nondeterministic).
+/// Parse + render one document. For the same input/format the body is
+/// byte-identical to `docparse <name> -f <format>` (CLI lockstep) — the one
+/// REST-only superset is `chunks` + `envelope=true`, which wraps the same
+/// chunk array in the MCP `get_chunks` envelope (additive, opt-in).
+/// `source_name` replaces the staging temp path in the document's source
+/// annotation — clients sent the file, they should see its name, not our temp
+/// dir (which would also leak server paths and make responses nondeterministic).
 fn render(
     path: &Path,
     source_name: &str,
     format: &str,
     opts: crate::EnhanceOpts,
+    envelope: bool,
     state: &crate::EnhanceState,
 ) -> anyhow::Result<(String, &'static str)> {
     let doc = crate::parse_path_with(path, opts.images_embedded)?;
@@ -149,10 +154,23 @@ fn render(
         "json" => (output::to_json(&doc)?, "application/json"),
         "markdown" => (output::to_markdown(&doc), "text/markdown; charset=utf-8"),
         "text" => (output::to_text(&doc), "text/plain; charset=utf-8"),
-        "chunks" => (
-            docparse_core::chunk::to_json(&docparse_core::chunk::chunk_document(&doc)),
-            "application/json",
-        ),
+        "chunks" => {
+            let chunks = docparse_core::chunk::chunk_document(&doc);
+            let body = if envelope {
+                // Same shape as MCP get_chunks: provenance + quality + per-page
+                // profile alongside the chunks, so a RAG client can route
+                // enhancement (OCR/layout) off quality.flags without a 2nd call.
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "provenance": serde_json::to_value(&doc.provenance)?,
+                    "quality": serde_json::to_value(docparse_core::quality::analyze(&doc))?,
+                    "profile": serde_json::to_value(docparse_core::quality::profile(&doc))?,
+                    "chunks": serde_json::to_value(&chunks)?,
+                }))?
+            } else {
+                docparse_core::chunk::to_json(&chunks)
+            };
+            (body, "application/json")
+        }
         other => anyhow::bail!("unknown format: {other} (json|markdown|text|chunks)"),
     })
 }
@@ -200,8 +218,8 @@ mod tests {
     fn render_matches_cli_pipeline_and_is_deterministic() {
         let path = temp_html("docparse-rest-test.html");
         let st = test_state();
-        let (a, ct) = render(&path, "up.html", "markdown", Default::default(), &st).unwrap();
-        let (b, _) = render(&path, "up.html", "markdown", Default::default(), &st).unwrap();
+        let (a, ct) = render(&path, "up.html", "markdown", Default::default(), false, &st).unwrap();
+        let (b, _) = render(&path, "up.html", "markdown", Default::default(), false, &st).unwrap();
         assert_eq!(a, b, "same input must render byte-identically");
         assert_eq!(ct, "text/markdown; charset=utf-8");
         assert!(a.contains("Hello rest."));
@@ -216,7 +234,27 @@ mod tests {
     #[test]
     fn unknown_format_is_an_error() {
         let path = temp_html("docparse-rest-badfmt.html");
-        assert!(render(&path, "x.html", "yaml", Default::default(), &test_state()).is_err());
+        assert!(render(&path, "x.html", "yaml", Default::default(), false, &test_state()).is_err());
+    }
+
+    #[test]
+    fn chunks_envelope_is_additive_superset() {
+        let path = temp_html("docparse-rest-envelope.html");
+        let st = test_state();
+        // 默认 = 裸数组（与 CLI 字节一致）
+        let (bare, ct) = render(&path, "up.html", "chunks", Default::default(), false, &st).unwrap();
+        assert_eq!(ct, "application/json");
+        let bare_json: serde_json::Value = serde_json::from_str(&bare).unwrap();
+        assert!(bare_json.is_array(), "bare chunks must be a JSON array");
+
+        // envelope=true = {provenance,quality,profile,chunks}，chunks 与裸数组同内容
+        let (env, _) =
+            render(&path, "up.html", "chunks", Default::default(), true, &st).unwrap();
+        let env_json: serde_json::Value = serde_json::from_str(&env).unwrap();
+        assert!(env_json["provenance"]["parser"].is_string());
+        assert!(env_json["quality"]["coverage"].is_number());
+        assert!(env_json["profile"].is_array());
+        assert_eq!(env_json["chunks"], bare_json, "envelope.chunks == bare array");
     }
 
     #[test]

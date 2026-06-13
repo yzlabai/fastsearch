@@ -72,10 +72,14 @@ docparse serve --port 8642            # 绑 127.0.0.1
 - `GET /healthz` — 存活探针。
 - `POST /parse?format=json|markdown|text|chunks` — **multipart** 上传文件字段，返回对应格式。
   增强用查询参数：`?ocr=true&layout=true&table_model=true&formula_model=true&vlm_describe=true&vlm_tables=true`（同样需启动时配模型，见 §5）。
+- `format=chunks` 可加 `?envelope=true`：把裸 chunk 数组包成 `{provenance, quality, profile, chunks}`（同 MCP `get_chunks`）。RAG 消费方可据 `quality.flags`（`ScannedNoText` / `HighGarble` 等）和 `profile` 自行决定要不要对该文档开 OCR/layout，**省一次往返**。默认（不加）仍是裸数组，与 CLI 逐字节一致。
 
 ```bash
 curl -s -F "file=@paper.pdf" \
   "http://127.0.0.1:8642/parse?format=chunks" | jq '.[0]'
+# 带质量信封（决定是否开 OCR）：
+curl -s -F "file=@scan.pdf" \
+  "http://127.0.0.1:8642/parse?format=chunks&envelope=true" | jq '.quality.flags'
 ```
 
 > OCR 等模型是**首请求懒加载**：只服务数字文档时进程零模型、冷启动 <100ms。
