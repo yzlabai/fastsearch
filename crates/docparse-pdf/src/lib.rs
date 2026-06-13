@@ -47,8 +47,10 @@ impl DocumentParser for PdfParser {
     }
 
     fn parse(&self, path: &Path) -> anyhow::Result<Document> {
-        let doc = PdfDocument::load(path)?;
-        let mut out = self.parse_document(doc)?;
+        // Read bytes ourselves so the path and in-memory entries share the same
+        // tolerant loader (CNKI/万方 PDFs need a repair pass; see load_tolerant).
+        let bytes = std::fs::read(path)?;
+        let mut out = self.parse_document(load_tolerant(&bytes)?)?;
         out.source = path.display().to_string();
         Ok(out)
     }
@@ -58,7 +60,7 @@ impl PdfParser {
     /// Parse an in-memory PDF (REST uploads, fuzzing) — same pipeline as the
     /// path-based entry, minus the file read.
     pub fn parse_bytes(&self, bytes: &[u8]) -> anyhow::Result<Document> {
-        self.parse_document(PdfDocument::load_mem(bytes)?)
+        self.parse_document(load_tolerant(bytes)?)
     }
 
     fn parse_document(&self, doc: PdfDocument) -> anyhow::Result<Document> {
@@ -105,6 +107,84 @@ impl PdfParser {
             provenance: Some(Provenance::new("pdf", env!("CARGO_PKG_VERSION"))),
             pages,
         })
+    }
+}
+
+/// Load a PDF, retrying with a byte-level repair pass if the strict parse fails.
+///
+/// CNKI / 万方 (common Chinese journal/thesis sources) write the cross-reference
+/// section as `xref 0 67` — the subsection header on the SAME line as the `xref`
+/// keyword. The spec puts it on the next line, and lopdf's reader rejects the
+/// variant with `InvalidTrailer` (MuPDF/Acrobat tolerate it). We only pay the
+/// repair cost on the error path, so well-formed PDFs are untouched.
+fn load_tolerant(bytes: &[u8]) -> anyhow::Result<PdfDocument> {
+    match PdfDocument::load_mem(bytes) {
+        Ok(doc) => Ok(doc),
+        Err(first_err) => match repair_xref_keyword(bytes) {
+            Some(fixed) => PdfDocument::load_mem(&fixed).map_err(|_| first_err.into()),
+            None => Err(first_err.into()),
+        },
+    }
+}
+
+/// Insert an EOL after a line-leading `xref` keyword that is followed by the
+/// subsection header on the same line (`xref 0 67` → `xref\r\n0 67`). Offset-safe:
+/// xref entries point at objects *before* the table, and `startxref` points at
+/// the `xref` keyword itself — both unaffected by inserting after the keyword.
+/// Returns `None` when nothing matched (caller keeps the original bytes/error).
+fn repair_xref_keyword(bytes: &[u8]) -> Option<Vec<u8>> {
+    const KW: &[u8] = b"xref";
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    let mut i = 0;
+    let mut changed = false;
+    while i < bytes.len() {
+        let at_line_start = i == 0 || bytes[i - 1] == b'\n' || bytes[i - 1] == b'\r';
+        // `xref` (not `startxref`, which the line-start check already excludes)
+        // followed by horizontal whitespace then a digit = the malformed header.
+        if at_line_start && bytes[i..].starts_with(KW) {
+            let after = i + KW.len();
+            let mut j = after;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j > after && j < bytes.len() && bytes[j].is_ascii_digit() {
+                out.extend_from_slice(KW);
+                out.extend_from_slice(b"\r\n");
+                i = j; // drop the horizontal whitespace, keep the digits
+                changed = true;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::repair_xref_keyword;
+
+    #[test]
+    fn normalizes_same_line_xref_header() {
+        let got = repair_xref_keyword(b"...\r\nxref 0 67\r\n0000 n\r\n").unwrap();
+        assert!(
+            got.windows(8).any(|w| w == b"xref\r\n0 "),
+            "got: {}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    #[test]
+    fn leaves_conforming_xref_untouched() {
+        // `xref` already followed by EOL → no change → None.
+        assert!(repair_xref_keyword(b"...\r\nxref\r\n0 67\r\n").is_none());
+        // `startxref 123` is not line-leading `xref`+ws+digit at the keyword.
+        assert!(repair_xref_keyword(b"startxref\r\n834254\r\n%%EOF").is_none());
     }
 }
 
