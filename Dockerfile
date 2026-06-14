@@ -2,13 +2,16 @@
 # Pure-Rust single binary (~26MB); optional model files (OCR/UniRec/layout) are
 # NOT baked in — mount them at /app/models at runtime. Digital PDFs need none.
 # syntax=docker/dockerfile:1
+# REGISTRY: base-image registry prefix. Default empty = Docker Hub. For mirror-only
+# networks set e.g. --build-arg REGISTRY=docker.1ms.run/library/ (compose passes it).
+ARG REGISTRY=
 
-FROM rust:1-bookworm AS builder
+FROM ${REGISTRY}rust:1-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --bin docparse
 
-FROM debian:bookworm-slim
+FROM ${REGISTRY}debian:bookworm-slim
 # ca-certificates: outbound HTTPS for the optional VLM enhancer (--vlm-url).
 # curl: container HEALTHCHECK against /healthz.
 RUN apt-get update \
