@@ -48,7 +48,7 @@
 | Marker | 管线工具 | 78.44 |
 | **docparse-rs**（论文子集，代理） | 管线工具 | **~75** |
 
-诚实定位：**文本与公式已不是短板（各 ~0.87）；与 leaderboard 顶部（90+）的差距主要在难学术表 + 端到端管线打磨。** 我们内嵌 UniRec，但 ≠ 完整 OpenDoc 系统（它 PP-DocLayoutV2 + UniRec 端到端；我们 DocLayout-YOLO + 分任务重抽 + 自写拼接），且 **born-digital 优先**——图像文档是补充域。完整方法与边界：[OmniDocBench 测评](docs/testresults/2026-06-12-omnidocbench.md)。
+诚实定位：**文本与公式已不是短板（各 ~0.87）；与 leaderboard 顶部（90+）的差距主要在难学术表 + 端到端管线打磨。** 我们把 OpenDoc-0.1B 的两半都内嵌为可选 `tract` 后端——UniRec（识别）+ 现在的 **PP-DocLayoutV2**（版面，与默认 DocLayout-YOLO 并存、opt-in）——但用自己的确定性核心拼接，而非跑 OpenDoc 的端到端管线;且 **born-digital 优先**——图像文档是补充域。（PP-DocLayoutV2 把杂版面端到端表识别提升约 3×,见 [版面后端 A/B](docs/testresults/2026-06-15-ppv2-vs-yolo-omnidocbench.md)。）完整方法与边界：[OmniDocBench 测评](docs/testresults/2026-06-12-omnidocbench.md)。
 
 ### 一致度记分牌（vs ODL / Docling，born-digital）
 
@@ -90,7 +90,8 @@ cargo build --release
 ./target/release/docparse input.pdf -f text -o out.txt
 ./target/release/docparse input.pdf -f chunks      # RAG 切块（page+bbox+标题面包屑）
 ./target/release/docparse scan.pdf --ocr           # 扫描件 OCR（需 models/ppocr，数字页零成本）
-./target/release/docparse hard.pdf --layout        # 版面模型重排宏观读序（需 models/layout，opt-in）
+./target/release/docparse hard.pdf --layout        # 版面模型重排宏观读序（需 models/layout，opt-in；默认 DocLayout-YOLO）
+./target/release/docparse hard.pdf --layout --layout-model models/layout-ppv2/PP-DoclayoutV2_simp.onnx   # PP-DocLayoutV2 后端（自动识别；杂版面表检测 ≈3× YOLO）
 ./target/release/docparse doc.pdf --vlm-describe --vlm-url http://127.0.0.1:8000 --vlm-model <vision-model>   # VLM 图片描述
 ./target/release/docparse doc.pdf --vlm-tables --vlm-url http://127.0.0.1:8000 --vlm-model <vision-model>     # VLM 重抽表结构（合并格/多级表头），失败保底确定性网格
 ./target/release/docparse doc.pdf --table-model models/unirec   # 内嵌 UniRec-0.1B 重抽表结构（合并格/多级表头），进程内无服务
@@ -123,7 +124,8 @@ curl -F "file=@doc.pdf" "http://127.0.0.1:8642/parse?format=chunks&ocr=true&tabl
 | 目录 | 模型 | 来源 | 驱动的功能 |
 |---|---|---|---|
 | `models/ppocr/`（~16MB） | PP-OCRv4 det+rec + 字典；可选 cls 方向分类（~0.6MB，缺失则禁用旋转校正） | PaddleOCR（HuggingFace `SWHL/RapidOCR` 转换件；cls 在其 `PP-OCRv1/ch_ppocr_mobile_v2.0_cls_infer.onnx`） | `--ocr` 扫描件文字 + 旋转扫描自动转正（0/90/180/270） |
-| `models/layout/`（~75MB） | DocLayout-YOLO | [opendatalab/DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO)（DocStructBench） | `--layout` 版面区域、公式区检出 |
+| `models/layout/`（~75MB） | DocLayout-YOLO | [opendatalab/DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO)（DocStructBench） | `--layout` 版面区域（默认后端）、公式区检出 |
+| `models/layout-ppv2/`（~210MB） | **PP-DocLayoutV2**（RT-DETR，25 类 + 原生阅读顺序） | [PaddleOCR](https://www.paddleocr.ai/) PP-DocLayoutV2；ONNX 经 [OpenOCR](https://github.com/Topdu/OpenOCR)（`topdu/PP_DoclayoutV2_onnx`）——**OpenDoc-0.1B** 的版面那半 | `--layout --layout-model …PP-DoclayoutV2_simp.onnx`：类别更丰富 + 原生读序，**杂版面端到端表检测 ≈3× YOLO**（自动识别）。一次性静态化：`scripts/spike/ppv2/prepare.py` |
 | `models/unirec/`（~700MB） | **UniRec-0.1B**（统一文本/公式/表格识别） | [OpenOCR](https://github.com/Topdu/OpenOCR)（FVL Lab；[论文 arXiv 2512.21095](https://arxiv.org/abs/2512.21095)）——其 **OpenDoc-0.1B** 文档解析系统的识别器，官方 ONNX：`huggingface-cli download topdu/unirec_0_1b_onnx --local-dir models/unirec` | `--table-model` 合并格表结构 / `--formula-model` 公式→LaTeX / `--transcribe-model` 整页转写（中英） |
 
 > UniRec 接入方式：我们用 `tract` 纯 Rust 运行其官方 encoder/decoder ONNX，自回归循环与 KV-cache 在 Rust 宿主侧驱动——OpenOCR 的 OpenDoc 管线本身是 Python/ONNX Runtime,我们复用其模型与 tokenizer 映射、独立实现推理与 HTML/LaTeX 结果解析（选型与 spike 实测见 [docs/refer/openocr-0.1b-evaluation.md](docs/refer/openocr-0.1b-evaluation.md)）。
@@ -143,7 +145,7 @@ Cargo workspace，十七个 crate：
 | [`docparse-docx`](crates/docparse-docx) | DOCX 后端：docx-rs 结构 → 合成坐标汇入同一 IR；含 zip-bomb 预检 | docx-rs |
 | [`docparse-html`](crates/docparse-html) | HTML 后端：DOM 前序遍历 → 标题/段落/列表/表格 | scraper |
 | `docparse-{xlsx,pptx,md,csv,srt,tex}` | 薄后端：XLSX（calamine）/ PPTX（每 slide 一页）/ Markdown / CSV（手写 RFC-4180 子集）/ SRT·WebVTT 字幕（每 cue 一段带时间戳）/ LaTeX 源码子集（章节/列表/tabular→表）/ EML 邮件（头部/正文/附件列举）/ PNG·JPEG 图片即文档（走 OCR 路由）/ AsciiDoc 子集——同一合成布局汇入 IR | calamine, quick-xml, pulldown-cmark, mail-parser, zune-png |
-| [`docparse-ocr`](crates/docparse-ocr) | ONNX 内嵌 enhancer：OCR（PP-OCRv4 det+rec，DBNet 后处理/CTC 解码自研）+ 版面（DocLayout-YOLO 区域→阅读组），均经 `tract` 纯 Rust 推理 | tract-onnx, zune-jpeg |
+| [`docparse-ocr`](crates/docparse-ocr) | ONNX 内嵌 enhancer：OCR（PP-OCRv4 det+rec，DBNet 后处理/CTC 解码自研）+ 版面（DocLayout-YOLO 或 PP-DocLayoutV2 区域→阅读组，统一 `RegionKind`），均经 `tract` 纯 Rust 推理 | tract-onnx, zune-jpeg |
 | [`docparse-raster`](crates/docparse-raster) | 难页按需渲染（纯 Rust `hayro`，~100ms/页）——主流程永不渲染；仅 enhancer 路由页 opt-in，含坏渲染守卫 | hayro |
 | [`docparse-vlm`](crates/docparse-vlm) | VLM enhancer：OpenAI 兼容服务（vLLM/LM Studio 等）图片描述等任务，自带最小 PNG 编码器，服务失败优雅降级 | ureq, base64 |
 | [`docparse-cli`](crates/docparse-cli) | `docparse` 命令行 + **MCP stdio server**（手写 JSON-RPC，零 SDK 依赖）+ **REST**（axum） | clap, axum, tokio |
@@ -181,4 +183,4 @@ Cargo workspace，十七个 crate：
 
 ## 许可
 
-Apache-2.0。本项目为独立实现，不包含 veraPDF 代码（veraPDF 为 GPLv3+/MPLv2，仅参考其算法并在源码注明出处）。外部模型文件均为 Apache-2.0：PP-OCR（PaddleOCR）、DocLayout-YOLO（opendatalab）、UniRec-0.1B（[OpenOCR](https://github.com/Topdu/OpenOCR)/FVL Lab——感谢其开源 OpenDoc-0.1B 文档解析系统与官方 ONNX 导出）。
+Apache-2.0。本项目为独立实现，不包含 veraPDF 代码（veraPDF 为 GPLv3+/MPLv2，仅参考其算法并在源码注明出处）。外部模型文件均为 Apache-2.0：PP-OCR（PaddleOCR）、DocLayout-YOLO（opendatalab）、PP-DocLayoutV2（PaddleOCR；ONNX 经 OpenOCR）、UniRec-0.1B（[OpenOCR](https://github.com/Topdu/OpenOCR)/FVL Lab——感谢其开源 OpenDoc-0.1B 文档解析系统与官方 ONNX 导出）。构建携带两处最小、已注明出处的 [tract 补丁](vendor/PATCHES.md)（vendored，待上游合并）以在 `tract` 上运行 PP-DocLayoutV2（RT-DETR）。

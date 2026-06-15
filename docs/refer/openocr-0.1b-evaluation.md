@@ -1,5 +1,7 @@
 # 调研:OpenOCR 0.1B(UniRec/OpenDoc)能否承接表结构/公式/整页转写(2026-06-11)
 
+> **后续(2026-06-14/15)**:本调研聚焦 UniRec(识别,已落地 G3-R)。OpenDoc 的另一半 **PP-DocLayoutV2(版面)** 也已内嵌——见 [plans/ppv2-layout-via-tract-patch.md](../plans/ppv2-layout-via-tract-patch.md) 与 analysis [why-tract-cant-run](../analysis/2026-06-14-why-tract-cant-run-pp-doclayoutv2.md);两处 tract 补丁即跑通,杂版面端到端表 ≈3×([记分牌 A/B](../testresults/2026-06-15-ppv2-vs-yolo-omnidocbench.md))。
+>
 > 用户提议:考虑 [Topdu/OpenOCR](https://github.com/Topdu/OpenOCR) 的 0.1B 模型。
 > 结论先行:**高度对口,值得 spike**——它正打在我们三个"原计划只能靠 VLM 服务"的缺口上(表结构、公式→LaTeX、整页转写),且架构形态比 SLANet/TATR **tract-友好得多**(宿主驱动自回归,无 ONNX `Loop`)。关键不确定性只有一个:**CPU 推理速度**(官方数字全是 A800 GPU)。建议按老规矩 spike 门控,过了就把这三项从"VLM 服务驱动"改划"P4 内嵌"。
 
