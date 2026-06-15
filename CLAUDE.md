@@ -71,7 +71,7 @@ Cargo workspace，十七个 crate（core/pdf/docx/html/ocr/raster/vlm/xlsx/pptx/
 | 不静默吞数据 | 见 AI_AGENT_DEV_SPEC §7 红旗：不 `try/swallow`、不删测试绿 CI |
 | 风格 | `cargo fmt` 默认风格；clippy 零 warning；模块级 `//!` doc 说明"是什么、为什么" |
 | 依赖 | 版本集中在根 `Cargo.toml` 的 `[workspace.dependencies]`，crate 用 `dep.workspace = true` 继承；新依赖按通用规范先问 |
-| **vendored tract 补丁** | 根 `Cargo.toml` `[patch.crates-io]` 把 `tract-hir`/`tract-core` 指向 `vendor/`，内含 2 处最小修复（GatherNd 推断 + TopK 收 TDim）让 PP-DocLayoutV2 跑通——见 [vendor/PATCHES.md](vendor/PATCHES.md)。**bump tract 前先读它**：升级需重新 vendor + 重打补丁；上游 PR 合并发版后删 `vendor/` 改回版本依赖（草稿 [vendor/UPSTREAM-PRS.md](vendor/UPSTREAM-PRS.md)） |
+| **vendored tract 补丁** | 根 `Cargo.toml` `[patch.crates-io]` 把 `tract-hir`/`tract-core` 指向 `vendor/`，内含 2 处最小修复（GatherNd 推断 + TopK 收 TDim）让 PP-DocLayoutV2 跑通。**决定（2026-06-15）：长期 vendored 留 main，不发上游 PR**——为什么/bump tract 时如何重打补丁/何时可删全在 [vendor/README.md](vendor/README.md)（每处 diff 见 [vendor/PATCHES.md](vendor/PATCHES.md)）。**bump tract 前必读 vendor/README.md §4** |
 
 ## 5. veraPDF 参考与许可边界（落实通用规范"外部参考与许可底线"）
 

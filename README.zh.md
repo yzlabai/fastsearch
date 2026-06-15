@@ -183,4 +183,4 @@ Cargo workspace，十七个 crate：
 
 ## 许可
 
-Apache-2.0。本项目为独立实现，不包含 veraPDF 代码（veraPDF 为 GPLv3+/MPLv2，仅参考其算法并在源码注明出处）。外部模型文件均为 Apache-2.0：PP-OCR（PaddleOCR）、DocLayout-YOLO（opendatalab）、PP-DocLayoutV2（PaddleOCR；ONNX 经 OpenOCR）、UniRec-0.1B（[OpenOCR](https://github.com/Topdu/OpenOCR)/FVL Lab——感谢其开源 OpenDoc-0.1B 文档解析系统与官方 ONNX 导出）。构建携带两处最小、已注明出处的 [tract 补丁](vendor/PATCHES.md)（vendored，待上游合并）以在 `tract` 上运行 PP-DocLayoutV2（RT-DETR）。
+Apache-2.0。本项目为独立实现，不包含 veraPDF 代码（veraPDF 为 GPLv3+/MPLv2，仅参考其算法并在源码注明出处）。外部模型文件均为 Apache-2.0：PP-OCR（PaddleOCR）、DocLayout-YOLO（opendatalab）、PP-DocLayoutV2（PaddleOCR；ONNX 经 OpenOCR）、UniRec-0.1B（[OpenOCR](https://github.com/Topdu/OpenOCR)/FVL Lab——感谢其开源 OpenDoc-0.1B 文档解析系统与官方 ONNX 导出）。构建携带两处最小、已注明出处的 [tract 补丁](vendor/PATCHES.md)（按决定长期 vendored 留 main，见 [vendor/README.md](vendor/README.md)）以在 `tract` 上运行 PP-DocLayoutV2（RT-DETR）。

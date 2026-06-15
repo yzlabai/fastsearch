@@ -4,7 +4,7 @@
 >
 > **立项依据(已证事实)**:① PP-DocLayoutV2 质量明显优于现役 DocLayout-YOLO(25 类语义 + 原生阅读顺序 + 召回,S3-lite 已证);② 落地的"墙"是 **tract 0.23.1 对 RT-DETR 动态检测头的具体 bug/短板**,不是缺算子——`GridSample×18` tract 能 optimize(虚惊),头号坎 **GatherNd 推断 bug 是一行,打补丁后全图 optimize 通过(已验证)**;③ 仅剩 eval 期的 TDim 类坎(TopK 起)待修。
 >
-> **目标**:走路 A——**修几处 tract 算子 → eval 跑通 → 对齐 ORT → 内嵌落地 `--layout-model ppv2`(与 YOLO 共存)**,并把 tract 修复上游化。
+> **目标**:走路 A——**修几处 tract 算子 → eval 跑通 → 对齐 ORT → 内嵌落地 `--layout-model ppv2`(与 YOLO 共存)**。(原计划含"上游化 tract 修复";**已于 2026-06-15 决定:补丁长期 vendored 留 main,不发上游 PR**,见 [vendor/README.md](../../vendor/README.md)。)
 >
 > ---
 > **✅ 实施进度(2026-06-14,devlog [2026-06-14-ppv2-tract-integration.md](../devlogs/2026-06-14-ppv2-tract-integration.md)):P0–P6 完成。**
@@ -13,7 +13,7 @@
 > - **P5** 速度:2391ms = YOLO(1738ms)的 **1.38×**,过 1.5× 门。
 > - **依赖分析**:vendored 补丁进 main 低风险且可证明对现有模型零影响(PP-OCR/UniRec/SLANet/TATR 不用这两算子;YOLO 的 TopK 走非 TDim 原路径)。见 [analysis/2026-06-14-vendored-tract-patch-on-main.md](../analysis/2026-06-14-vendored-tract-patch-on-main.md)。
 > - **P6** 内嵌:`layout.rs` 双后端(**按 ONNX 输入数自动识别** YOLO/PPV2)、`RegionKind` 25→统一语义、原生 order 定序、标题 `tag` 流入输出、表区 seed;`formula.rs`/`transcribe.rs` 迁移到 `kind`(顺带支持 PPV2);YOLO 路径零回归(单测 25/25、e2e 16 区域不变)。**用法:`--layout --layout-model models/layout-ppv2/PP-DoclayoutV2_simp.onnx`**。
-> - **待办 P7**:上游 PR + 记分牌全回归 + status.md。
+> - **P7(已收尾,2026-06-15)**:记分牌 A/B 已跑(General 端到端表 0.206→0.654 ≈3×,见 [testresults/2026-06-15](../testresults/2026-06-15-ppv2-vs-yolo-omnidocbench.md))、status.md 已更;**上游 PR 决定不发**(补丁长期 vendored,[vendor/README.md](../../vendor/README.md);草稿留 [vendor/UPSTREAM-PRS.md](../../vendor/UPSTREAM-PRS.md) 备用)。**本计划全部收官。**
 >
 > **边界(延续 G2/G3-R 身份)**:纯 Rust、确定性核心独立、模型可插拔;主流程不渲染像素,难页按需渲染;版面是 **opt-in** 路径,**快路径(born-digital 无模型)零触碰**。不追:GPU、自训模型、paddlex/onnxruntime 运行时依赖(onnxruntime 仅 spike 期做金标准对照,不进产物)。
 
@@ -75,11 +75,11 @@
 - [ ] **依赖**:tract patch 经 `[patch.crates-io]` 生效;**onnxruntime 不进任何产物路径**。
 - **验收**:`docparse <pdf> --layout --layout-model ppv2` 跑通,输出阅读顺序/类别明显优于 yolo(对照 S3-lite 同页);yolo 路径零回归。
 
-### P7 · 上游化 tract 修复 + 收尾 —— *0.5d*
-- [ ] 给 tract 提 issue/PR:GatherNd 推断 bug(明确 bug,附最小复现)+ TopK/TDim 修复;`PATCHES.md` 链接 PR。
-- [ ] 决策 vendoring 去留:上游合并前维持 `vendor/`+`[patch]`;合并发版后改为版本依赖并删 vendor。
-- [ ] **回归三件套**(§1 lorem/bialetti/1901.03003)+ PP-OCR/YOLO/UniRec 推理 + 记分牌必跑——确认 tract patch 对现栈零副作用。
-- [ ] devlog + testresults 落档;更新 [docs/status.md](../status.md) 记分牌与状态。
+### P7 · 收尾 —— *已完成 2026-06-15*
+- [x] **vendoring 去留(决定)**:**长期 vendored 留 main,不发上游 PR**(理由/维护/回退见 [vendor/README.md](../../vendor/README.md);PR 草稿留 [vendor/UPSTREAM-PRS.md](../../vendor/UPSTREAM-PRS.md) 备用)。
+- [x] **回归**(§1 lorem/bialetti/1901.03003)+ PP-OCR/YOLO/UniRec + 149 单测——确认 tract patch 对现栈零副作用;算子级证明零影响。
+- [x] **记分牌 A/B**(YOLO vs PPV2,同页同打分器):General 端到端表 0.206→0.654 ≈3×,见 [testresults/2026-06-15](../testresults/2026-06-15-ppv2-vs-yolo-omnidocbench.md)。
+- [x] devlog + testresults 落档;[docs/status.md](../status.md) Phase 7 已更;README/CLAUDE/roadmap/agent-integration/CLI help 全量同步。
 - **验收**:clippy 零 warning、`cargo fmt`、全单测绿、三件套回归无异、记分牌无回归。
 
 ## 2. 工作量与关键路径
@@ -93,7 +93,7 @@
 | **P4 正确性 == ORT** | 1d | **可用性闸门** |
 | P5 速度 | 0.5d | ≤1.5× YOLO |
 | P6 内嵌落地 | 2–3d | yolo 零回归 |
-| P7 上游 + 回归 | 0.5d | 记分牌无回归 |
+| P7 收尾 + 回归 + A/B | 0.5d | 记分牌无回归 |
 
 **合计 ≈ 7–11d**。关键路径 = P2→P3→P4(tract 修复链 + 正确性);P0/P1 已基本就绪。**P4 不过或闸门 G 触发 → 掉头路 C 或搁置。**
 
@@ -103,7 +103,7 @@
 |---|---|
 | TDim 坎不止 TopK,蔓延成 tract 子系统重写 | **闸门 G**(≤6 处)硬限;超则掉头路 C |
 | tract 修复引入数值偏差(非纯形状) | P4 逐框对齐 ORT;参考 `compute_shape` 正确实现校准 |
-| 维护 tract fork 的长期成本 | P7 上游 PR;GatherNd 是明确 bug,大概率被接受 |
+| 维护 tract fork 的长期成本 | 接受为已知有界成本(bump tract 时重打补丁,流程见 [vendor/README.md](../../vendor/README.md) §4);PR 草稿留存,需要时再上游 |
 | 静态化把 batch 钉死=1(单页) | 版面本就逐页跑,无需 batch>1;若要批处理另议 |
 | 速度比 YOLO 慢(RT-DETR 更重) | P5 门 + int8 量化备选;opt-in 路径容忍 |
 | onnxsim/onnx 版本漂移致静态化不稳 | P0 脚本固定版本;产物是静态 onnx(一次性) |
