@@ -68,6 +68,7 @@ pulldown-cmark = { version = "0.12", default-features = false }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = true
 
 [patch.crates-io]
 tract-hir = { path = "vendor/tract-hir" }
