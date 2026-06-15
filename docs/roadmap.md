@@ -139,7 +139,7 @@ flowchart TB
 |---|---|---|---|---|
 | 1 | **统一 IR** | 格式无关数据模型 + 版本化 schema + provenance（解析器/版本/置信度）。系统最重要的长期接口 | ✅ 版本化 `SCHEMA_VERSION` + provenance + 每 chunk confidence（M2） | 报告 §6 Document IR / `document-ir` |
 | 2 | **PDF 确定性后端** | 内容流解释器 + 字体层 + 精确坐标，纯 Rust 复刻 ODL 快路径 | ✅ 内容流+字体层成熟（AFM/Encoding/CMap/字距，M1）；clean LTR 达 ODL/Docling 水平 | veraPDF-parser（`pd.font`/CMap） |
-| 3 | **版面与阅读顺序** | XY-cut 多栏排序、页眉页脚/水印识别、段落聚合 | ✅ XY-cut+段落聚合+页眉页脚+去连字（M3）；CJK/最难双栏首页属确定性天花板（→模块 8） | ODL XY-Cut++ |
+| 3 | **版面与阅读顺序** | XY-cut 多栏排序、页眉页脚/水印识别、段落聚合 | ✅ XY-cut+段落聚合+页眉页脚+去连字（M3）；CJK/最难双栏首页属确定性天花板（→模块 8）；opt-in 版面模型双后端 DocLayout-YOLO / **PP-DocLayoutV2**（25 类+原生读序，Phase 7，杂版面端到端表 ≈3×） | ODL XY-Cut++ |
 | 4 | **语义结构层** | 表格识别、列表层级、标题分级——把 chunk 升维成结构。最大、最有价值、最难 | ✅ 表格四检测器（bordered/ruled/cluster/borderless，M4+N4）+ 标题分级；多级表头/合并单元格属神经域 | veraPDF-wcag-algs（`TableBorderConsumer`/`ClusterTableConsumer`） |
 | 5 | **多格式后端** | DOCX/PPTX/XLSX/HTML，各 `impl DocumentParser` 汇入同一 IR | ✅ DOCX/HTML 已接入同一 IR（M5）；PPTX/XLSX 未做 | 报告 §10.6 `parser-ooxml`/`parser-web` |
 | 6 | **输出与 RAG** | 序列化 + 结构化切块 + chunk↔页码/bbox 双向引用定位 | ✅ JSON/MD/Text + 结构化切块 + chunk↔bbox 双向引用（M6），引用率 100% | 报告 §10.6 `document-export`/`document-chunk` |

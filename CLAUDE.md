@@ -18,7 +18,9 @@ cargo build --release            # 优化构建（lto=thin, codegen-units=1）
 ./target/release/docparse mcp                # MCP stdio server（agent 直连）
 ./target/release/docparse serve --port 8642  # REST（绑 127.0.0.1）
 ./target/release/docparse <scan.pdf> --ocr    # 扫描件 OCR（需 models/ppocr，数字页零模型）
-./target/release/docparse <hard.pdf> --layout # 版面模型重排（需 models/layout，opt-in）
+./target/release/docparse <hard.pdf> --layout # 版面模型重排（需 models/layout，opt-in；默认 DocLayout-YOLO）
+./target/release/docparse <hard.pdf> --layout --layout-model models/layout-ppv2/PP-DoclayoutV2_simp.onnx
+                                              # PP-DocLayoutV2 后端（按 ONNX 输入数自动识别；杂版面表检测 ≈3× YOLO）
 ```
 
 **跨真实样例回归**（字体/解码/输出改动必跑）：
@@ -49,7 +51,7 @@ Cargo workspace，十七个 crate（core/pdf/docx/html/ocr/raster/vlm/xlsx/pptx/
 | OCR / enhancer | [crates/docparse-ocr/src/lib.rs](crates/docparse-ocr/src/lib.rs)（tract 推理管线）；边界在 [core/enhance.rs](crates/docparse-core/src/enhance.rs)；图抽取在 [pdf/images.rs](crates/docparse-pdf/src/images.rs) |
 | UniRec 任务（表/公式/转写） | 推理在 [ocr/unirec.rs](crates/docparse-ocr/src/unirec.rs)（OpenOCR 官方 ONNX，宿主驱动 AR+KV-cache，退化守卫）；任务编排各在 [ocr/table_model.rs](crates/docparse-ocr/src/table_model.rs) / [ocr/formula.rs](crates/docparse-ocr/src/formula.rs) / [ocr/transcribe.rs](crates/docparse-ocr/src/transcribe.rs)；模型来源/选型见 docs/refer/openocr-0.1b-evaluation.md |
 | VLM 任务 / 服务接入 | [crates/docparse-vlm/src/lib.rs](crates/docparse-vlm/src/lib.rs)（OpenAI 兼容协议 + 图片描述;协议变更先改 mock 单测） |
-| 版面模型 / 阅读组 / 按需渲染 | [ocr/layout.rs](crates/docparse-ocr/src/layout.rs)（区域→`TextChunk.group`）；渲染在 [docparse-raster](crates/docparse-raster/src/lib.rs)（hayro，仅难页 opt-in）；分组重排在 [core/layout.rs](crates/docparse-core/src/layout.rs) `reconstruct_lines` |
+| 版面模型 / 阅读组 / 按需渲染 | [ocr/layout.rs](crates/docparse-ocr/src/layout.rs)：**双后端**（DocLayout-YOLO / PP-DocLayoutV2，按 ONNX 输入数自动识别），`RegionKind` 统一两者语义，区域→`TextChunk.group`（PPV2 有原生 `order` 直用，否则 XY-cut）、标题类→`TextChunk.tag`；渲染在 [docparse-raster](crates/docparse-raster/src/lib.rs)（hayro，仅难页 opt-in）；分组重排在 [core/layout.rs](crates/docparse-core/src/layout.rs) `reconstruct_lines`。加版面模型/改类别映射改这里 |
 
 ## 3. 关键不变量（跨格式后端都要守）
 
@@ -69,6 +71,7 @@ Cargo workspace，十七个 crate（core/pdf/docx/html/ocr/raster/vlm/xlsx/pptx/
 | 不静默吞数据 | 见 AI_AGENT_DEV_SPEC §7 红旗：不 `try/swallow`、不删测试绿 CI |
 | 风格 | `cargo fmt` 默认风格；clippy 零 warning；模块级 `//!` doc 说明"是什么、为什么" |
 | 依赖 | 版本集中在根 `Cargo.toml` 的 `[workspace.dependencies]`，crate 用 `dep.workspace = true` 继承；新依赖按通用规范先问 |
+| **vendored tract 补丁** | 根 `Cargo.toml` `[patch.crates-io]` 把 `tract-hir`/`tract-core` 指向 `vendor/`，内含 2 处最小修复（GatherNd 推断 + TopK 收 TDim）让 PP-DocLayoutV2 跑通——见 [vendor/PATCHES.md](vendor/PATCHES.md)。**bump tract 前先读它**：升级需重新 vendor + 重打补丁；上游 PR 合并发版后删 `vendor/` 改回版本依赖（草稿 [vendor/UPSTREAM-PRS.md](vendor/UPSTREAM-PRS.md)） |
 
 ## 5. veraPDF 参考与许可边界（落实通用规范"外部参考与许可底线"）
 

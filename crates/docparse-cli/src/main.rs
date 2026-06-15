@@ -107,7 +107,10 @@ struct Cli {
     #[arg(long)]
     layout: bool,
 
-    /// Path to the DocLayout-YOLO ONNX model.
+    /// Path to the layout ONNX model. Backend is auto-detected: DocLayout-YOLO
+    /// (default) or PP-DocLayoutV2 (pass models/layout-ppv2/PP-DoclayoutV2_simp.onnx
+    /// — richer 25-class semantics + native reading order; ~3x YOLO on
+    /// messy-layout table detection).
     #[arg(long, default_value = "models/layout/doclayout_yolo.onnx")]
     layout_model: PathBuf,
 
@@ -184,7 +187,8 @@ enum Command {
         /// Model dir for the optional `ocr: true` tool argument.
         #[arg(long, default_value = "models/ppocr")]
         ocr_models: PathBuf,
-        /// DocLayout-YOLO path for `layout`/`formula_model` tool arguments.
+        /// Layout ONNX path for `layout`/`formula_model` tool arguments
+        /// (DocLayout-YOLO or PP-DocLayoutV2, auto-detected).
         #[arg(long, default_value = "models/layout/doclayout_yolo.onnx")]
         layout_model: PathBuf,
         /// UniRec model dir enabling `table_model`/`formula_model` arguments.
@@ -213,7 +217,8 @@ enum Command {
         /// Model dir for the optional `?ocr=true` query parameter.
         #[arg(long, default_value = "models/ppocr")]
         ocr_models: PathBuf,
-        /// DocLayout-YOLO path for `?layout=true` / `?formula_model=true`.
+        /// Layout ONNX path for `?layout=true` / `?formula_model=true`
+        /// (DocLayout-YOLO or PP-DocLayoutV2, auto-detected).
         #[arg(long, default_value = "models/layout/doclayout_yolo.onnx")]
         layout_model: PathBuf,
         /// UniRec model dir enabling `?table_model=true` / `?formula_model=true`.

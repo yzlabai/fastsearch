@@ -48,7 +48,7 @@ All ten roadmap modules are closed (IR / PDF / layout / semantics / multi-format
 | Marker | pipeline tool | 78.44 |
 | **docparse-rs** (paper subset, proxy) | pipeline tool | **~75** |
 
-Honest positioning: **text and formula are no longer the bottleneck (~0.87 each); we trail the leaderboard top (90+) mainly on hard academic tables plus end-to-end pipeline polish.** We embed UniRec but are not the full OpenDoc system (it runs PP-DocLayoutV2 + UniRec end-to-end; we use DocLayout-YOLO + per-task re-extraction + our own stitching), and we are **born-digital first** — image documents are a complementary domain. Full method and caveats: [OmniDocBench eval](docs/testresults/2026-06-12-omnidocbench.md).
+Honest positioning: **text and formula are no longer the bottleneck (~0.87 each); we trail the leaderboard top (90+) mainly on hard academic tables plus end-to-end pipeline polish.** We embed both halves of OpenDoc-0.1B as optional `tract` backends — UniRec (recognition) and now **PP-DocLayoutV2** (layout, opt-in alongside the default DocLayout-YOLO) — but stitch them with our own deterministic core rather than running OpenDoc's end-to-end pipeline, and we are **born-digital first** — image documents are a complementary domain. (PP-DocLayoutV2 lifts messy-layout end-to-end table extraction ~3×; see [layout-backend A/B](docs/testresults/2026-06-15-ppv2-vs-yolo-omnidocbench.md).) Full method and caveats: [OmniDocBench eval](docs/testresults/2026-06-12-omnidocbench.md).
 
 ### Agreement scoreboard (vs ODL / Docling, born-digital)
 
@@ -90,7 +90,8 @@ cargo build --release
 ./target/release/docparse input.pdf -f text -o out.txt
 ./target/release/docparse input.pdf -f chunks      # RAG chunks (page + bbox + breadcrumbs)
 ./target/release/docparse scan.pdf --ocr           # OCR scans (needs models/ppocr; free for digital pages)
-./target/release/docparse hard.pdf --layout        # layout-model macro reading order (needs models/layout, opt-in)
+./target/release/docparse hard.pdf --layout        # layout-model macro reading order (needs models/layout, opt-in; default DocLayout-YOLO)
+./target/release/docparse hard.pdf --layout --layout-model models/layout-ppv2/PP-DoclayoutV2_simp.onnx   # PP-DocLayoutV2 backend (auto-detected; ~3x YOLO on messy-layout table detection)
 ./target/release/docparse doc.pdf --vlm-describe --vlm-url http://127.0.0.1:8000 --vlm-model <vision-model>   # VLM figure captions
 ./target/release/docparse doc.pdf --vlm-tables --vlm-url http://127.0.0.1:8000 --vlm-model <vision-model>     # VLM table re-extraction (merged cells / multi-row headers); failures keep the deterministic grid
 ./target/release/docparse doc.pdf --table-model models/unirec   # embedded UniRec-0.1B table re-extraction (merged cells), in-process, no service
@@ -123,7 +124,8 @@ Optional model files (all Apache-2.0, shipped as external files, never baked int
 | Directory | Model | Origin | Powers |
 |---|---|---|---|
 | `models/ppocr/` (~16 MB) | PP-OCRv4 det+rec + dict; optional cls orientation classifier (~0.6 MB; absent → rotation correction disabled) | PaddleOCR (HuggingFace `SWHL/RapidOCR` conversions; cls at `PP-OCRv1/ch_ppocr_mobile_v2.0_cls_infer.onnx`) | `--ocr` scanned text + auto-deskew of rotated scans (0/90/180/270) |
-| `models/layout/` (~75 MB) | DocLayout-YOLO | [opendatalab/DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO) (DocStructBench) | `--layout` regions, formula-region detection |
+| `models/layout/` (~75 MB) | DocLayout-YOLO | [opendatalab/DocLayout-YOLO](https://github.com/opendatalab/DocLayout-YOLO) (DocStructBench) | `--layout` regions (default backend), formula-region detection |
+| `models/layout-ppv2/` (~210 MB) | **PP-DocLayoutV2** (RT-DETR, 25 classes + native reading order) | [PaddleOCR](https://www.paddleocr.ai/) PP-DocLayoutV2; ONNX via [OpenOCR](https://github.com/Topdu/OpenOCR) (`topdu/PP_DoclayoutV2_onnx`) — the layout half of **OpenDoc-0.1B** | `--layout --layout-model …PP-DoclayoutV2_simp.onnx`: richer classes + native order; **~3× YOLO on messy-layout table detection** (auto-detected backend). One-time static export: `scripts/spike/ppv2/prepare.py` |
 | `models/unirec/` (~700 MB) | **UniRec-0.1B** (unified text/formula/table recognition) | [OpenOCR](https://github.com/Topdu/OpenOCR) (FVL Lab; [paper arXiv 2512.21095](https://arxiv.org/abs/2512.21095)) — the recognizer of their **OpenDoc-0.1B** document-parsing system; official ONNX: `huggingface-cli download topdu/unirec_0_1b_onnx --local-dir models/unirec` | `--table-model` merged-cell tables / `--formula-model` formula→LaTeX / `--transcribe-model` full-page transcription (zh/en) |
 
 > How UniRec is integrated: we run its official encoder/decoder ONNX on pure-Rust `tract`, driving the autoregressive loop and KV cache on the Rust host — OpenOCR's own OpenDoc pipeline is Python/ONNX Runtime; we reuse the models and tokenizer mapping and independently implement inference plus HTML/LaTeX result parsing (selection rationale and spike measurements: [docs/refer/openocr-0.1b-evaluation.md](docs/refer/openocr-0.1b-evaluation.md), Chinese).
@@ -143,7 +145,7 @@ A Cargo workspace with seventeen crates:
 | [`docparse-docx`](crates/docparse-docx) | DOCX backend: docx-rs structure → synthetic coordinates into the same IR; zip-bomb pre-check | docx-rs |
 | [`docparse-html`](crates/docparse-html) | HTML backend: DOM pre-order walk → headings / paragraphs / lists / tables | scraper |
 | `docparse-{xlsx,pptx,md,csv,srt,tex}` | Thin backends: XLSX (calamine) / PPTX (one page per slide) / Markdown / CSV (hand-rolled RFC-4180 subset) / SRT·WebVTT subtitles (one timestamped paragraph per cue) / LaTeX source subset (sections/lists/tabular→Table) / EML email (headers/body/attachment listing) / PNG·JPEG images-as-documents (riding the OCR route) / AsciiDoc subset — all flow into the same IR via the synthetic layout | calamine, quick-xml, pulldown-cmark, mail-parser, zune-png |
-| [`docparse-ocr`](crates/docparse-ocr) | ONNX-embedded enhancers: OCR (PP-OCRv4 det+rec, self-built DBNet post-processing / CTC decoding) and layout (DocLayout-YOLO regions → reading groups), both on `tract` pure-Rust inference | tract-onnx, zune-jpeg |
+| [`docparse-ocr`](crates/docparse-ocr) | ONNX-embedded enhancers: OCR (PP-OCRv4 det+rec, self-built DBNet post-processing / CTC decoding) and layout (DocLayout-YOLO or PP-DocLayoutV2 regions → reading groups, unified `RegionKind`), both on `tract` pure-Rust inference | tract-onnx, zune-jpeg |
 | [`docparse-raster`](crates/docparse-raster) | On-demand hard-page rendering (pure-Rust `hayro`, ~100ms/page) — the main pipeline never renders; enhancer-routed pages only, opt-in, with a broken-render guard | hayro |
 | [`docparse-vlm`](crates/docparse-vlm) | VLM enhancer: picture description & friends over OpenAI-compatible services (vLLM/LM Studio 等), minimal built-in PNG encoder, graceful degradation | ureq, base64 |
 | [`docparse-cli`](crates/docparse-cli) | The `docparse` CLI + an **MCP stdio server** (hand-written JSON-RPC, no SDK dependency) + **REST** (axum) | clap, axum, tokio |
@@ -180,4 +182,4 @@ Show strings of embedded subset CID fonts are glyph indices — unreadable witho
 
 ## License
 
-Apache-2.0. This is an independent implementation containing no veraPDF code (veraPDF is GPLv3+/MPLv2; its algorithms are referenced with attribution in the sources). All external model files are Apache-2.0: PP-OCR (PaddleOCR), DocLayout-YOLO (opendatalab), and UniRec-0.1B ([OpenOCR](https://github.com/Topdu/OpenOCR) / FVL Lab — with thanks for open-sourcing the OpenDoc-0.1B document-parsing system and the official ONNX export).
+Apache-2.0. This is an independent implementation containing no veraPDF code (veraPDF is GPLv3+/MPLv2; its algorithms are referenced with attribution in the sources). All external model files are Apache-2.0: PP-OCR (PaddleOCR), DocLayout-YOLO (opendatalab), PP-DocLayoutV2 (PaddleOCR; ONNX via OpenOCR), and UniRec-0.1B ([OpenOCR](https://github.com/Topdu/OpenOCR) / FVL Lab — with thanks for open-sourcing the OpenDoc-0.1B document-parsing system and the official ONNX exports). The build carries two minimal, attributed [tract patches](vendor/PATCHES.md) (vendored, pending upstream) needed to run PP-DocLayoutV2 (RT-DETR) on `tract`.

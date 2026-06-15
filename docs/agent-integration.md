@@ -92,7 +92,7 @@ curl -s -F "file=@scan.pdf" \
 | 能力 | 开关 | 需要 | 说明 |
 |---|---|---|---|
 | 扫描件 OCR | `--ocr` | `models/ppocr`（PP-OCRv4，~16MB） | 数字页零模型；CCITT/JBIG2 扫描、四方向旋转校正 |
-| 版面重排 | `--layout` | DocLayout-YOLO ONNX | 难版面（设计稿/CJK）按版面模型重排读序 |
+| 版面重排 | `--layout`（默认 YOLO）；`--layout-model …PP-DoclayoutV2_simp.onnx` 切 PP-DocLayoutV2 | DocLayout-YOLO / PP-DocLayoutV2 ONNX（按输入数自动识别） | 难版面（设计稿/CJK）按版面模型重排读序；PPV2 类别更丰富 + 原生阅读顺序，**杂版面端到端表识别 ≈3× YOLO** |
 | 表结构重抽 | `--table-model DIR` | UniRec-0.1B（`models/unirec`） | 多级表头/合并单元格，进程内、无需服务 |
 | 公式→LaTeX | `--formula-model DIR` | UniRec + 版面模型 | display 公式转 LaTeX |
 | 整页转写 | `--transcribe-model DIR` | UniRec | 设计/CJK 版面整页重识别（中英域内强；行级定位降为区域级） |
