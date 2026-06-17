@@ -12,8 +12,11 @@
 | **库（Rust crate）** | 同进程嵌入 Rust 服务 | 依赖 `docparse-core` + 各后端 crate |
 | **MCP（stdio）** | Agent 直接工具调用（Claude/兼容 MCP 的运行时） | `docparse mcp` |
 | **REST（axum）** | 语言无关的服务化、内网/容器 | `docparse serve --port 8642`（绑 127.0.0.1） |
+| **Agent Skill** | 给编码 agent（Claude Code/Cursor…）一份"怎么用 CLI"的结构化技能：格式选择、OCR/表/公式增强决策矩阵、`--quality` 自检循环 | 包在 [skills/docparse-document-intelligence/](../skills/docparse-document-intelligence/SKILL.md)（软链到 `.claude/skills/` 即生效） |
 
 > **不变量**：同一输入 + 同一格式，CLI / MCP / REST 输出**逐字节一致**。任选其一不影响结果。
+>
+> Agent Skill 不是第五种解析路径——它只是**包装 CLI** 的使用说明（Bash 调 `docparse`），让 agent 自己按症状选增强档、用内置 `--quality`/`--profile`/`--route-plan` 自检并迭代。
 
 ## 2. 输出格式（四选一）
 
