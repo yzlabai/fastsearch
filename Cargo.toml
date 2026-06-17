@@ -62,7 +62,9 @@ hayro-jbig2 = "0.3"
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"
 # Format breadth (G1a, user-approved 2026-06-10): XLSX/PPTX/Markdown backends.
-calamine = "0.26"
+# `dates`: render date cells as ISO dates, not raw Excel serials (chrono already
+# in the tree; handles the Excel 1900 leap-year quirk correctly).
+calamine = { version = "0.26", features = ["dates"] }
 quick-xml = "0.37"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 pulldown-cmark = { version = "0.12", default-features = false }

@@ -38,6 +38,33 @@ fn heading_size(level: HeadingLevel) -> f32 {
     }
 }
 
+/// Flush the inline buffer as one block. Inside a list (`lists` non-empty) and
+/// when `as_list` is set, the block becomes a list item with a normalized
+/// marker — `• ` for bullets, `N. ` for ordered lists (the counter lives in the
+/// stack top and advances per item) — and the `LI` tag so downstream treats it
+/// as a list, not a numbered heading. Heading/code content passes
+/// `as_list = false` so it never picks up a bullet. Empty text is dropped.
+fn flush(b: &mut PageBuilder, buf: &mut String, size: f32, lists: &mut [Option<u64>], as_list: bool) {
+    let t = buf.trim();
+    if !t.is_empty() {
+        match lists.last_mut().filter(|_| as_list) {
+            Some(slot) => {
+                let marker = match slot {
+                    Some(n) => {
+                        let m = format!("{n}. ");
+                        *n += 1;
+                        m
+                    }
+                    None => "• ".to_string(),
+                };
+                b.list_item(format!("{marker}{t}"), size);
+            }
+            None => b.paragraph(t, size),
+        }
+    }
+    buf.clear();
+}
+
 /// Parse Markdown text into a [`Document`].
 pub fn parse_str(text: &str) -> Document {
     let mut opts = Options::empty();
@@ -50,31 +77,45 @@ pub fn parse_str(text: &str) -> Document {
     // table state
     let mut table: Option<Vec<Vec<String>>> = None;
     let mut row: Vec<String> = Vec::new();
-
-    let flush = |b: &mut PageBuilder, buf: &mut String, size: f32| {
-        let t = buf.trim();
-        if !t.is_empty() {
-            b.paragraph(t, size);
-        }
-        buf.clear();
-    };
+    // list nesting: each entry is the next ordinal for an ordered list, or
+    // `None` for a bullet list. Nesting is flattened (markers normalized), like
+    // the AsciiDoc/TeX backends.
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
 
     for ev in parser {
         match ev {
             Event::Start(Tag::Heading { level, .. }) => {
-                flush(&mut b, &mut buf, size);
+                flush(&mut b, &mut buf, size, &mut list_stack, true);
                 size = heading_size(level);
             }
             Event::End(TagEnd::Heading(_)) => {
-                flush(&mut b, &mut buf, size);
+                // Heading text is its own block, never a bullet.
+                flush(&mut b, &mut buf, size, &mut list_stack, false);
                 size = 11.0;
             }
-            Event::Start(Tag::Paragraph) | Event::Start(Tag::Item) => flush(&mut b, &mut buf, size),
-            Event::End(TagEnd::Paragraph) | Event::End(TagEnd::Item) => {
-                flush(&mut b, &mut buf, size)
+            Event::Start(Tag::List(start)) => {
+                // Any pending text belongs to the enclosing item (or a preceding
+                // paragraph); emit it before opening the new list level.
+                flush(&mut b, &mut buf, size, &mut list_stack, true);
+                list_stack.push(start);
             }
-            Event::Start(Tag::CodeBlock(_)) => flush(&mut b, &mut buf, size),
-            Event::End(TagEnd::CodeBlock) => flush(&mut b, &mut buf, size),
+            Event::End(TagEnd::List(_)) => {
+                flush(&mut b, &mut buf, size, &mut list_stack, true);
+                list_stack.pop();
+            }
+            Event::Start(Tag::Paragraph) | Event::Start(Tag::Item) => {
+                flush(&mut b, &mut buf, size, &mut list_stack, true)
+            }
+            Event::End(TagEnd::Paragraph) | Event::End(TagEnd::Item) => {
+                flush(&mut b, &mut buf, size, &mut list_stack, true)
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                flush(&mut b, &mut buf, size, &mut list_stack, true)
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                // Code content is verbatim, never a bullet.
+                flush(&mut b, &mut buf, size, &mut list_stack, false)
+            }
             Event::Start(Tag::Table(_)) => table = Some(Vec::new()),
             Event::End(TagEnd::Table) => {
                 if let Some(rows) = table.take() {
@@ -96,7 +137,7 @@ pub fn parse_str(text: &str) -> Document {
             _ => {}
         }
     }
-    flush(&mut b, &mut buf, size);
+    flush(&mut b, &mut buf, size, &mut list_stack, false);
 
     Document {
         source: "<markdown>".to_string(),
@@ -178,5 +219,60 @@ mod tests {
     fn empty_input_produces_no_text() {
         let doc = parse_str("");
         assert!(texts(&doc).is_empty());
+    }
+
+    fn text_tags(doc: &docparse_core::ir::Document) -> Vec<(String, Option<String>)> {
+        doc.pages[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::Text(t) => Some((t.text.clone(), t.tag.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bullet_list_items_get_marker_and_li_tag() {
+        // Previously list items flattened to bare paragraphs (no marker, no tag),
+        // so downstream demoted them to prose. Now they carry the • marker and
+        // the LI tag like the AsciiDoc/TeX/HTML backends.
+        let doc = parse_str("- alpha\n- beta\n");
+        assert_eq!(
+            text_tags(&doc),
+            vec![
+                ("• alpha".to_string(), Some("LI".to_string())),
+                ("• beta".to_string(), Some("LI".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_list_items_are_numbered_from_their_start() {
+        // The marker numbering honors the list's start value (pulldown reports
+        // the first ordinal), so "3." leads.
+        let doc = parse_str("3. three\n4. four\n");
+        let t: Vec<String> = text_tags(&doc).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(t, vec!["3. three", "4. four"]);
+    }
+
+    #[test]
+    fn nested_list_flattens_keeping_each_levels_marker() {
+        // A bullet item with a nested ordered list: nesting is flattened, but
+        // each item keeps the marker of its own list.
+        let doc = parse_str("- a\n    1. x\n    2. y\n- b\n");
+        let t: Vec<String> = text_tags(&doc).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(t, vec!["• a", "1. x", "2. y", "• b"]);
+    }
+
+    #[test]
+    fn code_block_inside_list_is_not_bulleted() {
+        // The item's lead text is a bullet; the fenced code below it stays
+        // verbatim (no marker) rather than becoming a bullet line.
+        let doc = parse_str("- item\n\n  ```\n  code\n  ```\n");
+        let t: Vec<String> = text_tags(&doc).into_iter().map(|(s, _)| s).collect();
+        assert!(t.iter().any(|s| s == "• item"), "{t:?}");
+        assert!(t.iter().any(|s| s == "code"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "• code"), "code must not be bulleted: {t:?}");
     }
 }

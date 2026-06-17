@@ -74,7 +74,26 @@ fn cell_text(d: &Data) -> String {
         }
         Data::Int(i) => format!("{i}"),
         Data::Bool(v) => format!("{v}"),
-        Data::DateTime(dt) => format!("{dt}"),
+        // calamine's Display writes the raw Excel serial (e.g. "46190"); convert
+        // date cells to ISO via chrono (correctly handles the 1900 leap quirk).
+        // Durations have no calendar meaning — keep their numeric value.
+        Data::DateTime(dt) => {
+            if dt.is_datetime() {
+                match dt.as_datetime() {
+                    // NaiveDateTime Display is "YYYY-MM-DD HH:MM:SS"; drop a
+                    // midnight time so plain dates read as just "YYYY-MM-DD".
+                    Some(ndt) => {
+                        let s = ndt.to_string();
+                        s.strip_suffix(" 00:00:00")
+                            .map(str::to_string)
+                            .unwrap_or(s)
+                    }
+                    None => dt.as_f64().to_string(),
+                }
+            } else {
+                dt.as_f64().to_string()
+            }
+        }
         Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
         Data::Error(e) => format!("#{e:?}"),
     }
@@ -125,5 +144,20 @@ mod tests {
             cell_text(&Data::DateTimeIso("2026-06-17T00:00:00".into())),
             "2026-06-17T00:00:00"
         );
+    }
+
+    #[test]
+    fn datetime_cells_render_as_iso_not_serial() {
+        use calamine::{ExcelDateTime, ExcelDateTimeType};
+        // Excel serial 1 = 1900-01-01. Previously this rendered as "1" (the raw
+        // serial via Display); now it's the ISO date, midnight time dropped.
+        let date = ExcelDateTime::new(1.0, ExcelDateTimeType::DateTime, false);
+        assert_eq!(cell_text(&Data::DateTime(date)), "1900-01-01");
+        // A half-day fraction keeps the time component.
+        let dt = ExcelDateTime::new(1.5, ExcelDateTimeType::DateTime, false);
+        assert_eq!(cell_text(&Data::DateTime(dt)), "1900-01-01 12:00:00");
+        // Durations have no calendar meaning — keep the numeric value.
+        let dur = ExcelDateTime::new(2.5, ExcelDateTimeType::TimeDelta, false);
+        assert_eq!(cell_text(&Data::DateTime(dur)), "2.5");
     }
 }

@@ -5,8 +5,8 @@
 use anyhow::Context;
 use docparse_core::ir::{Document, Provenance};
 use docparse_core::parser::DocumentParser;
-use docparse_core::synth::PageBuilder;
-use quick_xml::events::Event;
+use docparse_core::synth::{PageBuilder, SpanCell};
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::io::Read;
 use std::path::Path;
@@ -75,9 +75,14 @@ fn parse_slide(xml: &str, b: &mut PageBuilder) {
     let mut para = String::new();
     let mut in_title = false;
     // table state
-    let mut table: Option<Vec<Vec<String>>> = None;
-    let mut row: Vec<String> = Vec::new();
+    let mut table: Option<Vec<Vec<SpanCell>>> = None;
+    let mut row: Vec<SpanCell> = Vec::new();
     let mut cell = String::new();
+    // span state of the current <a:tc> (DrawingML declares both spans on the
+    // anchor; covered positions are explicit hMerge/vMerge cells we drop).
+    let mut col_span = 1u32;
+    let mut row_span = 1u32;
+    let mut covered = false;
 
     loop {
         match r.read_event() {
@@ -97,7 +102,14 @@ fn parse_slide(xml: &str, b: &mut PageBuilder) {
                 }
                 b"tbl" => table = Some(Vec::new()),
                 b"tr" if table.is_some() => row.clear(),
-                b"tc" if table.is_some() => cell.clear(),
+                b"tc" if table.is_some() => {
+                    cell.clear();
+                    col_span = attr_u32(&e, b"gridSpan").unwrap_or(1).max(1);
+                    row_span = attr_u32(&e, b"rowSpan").unwrap_or(1).max(1);
+                    // hMerge/vMerge mark a position covered by an anchor to the
+                    // left/above; expand_spans regenerates it from the anchor.
+                    covered = attr_flag(&e, b"hMerge") || attr_flag(&e, b"vMerge");
+                }
                 _ => {}
             },
             Ok(Event::Text(t)) => {
@@ -122,7 +134,18 @@ fn parse_slide(xml: &str, b: &mut PageBuilder) {
                     para.clear();
                 }
                 b"sp" => in_title = false, // shape ends
-                b"tc" => row.push(std::mem::take(&mut cell).trim().to_string()),
+                b"tc" => {
+                    let text = std::mem::take(&mut cell).trim().to_string();
+                    // Covered positions are dropped; the anchor's spans let
+                    // expand_spans rematerialize them with the replicated text.
+                    if !covered {
+                        row.push(SpanCell {
+                            text,
+                            row_span,
+                            col_span,
+                        });
+                    }
+                }
                 b"tr" => {
                     if let Some(t) = table.as_mut() {
                         t.push(std::mem::take(&mut row));
@@ -131,7 +154,7 @@ fn parse_slide(xml: &str, b: &mut PageBuilder) {
                 b"tbl" => {
                     if let Some(rows) = table.take() {
                         if !rows.is_empty() {
-                            b.table(rows, 10.0);
+                            b.table_spanned(rows, 10.0);
                         }
                     }
                 }
@@ -142,6 +165,25 @@ fn parse_slide(xml: &str, b: &mut PageBuilder) {
             _ => {}
         }
     }
+}
+
+/// Parse an unprefixed attribute of `e` as a `u32` (e.g. `gridSpan="2"`).
+fn attr_u32(e: &BytesStart, name: &[u8]) -> Option<u32> {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.local_name().as_ref() == name)
+        .and_then(|a| a.unescape_value().ok())
+        .and_then(|v| v.parse().ok())
+}
+
+/// True if attribute `name` is present and truthy (`"1"`/`"true"`) — the
+/// DrawingML `hMerge`/`vMerge` covered-cell flags.
+fn attr_flag(e: &BytesStart, name: &[u8]) -> bool {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.local_name().as_ref() == name)
+        .and_then(|a| a.unescape_value().ok())
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]
@@ -245,5 +287,53 @@ mod tests {
         let doc = parse_bytes(&pptx_with(&[s])).unwrap();
         let t = slide_texts(&doc, 0);
         assert!(t.iter().any(|(s, _)| s == "partial"), "{t:?}");
+    }
+
+    fn first_table(doc: &docparse_core::ir::Document) -> &docparse_core::ir::Table {
+        doc.pages[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("a table")
+    }
+
+    // TC-P5a: gridSpan on the anchor + an hMerge covered cell → col_span + a
+    // replicated covered position.
+    #[test]
+    fn table_gridspan_becomes_colspan() {
+        let s = r#"<p:sld xmlns:a="a"><a:tbl>
+            <a:tr><a:tc gridSpan="2"><a:t>Wide</a:t></a:tc><a:tc hMerge="1"><a:t></a:t></a:tc><a:tc><a:t>C</a:t></a:tc></a:tr>
+            <a:tr><a:tc><a:t>a</a:t></a:tc><a:tc><a:t>b</a:t></a:tc><a:tc><a:t>c</a:t></a:tc></a:tr>
+            </a:tbl></p:sld>"#;
+        let doc = parse_bytes(&pptx_with(&[s])).unwrap();
+        let table = first_table(&doc);
+        assert!(table.rows.iter().all(|r| r.len() == 3), "3-col grid");
+        assert_eq!((table.rows[0][0].col_span, table.rows[0][0].merged), (2, false));
+        assert_eq!(table.rows[0][0].text, "Wide");
+        assert!(table.rows[0][1].merged);
+        assert_eq!(table.rows[0][1].text, "Wide", "covered text replicated");
+        assert_eq!(table.rows[0][2].text, "C");
+        assert_eq!(table.rows[1][0].text, "a");
+    }
+
+    // TC-P5b: rowSpan on the anchor + a vMerge covered cell below → row_span + a
+    // replicated covered position.
+    #[test]
+    fn table_rowspan_via_vmerge_becomes_rowspan() {
+        let s = r#"<p:sld xmlns:a="a"><a:tbl>
+            <a:tr><a:tc rowSpan="2"><a:t>Tall</a:t></a:tc><a:tc><a:t>b1</a:t></a:tc></a:tr>
+            <a:tr><a:tc vMerge="1"><a:t></a:t></a:tc><a:tc><a:t>c2</a:t></a:tc></a:tr>
+            </a:tbl></p:sld>"#;
+        let doc = parse_bytes(&pptx_with(&[s])).unwrap();
+        let table = first_table(&doc);
+        assert_eq!((table.rows[0][0].row_span, table.rows[0][0].merged), (2, false));
+        assert_eq!(table.rows[0][0].text, "Tall");
+        assert_eq!(table.rows[0][1].text, "b1");
+        assert!(table.rows[1][0].merged);
+        assert_eq!(table.rows[1][0].text, "Tall", "covered text replicated down");
+        assert_eq!(table.rows[1][1].text, "c2");
     }
 }

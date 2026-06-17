@@ -128,37 +128,55 @@ impl PageBuilder {
         self.y -= lh + Self::PARA_SPACING * size;
     }
 
-    /// Add a table from row-major cell text. Cells get synthetic grid bboxes so
-    /// downstream sees a real [`Table`] element.
+    /// Add a table from row-major cell text (every cell 1×1). Thin wrapper over
+    /// [`PageBuilder::table_spanned`] — the no-span path for CSV/Markdown/XLSX/…
     pub fn table(&mut self, rows: Vec<Vec<String>>, size: f32) {
-        let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        if ncols == 0 || rows.is_empty() {
+        let sparse = rows
+            .into_iter()
+            .map(|r| r.into_iter().map(SpanCell::plain).collect())
+            .collect();
+        self.table_spanned(sparse, size);
+    }
+
+    /// Add a table from a SPARSE span grid: covered positions are omitted and
+    /// each anchor carries its spans (the shape HTML `colspan`/`rowspan` and
+    /// DOCX `gridSpan`/`vMerge` produce). [`expand_spans`] materializes it into
+    /// the IR's flat grid — anchors keep their spans, covered positions are
+    /// filled with the replicated text and `merged = true`. Cells get synthetic
+    /// grid bboxes; anchors span their merged region.
+    pub fn table_spanned(&mut self, rows: Vec<Vec<SpanCell>>, size: f32) {
+        if rows.is_empty() {
+            return;
+        }
+        let grid = expand_spans(rows);
+        let nrows = grid.len();
+        let ncols = grid.iter().map(Vec::len).max().unwrap_or(0);
+        if ncols == 0 {
             return;
         }
         let row_h = Self::line_height(size) + size * 0.4;
-        let total = row_h * rows.len() as f32;
+        let total = row_h * nrows as f32;
         self.ensure(total.min(self.height - 2.0 * self.margin));
         let col_w = (self.width - 2.0 * self.margin) / ncols as f32;
         let top = self.y;
-        let mut out_rows: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
-        for (r, row) in rows.iter().enumerate() {
+        let mut out_rows: Vec<Vec<Cell>> = Vec::with_capacity(nrows);
+        for (r, row) in grid.into_iter().enumerate() {
             let y_top = top - r as f32 * row_h;
-            let y_bot = y_top - row_h;
-            let mut cells = Vec::with_capacity(ncols);
-            for c in 0..ncols {
+            let mut cells = Vec::with_capacity(row.len());
+            for (c, fc) in row.into_iter().enumerate() {
                 let x0 = self.margin + c as f32 * col_w;
-                let text = row.get(c).cloned().unwrap_or_default();
                 cells.push(Cell {
-                    text,
                     bbox: BBox {
                         x0,
-                        y0: y_bot,
-                        x1: x0 + col_w,
+                        // Anchors extend over their span; covered cells are 1×1.
+                        y0: y_top - fc.row_span as f32 * row_h,
+                        x1: x0 + fc.col_span as f32 * col_w,
                         y1: y_top,
                     },
-                    row_span: 1,
-                    col_span: 1,
-                    merged: false,
+                    text: fc.text,
+                    row_span: fc.row_span,
+                    col_span: fc.col_span,
+                    merged: fc.merged,
                 });
             }
             out_rows.push(cells);
@@ -185,6 +203,113 @@ impl PageBuilder {
         }
         self.pages
     }
+}
+
+/// A source cell in a SPARSE span grid: covered positions are omitted and the
+/// anchor carries its spans (the shape HTML `colspan`/`rowspan` and a
+/// normalized DOCX `gridSpan`/`vMerge` produce). Expanded into the IR's flat
+/// grid by [`PageBuilder::table_spanned`].
+pub struct SpanCell {
+    pub text: String,
+    pub row_span: u32,
+    pub col_span: u32,
+}
+
+impl SpanCell {
+    /// A plain 1×1 cell (no span).
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            row_span: 1,
+            col_span: 1,
+        }
+    }
+}
+
+/// One materialized grid position after span expansion.
+struct FlatCell {
+    text: String,
+    row_span: u32,
+    col_span: u32,
+    merged: bool,
+}
+
+/// Expand a sparse span grid into the IR's flat row-major grid: the anchor keeps
+/// its spans (`merged = false`); every covered position is materialized with the
+/// replicated anchor text and `merged = true`; rows are padded to a rectangle.
+///
+/// Mirrors [`docparse_ocr::table_model::parse_html_table`]'s pending-rowspan
+/// algorithm (the eval/ODL convention) so the synthetic backends and the table
+/// model agree on span semantics. (Kept separate to avoid a core→ocr dependency;
+/// the two should stay in sync.)
+fn expand_spans(sparse: Vec<Vec<SpanCell>>) -> Vec<Vec<FlatCell>> {
+    let covered = |text: &str| FlatCell {
+        text: text.to_string(),
+        row_span: 1,
+        col_span: 1,
+        merged: true,
+    };
+    let mut rows: Vec<Vec<FlatCell>> = Vec::with_capacity(sparse.len());
+    // pending[col] = (remaining_rows, replicated_text) owed by an earlier rowspan.
+    let mut pending: Vec<(u32, String)> = Vec::new();
+    for src_row in sparse {
+        let mut row: Vec<FlatCell> = Vec::new();
+        let mut col = 0usize;
+        let mut cells = src_row.into_iter();
+        loop {
+            // Fill positions owed to earlier rowspans before placing a new cell.
+            if let Some(slot) = pending.get_mut(col).filter(|(left, _)| *left > 0) {
+                slot.0 -= 1;
+                let t = slot.1.clone();
+                row.push(covered(&t));
+                col += 1;
+                continue;
+            }
+            let Some(cell) = cells.next() else { break };
+            let rs = cell.row_span.max(1);
+            let cs = cell.col_span.max(1);
+            for k in 0..cs {
+                if pending.len() <= col {
+                    pending.resize(col + 1, (0, String::new()));
+                }
+                pending[col] = (rs - 1, cell.text.clone());
+                row.push(if k == 0 {
+                    FlatCell {
+                        text: cell.text.clone(),
+                        row_span: rs,
+                        col_span: cs,
+                        merged: false,
+                    }
+                } else {
+                    covered(&cell.text)
+                });
+                col += 1;
+            }
+        }
+        // Trailing rowspan positions after the row's last explicit cell.
+        while col < pending.len() {
+            if pending[col].0 > 0 {
+                pending[col].0 -= 1;
+                let t = pending[col].1.clone();
+                row.push(covered(&t));
+            }
+            col += 1;
+        }
+        rows.push(row);
+    }
+    // Pad to a rectangle (short rows get empty 1×1 cells).
+    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    for r in &mut rows {
+        while r.len() < ncols {
+            r.push(FlatCell {
+                text: String::new(),
+                row_span: 1,
+                col_span: 1,
+                merged: false,
+            });
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -220,5 +345,91 @@ mod tests {
             .filter(|e| matches!(e, Element::Table(_)))
             .collect();
         assert_eq!(tables.len(), 1);
+    }
+
+    // TC-01: a plain grid expands unchanged; short rows pad to a rectangle.
+    #[test]
+    fn expand_plain_grid_pads_and_keeps_1x1() {
+        let g = expand_spans(vec![
+            vec![SpanCell::plain("a"), SpanCell::plain("b")],
+            vec![SpanCell::plain("c")],
+        ]);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].len(), 2);
+        assert_eq!(g[1].len(), 2, "short row padded to ncols");
+        assert!(g
+            .iter()
+            .flatten()
+            .all(|c| c.row_span == 1 && c.col_span == 1 && !c.merged));
+        assert_eq!(g[1][1].text, "", "pad cell is empty");
+    }
+
+    // TC-02: colspan anchor + replicated covered position to its right.
+    #[test]
+    fn expand_colspan_materializes_covered() {
+        let g = expand_spans(vec![
+            vec![SpanCell {
+                text: "H".into(),
+                row_span: 1,
+                col_span: 2,
+            }],
+            vec![SpanCell::plain("x"), SpanCell::plain("y")],
+        ]);
+        assert_eq!((g[0][0].col_span, g[0][0].merged), (2, false));
+        assert_eq!(g[0][0].text, "H");
+        assert!(g[0][1].merged, "colspan-covered position");
+        assert_eq!(g[0][1].text, "H", "covered text is replicated");
+        assert_eq!(g[1][0].text, "x");
+    }
+
+    // TC-03: rowspan anchor + replicated covered position below it.
+    #[test]
+    fn expand_rowspan_materializes_covered() {
+        let g = expand_spans(vec![
+            vec![
+                SpanCell {
+                    text: "R".into(),
+                    row_span: 2,
+                    col_span: 1,
+                },
+                SpanCell::plain("b"),
+            ],
+            vec![SpanCell::plain("c")],
+        ]);
+        assert_eq!((g[0][0].row_span, g[0][0].merged), (2, false));
+        assert!(g[1][0].merged, "rowspan-covered position");
+        assert_eq!(g[1][0].text, "R", "covered text replicated downward");
+        assert_eq!(g[1][1].text, "c", "the row's own cell flows past the cover");
+    }
+
+    #[test]
+    fn table_spanned_carries_spans_and_widens_anchor_bbox() {
+        let mut b = PageBuilder::letter();
+        b.table_spanned(
+            vec![
+                vec![SpanCell {
+                    text: "H".into(),
+                    row_span: 1,
+                    col_span: 2,
+                }],
+                vec![SpanCell::plain("x"), SpanCell::plain("y")],
+            ],
+            12.0,
+        );
+        let pages = b.finish();
+        let table = pages
+            .iter()
+            .flat_map(|p| &p.elements)
+            .find_map(|e| match e {
+                Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(table.rows[0][0].col_span, 2);
+        assert!(!table.rows[0][0].merged);
+        assert!(table.rows[0][1].merged);
+        let anchor_w = table.rows[0][0].bbox.x1 - table.rows[0][0].bbox.x0;
+        let plain_w = table.rows[1][0].bbox.x1 - table.rows[1][0].bbox.x0;
+        assert!(anchor_w > plain_w, "anchor bbox spans two columns");
     }
 }

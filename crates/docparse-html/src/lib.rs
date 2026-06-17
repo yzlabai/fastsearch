@@ -8,7 +8,7 @@
 
 use docparse_core::ir::Document;
 use docparse_core::parser::DocumentParser;
-use docparse_core::synth::PageBuilder;
+use docparse_core::synth::{PageBuilder, SpanCell};
 use ego_tree::NodeRef;
 use scraper::node::Node;
 use scraper::Html;
@@ -84,11 +84,43 @@ fn walk(node: NodeRef<Node>, b: &mut PageBuilder) {
             "p" | "blockquote" | "figcaption" | "pre" | "dd" | "dt" | "caption" => {
                 b.paragraph(collect_text(child), 12.0);
             }
-            "li" => b.paragraph(format!("- {}", collect_text(child)), 12.0),
-            "table" => b.table(parse_table(child), 12.0),
+            "ul" => walk_list(child, b, None),
+            "ol" => {
+                // Honor <ol start="N">; default to 1.
+                let start = el.attr("start").and_then(|s| s.parse().ok()).unwrap_or(1);
+                walk_list(child, b, Some(start));
+            }
+            // A stray <li> outside any list: treat as a bullet.
+            "li" => b.list_item(format!("• {}", collect_text(child)), 12.0),
+            "table" => b.table_spanned(parse_table(child), 12.0),
             // Containers: recurse to preserve document order.
             _ => walk(child, b),
         }
+    }
+}
+
+/// Emit each direct `<li>` of a list as a tagged list item: bullets get `• `,
+/// ordered lists get `N. ` (starting at `ordered_start`). The `LI` tag keeps
+/// downstream from reading an ordinal item as a numbered heading. Nested lists
+/// fold into their parent item's text (flattened, matching the other backends).
+fn walk_list(list: NodeRef<Node>, b: &mut PageBuilder, ordered_start: Option<u64>) {
+    let mut n = ordered_start.unwrap_or(0);
+    for child in list.children() {
+        let Node::Element(el) = child.value() else {
+            continue;
+        };
+        if el.name() != "li" {
+            continue;
+        }
+        let marker = match ordered_start {
+            Some(_) => {
+                let m = format!("{n}. ");
+                n += 1;
+                m
+            }
+            None => "• ".to_string(),
+        };
+        b.list_item(format!("{marker}{}", collect_text(child)), 12.0);
     }
 }
 
@@ -107,9 +139,11 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Build row-major cell text from a `<table>`: each descendant `tr` is a row,
-/// each `td`/`th` a cell. Nested tables are flattened into their cell text.
-fn parse_table(table: NodeRef<Node>) -> Vec<Vec<String>> {
+/// Build a sparse span grid from a `<table>`: each descendant `tr` is a row,
+/// each `td`/`th` a cell carrying its `colspan`/`rowspan` (covered positions are
+/// omitted in HTML — `table_spanned` materializes them). Nested tables flatten
+/// into their cell text.
+fn parse_table(table: NodeRef<Node>) -> Vec<Vec<SpanCell>> {
     let mut rows = Vec::new();
     for d in table.descendants() {
         let Node::Element(el) = d.value() else {
@@ -122,7 +156,12 @@ fn parse_table(table: NodeRef<Node>) -> Vec<Vec<String>> {
         for cell in d.children() {
             if let Node::Element(c) = cell.value() {
                 if matches!(c.name(), "td" | "th") {
-                    row.push(collect_text(cell));
+                    let span = |name| c.attr(name).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
+                    row.push(SpanCell {
+                        text: collect_text(cell),
+                        row_span: span("rowspan"),
+                        col_span: span("colspan"),
+                    });
                 }
             }
         }
@@ -213,11 +252,41 @@ mod tests {
         assert!(*sizes.last().unwrap() >= 12.0);
     }
 
+    fn text_tags(doc: &Document) -> Vec<(String, Option<String>)> {
+        doc.pages
+            .iter()
+            .flat_map(|p| &p.elements)
+            .filter_map(|e| match e {
+                Element::Text(t) => Some((t.text.clone(), t.tag.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn list_items_get_bullet_prefix() {
+    fn bullet_list_items_get_marker_and_li_tag() {
         let doc = parse_str("<ul><li>one</li><li>two</li></ul>");
-        let t: Vec<String> = texts(&doc).into_iter().map(|(s, _)| s).collect();
-        assert_eq!(t, vec!["- one", "- two"]);
+        assert_eq!(
+            text_tags(&doc),
+            vec![
+                ("• one".to_string(), Some("LI".to_string())),
+                ("• two".to_string(), Some("LI".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_list_numbers_items_and_honors_start() {
+        // <ol> items are numbered (not bulleted), and start= is honored.
+        let doc = parse_str("<ol start=\"3\"><li>c</li><li>d</li></ol>");
+        let t: Vec<(String, Option<String>)> = text_tags(&doc);
+        assert_eq!(
+            t,
+            vec![
+                ("3. c".to_string(), Some("LI".to_string())),
+                ("4. d".to_string(), Some("LI".to_string())),
+            ]
+        );
     }
 
     #[test]
@@ -243,5 +312,38 @@ mod tests {
         // The single top-level table; nested cell text folds into the outer cell.
         assert!(tables[0].rows[0][0].text.contains("outer"));
         assert!(tables[0].rows[0][0].text.contains("inner"));
+    }
+
+    #[test]
+    fn table_spans_colspan_and_rowspan() {
+        // A colspan header and a rowspan body cell: spans/merged land in the IR
+        // flat grid, covered positions replicate the anchor text.
+        let html = "<table>\
+            <tr><th colspan=\"2\">Header</th></tr>\
+            <tr><td rowspan=\"2\">A</td><td>b1</td></tr>\
+            <tr><td>c2</td></tr>\
+            </table>";
+        let doc = parse_str(html);
+        let table = doc
+            .pages
+            .iter()
+            .flat_map(|p| &p.elements)
+            .find_map(|e| match e {
+                Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(table.rows.len(), 3);
+        assert!(table.rows.iter().all(|r| r.len() == 2), "rectangular 2-col");
+        // colspan header anchor + covered position.
+        assert_eq!((table.rows[0][0].col_span, table.rows[0][0].merged), (2, false));
+        assert_eq!(table.rows[0][0].text, "Header");
+        assert!(table.rows[0][1].merged);
+        // rowspan anchor + covered position below (replicated text).
+        assert_eq!((table.rows[1][0].row_span, table.rows[1][0].merged), (2, false));
+        assert_eq!(table.rows[1][1].text, "b1");
+        assert!(table.rows[2][0].merged);
+        assert_eq!(table.rows[2][0].text, "A");
+        assert_eq!(table.rows[2][1].text, "c2");
     }
 }
