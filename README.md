@@ -114,11 +114,11 @@ All Apache-2.0, fetched from their original repos as external files — never ba
 ./scripts/fetch-models.sh all
 ```
 
-Needs the HuggingFace CLI (`pip install -U huggingface_hub`); `ppocr-v6` and `ppv2` additionally need `onnx` (+`pyyaml` for v6) to static-ize their graphs for `tract` (the script prints the one-liner).
+Needs the HuggingFace CLI (`pip install -U huggingface_hub`); `ppv2` additionally needs `onnx`+`onnxsim` to static-ize its graph for `tract` (the script prints the one-liner).
 
 | Tier | Model (source) | Powers |
 |---|---|---|
-| `ppocr-v6` → `models/ppocr-v6/` (~6 MB) | PP-OCRv6 tiny det+rec (`PaddlePaddle/PP-OCRv6_tiny_*_onnx`) | `--ocr` scanned text (**default**), auto-deskew |
+| `ppocr-v6` → `models/ppocr-v6/` (~7 MB) | PP-OCRv6 tiny det+rec (`PaddlePaddle/PP-OCRv6_tiny_*_onnx`) | `--ocr` scanned text (**default**), auto-deskew |
 | `ocr` → `models/ppocr/` (~16 MB) | PP-OCRv4 det+rec+cls (`SWHL/RapidOCR`) | `--ocr` v4 fallback (no static-ize step) |
 | `layout` → `models/layout/` (~75 MB) | DocLayout-YOLO (`wybxc/DocLayout-YOLO-DocStructBench-onnx`) | `--layout` regions (default), formula detection |
 | `ppv2` → `models/layout-ppv2/` (~210 MB) | PP-DocLayoutV2 (`topdu/PP_DoclayoutV2_onnx`) | richer layout + native reading order ([A/B](docs/testresults/2026-06-15-ppv2-vs-yolo-omnidocbench.md)) |

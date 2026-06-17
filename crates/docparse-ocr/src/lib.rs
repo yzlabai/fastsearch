@@ -1,8 +1,9 @@
-//! ONNX-embedded OCR enhancer — the N3/P4 route: PP-OCRv4 mobile models
-//! (RapidOCR's ONNX export) running on `tract`, a pure-Rust inference runtime.
-//! No Python, no C++, no subprocess; models are *external files* loaded at
-//! runtime, so the core stays model-free and the deterministic path never
-//! touches this crate (cost thesis: only quality-flagged pages route here).
+//! ONNX-embedded OCR enhancer — the N3/P4 route: PP-OCR det+rec models
+//! (any generation — v4/v5 from RapidOCR, v6 from PaddlePaddle) running on
+//! `tract`, a pure-Rust inference runtime. No Python, no C++, no subprocess;
+//! models are *external files* loaded at runtime, so the core stays model-free
+//! and the deterministic path never touches this crate (cost thesis: only
+//! quality-flagged pages route here). Default is PP-OCRv6 tiny.
 //!
 //! Pipeline (mirrors RapidOCR's, independently implemented):
 //!   page image (extracted XObject pixels, never rasterized)
@@ -10,11 +11,15 @@
 //!   → boxes (rect offset ≈ DB unclip) → per-box crop, resize h=48, width
 //!   buckets → rec (SVTR-LCNet) → CTC greedy decode + mean-prob confidence
 //!   → TextChunks in PDF user space (pixel coords mapped through the image's
-//!   placement bbox), `source: "ocr:ppocr-v4"`, confidence < 1.
+//!   placement bbox), `source: "ocr:ppocr"`, confidence < 1.
 //!
-//! Model files (see docs/plans/n3-real-enhancer.md): ch_PP-OCRv4_det_infer.onnx,
-//! ch_PP-OCRv4_rec_infer.onnx, ppocr_keys_v1.txt. paddle2onnx dim names contain
-//! dots tract can't parse — sanitized in-memory at load.
+//! Model files (see docs/plans/n3-real-enhancer.md): a `*det*.onnx`, a
+//! `*rec*.onnx`, and the char dict (either a `*dict*.txt`, or `character_dict`
+//! parsed from a `*rec*.yml` for PP-OCRv6). paddle2onnx dim names contain dots
+//! tract can't parse (sanitized in-memory), and PP-OCRv6's export bakes a
+//! symbolic batch dim into intermediate shapes that tract rejects — both are
+//! handled at load (see `onnx_loader` / `load_dict`), so the raw HuggingFace
+//! ONNX loads with no offline prep step.
 //!
 //! Orientation (H2): the scan buffer is first rotated to viewing orientation
 //! (`ImageChunk::turns`, recorded by the PDF backend from /Rotate or a rotated
@@ -76,12 +81,11 @@ impl PpOcrEnhancer {
     /// Load models from a directory. Fails with a traceable error when files
     /// are missing — callers decide whether OCR is optional.
     pub fn new(model_dir: &Path) -> Result<Self> {
-        // Accept any PP-OCR generation: the v4 file names, or generic ones
-        // (det*.onnx / rec*.onnx / *dict*.txt | ppocr_keys*) so a PP-OCRv5
-        // model set drops in without renames.
+        // Accept any PP-OCR generation: the v4 exact file names, or generic
+        // ones (*det*.onnx / *rec*.onnx, dict via *dict*.txt or a *rec*.yml) so
+        // a v5 or v6 model set drops in without renames or offline prep.
         let det_path = find_file(model_dir, &["ch_PP-OCRv4_det_infer.onnx"], "det", ".onnx")?;
         let rec_path = find_file(model_dir, &["ch_PP-OCRv4_rec_infer.onnx"], "rec", ".onnx")?;
-        let dict_path = find_file(model_dir, &["ppocr_keys_v1.txt"], "dict", ".txt")?;
         let det_bytes = sanitize_dims(
             &std::fs::read(&det_path)
                 .with_context(|| format!("det model {}", det_path.display()))?,
@@ -90,18 +94,14 @@ impl PpOcrEnhancer {
             &std::fs::read(&rec_path)
                 .with_context(|| format!("rec model {}", rec_path.display()))?,
         );
-        let dict: Vec<String> = std::fs::read_to_string(&dict_path)
-            .with_context(|| format!("dictionary {}", dict_path.display()))?
-            .lines()
-            .map(str::to_owned)
-            .collect();
+        let dict = load_dict(model_dir)?;
         anyhow::ensure!(
             dict.len() > 6000,
-            "dictionary looks truncated: {} lines",
+            "dictionary looks truncated: {} entries",
             dict.len()
         );
 
-        let det = tract_onnx::onnx()
+        let det = onnx_loader()
             .model_for_read(&mut &det_bytes[..])?
             .with_input_fact(0, f32::fact([1, 3, DET_SIDE, DET_SIDE]).into())?
             .into_optimized()?
@@ -118,7 +118,7 @@ impl PpOcrEnhancer {
         .and_then(|p| std::fs::read(&p).ok())
         .and_then(|bytes| {
             let bytes = sanitize_dims(&bytes);
-            tract_onnx::onnx()
+            onnx_loader()
                 .model_for_read(&mut &bytes[..])
                 .ok()?
                 .with_input_fact(0, f32::fact([1, 3, CLS_HEIGHT, CLS_WIDTH]).into())
@@ -349,7 +349,7 @@ impl PpOcrEnhancer {
         let model = match cache.entry(bucket) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(
-                tract_onnx::onnx()
+                onnx_loader()
                     .model_for_read(&mut &self.rec_bytes[..])?
                     .with_input_fact(0, f32::fact([1, 3, REC_HEIGHT, bucket]).into())?
                     .into_optimized()?
@@ -538,7 +538,7 @@ impl Enhancer for PpOcrEnhancer {
                 confidence: conf.min(0.99),
                 bold: false,
                 hidden: false,
-                source: Some("ocr:ppocr-v4".into()),
+                source: Some("ocr:ppocr".into()),
                 group: None,
                 tag: None,
             }));
@@ -667,6 +667,76 @@ fn sanitize_dims(bytes: &[u8]) -> Vec<u8> {
     replace_inplace(&mut out, b"p2o.DynamicDimension.", b"p2o_DynamicDimension_");
     replace_inplace(&mut out, b"DynamicDimension.", b"DynamicDimension_");
     out
+}
+
+/// ONNX loader configured to ignore the graph's baked-in `value_info`.
+///
+/// PaddleOCR's PP-OCRv6 export annotates intermediate nodes with a symbolic
+/// batch dim, which tract refuses to unify with the concrete batch=1 we pin via
+/// `with_input_fact` (`Impossible to unify Sym(DynamicDimension_0) with Val(1)`).
+/// Ignoring `value_info` makes tract re-infer every intermediate shape from the
+/// pinned input — equivalent to the old `prepare.py` static-ization, but with
+/// zero Python: the raw HuggingFace ONNX loads as-is. Shapes are fully
+/// inferable for DB det / SVTR rec / cls, so this is safe across PP-OCRv4/v5/v6
+/// (verified: v4 chinese_scan unchanged, v6 raw == onnxruntime).
+fn onnx_loader() -> tract_onnx::Onnx {
+    tract_onnx::onnx().with_ignore_value_info(true)
+}
+
+/// Load the recognition character dict: the flat `*dict*.txt` if present, else
+/// parse `character_dict` out of a PP-OCR `*rec*.yml` / `*.yml` (PP-OCRv6 ships
+/// the dict only inside inference.yml, so this avoids a Python extraction step).
+fn load_dict(dir: &Path) -> Result<Vec<String>> {
+    if let Ok(txt) = find_file(dir, &["ppocr_keys_v1.txt"], "dict", ".txt") {
+        return Ok(std::fs::read_to_string(&txt)
+            .with_context(|| format!("dictionary {}", txt.display()))?
+            .lines()
+            .map(str::to_owned)
+            .collect());
+    }
+    let yml = find_file(dir, &[], "rec", ".yml")
+        .or_else(|_| find_file(dir, &[], "", ".yml"))
+        .context("no *dict*.txt and no *.yml to extract character_dict from")?;
+    let text =
+        std::fs::read_to_string(&yml).with_context(|| format!("rec yml {}", yml.display()))?;
+    parse_yml_char_dict(&text).with_context(|| format!("character_dict in {}", yml.display()))
+}
+
+/// Parse the `character_dict:` block list from a PP-OCR rec inference.yml.
+///
+/// The block is a constrained YAML list — `  - <scalar>` lines, one char each,
+/// either single-quoted (`'x'`, with `''` escaping a literal quote) or bare —
+/// so a full YAML parser is overkill. Reads from `character_dict:` until the
+/// indentation drops below the list items.
+fn parse_yml_char_dict(text: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        if !in_block {
+            if line.trim_end() == "character_dict:" || line.trim_start() == "character_dict:" {
+                in_block = true;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let Some(item) = trimmed.strip_prefix("- ") else {
+            // A non-list line at this point ends the block (next yml key).
+            if trimmed.is_empty() {
+                continue;
+            }
+            break;
+        };
+        let item = item.trim();
+        let unquoted =
+            if let Some(inner) = item.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+                inner.replace("''", "'")
+            } else {
+                item.to_string()
+            };
+        out.push(unquoted);
+    }
+    anyhow::ensure!(!out.is_empty(), "character_dict block empty or not found");
+    Ok(out)
 }
 
 /// Resolve a model file: exact known names first, then any file whose name
@@ -926,6 +996,15 @@ mod tests {
         let out = sanitize_dims(&input);
         assert_eq!(out.len(), input.len());
         assert!(!out.windows(21).any(|w| w == b"p2o.DynamicDimension."));
+    }
+
+    #[test]
+    fn parse_yml_char_dict_handles_quotes_and_block_end() {
+        // Mirrors a PP-OCRv6 rec inference.yml: quoted, bare, escaped, space,
+        // then a following key that must end the block.
+        let yml = "PostProcess:\n  name: CTCLabelDecode\n  character_dict:\n  - '!'\n  - '\"'\n  - $\n  - ''''\n  - ' '\n  - 枯\n  use_space_char: true\n";
+        let d = parse_yml_char_dict(yml).unwrap();
+        assert_eq!(d, ["!", "\"", "$", "'", " ", "枯"]);
     }
 
     #[test]

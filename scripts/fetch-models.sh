@@ -6,7 +6,7 @@
 # models/ (gitignored). All are Apache-2.0; we redistribute nothing — this
 # script pulls from the original HuggingFace repos.
 #
-#   ./scripts/fetch-models.sh ppocr-v6   # --ocr (default)     (~6 MB + local prep)
+#   ./scripts/fetch-models.sh ppocr-v6   # --ocr (default)     (~7 MB, no prep)
 #   ./scripts/fetch-models.sh ocr        # --ocr v4 fallback   (~16 MB)
 #   ./scripts/fetch-models.sh layout     # --layout (default)  (~75 MB)
 #   ./scripts/fetch-models.sh unirec     # --table/formula/transcribe-model (~700 MB)
@@ -89,24 +89,15 @@ fetch_ppv2() {
 
 fetch_ppocr_v6() {
   echo "OCR v6 (PP-OCRv6 tiny, PaddlePaddle, Apache-2.0) → $MODELS/ppocr-v6/"
-  # Stage raw ONNX + rec yml (carries the char dict); det/rec live in separate
-  # _onnx repos, each as inference.onnx + inference.yml.
-  dl_file PaddlePaddle/PP-OCRv6_tiny_det_onnx "**/inference.onnx" "$MODELS/ppocr-v6/_raw/det.onnx"
-  dl_file PaddlePaddle/PP-OCRv6_tiny_rec_onnx "**/inference.onnx" "$MODELS/ppocr-v6/_raw/rec.onnx"
-  dl_file PaddlePaddle/PP-OCRv6_tiny_rec_onnx "**/inference.yml"  "$MODELS/ppocr-v6/_raw/rec.yml"
+  # The loader handles PaddleOCR's dynamic-graph export directly (tract with
+  # ignore_value_info) and reads the char dict out of the rec yml — so we just
+  # drop the raw HuggingFace files in under loader-matchable names. No prep step.
+  dl_file PaddlePaddle/PP-OCRv6_tiny_det_onnx "**/inference.onnx" "$MODELS/ppocr-v6/PP-OCRv6_tiny_det.onnx"
+  dl_file PaddlePaddle/PP-OCRv6_tiny_rec_onnx "**/inference.onnx" "$MODELS/ppocr-v6/PP-OCRv6_tiny_rec.onnx"
+  dl_file PaddlePaddle/PP-OCRv6_tiny_rec_onnx "**/inference.yml"  "$MODELS/ppocr-v6/PP-OCRv6_tiny_rec.yml"
   # v6 ships no new orientation classifier — reuse v4's (optional 0/180 cls).
   dl_file SWHL/RapidOCR "**/ch_ppocr_mobile_v2.0_cls_infer.onnx" "$MODELS/ppocr-v6/ch_ppocr_mobile_v2.0_cls_infer.onnx"
-  echo ""
-  echo "  PP-OCRv6's official export has a dynamic graph (symbolic batch baked"
-  echo "  into intermediate shapes) tract can't shape-infer, and the dict lives"
-  echo "  in the rec yml. Static-ize + extract the dict once (needs a venv with"
-  echo "  onnx + pyyaml; onnxsim optional):"
-  echo ""
-  echo "      pip install onnx pyyaml"
-  echo "      python scripts/spike/ppocrv6/prepare.py"
-  echo ""
-  echo "  → produces $MODELS/ppocr-v6/{PP-OCRv6_tiny_det,_rec}_simp.onnx + ppocrv6_dict.txt,"
-  echo "    then run with  --ocr --ocr-models $MODELS/ppocr-v6"
+  echo "  → run with  --ocr  (default)  or  --ocr-models $MODELS/ppocr-v6"
 }
 
 case "${1:-}" in
