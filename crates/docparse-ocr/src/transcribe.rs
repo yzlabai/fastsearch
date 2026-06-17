@@ -89,11 +89,7 @@ pub fn transcribe_pages(
                     new_chunks.push(TextChunk {
                         text,
                         bbox: region.bbox,
-                        font_size: if region.kind.is_title() {
-                            16.0
-                        } else {
-                            10.0
-                        },
+                        font_size: if region.kind.is_title() { 16.0 } else { 10.0 },
                         font: None,
                         page: page.number,
                         confidence: 0.85,

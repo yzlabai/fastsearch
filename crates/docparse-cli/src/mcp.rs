@@ -229,8 +229,7 @@ fn tool_parse_document(args: &Value, state: &crate::EnhanceState) -> anyhow::Res
 
 fn tool_get_chunks(args: &Value, state: &crate::EnhanceState) -> anyhow::Result<String> {
     let doc = parse_enhanced(args, state)?;
-    let table_markdown =
-        args.get("table_format").and_then(Value::as_str) == Some("markdown");
+    let table_markdown = args.get("table_format").and_then(Value::as_str) == Some("markdown");
     let chunks = docparse_core::chunk::chunk_document_with(
         &doc,
         docparse_core::chunk::ChunkOptions {

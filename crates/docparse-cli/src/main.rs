@@ -790,9 +790,7 @@ fn main() -> anyhow::Result<()> {
                 table_markdown: matches!(cli.table_format, TableFormat::Markdown),
                 ..Default::default()
             };
-            docparse_core::chunk::to_json(&docparse_core::chunk::chunk_document_with(
-                &doc, opts,
-            ))
+            docparse_core::chunk::to_json(&docparse_core::chunk::chunk_document_with(&doc, opts))
         }
     };
 

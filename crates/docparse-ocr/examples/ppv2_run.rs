@@ -15,8 +15,12 @@ fn read_f32(p: &str) -> Vec<f32> {
 }
 
 fn main() -> TractResult<()> {
-    let onnx = std::env::args().nth(1).expect("usage: ppv2_run <model.onnx> [spike_dir]");
-    let dir = std::env::args().nth(2).unwrap_or_else(|| "/tmp/ppv2_spike".into());
+    let onnx = std::env::args()
+        .nth(1)
+        .expect("usage: ppv2_run <model.onnx> [spike_dir]");
+    let dir = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "/tmp/ppv2_spike".into());
     let img = tensor1(&read_f32(&format!("{dir}/in_image.f32"))).into_shape(&[1, 3, 800, 800])?;
     let imshape = tensor1(&read_f32(&format!("{dir}/in_imshape.f32"))).into_shape(&[1, 2])?;
     let scale = tensor1(&read_f32(&format!("{dir}/in_scale.f32"))).into_shape(&[1, 2])?;
@@ -27,7 +31,13 @@ fn main() -> TractResult<()> {
         .into_runnable()?;
 
     // ONNX input order: [im_shape, image, scale_factor].
-    let mk = || tvec!(imshape.clone().into(), img.clone().into(), scale.clone().into());
+    let mk = || {
+        tvec!(
+            imshape.clone().into(),
+            img.clone().into(),
+            scale.clone().into()
+        )
+    };
     if std::env::var_os("PPV2_TIME").is_some() {
         let _ = model.run(mk())?; // warmup
         let t = std::time::Instant::now();
@@ -35,7 +45,11 @@ fn main() -> TractResult<()> {
         for _ in 0..iters {
             let _ = model.run(mk())?;
         }
-        eprintln!("[time] tract run avg = {:.0} ms ({} iters)", t.elapsed().as_secs_f64() * 1000.0 / iters as f64, iters);
+        eprintln!(
+            "[time] tract run avg = {:.0} ms ({} iters)",
+            t.elapsed().as_secs_f64() * 1000.0 / iters as f64,
+            iters
+        );
     }
     let out = model.run(mk())?;
     let b = out[0].to_plain_array_view::<f32>()?;
@@ -49,7 +63,10 @@ fn main() -> TractResult<()> {
         blob.extend(v.to_le_bytes());
     }
     std::fs::write(format!("{dir}/tract_boxes.bin"), &blob)?;
-    let mut rows: Vec<&[f32]> = (0..n).map(|i| &b[i * k..(i + 1) * k]).filter(|r| r[1] > 0.5).collect();
+    let mut rows: Vec<&[f32]> = (0..n)
+        .map(|i| &b[i * k..(i + 1) * k])
+        .filter(|r| r[1] > 0.5)
+        .collect();
     rows.sort_by(|a, c| a[6].partial_cmp(&c[6]).unwrap());
     eprintln!("tract boxes>0.5: {}", rows.len());
     for r in rows.iter().take(10) {

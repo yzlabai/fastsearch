@@ -237,10 +237,26 @@ mod tests {
     fn render_matches_cli_pipeline_and_is_deterministic() {
         let path = temp_html("docparse-rest-test.html");
         let st = test_state();
-        let (a, ct) =
-            render(&path, "up.html", "markdown", Default::default(), false, false, &st).unwrap();
-        let (b, _) =
-            render(&path, "up.html", "markdown", Default::default(), false, false, &st).unwrap();
+        let (a, ct) = render(
+            &path,
+            "up.html",
+            "markdown",
+            Default::default(),
+            false,
+            false,
+            &st,
+        )
+        .unwrap();
+        let (b, _) = render(
+            &path,
+            "up.html",
+            "markdown",
+            Default::default(),
+            false,
+            false,
+            &st,
+        )
+        .unwrap();
         assert_eq!(a, b, "same input must render byte-identically");
         assert_eq!(ct, "text/markdown; charset=utf-8");
         assert!(a.contains("Hello rest."));
@@ -255,10 +271,16 @@ mod tests {
     #[test]
     fn unknown_format_is_an_error() {
         let path = temp_html("docparse-rest-badfmt.html");
-        assert!(
-            render(&path, "x.html", "yaml", Default::default(), false, false, &test_state())
-                .is_err()
-        );
+        assert!(render(
+            &path,
+            "x.html",
+            "yaml",
+            Default::default(),
+            false,
+            false,
+            &test_state()
+        )
+        .is_err());
     }
 
     #[test]
@@ -266,20 +288,39 @@ mod tests {
         let path = temp_html("docparse-rest-envelope.html");
         let st = test_state();
         // 默认 = 裸数组（与 CLI 字节一致）
-        let (bare, ct) =
-            render(&path, "up.html", "chunks", Default::default(), false, false, &st).unwrap();
+        let (bare, ct) = render(
+            &path,
+            "up.html",
+            "chunks",
+            Default::default(),
+            false,
+            false,
+            &st,
+        )
+        .unwrap();
         assert_eq!(ct, "application/json");
         let bare_json: serde_json::Value = serde_json::from_str(&bare).unwrap();
         assert!(bare_json.is_array(), "bare chunks must be a JSON array");
 
         // envelope=true = {provenance,quality,profile,chunks}，chunks 与裸数组同内容
-        let (env, _) =
-            render(&path, "up.html", "chunks", Default::default(), true, false, &st).unwrap();
+        let (env, _) = render(
+            &path,
+            "up.html",
+            "chunks",
+            Default::default(),
+            true,
+            false,
+            &st,
+        )
+        .unwrap();
         let env_json: serde_json::Value = serde_json::from_str(&env).unwrap();
         assert!(env_json["provenance"]["parser"].is_string());
         assert!(env_json["quality"]["coverage"].is_number());
         assert!(env_json["profile"].is_array());
-        assert_eq!(env_json["chunks"], bare_json, "envelope.chunks == bare array");
+        assert_eq!(
+            env_json["chunks"], bare_json,
+            "envelope.chunks == bare array"
+        );
     }
 
     #[test]

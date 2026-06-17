@@ -342,7 +342,9 @@ mod tests {
 
         // A real table's blocks differ between cells (only the tags repeat) →
         // no verbatim block reaches the repeat threshold → not trimmed.
-        let table: Vec<i64> = (0..200).map(|i| [1i64, 2, (i % 37) + 100][i as usize % 3]).collect();
+        let table: Vec<i64> = (0..200)
+            .map(|i| [1i64, 2, (i % 37) + 100][i as usize % 3])
+            .collect();
         assert!(loop_trim_len(&table, LOOP_MIN_REPEATS).is_none());
 
         // Fewer than min_repeats copies is left alone (legit short repetition).

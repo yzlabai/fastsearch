@@ -97,15 +97,15 @@ impl RegionKind {
 fn map_yolo(class: u8) -> RegionKind {
     match class {
         0 => RegionKind::Title,
-        1 => RegionKind::Text,        // plain text
-        2 => RegionKind::Other,       // abandon (header/footer/marginalia)
+        1 => RegionKind::Text,  // plain text
+        2 => RegionKind::Other, // abandon (header/footer/marginalia)
         3 => RegionKind::Figure,
-        4 => RegionKind::Caption,     // figure_caption
+        4 => RegionKind::Caption, // figure_caption
         5 => RegionKind::Table,
-        6 => RegionKind::Caption,     // table_caption
-        7 => RegionKind::Footnote,    // table_footnote
-        8 => RegionKind::Formula,     // isolate_formula
-        9 => RegionKind::Caption,     // formula_caption
+        6 => RegionKind::Caption,  // table_caption
+        7 => RegionKind::Footnote, // table_footnote
+        8 => RegionKind::Formula,  // isolate_formula
+        9 => RegionKind::Caption,  // formula_caption
         _ => RegionKind::Other,
     }
 }
@@ -114,26 +114,26 @@ fn map_yolo(class: u8) -> RegionKind {
 fn map_ppv2(class: u8) -> RegionKind {
     match class {
         0 => RegionKind::Abstract,
-        1 => RegionKind::Text,        // algorithm
-        2 => RegionKind::Text,        // aside_text
-        3 => RegionKind::Figure,      // chart
-        4 => RegionKind::Text,        // content (toc-ish)
-        5 => RegionKind::Formula,     // display_formula
-        6 => RegionKind::Title,       // doc_title
-        7 => RegionKind::Caption,     // figure_title
-        8 | 9 => RegionKind::Footer,  // footer / footer_image
+        1 => RegionKind::Text,       // algorithm
+        2 => RegionKind::Text,       // aside_text
+        3 => RegionKind::Figure,     // chart
+        4 => RegionKind::Text,       // content (toc-ish)
+        5 => RegionKind::Formula,    // display_formula
+        6 => RegionKind::Title,      // doc_title
+        7 => RegionKind::Caption,    // figure_title
+        8 | 9 => RegionKind::Footer, // footer / footer_image
         10 => RegionKind::Footnote,
-        11 => RegionKind::Other,      // formula_number
+        11 => RegionKind::Other,       // formula_number
         12 | 13 => RegionKind::Header, // header / header_image
-        14 => RegionKind::Figure,     // image
+        14 => RegionKind::Figure,      // image
         15 => RegionKind::InlineFormula,
         16 => RegionKind::PageNumber,
-        17 => RegionKind::SubTitle,   // paragraph_title
+        17 => RegionKind::SubTitle, // paragraph_title
         18 | 19 => RegionKind::Reference,
-        20 => RegionKind::Other,      // seal
+        20 => RegionKind::Other, // seal
         21 => RegionKind::Table,
-        22 | 23 => RegionKind::Text,  // text / vertical_text
-        24 => RegionKind::Footnote,   // vision_footnote
+        22 | 23 => RegionKind::Text, // text / vertical_text
+        24 => RegionKind::Footnote,  // vision_footnote
         _ => RegionKind::Other,
     }
 }
@@ -170,7 +170,11 @@ impl LayoutModel {
         let raw = tract_onnx::onnx().model_for_read(&mut &bytes[..])?;
         // Auto-detect backend by input arity: DocLayout-YOLO has 1 input;
         // PP-DocLayoutV2 (RT-DETR) has 3 (im_shape, image, scale_factor).
-        let backend = if raw.input_outlets()?.len() >= 3 { Backend::Ppv2 } else { Backend::Yolo };
+        let backend = if raw.input_outlets()?.len() >= 3 {
+            Backend::Ppv2
+        } else {
+            Backend::Yolo
+        };
         let model = match backend {
             // YOLO: single dynamic input fixed to the detection canvas.
             Backend::Yolo => raw
@@ -679,7 +683,12 @@ mod tests {
     #[test]
     fn skips_region_covered_by_existing_table_and_non_table_class() {
         let mut els = vec![Element::Table(Table {
-            bbox: BBox { x0: 100.0, y0: 100.0, x1: 300.0, y1: 300.0 },
+            bbox: BBox {
+                x0: 100.0,
+                y0: 100.0,
+                x1: 300.0,
+                y1: 300.0,
+            },
             page: 1,
             rows: vec![vec![]],
             source: None,
@@ -687,7 +696,10 @@ mod tests {
         // Same-area table region → covered, not seeded; a non-table region → ignored.
         let n = seed_table_regions(
             &mut els,
-            &[table_region(105.0, 105.0, 295.0, 295.0), region(400.0, 400.0, 500.0, 500.0)],
+            &[
+                table_region(105.0, 105.0, 295.0, 295.0),
+                region(400.0, 400.0, 500.0, 500.0),
+            ],
             1,
         );
         assert_eq!(n, 0);

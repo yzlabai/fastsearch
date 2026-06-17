@@ -381,7 +381,13 @@ mod tests {
         let d = doc(vec![table]);
 
         // markdown 选项 → 管道表
-        let md = chunk_document_with(&d, ChunkOptions { table_markdown: true, ..Default::default() });
+        let md = chunk_document_with(
+            &d,
+            ChunkOptions {
+                table_markdown: true,
+                ..Default::default()
+            },
+        );
         let t = md.iter().find(|c| c.kind == ChunkKind::Table).unwrap();
         assert!(t.text.contains("| 方法 | 准确率 |"), "got: {}", t.text);
         assert!(t.text.contains("| --- | --- |"));
