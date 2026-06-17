@@ -86,15 +86,20 @@ Scored on **[OmniDocBench](https://github.com/opendatalab/OmniDocBench)** (CVPR 
 
 ## 🆚 vs related tools
 
-| | **docparse-rs** | Docling | OpenDataLoader | MarkItDown |
-|---|---|---|---|---|
-| Deploy | **pure-Rust ~29 MB binary** | Python + models (GB env) | Java / JVM | Python |
-| Determinism | **byte-identical default path** | not strictly | deterministic | deterministic |
-| Citations | **page+bbox both ways, 100%** | element-level | coordinates | none |
-| Formats | 12 | 15+ | PDF-focused | 20+ |
-| Speed (born-digital) | **<10 ms / ~700 pg/s** | seconds/page | fast | fast |
+| | **docparse-rs** | [liteparse](https://github.com/run-llama/liteparse) | Docling | OpenDataLoader | MarkItDown |
+|---|---|---|---|---|---|
+| Deploy | **pure-Rust ~29 MB binary, zero runtime deps** | Rust + PDFium/Tesseract (C++); LibreOffice/ImageMagick for non-PDF | Python + models (GB env) | Java / JVM | Python |
+| PDF engine | **own content-stream interpreter** | wraps PDFium | own | veraPDF | (delegates) |
+| Determinism | **byte-identical default path** | deterministic | not strictly | deterministic | deterministic |
+| Citations | **page+bbox both ways, 100%** | bbox per text element | element-level | coordinates | none |
+| Output | JSON / **Markdown** / text / **RAG chunks** | JSON / text / PNG | Markdown / JSON | JSON / Markdown | Markdown |
+| Formats | **12, all in-process** | PDF native; others via external convert | 15+ | PDF-focused | 20+ |
+| Hard pages | opt-in embedded models (table/formula/CJK) | none (by design) | neural layout | rule-based | none |
+| Speed (born-digital) | **<10 ms / ~700 pg/s** | fast | seconds/page | fast | fast |
 
-Where others win: Docling's neural layout has a higher ceiling on the hardest layouts and a more mature ecosystem; MarkItDown covers more long-tail formats; we ship no GPU pipeline, and non-zh/en OCR (RTL / Korean …) isn't covered yet. [Detailed comparison →](docs/refer/docling-objective-comparison.md)
+**Closest peer — liteparse** (run-llama, also Rust + deterministic + bbox-first): the design philosophies overlap, the tradeoffs differ. liteparse wraps **PDFium** for PDF text, bundles **Tesseract**, and converts DOCX/XLSX/PPTX/images through **LibreOffice + ImageMagick** — so it carries native C++ deps and external tools, where docparse-rs is a single zero-dependency binary with its own from-scratch PDF interpreter and in-process parsers for all 12 formats. **liteparse wins on reach:** WASM/browser builds, first-class Node/Python bindings, `npm`/`pip`/`cargo install`, and Tesseract's broad multi-language OCR out of the box (docparse-rs OCR is zh/en-focused). **docparse-rs adds** Markdown + RAG-chunk output with heading breadcrumbs and bidirectional `locate()`, plus opt-in embedded models (merged-cell tables, formula→LaTeX, CJK/full-page transcription) that liteparse deliberately omits to stay light.
+
+Where the others win: Docling's neural layout has a higher ceiling on the hardest layouts and a more mature ecosystem; MarkItDown covers more long-tail formats; we ship no GPU pipeline, and non-zh/en OCR (RTL / Korean …) isn't covered yet. [Detailed comparison →](docs/refer/docling-objective-comparison.md)
 
 ## 🏗️ Architecture
 

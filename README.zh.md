@@ -86,13 +86,18 @@ docs = DocparseLoader("paper.pdf").load()   # 每 chunk 一个 Document，metada
 
 ## 🆚 与同类对比
 
-| | **docparse-rs** | Docling | OpenDataLoader | MarkItDown |
-|---|---|---|---|---|
-| 部署 | **纯 Rust ~29 MB 二进制** | Python + 模型（GB 级环境） | Java / JVM | Python |
-| 确定性 | **默认路径逐字节确定** | 非严格 | 确定 | 确定 |
-| 引用 | **page+bbox 双向，100%** | 元素级 | 坐标 | 无 |
-| 格式数 | 12 | 15+ | PDF 专注 | 20+ |
-| 速度（born-digital） | **<10ms / ~700 页/s** | 秒级/页 | 快 | 快 |
+| | **docparse-rs** | [liteparse](https://github.com/run-llama/liteparse) | Docling | OpenDataLoader | MarkItDown |
+|---|---|---|---|---|---|
+| 部署 | **纯 Rust ~29 MB 二进制，零运行时依赖** | Rust + PDFium/Tesseract（C++）；非 PDF 走 LibreOffice/ImageMagick | Python + 模型（GB 级环境） | Java / JVM | Python |
+| PDF 引擎 | **自研内容流解释器** | 包 PDFium | 自研 | veraPDF | （委托） |
+| 确定性 | **默认路径逐字节确定** | 确定 | 非严格 | 确定 | 确定 |
+| 引用 | **page+bbox 双向，100%** | 每文本元素带 bbox | 元素级 | 坐标 | 无 |
+| 输出 | JSON / **Markdown** / text / **RAG chunks** | JSON / text / PNG | Markdown / JSON | JSON / Markdown | Markdown |
+| 格式数 | **12，全部进程内** | PDF 原生；其余靠外部转换 | 15+ | PDF 专注 | 20+ |
+| 难页 | 可选内嵌模型（表/公式/CJK） | 无（设计如此） | 神经版面 | 规则 | 无 |
+| 速度（born-digital） | **<10ms / ~700 页/s** | 快 | 秒级/页 | 快 | 快 |
+
+**最近的同类——liteparse**（run-llama，同为 Rust + 确定性 + bbox 优先）：设计哲学高度重合，取舍不同。liteparse 用 **PDFium** 抽 PDF 文本、内置 **Tesseract**、并经 **LibreOffice + ImageMagick** 转换 DOCX/XLSX/PPTX/图片——因此带原生 C++ 依赖与外部工具；docparse-rs 则是单个零依赖二进制，自研 PDF 解释器 + 12 种格式全进程内解析。**liteparse 占优在"触达面"**：WASM/浏览器构建、一流的 Node/Python 绑定、`npm`/`pip`/`cargo install`、以及 Tesseract 开箱即用的多语种 OCR（docparse-rs 的 OCR 聚焦中英）。**docparse-rs 多出**：带标题面包屑的 Markdown + RAG chunks 输出与双向 `locate()`，以及 liteparse 为保持轻量而刻意不做的可选内嵌模型（合并格表、公式→LaTeX、CJK/整页转写）。
 
 对方仍占优处：Docling 的神经版面在最难版面上质量上限更高、生态更成熟；MarkItDown 长尾格式更多；我方不做 GPU 管线，非中英 OCR（RTL / 韩文…）暂未覆盖。[详细对比 →](docs/refer/docling-objective-comparison.md)
 
