@@ -95,18 +95,19 @@
 - [x] **Gate 0:tiny det+rec 在 tract `into_runnable` + 前向成功**(2026-06-17,静态化后,无 vendored 补丁;`scripts/spike/ppocrv6/prepare.py`)
 - [x] **Gate 1:真图 chinese_scan 端到端跑通——v6 更优(修正 `丶`→`、`)+ 2.06× 快 + 体积减半,零代码改动**
 - [ ] Gate 2:`DET_SIDE`/阈值 A/B 定案 + medium 档量化(可选打磨)
-- [x] **Gate 3**:`fetch-models.sh ppocr-v6` tier + `prepare.py`(静态化+抽字典+铺平)已加并验证 prep→run;**默认已翻**——`main.rs` 三处(CLI/MCP/serve)`default_value` → `models/ppocr-v6`,bare `--ocr` 直走 v6(v4 留回退档);CLAUDE.md §1 + status.md Phase 8 已回写
-- [ ] Gate 3 余项:download 路径待本机 hf CLI 修复后实跑(prepare+run 已验);用户需先 `fetch-models.sh ppocr-v6` + `prepare.py` 才有默认 dir
-- [x] [docs/status.md](../status.md) Phase 8 已补
+- [x] **Gate 3**:`fetch-models.sh ppocr-v6` tier + **默认已翻**(`main.rs` 三处 CLI/MCP/serve `default_value` → `models/ppocr-v6`)+ **首次缺模型交互确认自动下载**(ureq);CLAUDE.md/README/status 已回写。
+- [x] **静态化整步已消除(`774fe54`)**:`prepare.py` 弃用并删除——tract `with_ignore_value_info` 让 raw HF ONNX 直载,字典从 rec yml 解析。下方 §6 的 prepare.py 布局**已作废**,以本条为准。
+- [x] [docs/status.md](../status.md) Phase 8 + [devlogs/2026-06-17-ppocr-v6-integration.md](../devlogs/2026-06-17-ppocr-v6-integration.md) 已补
+- [ ] Gate 2(非阻断):`DET_SIDE`/阈值 A/B、medium 量化、更多扫描回归。
 
-## 6. 产品化落点(Gate 3 待做)
+## 6. 产品化落点(⚠️ 历史:静态化路线,已被 raw 直载取代)
 
-已验证的生产目录布局(`fetch-models.sh` 应产出 `models/ppocr-v6/`):
-- `*det*.onnx` / `*rec*.onnx`:`PaddlePaddle/PP-OCRv6_tiny_{det,rec}_onnx` 的 `inference.onnx` 经 `scripts/spike/ppocrv6/prepare.py` 静态化(钉 batch=1 + strip value_info + infer_shapes);
-- `*dict*.txt`:从 rec `inference.yml` 的 `PostProcess.character_dict` 抽 6904 字一行一个;
-- `*cls*.onnx`:复用现役 v4 `ch_ppocr_mobile_v2.0_cls_infer.onnx`(v6 无新 cls)。
+> **此节描述的 `prepare.py` 静态化布局已作废**(见 [ppocr-v6-ux-autoload.md](ppocr-v6-ux-autoload.md))。现役生产布局:`fetch-models.sh ppocr-v6` 直接下 4 个 **raw** 文件到 `models/ppocr-v6/`——`PP-OCRv6_tiny_{det,rec}.onnx`(HF `inference.onnx` 原样)+ `PP-OCRv6_tiny_rec.yml`(供 `load_dict` 抽字典)+ v4 `*cls*.onnx`;loader(`onnx_loader`/`load_dict`)直接消化,**无任何离线 prep**。下文留作 Gate 0 spike 的历史记录。
 
-> ⚠️ `prepare.py` 需 Python `onnx`(+ `pyyaml` 抽字典);`onnxsim` 可选(Python 3.14 rec 段 segfault,已设跳过)。仿 ppv2 tier 在脚本里提示这步。
+原静态化布局(已弃):
+- `*det*.onnx` / `*rec*.onnx`:`inference.onnx` 经 `prepare.py` 静态化(钉 batch=1 + strip value_info + infer_shapes);
+- `*dict*.txt`:从 rec `inference.yml` 的 `character_dict` 抽;
+- `*cls*.onnx`:复用 v4。
 
 ## 7. 一句话
 

@@ -25,7 +25,7 @@ docparse-rs turns **PDF · DOCX · HTML · XLSX · PPTX · Markdown · CSV · SR
 - 🦀 **One pure-Rust binary** — ~29 MB, zero runtime deps, <10 ms warm parse (~700 pages/s)
 - 🔌 **Four faces, one output** — CLI / library / MCP (stdio) / REST, **byte-identical across all**
 - 📍 **RAG-native citations** — every chunk carries page + bbox + heading breadcrumbs; `locate(x, y)` reverse lookup, 100% coverage
-- 🔍 **In-process OCR** — `--ocr` runs ONNX on `tract` (PP-OCRv4); digital pages never touch a model; CCITT G3/G4 fax + JBIG2 scans covered
+- 🔍 **In-process OCR** — `--ocr` runs ONNX on `tract` (PP-OCRv6 tiny by default; offers to fetch ~7 MB on first use); digital pages never touch a model; CCITT G3/G4 fax + JBIG2 scans covered
 - 🧠 **Embedded models, opt-in** — merged-cell table structure, formula→LaTeX, full-page transcription (UniRec-0.1B), plus PP-DocLayoutV2 / DocLayout-YOLO layout
 - 🛡️ **Security pre-checks** — hidden-text filtering (flagged & auditable, never silently dropped), zip-bomb & page-count guards, per-page complexity profiling
 - 🧩 **Pluggable AI boundary** — the deterministic core stands alone; models trigger only on hard pages and carry a `source` tag + capped confidence
@@ -107,23 +107,27 @@ The heart of the project is a self-built **PDF content-stream interpreter** (gra
 All Apache-2.0, fetched from their original repos as external files — never baked into the binary. The core needs **none of them**: born-digital PDFs and every other format parse with zero downloads. Pull a tier only when you want the feature:
 
 ```bash
-./scripts/fetch-models.sh ocr        # --ocr               (~16 MB)
+# --ocr's default models are also auto-offered on first use — this is just the explicit path:
+./scripts/fetch-models.sh ppocr-v6   # --ocr (default)     (~7 MB)
+./scripts/fetch-models.sh ocr        # --ocr v4 fallback   (~16 MB)
 ./scripts/fetch-models.sh layout     # --layout (default)  (~75 MB)
 ./scripts/fetch-models.sh unirec     # --table/formula/transcribe-model (~700 MB)
 ./scripts/fetch-models.sh ppv2       # --layout-model ppv2 (~210 MB + a local prep step)
 ./scripts/fetch-models.sh all
 ```
 
-Needs the HuggingFace CLI (`pip install -U huggingface_hub`); `ppv2` additionally needs `onnx`+`onnxsim` to static-ize its graph for `tract` (the script prints the one-liner).
+Needs the HuggingFace CLI (`pip install -U huggingface_hub`); `ppv2` additionally needs `onnx`+`onnxsim` to static-ize its graph for `tract` (the script prints the one-liner). The `ppocr-v6` default needs no prep — the loader reads PaddleOCR's raw ONNX directly (tract's `ignore_value_info` handles its dynamic graph) and parses the char dict out of the rec yml.
 
 | Tier | Model (source) | Powers |
 |---|---|---|
 | `ppocr-v6` → `models/ppocr-v6/` (~7 MB) | PP-OCRv6 tiny det+rec (`PaddlePaddle/PP-OCRv6_tiny_*_onnx`) | `--ocr` scanned text (**default**), auto-deskew |
-| `ocr` → `models/ppocr/` (~16 MB) | PP-OCRv4 det+rec+cls (`SWHL/RapidOCR`) | `--ocr` v4 fallback (no static-ize step) |
+| `ocr` → `models/ppocr/` (~16 MB) | PP-OCRv4 det+rec+cls (`SWHL/RapidOCR`) | `--ocr` v4 fallback |
 | `layout` → `models/layout/` (~75 MB) | DocLayout-YOLO (`wybxc/DocLayout-YOLO-DocStructBench-onnx`) | `--layout` regions (default), formula detection |
 | `ppv2` → `models/layout-ppv2/` (~210 MB) | PP-DocLayoutV2 (`topdu/PP_DoclayoutV2_onnx`) | richer layout + native reading order ([A/B](docs/testresults/2026-06-15-ppv2-vs-yolo-omnidocbench.md)) |
 | `unirec` → `models/unirec/` (~700 MB) | UniRec-0.1B (`topdu/unirec_0_1b_onnx`) | `--table-model` / `--formula-model` / `--transcribe-model` |
 
+> **PP-OCRv6** (PaddleOCR, 2026-06) is the default OCR tier: on a real Chinese scan it's more accurate than the previous PP-OCRv4 mobile (e.g. fixes a 顿号 `、` misread), ~2× faster, and ~half the size — at 1.5 M params. Same DB-detection + CTC-recognition interface as v4/v5, so it drops into the existing pipeline; tract reads the raw export directly. [Evaluation →](docs/refer/ppocr-v6-evaluation.md)
+>
 > UniRec and PP-DocLayoutV2 are the two halves of [OpenOCR](https://github.com/Topdu/OpenOCR)'s **OpenDoc-0.1B**; we run their official ONNX on pure-Rust `tract` and stitch them with our own deterministic core. [Selection rationale →](docs/refer/openocr-0.1b-evaluation.md)
 
 ## 📄 License
