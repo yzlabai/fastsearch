@@ -98,7 +98,8 @@
 - [x] **Gate 3**:`fetch-models.sh ppocr-v6` tier + **默认已翻**(`main.rs` 三处 CLI/MCP/serve `default_value` → `models/ppocr-v6`)+ **首次缺模型交互确认自动下载**(ureq);CLAUDE.md/README/status 已回写。
 - [x] **静态化整步已消除(`774fe54`)**:`prepare.py` 弃用并删除——tract `with_ignore_value_info` 让 raw HF ONNX 直载,字典从 rec yml 解析。下方 §6 的 prepare.py 布局**已作废**,以本条为准。
 - [x] [docs/status.md](../status.md) Phase 8 + [devlogs/2026-06-17-ppocr-v6-integration.md](../devlogs/2026-06-17-ppocr-v6-integration.md) 已补
-- [ ] Gate 2(非阻断):`DET_SIDE`/阈值 A/B、medium 量化、更多扫描回归。
+- [x] **Gate 2 廉价旋钮 A/B 已测并定案**(2026-06-17):`DET_SIDE` 640 与阈值 `0.2`/`1.4` 均**降级 v4**(数字/句号错)、对 v6 无收益 → **保持全局 960/0.3/1.6,不做 per-model**(det 参数全局共享,v4 挑参数 v6 鲁棒)。见 [评估 §6c](../refer/ppocr-v6-evaluation.md)。
+- [ ] Gate 2 余项(需更多资源):medium 档量化(需难样例)、OmniDocBench `--ocr` 记分牌回归(需 harness)、更多扫描样例。
 
 ## 6. 产品化落点(⚠️ 历史:静态化路线,已被 raw 直载取代)
 
