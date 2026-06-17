@@ -11,3 +11,6 @@ __pycache__/
 hs_err_pid*.log
 replay_pid*.log
 .claude/
+# Cross-project scratch dropped here by other tooling — not part of docparse-rs
+video/
+skills/remotion-best-practices/
