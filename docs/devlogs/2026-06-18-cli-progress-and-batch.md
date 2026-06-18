@@ -125,3 +125,29 @@
 **review 自查**:`getrusage` 用 `unsafe` 但只读 zero-init 的 C 结构、检查返回码非 0 退化为 unavailable;`ru_maxrss.max(0) as u64` 防负;util/mb 用 `wall.max(1e-6)` 防除零;`--stats` 与 stdout 无关(纯 stderr/event),`-f json --stats --progress=json >out.json` 实测 stdout 零 event;非 json 模式 `emit` 不触发,human 行照打。**实测**单文件 338% util(15 页并行)、批量 517%、peak RSS ~50MB,json 模式 `resources` 事件合法、stdout 纯净。
 
 cli 25 单测 + 全工作区 34 套件 + clippy 零 warning。归入计划 I10(M2)。
+
+## 会话总结 + 完成进度(2026-06-18 收尾)
+
+**一条主线**:把 CLI 从"单文件、静默、无资源观测"补成"进度可见 + 批量 + 机器可读 + 资源观测",共 10 个 commit(均在 `main`):
+
+| commit | 内容 |
+|---|---|
+| `616b7b6` | 进度可视化 + 文件夹批量 + 聚合报告(indicatif) |
+| `84fb9a8` | 批量整批只载一次 OCR/UniRec + 递归落盘镜像 |
+| `076b4f8` | review 验收 + 迭代计划文档 |
+| `2d75391` | I2 递归不跟随符号链接环(防爆栈) |
+| `2b1cbb3` | I1 版面模型整批/整服务只载一次(模型复用收尾) |
+| `8a7abf4` | I5 报告显相对路径 + I3 落盘路径硬化(M1 收官) |
+| `effc5cd` | I4 `--progress=json` 机器可读事件流 |
+| `3f5786f` | I10 `--stats` CPU/内存用量 |
+| (本) | resources 测试补全 + 会话总结 |
+
+**完成进度**([plans/cli-experience-iteration.md](../plans/cli-experience-iteration.md)):
+- **M1 模型复用收尾 + 健壮性** ✅ 全完成:I1 版面复用 · I2 符号链接环 · I3 路径硬化。
+- **M2 机器可读 + 报告增强** 主体完成:✅ I4 `--progress=json` · ✅ I5 相对路径 · ✅ I10 `--stats`;**余 I6**(报告小料,P3 可选)。
+- **M3 吞吐**:I7 文件级并行 `--jobs`(需先 spike,受内存闸约束)——未开工。
+- **M4 深水(候)**:I8 基础解析页内进度(触 `DocumentParser` trait)、I9 模型加载失败语义。
+
+**质量**:全工作区 **34 套件 / 233 测试通过**,clippy 零 warning,fmt 净;单文件 `-f json`/`--ocr` 全程逐字节不变;新增依赖仅 `indicatif`(新)+ `libc`(本就在树,零新供应链面)。
+
+**剩余下一步**:I6(小)或 M3 I7(先 spike)。
