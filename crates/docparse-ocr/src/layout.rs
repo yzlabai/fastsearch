@@ -477,11 +477,10 @@ fn resize_nn(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> 
 pub fn enhance_document(
     doc: &mut docparse_core::ir::Document,
     pdf_bytes: Vec<u8>,
-    model_path: &Path,
+    model: &LayoutModel,
     scale: f32,
 ) -> Result<usize> {
     let raster = docparse_raster::Rasterizer::new(pdf_bytes)?;
-    let model = LayoutModel::new(model_path)?;
     let mut enhanced = 0usize;
     for page in &mut doc.pages {
         let idx = page.number.saturating_sub(1);

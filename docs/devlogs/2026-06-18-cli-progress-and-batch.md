@@ -80,3 +80,13 @@
 **暴露一处真硬伤(已记入下轮计划 I2)**:`collect_dir` 用 `path.is_dir()` 判递归,**跟随符号链接**——`-r` 遇符号链接环会无限递归爆栈(病态输入,Low,违"不 panic"红线)。一行可修(`!path.is_symlink()`),排进 [plans/cli-experience-iteration.md](../plans/cli-experience-iteration.md) M1。另:递归同名文件在人读表格里显示相同裸名(JSON/CSV 报告带全 path 无歧义),记 I5。
 
 **下轮迭代计划**:[plans/cli-experience-iteration.md](../plans/cli-experience-iteration.md)——M1 版面模型复用(Phase 9 模型复用真正收尾,顺带修服务端每请求重载)+ 符号链接/路径硬化;M2 `--progress=json` + 报告显相对路径;M3 文件级并行(需 spike);M4 基础解析页内进度(触 trait,候)。
+
+## 续:I1 版面模型复用(模型复用彻底收尾)
+
+收口迭代计划 M1 的 I1。原先 `--layout`/`--formula-model`/`--transcribe-model` 每文件从路径 `LayoutModel::new`,**连服务端也每请求重载**。
+
+- **docparse-ocr**:三个公有函数 `layout::enhance_document`/`formula::enhance_formulas`/`transcribe::transcribe_pages` 签名从收 `&Path` 改为收**预载 `&LayoutModel`**,删掉内部 `LayoutModel::new`(`formula.rs`/`transcribe.rs` 顺带去掉 `use std::path::Path`)。全 5 处调用都在 CLI crate,无外部消费者,改签名干净。
+- **CLI**:`RunModels` 加 `LazyLayout`(`OnceLock<Result<LayoutModel,String>>`),`parse_and_enhance` 三处从缓存取(惰性,不带 flag 永不加载)。
+- **服务端**:`EnhanceState` 加 `layout: OnceLock<Arc<LayoutModel>>` + `loaded_layout()`,layout/formula 走缓存——**服务从此每服务只载一次版面模型**(原每请求白重载,本项免费修掉)。`Arc<LayoutModel>` 跨并发请求共享编译通过 = `LayoutModel` 实证 `Send+Sync`。
+
+验收:全工作区 34 套件 + clippy 零 warning + 改动 crate fmt 净;`--layout` 单文件(`layout_enhanced_pages:1`)+ 2 文件批量实测产出正常、模型复用;单文件 `-f json`/`--ocr` 逐字不变。**至此 OCR/UniRec/版面三类模型都整批(或整服务)只载一次,Phase 9 模型复用彻底收尾**。M1 余 I3(落盘路径硬化,小)。

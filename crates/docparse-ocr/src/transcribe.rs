@@ -20,7 +20,6 @@ use crate::table_model::crop_region;
 use crate::unirec::UniRec;
 use anyhow::Result;
 use docparse_core::ir::{Document, Element, TextChunk};
-use std::path::Path;
 
 /// Detection confidence floor.
 const SCORE_MIN: f32 = 0.30;
@@ -36,10 +35,9 @@ const MIN_CHAR_RATIO: f32 = 0.5;
 pub fn transcribe_pages(
     doc: &mut Document,
     pdf_bytes: Vec<u8>,
-    layout_model_path: &Path,
+    layout: &LayoutModel,
     model: &UniRec,
 ) -> Result<usize> {
-    let layout = LayoutModel::new(layout_model_path)?;
     let raster = docparse_raster::Rasterizer::new(pdf_bytes)?;
     let mut replaced = 0usize;
 

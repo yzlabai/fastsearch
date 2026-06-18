@@ -108,7 +108,7 @@ broken.pdf          —       0.73   —       —         ERROR: failed parsing
 
 > 这些都已排进下一轮迭代计划 [plans/cli-experience-iteration.md](plans/cli-experience-iteration.md)。
 
-- **版面模型仍每文件加载**:`--layout`(及 `--formula-model`/`--transcribe-model` 内部用到的版面检测)的 ONNX 模型目前仍每文件从路径加载——这与服务端(MCP/REST)行为一致,需改 `docparse-ocr` 的 `enhance_document`/`enhance_formulas`/`transcribe_pages` 接受预载 `LayoutModel` 才能复用,属更大的跨 crate 改动,暂未做(计划 I1)。OCR 与 UniRec 模型已整批只载一次。
+- **模型整批只载一次**(已处理):OCR、UniRec、版面(`--layout`/`--formula-model`/`--transcribe-model`)模型在一次批量里**只加载一次**并复用(惰性,不带 flag 永不加载);服务端(MCP/REST)也改为每服务只载一次。
 - **递归不跟随符号链接目录**(已处理):`-r` 不进入符号链接指向的目录(避免符号链接环无限递归爆栈);符号链接文件仍纳入。如需跟随,后续 `--follow-symlinks`(计划 I2 已修部分)。
 - **同子目录同名仍覆盖**:递归已按相对路径镜像,但**同一**子目录下同名文件(或跨多个输入根的相同相对路径)仍会覆盖——这与源端本就重名一致。
 - **报告人读表格显示裸文件名**:递归批量里不同子目录的同名文件,表格行看着一样(JSON/CSV 报告带全路径,无歧义;计划 I5 拟显示相对路径)。

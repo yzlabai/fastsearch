@@ -325,13 +325,39 @@ impl LazyUniRec {
     }
 }
 
+/// A layout (DocLayout-YOLO / PP-DocLayoutV2) model loaded on first use and
+/// cached — `--layout`/`--formula-model`/`--transcribe-model` all need it, so a
+/// batch (or a single file using several of them) reads it once.
+pub(crate) struct LazyLayout {
+    cell: std::sync::OnceLock<Result<docparse_ocr::layout::LayoutModel, String>>,
+}
+
+impl LazyLayout {
+    fn new() -> Self {
+        Self {
+            cell: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn get(&self, path: &std::path::Path) -> anyhow::Result<&docparse_ocr::layout::LayoutModel> {
+        self.cell
+            .get_or_init(|| {
+                docparse_ocr::layout::LayoutModel::new(path).map_err(|e| format!("{e:#}"))
+            })
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("layout model unavailable: {e}"))
+    }
+}
+
 /// Models loaded once per CLI run and reused across every input. In single-file
 /// mode this is just the one file; in batch mode it's the whole folder — so the
-/// heavy OCR / UniRec models are read at most once, not per file. All fields are
-/// lazy (interior-mutable `OnceLock`): a digital-only `--ocr` batch still never
-/// touches the model, preserving the "digital stays model-free" invariant.
+/// heavy OCR / UniRec / layout models are read at most once, not per file. All
+/// fields are lazy (interior-mutable `OnceLock`): a digital-only `--ocr` batch
+/// still never touches a model, preserving the "digital stays model-free"
+/// invariant.
 pub(crate) struct RunModels {
     ocr: OcrState,
+    layout: LazyLayout,
     table: LazyUniRec,
     formula: LazyUniRec,
     transcribe: LazyUniRec,
@@ -341,6 +367,7 @@ impl RunModels {
     fn from_cli(cli: &Cli) -> Self {
         Self {
             ocr: OcrState::new(cli.ocr_models.clone()),
+            layout: LazyLayout::new(),
             table: LazyUniRec::new(),
             formula: LazyUniRec::new(),
             transcribe: LazyUniRec::new(),
@@ -464,6 +491,7 @@ pub(crate) struct EnhanceState {
     unirec_dir: Option<PathBuf>,
     vlm: Option<docparse_vlm::VlmConfig>,
     unirec: std::sync::OnceLock<Result<std::sync::Arc<docparse_ocr::unirec::UniRec>, String>>,
+    layout: std::sync::OnceLock<Result<std::sync::Arc<docparse_ocr::layout::LayoutModel>, String>>,
 }
 
 impl EnhanceState {
@@ -479,6 +507,7 @@ impl EnhanceState {
             unirec_dir,
             vlm,
             unirec: std::sync::OnceLock::new(),
+            layout: std::sync::OnceLock::new(),
         }
     }
 
@@ -494,6 +523,19 @@ impl EnhanceState {
             })
             .clone()
             .map_err(|e| anyhow::anyhow!("unirec models unavailable: {e}"))
+    }
+
+    /// Layout model loaded once per server lifetime (lazy), shared across
+    /// requests — the serving counterpart of the CLI's `RunModels.layout`.
+    fn loaded_layout(&self) -> anyhow::Result<std::sync::Arc<docparse_ocr::layout::LayoutModel>> {
+        self.layout
+            .get_or_init(|| {
+                docparse_ocr::layout::LayoutModel::new(&self.layout_model)
+                    .map(std::sync::Arc::new)
+                    .map_err(|e| format!("{e:#}"))
+            })
+            .clone()
+            .map_err(|e| anyhow::anyhow!("layout model unavailable: {e}"))
     }
 
     /// Apply the requested enhancements in the CLI's order. PDF-only
@@ -526,18 +568,20 @@ impl EnhanceState {
         }
         if o.layout {
             let bytes = std::fs::read(path)?;
-            docparse_ocr::layout::enhance_document(&mut doc, bytes, &self.layout_model, 2.0)?;
+            let layout = self.loaded_layout()?;
+            docparse_ocr::layout::enhance_document(&mut doc, bytes, &layout, 2.0)?;
         }
         if o.table_model {
             let model = self.unirec()?;
             docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(path)?, &model)?;
         }
         if o.formula_model {
+            let layout = self.loaded_layout()?;
             let model = self.unirec()?;
             docparse_ocr::formula::enhance_formulas(
                 &mut doc,
                 std::fs::read(path)?,
-                &self.layout_model,
+                &layout,
                 &model,
             )?;
         }
@@ -846,9 +890,10 @@ fn parse_and_enhance(
     if cli.layout {
         if is_pdf {
             let pdf_bytes = std::fs::read(input)?;
+            let layout = models.layout.get(&cli.layout_model)?;
             let n = {
                 let _g = reporter.map(|r| r.spinner("layout"));
-                docparse_ocr::layout::enhance_document(&mut doc, pdf_bytes, &cli.layout_model, 2.0)?
+                docparse_ocr::layout::enhance_document(&mut doc, pdf_bytes, layout, 2.0)?
             };
             if log {
                 eprintln!("{{\"layout_enhanced_pages\": {n}}}");
@@ -881,13 +926,14 @@ fn parse_and_enhance(
                 eprintln!("--formula-model currently supports PDF inputs only; skipped");
             }
         } else {
+            let layout = models.layout.get(&cli.layout_model)?;
             let model = models.formula.get(dir)?;
             let n = {
                 let _g = reporter.map(|r| r.spinner("formula"));
                 docparse_ocr::formula::enhance_formulas(
                     &mut doc,
                     std::fs::read(input)?,
-                    &cli.layout_model,
+                    layout,
                     model,
                 )?
             };
@@ -903,13 +949,14 @@ fn parse_and_enhance(
                 eprintln!("--transcribe-model currently supports PDF inputs only; skipped");
             }
         } else {
+            let layout = models.layout.get(&cli.layout_model)?;
             let model = models.transcribe.get(dir)?;
             let n = {
                 let _g = reporter.map(|r| r.spinner("transcribe"));
                 docparse_ocr::transcribe::transcribe_pages(
                     &mut doc,
                     std::fs::read(input)?,
-                    &cli.layout_model,
+                    layout,
                     model,
                 )?
             };
