@@ -59,3 +59,11 @@
 - **批量 OCR 模型重载**:`PpOcrEnhancer::new` 现仍每文件构造(ONNX 重载)。一批扫描件会被模型加载主导;后续可把模型加载提到批量循环外复用(改 `parse_and_enhance` 签名传预载模型),本期未做,已记。
 - **递归同名落盘冲突**:不同子目录同名文件落 `--out-dir` 会撞(`a/x.pdf`、`b/x.pdf` → 都 `x.pdf.json`);v1 扁平命名,后续可镜像相对路径。
 - `--progress=json` 事件流(FR7)、方案 C 基础解析页内进度(触 trait,否决)留后续。
+
+## 续:收口两个待办(同日)
+
+**① 批量模型复用**:批量原先每文件重载模型。发现代码已有现成模式——服务端 `OcrState`(`OnceLock` 惰性载 + 缓存)、`EnhanceState`(惰性 `UniRec`,~700MB,"每服务器只载一次"是初衷)。照搬到 CLI 路:新增 `RunModels`(持 `OcrState` + 3 个 `LazyUniRec`,各 `OnceLock<Result<UniRec,String>>`),`from_cli` 构造一次,`parse_and_enhance` 改签名收 `&RunModels`,OCR/table/formula/transcribe 从缓存取而非 `::new`。**全惰性**——纯数字 `--ocr` 批量永不触模型,守"数字零成本"不变量;批量首个扫描页载、其余复用。实测 batch `--ocr` 两份 scan:scan1 9.33s(含一次性载)、scan2 6.98s(仅推理),~2.3s 差正是被复用掉的加载。**版面模型未纳入**——`enhance_document`/`formula`/`transcribe` 收的是路径、内部 `LayoutModel::new`,连服务端也每次重载;复用需改这 3 个 docparse-ocr 公有签名(跨 crate),属更大改动,记入已知限制。
+
+**② 递归落盘镜像**:`collect_files` 返回 `Vec<BatchInput>{path, rel}`——`rel` 是文件相对输入文件夹的路径(顶层/显式文件取裸文件名)。`write_output` 落 `--out-dir/<rel>.<后缀>` 并建父目录。实测 `alpha/paper.pdf` + `beta/paper.pdf`(同名异目录)→ `out/alpha/paper.pdf.md` + `out/beta/paper.pdf.md`,**不再互覆**。同一子目录同名仍覆盖(与源端本就重名一致)。
+
+新单测:`collect_files` 验 `rel` 镜像(顶层裸名、递归带子路径、显式文件裸名)。单文件 `-f json` 逐字节不变(`shasum` 同前)、`--ocr` 逐字不变;全工作区 34 套件 + clippy 零 warning。

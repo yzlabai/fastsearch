@@ -18,7 +18,19 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::{parse_and_enhance, parsers_with, progress::Reporter, render_doc, Cli, Format};
+use crate::{
+    parse_and_enhance, parsers_with, progress::Reporter, render_doc, Cli, Format, RunModels,
+};
+
+/// One discovered input: the file to parse plus the path to mirror under
+/// `--out-dir`. `rel` is the file's path relative to the folder it was found in
+/// (just the filename for top-level / explicitly-named files), so a recursive
+/// run writes `out/sub/x.pdf.json` instead of flattening every `x.pdf` onto one
+/// name.
+struct BatchInput {
+    path: PathBuf,
+    rel: PathBuf,
+}
 
 /// One file's outcome in the report.
 struct FileStat {
@@ -55,27 +67,31 @@ pub fn run(cli: &Cli, reporter: &Reporter) -> anyhow::Result<()> {
         );
     }
 
+    // Load OCR / UniRec models once for the whole batch (lazy: a digital-only or
+    // no-model run never touches them), not once per file.
+    let models = RunModels::from_cli(cli);
+
     let bar = reporter.files_bar(files.len() as u64);
     let started = Instant::now();
     let mut stats = Vec::with_capacity(files.len());
 
-    for path in &files {
-        let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    for inp in &files {
+        let bytes = std::fs::metadata(&inp.path).map(|m| m.len()).unwrap_or(0);
         let t = Instant::now();
         // Quiet pipeline (reporter = None): the file bar + report are the UI.
         // A parse failure becomes an error row; the batch never aborts.
-        let stat = match parse_and_enhance(path, cli, None) {
+        let stat = match parse_and_enhance(&inp.path, cli, &models, None) {
             Ok(doc) => FileStat {
-                path: path.clone(),
+                path: inp.path.clone(),
                 bytes,
                 pages: doc.pages.len(),
                 secs: t.elapsed().as_secs_f64(),
-                error: write_output(cli, path, &doc)
+                error: write_output(cli, &inp.rel, &doc)
                     .err()
                     .map(|e| format!("write: {e}")),
             },
             Err(e) => FileStat {
-                path: path.clone(),
+                path: inp.path.clone(),
                 bytes,
                 pages: 0,
                 secs: t.elapsed().as_secs_f64(),
@@ -106,23 +122,21 @@ pub fn run(cli: &Cli, reporter: &Reporter) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write one input's rendered output under `--out-dir` as
-/// `<original-filename>.<format-ext>` (e.g. `report.pdf` → `report.pdf.json`).
-/// Keeping the full original name avoids `a.pdf`/`a.docx` colliding on `a.json`.
+/// Write one input's rendered output under `--out-dir` at `<rel>.<format-ext>`
+/// (e.g. `sub/report.pdf` → `out/sub/report.pdf.json`). Keeping the full original
+/// name avoids `a.pdf`/`a.docx` colliding on `a.json`; mirroring `rel`'s sub-dirs
+/// avoids same-named files in different folders colliding in a recursive run.
 /// No-op when there's no `--out-dir` (report-only run).
-fn write_output(cli: &Cli, src: &Path, doc: &docparse_core::ir::Document) -> anyhow::Result<()> {
+fn write_output(cli: &Cli, rel: &Path, doc: &docparse_core::ir::Document) -> anyhow::Result<()> {
     let Some(dir) = &cli.out_dir else {
         return Ok(());
     };
     let rendered = render_doc(doc, cli)?;
-    let stem = src
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "out".into());
-    std::fs::write(
-        dir.join(format!("{stem}.{}", output_ext(cli.format))),
-        rendered,
-    )?;
+    let target = dir.join(format!("{}.{}", rel.display(), output_ext(cli.format)));
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(target, rendered)?;
     Ok(())
 }
 
@@ -135,32 +149,40 @@ fn output_ext(format: Format) -> &'static str {
     }
 }
 
-/// Expand inputs into a sorted, de-duplicated file list. Explicit file inputs
-/// are always included (the user named them); directory contents are filtered
-/// to extensions a backend supports. `recursive` descends into sub-folders.
-fn collect_files(inputs: &[PathBuf], recursive: bool) -> anyhow::Result<Vec<PathBuf>> {
+/// Expand inputs into a sorted, de-duplicated list. Explicit file inputs are
+/// always included (the user named them) and write under their bare filename;
+/// directory contents are filtered to supported extensions and carry their path
+/// relative to the input folder so `--out-dir` can mirror sub-dirs. `recursive`
+/// descends into sub-folders.
+fn collect_files(inputs: &[PathBuf], recursive: bool) -> anyhow::Result<Vec<BatchInput>> {
     let probe = parsers_with(false);
     let supported = |p: &Path| probe.iter().any(|parser| parser.supports(p));
     let mut out = Vec::new();
     for input in inputs {
         if input.is_dir() {
-            collect_dir(input, recursive, &supported, &mut out)?;
+            collect_dir(input, input, recursive, &supported, &mut out)?;
         } else if input.is_file() {
-            out.push(input.clone());
+            out.push(BatchInput {
+                rel: PathBuf::from(input.file_name().unwrap_or(input.as_os_str())),
+                path: input.clone(),
+            });
         } else {
             anyhow::bail!("input not found: {}", input.display());
         }
     }
-    out.sort();
-    out.dedup();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out.dedup_by(|a, b| a.path == b.path);
     Ok(out)
 }
 
+/// `base` is the directory the user named — `rel` is each file's path relative
+/// to it, so nested files keep their sub-path under `--out-dir`.
 fn collect_dir(
     dir: &Path,
+    base: &Path,
     recursive: bool,
     supported: &dyn Fn(&Path) -> bool,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<BatchInput>,
 ) -> anyhow::Result<()> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -170,10 +192,17 @@ fn collect_dir(
     for path in entries {
         if path.is_dir() {
             if recursive {
-                collect_dir(&path, recursive, supported, out)?;
+                collect_dir(&path, base, recursive, supported, out)?;
             }
         } else if path.is_file() && supported(&path) {
-            out.push(path);
+            let rel = path
+                .strip_prefix(base)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| PathBuf::from(path.file_name().unwrap_or(path.as_os_str())));
+            out.push(BatchInput {
+                path: path.clone(),
+                rel,
+            });
         }
     }
     Ok(())
@@ -437,22 +466,30 @@ mod tests {
         let top = collect_files(std::slice::from_ref(&root), false).unwrap();
         let names: Vec<String> = top
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|i| i.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(
             names,
             vec!["a.pdf", "b.docx"],
             "filtered + sorted, no sub-dir"
         );
+        // Top-level files mirror to their bare filename.
+        assert_eq!(top[0].rel, PathBuf::from("a.pdf"));
 
-        // Recursive: pulls in the nested pdf too.
+        // Recursive: pulls in the nested pdf, and its rel keeps the sub-dir so
+        // same-named files in different folders won't collide in --out-dir.
         let deep = collect_files(std::slice::from_ref(&root), true).unwrap();
-        assert!(deep.iter().any(|p| p.ends_with("nested/c.pdf")));
         assert_eq!(deep.len(), 3);
+        let nested = deep
+            .iter()
+            .find(|i| i.path.ends_with("nested/c.pdf"))
+            .expect("nested pdf collected");
+        assert_eq!(nested.rel, PathBuf::from("nested/c.pdf"));
 
         // Explicit file is always included, even with an unsupported extension.
         let explicit = collect_files(&[root.join("notes.xyz")], false).unwrap();
         assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].rel, PathBuf::from("notes.xyz"));
 
         // Missing input is an error, not a silent skip.
         assert!(collect_files(&[root.join("ghost.pdf")], false).is_err());

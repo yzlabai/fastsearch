@@ -93,6 +93,8 @@ broken.pdf          —       0.73   —       —         ERROR: failed parsing
 - **文件筛选**:文件夹里只挑后端支持的扩展名(pdf/docx/html/xlsx/pptx/md/csv/srt/tex/eml/图片/adoc);**显式点名的文件一律纳入**(即便扩展名陌生,交由解析时报错入表)。
 - **失败隔离**:单个坏文件 = 一行 `ERROR: …`,**绝不中断整批**。
 - **顺序处理**:文件逐个跑——每个文件内部已页级并行,OCR 走内存受限池;叠文件级并行会爆内存上限。
+- **模型加载一次**:OCR / UniRec(`--table-model`/`--formula-model`/`--transcribe-model`,~700MB)模型**整批只加载一次**并复用(惰性:纯数字或不带模型的批量永不加载),不再每文件重载。
+- **递归落盘镜像**:递归时按相对路径镜像到 `--out-dir`(`sub/x.pdf` → `out/sub/x.pdf.json`),不同子目录的同名文件**不再相互覆盖**。
 
 ### 增强 flag 透传
 
@@ -104,5 +106,5 @@ broken.pdf          —       0.73   —       —         ERROR: failed parsing
 
 ## 4. 已知限制
 
-- **批量 OCR 模型重载**:目前每个文件重新加载 OCR/版面 ONNX 模型;一批扫描件会被模型加载耗时主导(纯数字批量无此问题)。后续计划把模型加载提到批量循环外复用。
-- **递归同名冲突**:不同子目录下的同名文件落到同一 `--out-dir` 会相互覆盖(扁平命名)。如需保结构,暂请分目录跑或避免重名;后续可加相对路径镜像。
+- **版面模型仍每文件加载**:`--layout`(及 `--formula-model`/`--transcribe-model` 内部用到的版面检测)的 ONNX 模型目前仍每文件从路径加载——这与服务端(MCP/REST)行为一致,需改 `docparse-ocr` 的 `enhance_document`/`enhance_formulas`/`transcribe_pages` 接受预载 `LayoutModel` 才能复用,属更大的跨 crate 改动,暂未做。OCR 与 UniRec 模型已整批只载一次。
+- **同子目录同名仍覆盖**:递归已按相对路径镜像,但**同一**子目录下同名文件(或跨多个输入根的相同相对路径)仍会覆盖——这与源端本就重名一致。

@@ -300,6 +300,54 @@ impl OcrState {
     }
 }
 
+/// A UniRec model loaded on first use and cached for the rest of the run — the
+/// CLI-path analogue of `EnhanceState`'s server-lifetime UniRec. The model is
+/// ~700 MB to load, so a batch over many files (`--table-model` / `--formula-model`
+/// / `--transcribe-model`) must read it once, not once per file.
+pub(crate) struct LazyUniRec {
+    cell: std::sync::OnceLock<Result<docparse_ocr::unirec::UniRec, String>>,
+}
+
+impl LazyUniRec {
+    fn new() -> Self {
+        Self {
+            cell: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The model dir is fixed for a run (one CLI flag), so `dir` is the same on
+    /// every call; the first load wins and is reused.
+    fn get(&self, dir: &std::path::Path) -> anyhow::Result<&docparse_ocr::unirec::UniRec> {
+        self.cell
+            .get_or_init(|| docparse_ocr::unirec::UniRec::new(dir).map_err(|e| format!("{e:#}")))
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("unirec models unavailable: {e}"))
+    }
+}
+
+/// Models loaded once per CLI run and reused across every input. In single-file
+/// mode this is just the one file; in batch mode it's the whole folder — so the
+/// heavy OCR / UniRec models are read at most once, not per file. All fields are
+/// lazy (interior-mutable `OnceLock`): a digital-only `--ocr` batch still never
+/// touches the model, preserving the "digital stays model-free" invariant.
+pub(crate) struct RunModels {
+    ocr: OcrState,
+    table: LazyUniRec,
+    formula: LazyUniRec,
+    transcribe: LazyUniRec,
+}
+
+impl RunModels {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            ocr: OcrState::new(cli.ocr_models.clone()),
+            table: LazyUniRec::new(),
+            formula: LazyUniRec::new(),
+            transcribe: LazyUniRec::new(),
+        }
+    }
+}
+
 /// Make sure the OCR model dir is populated before the enhancer reads it.
 ///
 /// For the built-in PP-OCRv6 default we can fetch the ~7 MB model set on first
@@ -674,7 +722,8 @@ fn main() -> anyhow::Result<()> {
     let input = &cli.inputs[0];
     let input_bytes = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
 
-    let doc = parse_and_enhance(input, &cli, Some(&reporter))?;
+    let models = RunModels::from_cli(&cli);
+    let doc = parse_and_enhance(input, &cli, &models, Some(&reporter))?;
 
     if cli.quality {
         eprintln!("{}", docparse_core::quality::analyze(&doc).to_json());
@@ -728,6 +777,7 @@ fn main() -> anyhow::Result<()> {
 fn parse_and_enhance(
     input: &std::path::Path,
     cli: &Cli,
+    models: &RunModels,
     reporter: Option<&progress::Reporter>,
 ) -> anyhow::Result<docparse_core::ir::Document> {
     let is_pdf = input
@@ -763,8 +813,13 @@ fn parse_and_enhance(
             .iter()
             .any(|a| a.needs_enhancement);
         if needs {
-            ensure_ocr_models(&cli.ocr_models)?;
-            let ocr = docparse_ocr::PpOcrEnhancer::new(&cli.ocr_models)?;
+            // Loaded once per run and cached (lazy): a batch of scans reads the
+            // model on the first scanned page, not once per file.
+            let ocr = models
+                .ocr
+                .get()
+                .map_err(|e| anyhow::anyhow!("ocr models unavailable: {e}"))?;
+            let ocr: &dyn docparse_core::enhance::Enhancer = ocr;
             let (enhanced, report) = match reporter {
                 Some(r) => {
                     let (bar, _g) = r.page_bar("ocr", doc.pages.len() as u64);
@@ -772,12 +827,12 @@ fn parse_and_enhance(
                         Some(b) => {
                             let b = b.clone();
                             let on_page = move || b.inc(1);
-                            docparse_core::enhance::apply_with(&doc, &[&ocr], Some(&on_page))
+                            docparse_core::enhance::apply_with(&doc, &[ocr], Some(&on_page))
                         }
-                        None => docparse_core::enhance::apply(&doc, &[&ocr]),
+                        None => docparse_core::enhance::apply(&doc, &[ocr]),
                     }
                 }
-                None => docparse_core::enhance::apply(&doc, &[&ocr]),
+                None => docparse_core::enhance::apply(&doc, &[ocr]),
             };
             doc = enhanced;
             if log {
@@ -809,10 +864,10 @@ fn parse_and_enhance(
                 eprintln!("--table-model currently supports PDF inputs only; skipped");
             }
         } else {
-            let model = docparse_ocr::unirec::UniRec::new(dir)?;
+            let model = models.table.get(dir)?;
             let n = {
                 let _g = reporter.map(|r| r.spinner("table"));
-                docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(input)?, &model)?
+                docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(input)?, model)?
             };
             if log {
                 eprintln!("{{\"table_model_refined\": {n}}}");
@@ -826,14 +881,14 @@ fn parse_and_enhance(
                 eprintln!("--formula-model currently supports PDF inputs only; skipped");
             }
         } else {
-            let model = docparse_ocr::unirec::UniRec::new(dir)?;
+            let model = models.formula.get(dir)?;
             let n = {
                 let _g = reporter.map(|r| r.spinner("formula"));
                 docparse_ocr::formula::enhance_formulas(
                     &mut doc,
                     std::fs::read(input)?,
                     &cli.layout_model,
-                    &model,
+                    model,
                 )?
             };
             if log {
@@ -848,14 +903,14 @@ fn parse_and_enhance(
                 eprintln!("--transcribe-model currently supports PDF inputs only; skipped");
             }
         } else {
-            let model = docparse_ocr::unirec::UniRec::new(dir)?;
+            let model = models.transcribe.get(dir)?;
             let n = {
                 let _g = reporter.map(|r| r.spinner("transcribe"));
                 docparse_ocr::transcribe::transcribe_pages(
                     &mut doc,
                     std::fs::read(input)?,
                     &cli.layout_model,
-                    &model,
+                    model,
                 )?
             };
             if log {
