@@ -118,40 +118,66 @@ pub fn plan(doc: &Document, enhancers: &[&dyn Enhancer]) -> Vec<PageRoute> {
         .collect()
 }
 
+/// One page's routing: assess, run the first capable enhancer, merge its output.
+/// Returns the (possibly replaced) page plus the route record (`None` when the
+/// page didn't need enhancement). Pure and independent — safe to run in parallel.
+fn process_page(page: &Page, enhancers: &[&dyn Enhancer]) -> (Page, Option<PageRoute>) {
+    let assessment = quality::assess_page(page);
+    if !assessment.needs_enhancement {
+        return (page.clone(), None);
+    }
+    let mut route = PageRoute {
+        page: page.number,
+        flags: assessment.flags.clone(),
+        enhancer: None,
+        applied: false,
+    };
+    let mut replaced = None;
+    for e in enhancers {
+        let cap = e.capability();
+        if !assessment.flags.iter().any(|&f| cap.covers(f)) {
+            continue;
+        }
+        route.enhancer = Some(cap.name.clone());
+        if let Some(enhanced) = e.enhance_page(page) {
+            replaced = Some(enhanced);
+            route.applied = true;
+            break;
+        }
+    }
+    (replaced.unwrap_or_else(|| page.clone()), Some(route))
+}
+
 /// Apply routing: run the first capable enhancer on each flagged page and merge
 /// its output. The deterministic pages pass through untouched. Returns the new
 /// document and the per-page routing report.
 pub fn apply(doc: &Document, enhancers: &[&dyn Enhancer]) -> (Document, Vec<PageRoute>) {
+    apply_with(doc, enhancers, None)
+}
+
+/// Like [`apply`], but invokes `on_page` once per page as it finishes (in
+/// whatever order the parallel workers complete) — the hook the CLI feeds to a
+/// progress bar. `Sync` because the page loop runs on the shared rayon pool;
+/// the callback must do its own synchronization (a thread-safe progress bar
+/// does). Pass `None` for the plain behavior. Output stays byte-identical to
+/// [`apply`] regardless of the callback.
+pub fn apply_with(
+    doc: &Document,
+    enhancers: &[&dyn Enhancer],
+    on_page: Option<&(dyn Fn() + Sync)>,
+) -> (Document, Vec<PageRoute>) {
     // Per-page work: assess, route to the first capable enhancer, and merge its
     // output. Pure — reads the page, returns a (possibly replaced) page plus the
     // route record (`None` for pages that didn't need enhancement, matching the
     // old loop's `continue`-before-push). No cross-page shared state, so pages
-    // run independently in parallel below.
+    // run independently in parallel below. The progress callback fires on every
+    // page (enhanced or passed-through) so the bar tracks pages processed.
     let process = |page: &Page| -> (Page, Option<PageRoute>) {
-        let assessment = quality::assess_page(page);
-        if !assessment.needs_enhancement {
-            return (page.clone(), None);
+        let result = process_page(page, enhancers);
+        if let Some(cb) = on_page {
+            cb();
         }
-        let mut route = PageRoute {
-            page: page.number,
-            flags: assessment.flags.clone(),
-            enhancer: None,
-            applied: false,
-        };
-        let mut replaced = None;
-        for e in enhancers {
-            let cap = e.capability();
-            if !assessment.flags.iter().any(|&f| cap.covers(f)) {
-                continue;
-            }
-            route.enhancer = Some(cap.name.clone());
-            if let Some(enhanced) = e.enhance_page(page) {
-                replaced = Some(enhanced);
-                route.applied = true;
-                break;
-            }
-        }
-        (replaced.unwrap_or_else(|| page.clone()), Some(route))
+        result
     };
 
     // Parallelize across pages (CPU-bound, independent) through the shared
@@ -371,5 +397,52 @@ mod tests {
         let (out2, report2) = apply(&d, &[&ocr]);
         assert_eq!(texts(&out), texts(&out2));
         assert_eq!(routed, report2.iter().map(|r| r.page).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn apply_with_fires_callback_once_per_page_and_matches_apply() {
+        // Mixed digital/scanned, more pages than the pool so the callback fires
+        // from several workers concurrently.
+        let pages: Vec<Page> = (1..=12)
+            .map(|n| {
+                if n % 3 == 0 {
+                    page(n, None)
+                } else {
+                    page(n, Some("digital"))
+                }
+            })
+            .collect();
+        let d = doc(pages);
+        let ocr = StubOcr;
+
+        // Callback fires for EVERY page (enhanced or passed-through) so a progress
+        // bar reaches the total. Atomic because the page loop runs in parallel.
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let on_page = || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let (with_out, with_report) = apply_with(&d, &[&ocr], Some(&on_page));
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            12,
+            "callback fires exactly once per page"
+        );
+
+        // The callback must not change the result: byte-for-byte equal to apply().
+        let (plain_out, plain_report) = apply(&d, &[&ocr]);
+        let texts = |dd: &Document| -> Vec<String> {
+            dd.pages
+                .iter()
+                .map(|p| match &p.elements[0] {
+                    Element::Text(t) => t.text.clone(),
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        assert_eq!(texts(&with_out), texts(&plain_out));
+        assert_eq!(
+            with_report.iter().map(|r| r.page).collect::<Vec<_>>(),
+            plain_report.iter().map(|r| r.page).collect::<Vec<_>>(),
+        );
     }
 }

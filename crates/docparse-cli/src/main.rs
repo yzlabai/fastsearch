@@ -1,6 +1,8 @@
 //! `docparse` — parse a document into JSON / Markdown / text.
 
+mod batch;
 mod mcp;
+mod progress;
 mod server;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -63,8 +65,10 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Input document (PDF, DOCX, or HTML).
-    input: Option<PathBuf>,
+    /// Input document(s) and/or folder(s). One file → result to stdout (or
+    /// -o). Multiple inputs, a folder, or --out-dir → batch mode: each input is
+    /// parsed and an aggregate report is printed at the end.
+    inputs: Vec<PathBuf>,
 
     /// Output format.
     #[arg(short, long, value_enum, default_value_t = Format::Json)]
@@ -178,6 +182,37 @@ struct Cli {
     /// references them (PDF only). Mirrors ODL's external image output.
     #[arg(long)]
     image_dir: Option<PathBuf>,
+
+    /// Progress & speed visualization on stderr: auto (interactive TTY only,
+    /// the default), always (force, even when piped), never (off). Shows a
+    /// per-phase spinner / page bar and an end-of-run pages/s · MB/s summary.
+    /// Never touches stdout, so `-f json > out.json` stays clean.
+    #[arg(long, value_enum, default_value_t = progress::ProgressMode::Auto)]
+    progress: progress::ProgressMode,
+
+    /// Silence progress visualization (alias for --progress never).
+    #[arg(long)]
+    quiet: bool,
+
+    /// Batch output directory: write one result file per input as
+    /// <out-dir>/<stem>.<format-ext> (json/md/txt). Required to keep parsed
+    /// content when processing more than one file. Created if missing.
+    #[arg(long, value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+
+    /// In batch mode, descend into sub-folders. Default: only the folder's top
+    /// level. No effect on explicit file inputs.
+    #[arg(short, long)]
+    recursive: bool,
+
+    /// In batch mode, also write the aggregate report as JSON to this file.
+    #[arg(long, value_name = "FILE")]
+    report_json: Option<PathBuf>,
+
+    /// In batch mode, also write the aggregate report as CSV (one row per file)
+    /// to this file.
+    #[arg(long, value_name = "FILE")]
+    report_csv: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -558,7 +593,7 @@ pub(crate) fn embed_images(doc: &mut docparse_core::ir::Document) -> usize {
     n
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum)]
 enum Format {
     Json,
     Markdown,
@@ -579,186 +614,67 @@ enum TableFormat {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
-        Some(Command::Mcp {
-            ocr_models,
-            layout_model,
-            unirec_models,
-            vlm_url,
-            vlm_model,
-            vlm_api_key,
-        }) => {
-            return mcp::serve(EnhanceState::new(
+    // Borrow (not move) the subcommand so the whole `cli` stays available to the
+    // file-processing path below — server fields are cheap to clone.
+    if let Some(cmd) = &cli.command {
+        match cmd {
+            Command::Mcp {
                 ocr_models,
                 layout_model,
                 unirec_models,
-                vlm_config(vlm_url, vlm_model, vlm_api_key),
-            ))
-        }
-        Some(Command::Serve {
-            host,
-            port,
-            ocr_models,
-            layout_model,
-            unirec_models,
-            vlm_url,
-            vlm_model,
-            vlm_api_key,
-        }) => {
-            return server::serve(
-                &host,
+                vlm_url,
+                vlm_model,
+                vlm_api_key,
+            } => {
+                return mcp::serve(EnhanceState::new(
+                    ocr_models.clone(),
+                    layout_model.clone(),
+                    unirec_models.clone(),
+                    vlm_config(vlm_url.clone(), vlm_model.clone(), vlm_api_key.clone()),
+                ))
+            }
+            Command::Serve {
+                host,
                 port,
-                EnhanceState::new(
-                    ocr_models,
-                    layout_model,
-                    unirec_models,
-                    vlm_config(vlm_url, vlm_model, vlm_api_key),
-                ),
-            )
-        }
-        None => {}
-    }
-    let input = cli
-        .input
-        .ok_or_else(|| anyhow::anyhow!("missing input file (see --help)"))?;
-
-    let mut doc = parse_path_with(&input, cli.image_dir.is_some() || cli.image_embed)?;
-
-    if let Some(dir) = &cli.image_dir {
-        let n = export_images(&mut doc, dir)?;
-        eprintln!("{{\"images_exported\": {n}}}");
-    }
-    if cli.image_embed {
-        let n = embed_images(&mut doc);
-        eprintln!("{{\"images_embedded\": {n}}}");
-    }
-
-    if cli.ocr {
-        // Load models only when some page actually needs enhancement — a
-        // fully digital document with --ocr must stay zero-cost (and must not
-        // fail on a missing model dir it would never use).
-        let needs = docparse_core::quality::assess_pages(&doc)
-            .iter()
-            .any(|a| a.needs_enhancement);
-        if needs {
-            ensure_ocr_models(&cli.ocr_models)?;
-            let ocr = docparse_ocr::PpOcrEnhancer::new(&cli.ocr_models)?;
-            let (enhanced, report) = docparse_core::enhance::apply(&doc, &[&ocr]);
-            doc = enhanced;
-            eprintln!("{}", docparse_core::enhance::report_json(&report));
-        } else {
-            eprintln!("[]");
-        }
-    }
-
-    if cli.layout {
-        if input
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
-            .unwrap_or(false)
-        {
-            let pdf_bytes = std::fs::read(&input)?;
-            let n = docparse_ocr::layout::enhance_document(
-                &mut doc,
-                pdf_bytes,
-                &cli.layout_model,
-                2.0,
-            )?;
-            eprintln!("{{\"layout_enhanced_pages\": {n}}}");
-        } else {
-            eprintln!("--layout currently supports PDF inputs only; skipped");
-        }
-    }
-
-    if let Some(dir) = &cli.table_model {
-        let is_pdf = input
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
-            .unwrap_or(false);
-        if !is_pdf {
-            eprintln!("--table-model currently supports PDF inputs only; skipped");
-        } else {
-            let model = docparse_ocr::unirec::UniRec::new(dir)?;
-            let n =
-                docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(&input)?, &model)?;
-            eprintln!("{{\"table_model_refined\": {n}}}");
-        }
-    }
-
-    if let Some(dir) = &cli.formula_model {
-        let is_pdf = input
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
-            .unwrap_or(false);
-        if !is_pdf {
-            eprintln!("--formula-model currently supports PDF inputs only; skipped");
-        } else {
-            let model = docparse_ocr::unirec::UniRec::new(dir)?;
-            let n = docparse_ocr::formula::enhance_formulas(
-                &mut doc,
-                std::fs::read(&input)?,
-                &cli.layout_model,
-                &model,
-            )?;
-            eprintln!("{{\"formula_model_replaced\": {n}}}");
-        }
-    }
-
-    if let Some(dir) = &cli.transcribe_model {
-        let is_pdf = input
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
-            .unwrap_or(false);
-        if !is_pdf {
-            eprintln!("--transcribe-model currently supports PDF inputs only; skipped");
-        } else {
-            let model = docparse_ocr::unirec::UniRec::new(dir)?;
-            let n = docparse_ocr::transcribe::transcribe_pages(
-                &mut doc,
-                std::fs::read(&input)?,
-                &cli.layout_model,
-                &model,
-            )?;
-            eprintln!("{{\"transcribed_pages\": {n}}}");
-        }
-    }
-
-    if cli.vlm_describe || cli.vlm_tables {
-        let is_pdf = input
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
-            .unwrap_or(false);
-        if !is_pdf {
-            eprintln!("--vlm-describe/--vlm-tables currently support PDF inputs only; skipped");
-        } else {
-            let (url, model) = match (cli.vlm_url.clone(), cli.vlm_model.clone()) {
-                (Some(u), Some(m)) => (u, m),
-                _ => anyhow::bail!("--vlm-describe/--vlm-tables require --vlm-url and --vlm-model"),
-            };
-            let client = docparse_vlm::VlmClient::new(docparse_vlm::VlmConfig {
-                url,
-                model,
-                api_key: cli.vlm_api_key.clone(),
-            });
-            if cli.vlm_describe {
-                let n = docparse_vlm::annotate_pictures(&mut doc, std::fs::read(&input)?, &client)?;
-                eprintln!("{{\"vlm_described_figures\": {n}}}");
-            }
-            if cli.vlm_tables {
-                let n = docparse_vlm::refine_tables(&mut doc, std::fs::read(&input)?, &client)?;
-                eprintln!("{{\"vlm_refined_tables\": {n}}}");
+                ocr_models,
+                layout_model,
+                unirec_models,
+                vlm_url,
+                vlm_model,
+                vlm_api_key,
+            } => {
+                return server::serve(
+                    host,
+                    *port,
+                    EnhanceState::new(
+                        ocr_models.clone(),
+                        layout_model.clone(),
+                        unirec_models.clone(),
+                        vlm_config(vlm_url.clone(), vlm_model.clone(), vlm_api_key.clone()),
+                    ),
+                )
             }
         }
     }
+    if cli.inputs.is_empty() {
+        anyhow::bail!("missing input file or folder (see --help)");
+    }
 
-    // After all enhancers: drop empty-row table placeholders before any output
-    // or quality/profile pass sees them.
-    drop_empty_table_placeholders(&mut doc);
+    // Speed visualization (stderr-only, TTY-gated). The clock starts now so the
+    // end-of-run summary covers parse + every enhancement phase.
+    let reporter = progress::Reporter::new(cli.progress, cli.quiet);
+
+    // Batch when given a folder, several inputs, or an explicit --out-dir;
+    // otherwise the classic single-file path (result to stdout or -o).
+    let single = cli.inputs.len() == 1 && cli.inputs[0].is_file() && cli.out_dir.is_none();
+    if !single {
+        return batch::run(&cli, &reporter);
+    }
+
+    let input = &cli.inputs[0];
+    let input_bytes = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
+
+    let doc = parse_and_enhance(input, &cli, Some(&reporter))?;
 
     if cli.quality {
         eprintln!("{}", docparse_core::quality::analyze(&doc).to_json());
@@ -781,22 +697,228 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let rendered = match cli.format {
-        Format::Json => output::to_json(&doc)?,
-        Format::Markdown => output::to_markdown(&doc),
-        Format::Text => output::to_text(&doc),
+    // End-of-run speed summary (pages · MB · wall · pages/s · MB/s). No-op when
+    // progress is disabled; printed to stderr so stdout stays pure data.
+    reporter.finish(
+        &input.file_name().map_or_else(
+            || input.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        ),
+        doc.pages.len(),
+        input_bytes,
+    );
+
+    let rendered = render_doc(&doc, &cli)?;
+    match &cli.out {
+        Some(path) => std::fs::write(path, rendered)?,
+        None => println!("{rendered}"),
+    }
+    Ok(())
+}
+
+/// Parse one input and apply every enabled enhancement phase, returning the
+/// finished document (empty-table placeholders dropped). Shared by the
+/// single-file path and the batch runner.
+///
+/// `reporter`: `Some` shows a per-phase spinner / OCR page bar and emits the
+/// per-phase JSON count lines on stderr (single-file behavior); `None` runs
+/// quiet — batch mode's file bar + aggregate report stand in. A phase that
+/// doesn't apply to the input's format is skipped; failures propagate so the
+/// caller can record them.
+fn parse_and_enhance(
+    input: &std::path::Path,
+    cli: &Cli,
+    reporter: Option<&progress::Reporter>,
+) -> anyhow::Result<docparse_core::ir::Document> {
+    let is_pdf = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false);
+    let log = reporter.is_some();
+
+    let mut doc = {
+        let _g = reporter.map(|r| r.spinner("parse"));
+        parse_path_with(input, cli.image_dir.is_some() || cli.image_embed)?
+    };
+
+    if let Some(dir) = &cli.image_dir {
+        let n = export_images(&mut doc, dir)?;
+        if log {
+            eprintln!("{{\"images_exported\": {n}}}");
+        }
+    }
+    if cli.image_embed {
+        let n = embed_images(&mut doc);
+        if log {
+            eprintln!("{{\"images_embedded\": {n}}}");
+        }
+    }
+
+    if cli.ocr {
+        // Load models only when some page actually needs enhancement — a
+        // fully digital document with --ocr must stay zero-cost (and must not
+        // fail on a missing model dir it would never use).
+        let needs = docparse_core::quality::assess_pages(&doc)
+            .iter()
+            .any(|a| a.needs_enhancement);
+        if needs {
+            ensure_ocr_models(&cli.ocr_models)?;
+            let ocr = docparse_ocr::PpOcrEnhancer::new(&cli.ocr_models)?;
+            let (enhanced, report) = match reporter {
+                Some(r) => {
+                    let (bar, _g) = r.page_bar("ocr", doc.pages.len() as u64);
+                    match &bar {
+                        Some(b) => {
+                            let b = b.clone();
+                            let on_page = move || b.inc(1);
+                            docparse_core::enhance::apply_with(&doc, &[&ocr], Some(&on_page))
+                        }
+                        None => docparse_core::enhance::apply(&doc, &[&ocr]),
+                    }
+                }
+                None => docparse_core::enhance::apply(&doc, &[&ocr]),
+            };
+            doc = enhanced;
+            if log {
+                eprintln!("{}", docparse_core::enhance::report_json(&report));
+            }
+        } else if log {
+            eprintln!("[]");
+        }
+    }
+
+    if cli.layout {
+        if is_pdf {
+            let pdf_bytes = std::fs::read(input)?;
+            let n = {
+                let _g = reporter.map(|r| r.spinner("layout"));
+                docparse_ocr::layout::enhance_document(&mut doc, pdf_bytes, &cli.layout_model, 2.0)?
+            };
+            if log {
+                eprintln!("{{\"layout_enhanced_pages\": {n}}}");
+            }
+        } else if log {
+            eprintln!("--layout currently supports PDF inputs only; skipped");
+        }
+    }
+
+    if let Some(dir) = &cli.table_model {
+        if !is_pdf {
+            if log {
+                eprintln!("--table-model currently supports PDF inputs only; skipped");
+            }
+        } else {
+            let model = docparse_ocr::unirec::UniRec::new(dir)?;
+            let n = {
+                let _g = reporter.map(|r| r.spinner("table"));
+                docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(input)?, &model)?
+            };
+            if log {
+                eprintln!("{{\"table_model_refined\": {n}}}");
+            }
+        }
+    }
+
+    if let Some(dir) = &cli.formula_model {
+        if !is_pdf {
+            if log {
+                eprintln!("--formula-model currently supports PDF inputs only; skipped");
+            }
+        } else {
+            let model = docparse_ocr::unirec::UniRec::new(dir)?;
+            let n = {
+                let _g = reporter.map(|r| r.spinner("formula"));
+                docparse_ocr::formula::enhance_formulas(
+                    &mut doc,
+                    std::fs::read(input)?,
+                    &cli.layout_model,
+                    &model,
+                )?
+            };
+            if log {
+                eprintln!("{{\"formula_model_replaced\": {n}}}");
+            }
+        }
+    }
+
+    if let Some(dir) = &cli.transcribe_model {
+        if !is_pdf {
+            if log {
+                eprintln!("--transcribe-model currently supports PDF inputs only; skipped");
+            }
+        } else {
+            let model = docparse_ocr::unirec::UniRec::new(dir)?;
+            let n = {
+                let _g = reporter.map(|r| r.spinner("transcribe"));
+                docparse_ocr::transcribe::transcribe_pages(
+                    &mut doc,
+                    std::fs::read(input)?,
+                    &cli.layout_model,
+                    &model,
+                )?
+            };
+            if log {
+                eprintln!("{{\"transcribed_pages\": {n}}}");
+            }
+        }
+    }
+
+    if cli.vlm_describe || cli.vlm_tables {
+        if !is_pdf {
+            if log {
+                eprintln!("--vlm-describe/--vlm-tables currently support PDF inputs only; skipped");
+            }
+        } else {
+            let (url, model) = match (cli.vlm_url.clone(), cli.vlm_model.clone()) {
+                (Some(u), Some(m)) => (u, m),
+                _ => anyhow::bail!("--vlm-describe/--vlm-tables require --vlm-url and --vlm-model"),
+            };
+            let client = docparse_vlm::VlmClient::new(docparse_vlm::VlmConfig {
+                url,
+                model,
+                api_key: cli.vlm_api_key.clone(),
+            });
+            if cli.vlm_describe {
+                let n = {
+                    let _g = reporter.map(|r| r.spinner("vlm-describe"));
+                    docparse_vlm::annotate_pictures(&mut doc, std::fs::read(input)?, &client)?
+                };
+                if log {
+                    eprintln!("{{\"vlm_described_figures\": {n}}}");
+                }
+            }
+            if cli.vlm_tables {
+                let n = {
+                    let _g = reporter.map(|r| r.spinner("vlm-tables"));
+                    docparse_vlm::refine_tables(&mut doc, std::fs::read(input)?, &client)?
+                };
+                if log {
+                    eprintln!("{{\"vlm_refined_tables\": {n}}}");
+                }
+            }
+        }
+    }
+
+    // After all enhancers: drop empty-row table placeholders before any output
+    // or quality/profile pass sees them.
+    drop_empty_table_placeholders(&mut doc);
+    Ok(doc)
+}
+
+/// Render a finished document into the requested output format. Shared by the
+/// single-file path and the batch runner.
+fn render_doc(doc: &docparse_core::ir::Document, cli: &Cli) -> anyhow::Result<String> {
+    Ok(match cli.format {
+        Format::Json => output::to_json(doc)?,
+        Format::Markdown => output::to_markdown(doc),
+        Format::Text => output::to_text(doc),
         Format::Chunks => {
             let opts = docparse_core::chunk::ChunkOptions {
                 table_markdown: matches!(cli.table_format, TableFormat::Markdown),
                 ..Default::default()
             };
-            docparse_core::chunk::to_json(&docparse_core::chunk::chunk_document_with(&doc, opts))
+            docparse_core::chunk::to_json(&docparse_core::chunk::chunk_document_with(doc, opts))
         }
-    };
-
-    match cli.out {
-        Some(path) => std::fs::write(path, rendered)?,
-        None => println!("{rendered}"),
-    }
-    Ok(())
+    })
 }

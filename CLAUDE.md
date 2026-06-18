@@ -15,6 +15,11 @@ cargo clippy --all-targets       # lint —— 目标零 warning
 cargo fmt                        # 格式化（默认风格）
 cargo build --release            # 优化构建（lto=thin, codegen-units=1）
 ./target/release/docparse <file.pdf> -f json|markdown|text|chunks [-o out]
+                                              # 交互 TTY 默认显示进度+结束速度小结(stderr,不污染 stdout)
+                                              # --progress auto|always|never / --quiet 控制
+./target/release/docparse <dir> [-r] --out-dir out/ [--report-json r.json] [--report-csv r.csv]
+                                              # 批量:文件夹/多输入(或带 --out-dir)→ 每文件落 <原名>.<后缀> + 聚合报告
+                                              # 坏文件不中断整批;串行处理(每文件内部已页并行)。见 docs/cli-batch-and-progress.md
 ./target/release/docparse mcp                # MCP stdio server（agent 直连）
 ./target/release/docparse serve --port 8642  # REST（绑 127.0.0.1）
 ./target/release/docparse <scan.pdf> --ocr    # 扫描件 OCR（默认 PP-OCRv6 tiny；数字页零模型）

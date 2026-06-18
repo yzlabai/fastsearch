@@ -68,6 +68,10 @@ calamine = { version = "0.26", features = ["dates"] }
 quick-xml = "0.37"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 pulldown-cmark = { version = "0.12", default-features = false }
+# CLI progress & speed visualization (stderr-only, TTY-gated). Mature, widely
+# used, draws to stderr so stdout data output stays clean; thread-safe bar so the
+# page-parallel OCR loop can increment it from rayon workers.
+indicatif = "0.17"
 
 [profile.release]
 lto = "thin"
