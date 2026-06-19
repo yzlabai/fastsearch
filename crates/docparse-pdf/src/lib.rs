@@ -122,9 +122,31 @@ fn load_tolerant(bytes: &[u8]) -> anyhow::Result<PdfDocument> {
         Ok(doc) => Ok(doc),
         Err(first_err) => match repair_xref_keyword(bytes) {
             Some(fixed) => PdfDocument::load_mem(&fixed).map_err(|_| first_err.into()),
+            // A complete PDF ends with a `startxref`/`%%EOF` trailer; its absence
+            // means the file was cut off (partial download / corrupt). lopdf then
+            // reports a cryptic xref error ("invalid start value"), so surface the
+            // real cause instead — this is the common "truncated download" case.
+            None if is_truncated(bytes) => Err(anyhow::anyhow!(
+                "PDF appears truncated or incomplete — no trailer/%%EOF found \
+                 (partial download or corrupt file); underlying error: {first_err}"
+            )),
             None => Err(first_err.into()),
         },
     }
+}
+
+/// Heuristic: a complete PDF carries `%%EOF` (and `startxref`) in its trailer,
+/// at the very end. Their absence near the tail means the bytes were truncated.
+fn is_truncated(bytes: &[u8]) -> bool {
+    // The trailer lives in the last bytes; scan a generous tail window. (Some
+    // writers leave a little junk after %%EOF, hence not just the final bytes.)
+    let tail = &bytes[bytes.len().saturating_sub(2048)..];
+    !contains(tail, b"%%EOF") && !contains(bytes, b"startxref")
+}
+
+/// Whether `haystack` contains the byte subsequence `needle`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Insert an EOL after a line-leading `xref` keyword that is followed by the
@@ -227,7 +249,21 @@ fn page_rotation(doc: &PdfDocument, page_id: ObjectId) -> u8 {
 
 #[cfg(test)]
 mod repair_tests {
-    use super::repair_xref_keyword;
+    use super::{is_truncated, repair_xref_keyword};
+
+    #[test]
+    fn truncation_detected_by_missing_trailer() {
+        // Complete: has startxref + %%EOF in the tail → not truncated.
+        assert!(!is_truncated(
+            b"%PDF-1.5\n...body...\nstartxref\n1234\n%%EOF\n"
+        ));
+        assert!(!is_truncated(b"%PDF-1.7\n...\n%%EOF")); // %%EOF alone (in tail) is enough
+                                                         // Truncated: a header + body that ends mid-stream, no trailer at all.
+        assert!(is_truncated(
+            b"%PDF-1.5\nstream of bytes cut off here ......."
+        ));
+        assert!(is_truncated(b"")); // empty
+    }
 
     #[test]
     fn normalizes_same_line_xref_header() {
