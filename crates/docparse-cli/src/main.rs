@@ -95,6 +95,11 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
+    /// `-f okf`: write the bundle as a deterministic tar archive to stdout
+    /// (for `| tar x` / upload) instead of a directory. Ignores -o.
+    #[arg(long)]
+    okf_tar: bool,
+
     /// Print a parse-quality report (coverage/garble/flags) as JSON to stderr.
     #[arg(long)]
     quality: bool,
@@ -844,9 +849,16 @@ fn main() -> anyhow::Result<()> {
 
     // OKF is a directory bundle, not a stream — handle it before render_doc.
     if matches!(cli.format, Format::Okf) {
-        let dir = cli.out.clone().unwrap_or_else(|| derived_okf_dir(input));
-        let explicit = cli.out.is_some();
-        write_okf_bundle(&doc, &cli, input, &dir, explicit)?;
+        if cli.okf_tar {
+            // Deterministic tar to stdout (for `| tar x` / upload).
+            use std::io::Write;
+            let bundle = docparse_core::okf::build(&doc, &okf_options(&cli, input));
+            std::io::stdout().write_all(&bundle.to_tar())?;
+        } else {
+            let dir = cli.out.clone().unwrap_or_else(|| derived_okf_dir(input));
+            let explicit = cli.out.is_some();
+            write_okf_bundle(&doc, &cli, input, &dir, explicit)?;
+        }
     } else {
         let rendered = render_doc(&doc, &cli)?;
         match &cli.out {
@@ -1123,6 +1135,20 @@ fn write_okf_bundle(
 /// basename for `resource` URIs and the file's mtime as a deterministic
 /// ISO 8601 timestamp (never the wall clock).
 pub(crate) fn okf_options(cli: &Cli, input: &std::path::Path) -> docparse_core::okf::OkfOptions {
+    okf_options_for(
+        input,
+        cli.okf_resource_base.clone().unwrap_or_default(),
+        matches!(cli.table_format, TableFormat::Markdown),
+    )
+}
+
+/// `OkfOptions` from a source path alone (basename + mtime timestamp) — shared
+/// by the CLI and the MCP/REST `okf` surfaces, which have no `Cli`.
+pub(crate) fn okf_options_for(
+    input: &std::path::Path,
+    resource_base: String,
+    table_markdown: bool,
+) -> docparse_core::okf::OkfOptions {
     let source_name = input
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1133,10 +1159,10 @@ pub(crate) fn okf_options(cli: &Cli, input: &std::path::Path) -> docparse_core::
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| iso8601_utc(d.as_secs()));
     docparse_core::okf::OkfOptions {
-        resource_base: cli.okf_resource_base.clone().unwrap_or_default(),
+        resource_base,
         source_name,
         timestamp,
-        table_markdown: matches!(cli.table_format, TableFormat::Markdown),
+        table_markdown,
     }
 }
 

@@ -1,9 +1,9 @@
 //! MCP (Model Context Protocol) server over stdio.
 //!
-//! What: exposes the parser as three MCP tools — `parse_document`,
-//! `get_chunks`, `locate` — so agents (Claude Code, claude.ai, …) can call
-//! docparse directly and get structured results with provenance + bbox
-//! citations, no shell wrapping.
+//! What: exposes the parser as five MCP tools — `parse_document`,
+//! `get_chunks`, `outline`, `export_okf`, `locate` — so agents (Claude Code,
+//! claude.ai, …) can call docparse directly and get structured results with
+//! provenance + bbox citations, no shell wrapping.
 //!
 //! Why hand-written: the MCP stdio transport is newline-delimited JSON-RPC
 //! 2.0 with three methods we care about (`initialize`, `tools/list`,
@@ -165,6 +165,25 @@ fn tool_specs() -> Value {
             }
         },
         {
+            "name": "export_okf",
+            "description": "Parse a local document into an Open Knowledge Format (OKF v0.1) \
+                            bundle: a set of Markdown + YAML-frontmatter concept files mirroring \
+                            the structure tree (one per section, citable page+bbox). Returns the \
+                            files inline (path + content) so an agent can write or read them \
+                            directly — git-native, vendor-neutral knowledge delivery.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Local file path" },
+                    "resource_base": { "type": "string",
+                                       "description": "Prefix for concept resource URIs (default: bare basename)" },
+                    "ocr": { "type": "boolean", "description": "OCR scanned pages first (default false)" },
+                    "layout": { "type": "boolean", "description": "Layout-model reading order (PDF only)" }
+                },
+                "required": ["path"]
+            }
+        },
+        {
             "name": "locate",
             "description": "Reverse citation lookup: given a page (1-based) and a point x,y in \
                             PDF user space, return the chunk covering it (null if none).",
@@ -196,6 +215,7 @@ fn call_tool(params: &Value, state: &crate::EnhanceState) -> Result<Value, (i64,
         "parse_document" => tool_parse_document(&args, state),
         "get_chunks" => tool_get_chunks(&args, state),
         "outline" => tool_outline(&args, state),
+        "export_okf" => tool_export_okf(&args, state),
         "locate" => tool_locate(&args, state),
         _ => return Err((-32602, format!("unknown tool: {name}"))),
     };
@@ -287,6 +307,27 @@ fn tool_outline(args: &Value, state: &crate::EnhanceState) -> anyhow::Result<Str
     Ok(docparse_core::outline::to_json(&node))
 }
 
+fn tool_export_okf(args: &Value, state: &crate::EnhanceState) -> anyhow::Result<String> {
+    let doc = parse_enhanced(args, state)?;
+    let path = std::path::Path::new(str_arg(args, "path")?);
+    let resource_base = args
+        .get("resource_base")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let opts = crate::okf_options_for(path, resource_base, false);
+    let bundle = docparse_core::okf::build(&doc, &opts);
+    let files: Vec<Value> = bundle
+        .files
+        .iter()
+        .map(|(p, content)| json!({ "path": p.to_string_lossy(), "content": content }))
+        .collect();
+    Ok(serde_json::to_string_pretty(&json!({
+        "okf_version": "0.1",
+        "files": files,
+    }))?)
+}
+
 fn tool_locate(args: &Value, state: &crate::EnhanceState) -> anyhow::Result<String> {
     let doc = parse_enhanced(args, state)?;
     let page = args
@@ -345,7 +386,27 @@ mod tests {
         assert_eq!(r["serverInfo"]["name"], "docparse");
         assert_eq!(r["protocolVersion"], "2025-03-26");
         let tools = result_of(&req("tools/list", json!({})));
-        assert_eq!(tools["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(tools["tools"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn export_okf_returns_bundle_files() {
+        let path = temp_html("docparse-mcp-okf.html");
+        let r = result_of(&req(
+            "tools/call",
+            json!({ "name": "export_okf", "arguments": { "path": path } }),
+        ));
+        assert_eq!(r["isError"], false);
+        let bundle: Value =
+            serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(bundle["okf_version"], "0.1");
+        let files = bundle["files"].as_array().unwrap();
+        // index.md + the "Title" concept.
+        assert!(files.iter().any(|f| f["path"] == "index.md"));
+        assert!(files.iter().any(|f| f["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("type: \"Section\"")));
     }
 
     #[test]

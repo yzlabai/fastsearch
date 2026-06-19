@@ -56,6 +56,7 @@ stdio 上的 JSON-RPC 2.0，四个工具：
 | `parse_document` | 解析为 `json`/`markdown`/`text` | `path`（+ 可选 `format`、增强开关） |
 | `get_chunks` | 解析为检索 chunks（带 page+bbox+heading_path+section_id） | `path`（+ 可选增强开关） |
 | `outline` | **文档结构树**：导航长文档——列目录 + 钻取某节 | `path`（+ 可选 `id` 取子树、`max_depth` 限深、增强开关） |
+| `export_okf` | **OKF bundle**：解析为结构树镜像的 concept 文件集，返回 `{okf_version, files:[{path,content}]}`（agent 直写/直读，git 原生交付） | `path`（+ 可选 `resource_base`、增强开关） |
 | `locate` | **反向引用**：给页号 + 点 (x,y)，返回覆盖该点的 chunk（无则 null） | `path`、`page`、`x`、`y` |
 
 增强开关（布尔，默认 false）：`ocr`、`layout`、`table_model`、`formula_model`、`vlm_describe`、`vlm_tables`。**它们需要服务端启动时配好对应模型**（见 §5），否则缺失即跳过、不报错。
@@ -79,7 +80,7 @@ docparse serve --port 8642            # 绑 127.0.0.1
 ```
 
 - `GET /healthz` — 存活探针。
-- `POST /parse?format=json|markdown|text|chunks|outline` — **multipart** 上传文件字段，返回对应格式（`outline` = 文档结构树，section id 对齐 chunks 的 `section_id`）。
+- `POST /parse?format=json|markdown|text|chunks|outline|okf` — **multipart** 上传文件字段，返回对应格式（`outline` = 文档结构树，section id 对齐 chunks 的 `section_id`；`okf` = 确定性 OKF tar bundle，`application/x-tar`，可加 `?resource_base=<uri>`）。
   增强用查询参数：`?ocr=true&layout=true&table_model=true&formula_model=true&vlm_describe=true&vlm_tables=true`（同样需启动时配模型，见 §5）。
 - `format=chunks` 可加 `?envelope=true`：把裸 chunk 数组包成 `{provenance, quality, profile, chunks}`（同 MCP `get_chunks`）。RAG 消费方可据 `quality.flags`（`ScannedNoText` / `HighGarble` 等）和 `profile` 自行决定要不要对该文档开 OCR/layout，**省一次往返**。默认（不加）仍是裸数组，与 CLI 逐字节一致。
 - `format=chunks` 可加 `?table_format=markdown`：表格 chunk 文本出 GitHub 管道表（默认 `tab`=制表符/换行）。CLI 同名 `--table-format markdown`、MCP `get_chunks` 同名 `table_format` 参数 —— 三面同默认、同输出（不变量保持）。

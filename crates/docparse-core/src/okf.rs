@@ -60,6 +60,87 @@ impl Bundle {
         }
         Ok(())
     }
+
+    /// Serialize to a POSIX **ustar** archive (for stdout / pipe / upload). All
+    /// metadata is fixed (mode 0644, uid/gid 0, mtime 0, empty owner names) so
+    /// the same bundle yields byte-identical tar bytes — the determinism
+    /// guarantee extends to the archive, not just the on-disk directory. No
+    /// `tar` crate dependency (those stamp the real mtime, breaking that).
+    pub fn to_tar(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (rel, content) in &self.files {
+            tar_entry(&mut out, &rel.to_string_lossy(), content.as_bytes());
+        }
+        // Two zero blocks mark end-of-archive.
+        out.extend(std::iter::repeat_n(0u8, 1024));
+        out
+    }
+}
+
+/// Append one regular-file ustar entry (512-byte header + padded data).
+fn tar_entry(out: &mut Vec<u8>, path: &str, data: &[u8]) {
+    let mut h = [0u8; 512];
+    let (name, prefix) = tar_split_path(path);
+    copy_field(&mut h[0..100], name.as_bytes());
+    copy_field(&mut h[345..500], prefix.as_bytes());
+    write_octal(&mut h[100..108], 0o644); // mode
+    write_octal(&mut h[108..116], 0); // uid
+    write_octal(&mut h[116..124], 0); // gid
+    write_octal(&mut h[124..136], data.len() as u64); // size
+    write_octal(&mut h[136..148], 0); // mtime = 0 (deterministic)
+    h[156] = b'0'; // typeflag: regular file
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    // Checksum: sum of all header bytes with the checksum field as spaces.
+    for b in &mut h[148..156] {
+        *b = b' ';
+    }
+    let sum: u32 = h.iter().map(|&b| b as u32).sum();
+    // 6 octal digits + NUL + space (the conventional form).
+    let cs = format!("{sum:06o}");
+    h[148..154].copy_from_slice(cs.as_bytes());
+    h[154] = 0;
+    h[155] = b' ';
+    out.extend_from_slice(&h);
+    out.extend_from_slice(data);
+    let pad = (512 - data.len() % 512) % 512;
+    out.extend(std::iter::repeat_n(0u8, pad));
+}
+
+/// Split a path into ustar (name ≤100, prefix ≤155) at a `/`. Falls back to a
+/// truncated name for pathologically long paths (deeper than ustar supports).
+fn tar_split_path(path: &str) -> (&str, &str) {
+    if path.len() <= 100 {
+        return (path, "");
+    }
+    // Find a split point so the suffix (name) fits in 100 and prefix in 155.
+    if let Some(cut) = path
+        .char_indices()
+        .filter(|&(i, c)| c == '/' && path.len() - i - 1 <= 100 && i <= 155)
+        .map(|(i, _)| i)
+        .next()
+    {
+        (&path[cut + 1..], &path[..cut])
+    } else {
+        (&path[path.len() - 100..], "")
+    }
+}
+
+/// Write a NUL-terminated, zero-padded octal numeric tar field.
+fn write_octal(field: &mut [u8], val: u64) {
+    let digits = field.len() - 1; // last byte stays NUL
+    let s = format!("{val:0width$o}", width = digits);
+    // If it overflows (shouldn't for our sizes), keep the low digits.
+    let bytes = s.as_bytes();
+    let start = bytes.len().saturating_sub(digits);
+    field[..digits].copy_from_slice(&bytes[start..]);
+    field[digits] = 0;
+}
+
+/// Copy `src` into a fixed-width tar field, truncating if needed (rest is NUL).
+fn copy_field(field: &mut [u8], src: &[u8]) {
+    let n = src.len().min(field.len());
+    field[..n].copy_from_slice(&src[..n]);
 }
 
 /// Build an OKF bundle from a document. Joins the structure tree with chunks;
@@ -607,6 +688,24 @@ mod tests {
                 "no timestamp without mtime"
             );
         }
+    }
+
+    #[test]
+    fn tar_is_deterministic_and_well_formed() {
+        let b = build(&nested_doc(), &opts());
+        let t1 = b.to_tar();
+        let t2 = build(&nested_doc(), &opts()).to_tar();
+        assert_eq!(t1, t2, "same bundle → byte-identical tar");
+        // ustar: multiple of 512, ends with two zero blocks, magic present.
+        assert_eq!(t1.len() % 512, 0);
+        assert!(t1[t1.len() - 1024..].iter().all(|&b| b == 0));
+        assert_eq!(&t1[257..263], b"ustar\0");
+        // First entry's name is the first emitted file.
+        let first = b.files[0].0.to_string_lossy();
+        let name_end = t1[..100].iter().position(|&c| c == 0).unwrap_or(100);
+        assert_eq!(&t1[..name_end], first.as_bytes());
+        // mtime field is zero (deterministic, not wall clock).
+        assert_eq!(&t1[136..147], b"00000000000");
     }
 
     #[test]

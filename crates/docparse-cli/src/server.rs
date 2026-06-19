@@ -101,9 +101,37 @@ async fn parse(
             &format!("temp write failed: {e}"),
         );
     }
+    let started = std::time::Instant::now();
+
+    // OKF is a binary tar bundle, not a text body — handle it before `render`
+    // (which returns a String) and return early with application/x-tar.
+    if format == "okf" {
+        let resource_base = q.get("resource_base").cloned().unwrap_or_default();
+        let (tp, tn, st) = (tmp.clone(), name.clone(), state.clone());
+        let res =
+            tokio::task::spawn_blocking(move || render_okf_tar(&tp, &tn, opts, resource_base, &st))
+                .await;
+        let elapsed_ms = started.elapsed().as_millis().to_string();
+        std::fs::remove_file(&tmp).ok();
+        return match res {
+            Ok(Ok(tar)) => (
+                [
+                    (header::CONTENT_TYPE, "application/x-tar".to_string()),
+                    (header::HeaderName::from_static("x-docparse-ms"), elapsed_ms),
+                ],
+                tar,
+            )
+                .into_response(),
+            Ok(Err(e)) => err(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e:#}")),
+            Err(e) => err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("task failed: {e}"),
+            ),
+        };
+    }
+
     let task_path = tmp.clone();
     let task_name = name.clone();
-    let started = std::time::Instant::now();
     let rendered = tokio::task::spawn_blocking(move || {
         // Model load (first enhanced request only) and inference are both
         // CPU-bound — they belong on the blocking pool with the parse.
@@ -198,8 +226,25 @@ fn render(
                 "application/json",
             )
         }
-        other => anyhow::bail!("unknown format: {other} (json|markdown|text|chunks|outline)"),
+        // `okf` is intercepted by the handler (binary tar) before reaching here.
+        other => anyhow::bail!("unknown format: {other} (json|markdown|text|chunks|outline|okf)"),
     })
+}
+
+/// Parse + build a deterministic OKF tar archive (REST `format=okf`). Separate
+/// from `render` because the body is binary (`Vec<u8>`), not text.
+fn render_okf_tar(
+    path: &Path,
+    source_name: &str,
+    opts: crate::EnhanceOpts,
+    resource_base: String,
+    state: &crate::EnhanceState,
+) -> anyhow::Result<Vec<u8>> {
+    let doc = crate::parse_path_with(path, opts.images_embedded)?;
+    let mut doc = state.apply(doc, path, opts)?;
+    doc.source = source_name.to_string();
+    let okf_opts = crate::okf_options_for(path, resource_base, false);
+    Ok(docparse_core::okf::build(&doc, &okf_opts).to_tar())
 }
 
 /// Keep only a safe file name (extension included — it selects the backend).

@@ -1,6 +1,8 @@
 # 计划：全面支持 Open Knowledge Format（OKF）导出
 
-> 状态：**Phase 1 已落地（2026-06-19）**· 复杂度：复杂（新输出格式 / 影响输出契约 / 跨 crate）· 责任人：—
+> 状态：**Phase 1 + Phase 2 已落地（2026-06-19）**· 复杂度：复杂（新输出格式 / 影响输出契约 / 跨 crate）· 责任人：—
+>
+> **Phase 2 已落地小结（分发 + agent 接入）**：`Bundle::to_tar()` —— **确定性 POSIX ustar**(固定 mode 0644/uid 0/gid 0/**mtime 0**/空 owner,同 bundle → 字节一致;**手写无 `tar` 依赖**,因 `tar` crate 烙真实 mtime 破确定性);ustar prefix/name 拆分长路径。CLI `--okf-tar` → tar 到 stdout(实测 `| tar x` 还原 == 目录写出逐字节一致)。MCP `export_okf` 工具(返回 `{okf_version, files:[{path,content}]}`,agent 直读不需解 base64)。REST `?format=okf` → `application/x-tar`(实测 `curl | tar t` 列出条目;走独立 `render_okf_tar`,`render` 仍返 String 无改签)。共用 `okf::build` + `okf_options_for`(basename+mtime,CLI/MCP/REST 三面同源)。验收:tar 确定性单测(两次 build 字节相等、512 对齐、双零块、ustar magic、mtime 全零)+ MCP export_okf 单测 + REST e2e tar;三件套 5 格式仍逐字节不变;clippy 0、34+ 套件绿。**表/图升格 concept(可选)未做**——按需。
 >
 > **Phase 1 已落地小结**：`core/okf.rs`（纯函数 emitter，join outline+chunk → `Bundle{files}`，`write_to`；frontmatter `type`/`title`/`resource`/`description`/`timestamp` + 扩展键 `section_id`/`page`/`bbox`；slug 剥前导节号 + 截断 64 字符防超长文件名；目录嵌套镜像树；根 `index.md` 带 `okf_version`，子目录 `index.md` 无 frontmatter）。CLI `-f okf`：`-o` 给则用、否则**自动派生 `<stem>-okf/`** 并 stderr 提示；派生且非空 → 报错(除非 `--force`)；`--okf-resource-base` 前缀；**timestamp 用源文件 mtime**（`iso8601_utc` 自实现 days-from-civil，无 chrono 依赖，绝不 wall clock）。批量 `--out-dir` 下每文件 `<rel-fullname>-okf/`（保全名免 a.pdf/a.docx 撞）。验收：8 单测(含 §9 conformance 自校验、确定性 `diff -r` 空、优雅退化、无 wall-clock)；三件套 json/md/text/chunks/outline **逐字节不变**；HTML/PDF e2e 产合法嵌套 bundle；clippy 0。**对照 OKF SPEC §9 核实**：`type` 必填非空、`index.md`/`log.md` 保留(仅根 index.md 可带 `okf_version`)、绝对 bundle 链接——均符合。
 > **设计落点(回写)**：① slug **剥前导节号 + 截断 64 字符**（致密 PDF 的误检长"标题"会撑爆文件名,截断 + `NN-` 前缀保唯一）；② 根 index.md `source`/标题用**basename**(非全路径)保跨机确定性；③ 批量用 `<rel-fullname>-okf/`(单文件用 `<stem>-okf/`,前者重防撞、后者重可读)。
@@ -185,7 +187,7 @@ docparse report.pdf -f okf      # error: report-okf/ exists and is not empty; us
 | Phase | 内容 | 独立价值 |
 |---|---|---|
 | **1（信封内核心）** | `core/okf.rs` emitter（join outline+chunk、frontmatter、index.md、确定性 mtime、目录嵌套）+ CLI `-f okf -o dir` + 批量 + 单测 + conformance 自校验 + 跨样例回归。**完整可交付**。 | ✅ 能产出合法、确定、可溯源的 bundle |
-| **2（分发 + agent 接入）** | 确定性 tar 到 stdout（`Bundle::to_tar`）；MCP `export_okf` tool + REST `format=okf`；表/图升格 concept（可选）。 | ✅ agent 在线取 bundle / 管道化 |
+| **2（分发 + agent 接入）** ✅ 2026-06-19 | 确定性 tar 到 stdout（`Bundle::to_tar` + CLI `--okf-tar`）；MCP `export_okf` tool + REST `format=okf`（application/x-tar）。表/图升格 concept 未做（可选，按需）。 | ✅ agent 在线取 bundle / 管道化 |
 | **3（可选 consumer）** | OKF bundle 作**输入格式**（新 crate `docparse-okf` `impl DocumentParser`，读 md+frontmatter 回 IR）。**非本计划承诺**。 | 闭环：OKF ↔ IR 双向 |
 
 ## 10. 风险与开放问题

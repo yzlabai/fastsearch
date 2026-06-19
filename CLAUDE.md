@@ -38,7 +38,7 @@ cargo fmt                        # 格式化（默认风格）
 cargo build --release            # 优化构建（lto=thin, codegen-units=1）
 ./target/release/docparse <file.pdf> -f json|markdown|text|chunks|outline|okf [-o out]
                                               # outline=文档结构树(嵌套 section:title/level/page/bbox),供 agentic 导航;chunks 带 section_id 回指该树
-                                              # okf=Open Knowledge Format bundle(目录:md+YAML frontmatter,镜像结构树,git 原生可溯源);-o 给目录否则自动派生 <stem>-okf/(--force 覆盖);--okf-resource-base 前缀
+                                              # okf=Open Knowledge Format bundle(目录:md+YAML frontmatter,镜像结构树,git 原生可溯源);-o 给目录否则自动派生 <stem>-okf/(--force 覆盖);--okf-resource-base 前缀;--okf-tar 出确定性 tar 到 stdout(| tar x)。MCP export_okf / REST ?format=okf 同源
                                               # 交互 TTY 默认显示进度+结束速度小结(stderr,不污染 stdout)
                                               # --progress auto|always|never|json / --quiet 控制;--stats 看 CPU/内存(getrusage)
 ./target/release/docparse <dir> [-r] --out-dir out/ [--report-json r.json] [--report-csv r.csv]
