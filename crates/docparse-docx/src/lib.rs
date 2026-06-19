@@ -10,7 +10,7 @@ use docparse_core::ir::{Document, Page, Provenance};
 use docparse_core::parser::DocumentParser;
 use docparse_core::synth::{PageBuilder, SpanCell};
 use docx_rs::{
-    Docx, DocumentChild, Level, Numberings, Paragraph, ParagraphChild, RunChild, Table, TableCell,
+    DocumentChild, Docx, Level, Numberings, Paragraph, ParagraphChild, RunChild, Table, TableCell,
     TableCellContent, TableChild, TableRowChild,
 };
 use std::collections::HashMap;
@@ -127,7 +127,11 @@ fn list_marker(
 /// Resolve `(numId, ilvl)` to its level definition: numId → abstractNumId →
 /// the matching level.
 fn resolve_level(n: &Numberings, num_id: usize, ilvl: usize) -> Option<&Level> {
-    let abs_id = n.numberings.iter().find(|x| x.id == num_id)?.abstract_num_id;
+    let abs_id = n
+        .numberings
+        .iter()
+        .find(|x| x.id == num_id)?
+        .abstract_num_id;
     let abs = n.abstract_nums.iter().find(|a| a.id == abs_id)?;
     abs.levels.iter().find(|l| l.level == ilvl)
 }
@@ -209,7 +213,11 @@ enum VMergeKind {
 /// docx-rs's own tests; anything missing or unexpected degrades to a plain cell.
 fn cell_span(cell: &TableCell) -> (u32, Option<VMergeKind>) {
     let v = serde_json::to_value(&cell.property).unwrap_or(serde_json::Value::Null);
-    let col_span = v.get("gridSpan").and_then(|x| x.as_u64()).unwrap_or(1).max(1) as u32;
+    let col_span = v
+        .get("gridSpan")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(1)
+        .max(1) as u32;
     let vmerge = match v.get("verticalMerge").and_then(|x| x.as_str()) {
         Some("restart") => Some(VMergeKind::Restart),
         Some("continue") => Some(VMergeKind::Continue),
@@ -304,8 +312,15 @@ mod tests {
             TableRow::new(vec![cell("a"), cell("b")]),
         ]);
         let sparse = table_rows_spanned(&t);
-        assert_eq!(sparse[0].len(), 1, "one anchor cell, covered column omitted");
-        assert_eq!((sparse[0][0].text.as_str(), sparse[0][0].col_span), ("H", 2));
+        assert_eq!(
+            sparse[0].len(),
+            1,
+            "one anchor cell, covered column omitted"
+        );
+        assert_eq!(
+            (sparse[0][0].text.as_str(), sparse[0][0].col_span),
+            ("H", 2)
+        );
         assert_eq!(sparse[1].len(), 2);
     }
 
@@ -324,7 +339,10 @@ mod tests {
             ]),
         ]);
         let sparse = table_rows_spanned(&t);
-        assert_eq!((sparse[0][0].text.as_str(), sparse[0][0].row_span), ("A", 2));
+        assert_eq!(
+            (sparse[0][0].text.as_str(), sparse[0][0].row_span),
+            ("A", 2)
+        );
         assert_eq!(sparse[1].len(), 1, "continue cell dropped");
         assert_eq!(sparse[1][0].text, "c2");
     }
@@ -366,7 +384,10 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!((table.rows[0][0].row_span, table.rows[0][0].merged), (2, false));
+        assert_eq!(
+            (table.rows[0][0].row_span, table.rows[0][0].merged),
+            (2, false)
+        );
         assert!(table.rows[1][0].merged);
         assert_eq!(table.rows[1][0].text, "A", "covered text replicated");
         assert_eq!(table.rows[1][1].text, "c2");

@@ -311,7 +311,10 @@ mod tests {
         let doc = parse_bytes(&pptx_with(&[s])).unwrap();
         let table = first_table(&doc);
         assert!(table.rows.iter().all(|r| r.len() == 3), "3-col grid");
-        assert_eq!((table.rows[0][0].col_span, table.rows[0][0].merged), (2, false));
+        assert_eq!(
+            (table.rows[0][0].col_span, table.rows[0][0].merged),
+            (2, false)
+        );
         assert_eq!(table.rows[0][0].text, "Wide");
         assert!(table.rows[0][1].merged);
         assert_eq!(table.rows[0][1].text, "Wide", "covered text replicated");
@@ -329,11 +332,17 @@ mod tests {
             </a:tbl></p:sld>"#;
         let doc = parse_bytes(&pptx_with(&[s])).unwrap();
         let table = first_table(&doc);
-        assert_eq!((table.rows[0][0].row_span, table.rows[0][0].merged), (2, false));
+        assert_eq!(
+            (table.rows[0][0].row_span, table.rows[0][0].merged),
+            (2, false)
+        );
         assert_eq!(table.rows[0][0].text, "Tall");
         assert_eq!(table.rows[0][1].text, "b1");
         assert!(table.rows[1][0].merged);
-        assert_eq!(table.rows[1][0].text, "Tall", "covered text replicated down");
+        assert_eq!(
+            table.rows[1][0].text, "Tall",
+            "covered text replicated down"
+        );
         assert_eq!(table.rows[1][1].text, "c2");
     }
 }

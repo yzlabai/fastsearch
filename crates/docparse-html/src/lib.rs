@@ -156,7 +156,12 @@ fn parse_table(table: NodeRef<Node>) -> Vec<Vec<SpanCell>> {
         for cell in d.children() {
             if let Node::Element(c) = cell.value() {
                 if matches!(c.name(), "td" | "th") {
-                    let span = |name| c.attr(name).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
+                    let span = |name| {
+                        c.attr(name)
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(1)
+                            .max(1)
+                    };
                     row.push(SpanCell {
                         text: collect_text(cell),
                         row_span: span("rowspan"),
@@ -336,11 +341,17 @@ mod tests {
         assert_eq!(table.rows.len(), 3);
         assert!(table.rows.iter().all(|r| r.len() == 2), "rectangular 2-col");
         // colspan header anchor + covered position.
-        assert_eq!((table.rows[0][0].col_span, table.rows[0][0].merged), (2, false));
+        assert_eq!(
+            (table.rows[0][0].col_span, table.rows[0][0].merged),
+            (2, false)
+        );
         assert_eq!(table.rows[0][0].text, "Header");
         assert!(table.rows[0][1].merged);
         // rowspan anchor + covered position below (replicated text).
-        assert_eq!((table.rows[1][0].row_span, table.rows[1][0].merged), (2, false));
+        assert_eq!(
+            (table.rows[1][0].row_span, table.rows[1][0].merged),
+            (2, false)
+        );
         assert_eq!(table.rows[1][1].text, "b1");
         assert!(table.rows[2][0].merged);
         assert_eq!(table.rows[2][0].text, "A");

@@ -84,9 +84,7 @@ fn cell_text(d: &Data) -> String {
                     // midnight time so plain dates read as just "YYYY-MM-DD".
                     Some(ndt) => {
                         let s = ndt.to_string();
-                        s.strip_suffix(" 00:00:00")
-                            .map(str::to_string)
-                            .unwrap_or(s)
+                        s.strip_suffix(" 00:00:00").map(str::to_string).unwrap_or(s)
                     }
                     None => dt.as_f64().to_string(),
                 }
@@ -125,7 +123,10 @@ mod tests {
         // would overflow / lose magnitude.
         let s = cell_text(&Data::Float(1e16));
         assert!(!s.is_empty());
-        assert!(s.contains("1") && (s.contains("e16") || s.contains("0000")), "{s}");
+        assert!(
+            s.contains("1") && (s.contains("e16") || s.contains("0000")),
+            "{s}"
+        );
     }
 
     #[test]

@@ -44,7 +44,13 @@ fn heading_size(level: HeadingLevel) -> f32 {
 /// stack top and advances per item) — and the `LI` tag so downstream treats it
 /// as a list, not a numbered heading. Heading/code content passes
 /// `as_list = false` so it never picks up a bullet. Empty text is dropped.
-fn flush(b: &mut PageBuilder, buf: &mut String, size: f32, lists: &mut [Option<u64>], as_list: bool) {
+fn flush(
+    b: &mut PageBuilder,
+    buf: &mut String,
+    size: f32,
+    lists: &mut [Option<u64>],
+    as_list: bool,
+) {
     let t = buf.trim();
     if !t.is_empty() {
         match lists.last_mut().filter(|_| as_list) {
@@ -109,9 +115,7 @@ pub fn parse_str(text: &str) -> Document {
             Event::End(TagEnd::Paragraph) | Event::End(TagEnd::Item) => {
                 flush(&mut b, &mut buf, size, &mut list_stack, true)
             }
-            Event::Start(Tag::CodeBlock(_)) => {
-                flush(&mut b, &mut buf, size, &mut list_stack, true)
-            }
+            Event::Start(Tag::CodeBlock(_)) => flush(&mut b, &mut buf, size, &mut list_stack, true),
             Event::End(TagEnd::CodeBlock) => {
                 // Code content is verbatim, never a bullet.
                 flush(&mut b, &mut buf, size, &mut list_stack, false)
@@ -273,6 +277,9 @@ mod tests {
         let t: Vec<String> = text_tags(&doc).into_iter().map(|(s, _)| s).collect();
         assert!(t.iter().any(|s| s == "• item"), "{t:?}");
         assert!(t.iter().any(|s| s == "code"), "{t:?}");
-        assert!(!t.iter().any(|s| s == "• code"), "code must not be bulleted: {t:?}");
+        assert!(
+            !t.iter().any(|s| s == "• code"),
+            "code must not be bulleted: {t:?}"
+        );
     }
 }
