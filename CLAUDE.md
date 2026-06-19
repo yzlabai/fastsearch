@@ -6,6 +6,28 @@
 
 docparse-rs 是纯 Rust 的多格式文档解析系统，定位"**速度快、质量好**"：主流程走"结构提取"快路径不渲染像素；难页经路由用纯 Rust 渲染器按需画页、交给神经 enhancer（默认关闭）。从文档抽取带位置的结构化内容（文本/版面/阅读顺序 → JSON/Markdown/Text）。背景与里程碑见 [README.md](README.md)、[docs/phase-1-summary.md](docs/phase-1-summary.md)；怎么迭代见 [docs/iteration-guide.md](docs/iteration-guide.md)。
 
+## 0. 开发流程（开工前先判复杂度，再选路径）
+
+**第一步永远是判断需求复杂度**，再选下面两条路径之一。通用规范 [AI_AGENT_DEV_SPEC §4](./AI_AGENT_DEV_SPEC.md) 的 SDD 八步是"复杂路径"的展开；简单需求别套全套。
+
+**复杂需求**（新格式/新模型/跨 crate 改动/影响输出契约/有不确定性 → 需要先想清楚）：
+
+1. 写**计划文档** `docs/plans/YYYY-MM-DD-<topic>.md`——含需求三件套、范围与"不做什么"、**用户使用例子**、**测试用例**、验收标准。
+2. **review 相关文档**（plan + 关联 usecase/status），确认方向、落点、不变量无误，再动手。
+3. **实施**（源码 + 测试代码同 PR；偏离计划就回写 plan）。
+4. **测试**——跑单测 + §1 跨样例回归；有问题就**修复并 review**，循环直到完善、无遗留问题。
+5. **更新相关文档**（功能说明 + plan 标注完成情况 + 必要的 devlog/status）。
+6. **review** 全部改动与文档 → `commit` → `push`。
+
+**简单需求**（单 crate 局部改、bugfix、加 CLI 选项、小重构 → 落点清晰、可逆）：
+
+1. 先**实施**。
+2. **补充/更新文档**（功能说明、必要注释）。
+3. **测试**——单测 +（涉及文本/解码/输出时）§1 跨样例回归；有问题修复并 review。
+4. **review** → `commit` → `push`。
+
+**两条路径都不可省的收口**：最终都要**更新功能说明文档 + review + 测试通过**，才 commit、push。拿不准是简单还是复杂时，按复杂处理（先写计划）。
+
 ## 1. 命令
 
 ```bash
@@ -19,7 +41,7 @@ cargo build --release            # 优化构建（lto=thin, codegen-units=1）
                                               # --progress auto|always|never|json / --quiet 控制;--stats 看 CPU/内存(getrusage)
 ./target/release/docparse <dir> [-r] --out-dir out/ [--report-json r.json] [--report-csv r.csv]
                                               # 批量:文件夹/多输入(或带 --out-dir)→ 每文件落 <原名>.<后缀> + 聚合报告
-                                              # 坏文件不中断整批;串行处理(每文件内部已页并行)。见 docs/cli-batch-and-progress.md
+                                              # 坏文件不中断整批;默认串行(每文件内部已页并行),--jobs N 文件级并行(仅确定性档;模型 flag 强制串行防爆内存)。见 docs/cli-batch-and-progress.md
 ./target/release/docparse mcp                # MCP stdio server（agent 直连）
 ./target/release/docparse serve --port 8642  # REST（绑 127.0.0.1）
 ./target/release/docparse <scan.pdf> --ocr    # 扫描件 OCR（默认 PP-OCRv6 tiny；数字页零模型）

@@ -8,12 +8,14 @@
 //! time for page-covering images (scan candidates), so image-heavy digital
 //! documents pay nothing.
 //!
-//! Supported payloads: DCTDecode passthrough (JPEG bytes as-is), Flate/ASCII85
-//! raw bitmaps with 8 bpc, 1 or 3 components (Gray8/Rgb8), and 1-bit bi-level
-//! scans — CCITT G3/G4 (`hayro-ccitt`), JBIG2 (`hayro-jbig2`) and packed
-//! 1-bit Flate — expanded to Gray8 for the OCR path (H1, 2026-06-11).
-//! TODO: JPX (JPEG 2000) scans are still recorded position-only
-//! (`ImageKind::None`) — auditable Image element, no OCR; no sample seen yet.
+//! Supported payloads: DCTDecode passthrough (JPEG bytes as-is), JPXDecode
+//! (JPEG 2000 → Gray8/Rgb8 via `hayro-jpeg2000`, S2), Flate/ASCII85 raw bitmaps
+//! at 8/16/4/2 bpc (16-bit high-byte-downsampled; 2/4-bit DeviceGray unpacked),
+//! and 1-bit bi-level scans — CCITT G3/G4 (`hayro-ccitt`), JBIG2 (`hayro-jbig2`)
+//! and packed 1-bit Flate, incl. 2-entry Indexed palettes mapped by luminance —
+//! all expanded to Gray8/Rgb8 for the OCR path (H1, 2026-06-11; S2, 2026-06-19).
+//! Still position-only (auditable Image, no OCR): CMYK JPEG/JPX, ≥3-channel or
+//! alpha JPX, RGB sub-byte depths, and Indexed palettes with >2 entries.
 //! Form XObjects are resolved too (G4): each form carries its own content
 //! stream, /Matrix and resources (fonts/images/nested forms, resolved up
 //! front with a depth cap against cycles) — the interpreter executes them
@@ -68,6 +70,12 @@ impl XImage {
             })
             .unwrap_or_default();
 
+        // JPEG 2000: a complete codec like DCT (S2). Decode to Gray8/Rgb8;
+        // CMYK / ≥4-channel / alpha stay position-only (color-ambiguous).
+        if filters.last().map(String::as_str) == Some("JPXDecode") {
+            return self.decode_jpx();
+        }
+
         // JPEG passthrough: the common scan encoding. Only the bare chain —
         // a DCT behind ASCII85/Flate pre-filters is rare; TODO if ever seen.
         if filters.last().map(String::as_str) == Some("DCTDecode") {
@@ -90,7 +98,8 @@ impl XImage {
         }
 
         // Raw bitmap behind Flate/ASCII85/etc.: let lopdf apply the filters,
-        // then infer components from the byte count (covers ICCBased RGB too).
+        // then materialize per bit depth (the build gate admits 8/16 bpc, and
+        // 2/4 bpc only for DeviceGray — so sub-byte is always 1 component).
         let Ok(pixels) = self.stream.decompressed_content() else {
             return (ImageKind::None, Vec::new());
         };
@@ -98,10 +107,57 @@ impl XImage {
         if px == 0 {
             return (ImageKind::None, Vec::new());
         }
-        match pixels.len() / px {
-            3 if pixels.len() == px * 3 => (ImageKind::Rgb8, pixels),
-            1 if pixels.len() == px => (ImageKind::Gray8, pixels),
+        match self.bpc {
+            // 8 bpc: components inferred from the byte count (covers ICCBased
+            // RGB too) — byte-aligned, so no row padding to disambiguate.
+            8 => match pixels.len() / px {
+                3 if pixels.len() == px * 3 => (ImageKind::Rgb8, pixels),
+                1 if pixels.len() == px => (ImageKind::Gray8, pixels),
+                _ => (ImageKind::None, Vec::new()),
+            },
+            // 16 bpc: big-endian samples, downsample to 8 by the high byte (S2b).
+            16 => downsample_16bit(&pixels, px),
+            // 2/4 bpc DeviceGray: unpack MSB-first, row byte-aligned (S2c).
+            2 | 4 => {
+                unpack_gray_subbyte(&pixels, self.width as usize, self.height as usize, self.bpc)
+            }
             _ => (ImageKind::None, Vec::new()),
+        }
+    }
+
+    /// JPEG 2000 (`JPXDecode`) → Gray8/Rgb8 via `hayro-jpeg2000`. CMYK / ≥4
+    /// channels / alpha are color-ambiguous without proper conversion, so they
+    /// stay position-only (mirrors the CMYK-JPEG decision in [`XImage::decode`]).
+    fn decode_jpx(&self) -> (ImageKind, Vec<u8>) {
+        use hayro_jpeg2000::{ColorSpace, DecodeSettings, Image};
+
+        let Ok(img) = Image::new(&self.stream.content, &DecodeSettings::default()) else {
+            return (ImageKind::None, Vec::new());
+        };
+        // Only plain Gray/RGB (or an equivalent ICC/unknown channel count); the
+        // library returns 8-bit interleaved samples regardless of source depth.
+        let kind = match (img.color_space(), img.has_alpha()) {
+            (ColorSpace::Gray, false) => ImageKind::Gray8,
+            (ColorSpace::RGB, false) => ImageKind::Rgb8,
+            (ColorSpace::Unknown { num_channels: 1 }, false)
+            | (
+                ColorSpace::Icc {
+                    num_channels: 1, ..
+                },
+                false,
+            ) => ImageKind::Gray8,
+            (ColorSpace::Unknown { num_channels: 3 }, false)
+            | (
+                ColorSpace::Icc {
+                    num_channels: 3, ..
+                },
+                false,
+            ) => ImageKind::Rgb8,
+            _ => return (ImageKind::None, Vec::new()),
+        };
+        match img.decode() {
+            Ok(px) => (kind, px),
+            Err(_) => (ImageKind::None, Vec::new()),
         }
     }
 
@@ -214,6 +270,52 @@ impl XImage {
         img.decode(&mut sink).ok()?;
         Some(sink.0)
     }
+}
+
+/// 16-bit raw samples (big-endian, per PDF 32000-1 §7.4.4.2) → 8-bit by taking
+/// the high byte. Components inferred from the byte count (byte-aligned at 16
+/// bpc, so no row padding): `px*2` = Gray16, `px*6` = Rgb16.
+fn downsample_16bit(pixels: &[u8], px: usize) -> (ImageKind, Vec<u8>) {
+    let comps = if pixels.len() == px * 2 {
+        1
+    } else if pixels.len() == px * 6 {
+        3
+    } else {
+        return (ImageKind::None, Vec::new());
+    };
+    let n = px * comps;
+    // High byte of each big-endian sample (samples[2i], 2i+1 dropped).
+    let out: Vec<u8> = (0..n).map(|i| pixels[i * 2]).collect();
+    (
+        if comps == 3 {
+            ImageKind::Rgb8
+        } else {
+            ImageKind::Gray8
+        },
+        out,
+    )
+}
+
+/// 2/4-bit DeviceGray samples (MSB-first, rows byte-aligned per PDF 32000-1
+/// §7.4.4.2) → Gray8, each value linearly scaled to 0..=255. One component
+/// only — the build gate restricts sub-byte depths to DeviceGray.
+fn unpack_gray_subbyte(pixels: &[u8], w: usize, h: usize, bpc: u8) -> (ImageKind, Vec<u8>) {
+    let bpc = bpc as usize;
+    let stride = (w * bpc).div_ceil(8); // bytes per row (1 component)
+    let maxv = (1u16 << bpc) - 1; // 3 for 2-bit, 15 for 4-bit
+    let mut out = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let line = pixels.get(row * stride..(row + 1) * stride).unwrap_or(&[]);
+        let mut bit = 0usize;
+        for _ in 0..w {
+            let byte = line.get(bit / 8).copied().unwrap_or(0);
+            let shift = 8 - bpc - (bit % 8);
+            let v = (byte >> shift) & (maxv as u8);
+            out.push((v as u16 * 255 / maxv) as u8);
+            bit += bpc;
+        }
+    }
+    (ImageKind::Gray8, out)
 }
 
 /// Shared Gray8 output sink for the bi-level decoders (white = 0xFF). Both
@@ -358,15 +460,28 @@ fn build_images_from_resources(doc: &PdfDocument, res: &Dictionary) -> HashMap<S
                 .and_then(|o| o.as_i64())
                 .unwrap_or(8)
         };
-        if width <= 0 || height <= 0 || !(bpc == 8 || bpc == 1) {
-            continue; // TODO: 2/4/16-bit depths — position-only for now
-        }
-        // 1-bit Indexed palettes can invert polarity (index 0 may be white);
-        // keep those position-only rather than risk negative output.
-        // TODO: read the 2-entry palette and map it properly.
-        if bpc == 1 && colorspace_is_indexed(doc, &s.dict) {
+        // Depths the OCR path can materialize: 8/1 bpc unconditionally, 16 bpc
+        // (high-byte downsample), and 2/4 bpc only for DeviceGray (sub-byte RGB
+        // is rare; its byte-count is ambiguous under row padding — S2c).
+        let depth_ok = bpc == 8
+            || bpc == 1
+            || bpc == 16
+            || ((bpc == 2 || bpc == 4) && colorspace_is_device_gray(doc, &s.dict));
+        if width <= 0 || height <= 0 || !depth_ok {
             continue;
         }
+        // 1-bit Indexed palettes carry the polarity in the lookup table (index 0
+        // may be the light color). Resolve the 2-entry palette to a black/white
+        // polarity (S2d) and fold it into `invert`; undeterminable palettes
+        // (>2 entries, non-Gray/RGB base) stay position-only.
+        let palette_invert = if bpc == 1 && colorspace_is_indexed(doc, &s.dict) {
+            match indexed_1bit_invert(doc, &s.dict) {
+                Some(inv) => inv,
+                None => continue,
+            }
+        } else {
+            false
+        };
         // Bi-level extras are resolved here because decode() runs on worker
         // threads without document access.
         let parms = if bpc == 1 {
@@ -390,7 +505,8 @@ fn build_images_from_resources(doc: &PdfDocument, res: &Dictionary) -> HashMap<S
         });
         // /Decode [1 0] flips polarity. For an ImageMask the default decode is
         // [0 1] with sample 0 painted (usually black ink) — same Gray8 mapping.
-        let invert = bpc == 1
+        // For Indexed, the palette polarity (S2d) XORs with any /Decode flip.
+        let decode_invert = bpc == 1
             && s.dict
                 .get(b"Decode")
                 .and_then(|o| o.as_array())
@@ -400,6 +516,7 @@ fn build_images_from_resources(doc: &PdfDocument, res: &Dictionary) -> HashMap<S
                     matches!(o, Object::Integer(1)) || matches!(o, Object::Real(r) if *r > 0.5)
                 })
                 .unwrap_or(false);
+        let invert = decode_invert ^ palette_invert;
         out.insert(
             name,
             XImage {
@@ -427,6 +544,88 @@ fn colorspace_is_indexed(doc: &PdfDocument, dict: &Dictionary) -> bool {
         .and_then(|o| o.as_name().ok())
         .map(|n| n == b"Indexed" || n == b"I")
         .unwrap_or(false)
+}
+
+/// Whether the image's /ColorSpace is DeviceGray (the only space we admit for
+/// sub-byte depths — see [`build_images_from_resources`]). A bare `/G` alias or
+/// a 1-component ICCBased space both count as gray.
+fn colorspace_is_device_gray(doc: &PdfDocument, dict: &Dictionary) -> bool {
+    let Some((_, cs)) = dict
+        .get(b"ColorSpace")
+        .ok()
+        .and_then(|o| doc.dereference(o).ok())
+    else {
+        return false;
+    };
+    match cs {
+        Object::Name(n) => n == b"DeviceGray" || n == b"G",
+        // [/ICCBased stream] with /N 1 is gray.
+        Object::Array(a) => {
+            let is_icc = a.first().and_then(|o| o.as_name().ok()) == Some(b"ICCBased");
+            let n1 = a
+                .get(1)
+                .and_then(|o| doc.dereference(o).ok())
+                .and_then(|(_, o)| o.as_stream().ok().cloned())
+                .and_then(|s| s.dict.get(b"N").ok().and_then(|o| o.as_i64().ok()))
+                == Some(1);
+            is_icc && n1
+        }
+        _ => false,
+    }
+}
+
+/// Resolve a 2-entry (`hival == 1`) Indexed palette to a bi-level polarity:
+/// `Some(true)` if index 0 is the *lighter* color (so the packed-bit decoder's
+/// "bit set = white" assumption is backwards and must be inverted), `Some(false)`
+/// if index 0 is darker (assumption holds). `None` when the palette isn't a
+/// plain 2-entry DeviceGray/DeviceRGB table we can read, or the two colors have
+/// equal luminance — caller keeps such images position-only.
+fn indexed_1bit_invert(doc: &PdfDocument, dict: &Dictionary) -> Option<bool> {
+    let arr = dict
+        .get(b"ColorSpace")
+        .ok()
+        .and_then(|o| doc.dereference(o).ok())
+        .and_then(|(_, o)| o.as_array().ok().cloned())?;
+    // [/Indexed base hival lookup]
+    if arr.len() != 4 {
+        return None;
+    }
+    if arr[2].as_i64().ok()? != 1 {
+        return None; // only true 2-entry palettes
+    }
+    let base = doc.dereference(&arr[1]).ok()?.1;
+    let comps = match base.as_name().ok()? {
+        b"DeviceGray" | b"G" | b"CalGray" => 1usize,
+        b"DeviceRGB" | b"RGB" | b"CalRGB" => 3usize,
+        _ => return None,
+    };
+    // Lookup is a byte string or a stream of base-space samples.
+    let lookup = match doc.dereference(&arr[3]).ok()?.1 {
+        Object::String(s, _) => s.clone(),
+        Object::Stream(s) => s.decompressed_content().ok()?,
+        _ => return None,
+    };
+    if lookup.len() < comps * 2 {
+        return None;
+    }
+    // Rec. 601 luma for RGB; the byte itself for gray.
+    let luma = |off: usize| -> u32 {
+        if comps == 1 {
+            lookup[off] as u32
+        } else {
+            let (r, g, b) = (
+                lookup[off] as u32,
+                lookup[off + 1] as u32,
+                lookup[off + 2] as u32,
+            );
+            (299 * r + 587 * g + 114 * b) / 1000
+        }
+    };
+    let (l0, l1) = (luma(0), luma(comps));
+    if l0 == l1 {
+        return None;
+    }
+    Some(l0 > l1)
 }
 
 /// Resolve /DecodeParms (or legacy /DP) to a dictionary. Single-filter chains
@@ -577,5 +776,68 @@ mod tests {
         with_app0.extend_from_slice(&sof(4)[2..]);
         assert_eq!(jpeg_components(&with_app0), Some(4));
         assert_eq!(jpeg_components(&[0xFF, 0xD8]), None);
+    }
+
+    #[test]
+    fn downsample_16bit_takes_high_byte() {
+        // 2×1 Gray16, big-endian: 0x12 34, 0xAB CD → high bytes 0x12, 0xAB.
+        let (kind, px) = downsample_16bit(&[0x12, 0x34, 0xAB, 0xCD], 2);
+        assert_eq!(kind, ImageKind::Gray8);
+        assert_eq!(px, vec![0x12, 0xAB]);
+        // 1×1 Rgb16 → 3 high bytes.
+        let (kind, px) = downsample_16bit(&[0x10, 0, 0x20, 0, 0x30, 0], 1);
+        assert_eq!(kind, ImageKind::Rgb8);
+        assert_eq!(px, vec![0x10, 0x20, 0x30]);
+        // Wrong byte count → position-only.
+        assert_eq!(downsample_16bit(&[0x00], 1).0, ImageKind::None);
+    }
+
+    #[test]
+    fn unpack_subbyte_gray_scales_to_full_range() {
+        // 4-bit, 2px wide, 1 row: 0x0F → values 0,15 → 0, 255.
+        let (kind, px) = unpack_gray_subbyte(&[0x0F], 2, 1, 4);
+        assert_eq!(kind, ImageKind::Gray8);
+        assert_eq!(px, vec![0, 255]);
+        // 2-bit, 4px: 0b00_01_10_11 → 0,1,2,3 → 0,85,170,255.
+        let (_, px) = unpack_gray_subbyte(&[0b00_01_10_11], 4, 1, 2);
+        assert_eq!(px, vec![0, 85, 170, 255]);
+        // Row padding: 3px 4-bit → 2-byte stride; second row independent.
+        let (_, px) = unpack_gray_subbyte(&[0xF0, 0x00, 0x00, 0xF0], 3, 2, 4);
+        assert_eq!(px, vec![255, 0, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn device_gray_colorspace_detected() {
+        let doc = PdfDocument::new();
+        let mut d = Dictionary::new();
+        d.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        assert!(colorspace_is_device_gray(&doc, &d));
+        let mut rgb = Dictionary::new();
+        rgb.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+        assert!(!colorspace_is_device_gray(&doc, &rgb));
+    }
+
+    #[test]
+    fn indexed_palette_polarity_from_luminance() {
+        let doc = PdfDocument::new();
+        let indexed = |entry0: u8, entry1: u8| {
+            let mut d = Dictionary::new();
+            d.set(
+                "ColorSpace",
+                Object::Array(vec![
+                    Object::Name(b"Indexed".to_vec()),
+                    Object::Name(b"DeviceGray".to_vec()),
+                    Object::Integer(1),
+                    Object::String(vec![entry0, entry1], lopdf::StringFormat::Hexadecimal),
+                ]),
+            );
+            d
+        };
+        // index 0 = black, 1 = white → normal polarity, no invert.
+        assert_eq!(indexed_1bit_invert(&doc, &indexed(0x00, 0xFF)), Some(false));
+        // index 0 = white, 1 = black → inverted.
+        assert_eq!(indexed_1bit_invert(&doc, &indexed(0xFF, 0x00)), Some(true));
+        // Equal luminance → undeterminable.
+        assert_eq!(indexed_1bit_invert(&doc, &indexed(0x80, 0x80)), None);
     }
 }

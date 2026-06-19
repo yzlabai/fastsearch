@@ -58,6 +58,9 @@ hayro = "0.7"
 # Both were already transitive deps via hayro — zero new supply-chain surface.
 hayro-ccitt = "0.3"
 hayro-jbig2 = "0.3"
+# S2 (2026-06-19): JPX (JPEG 2000) scan decode for the OCR path. Also already a
+# transitive dep via hayro — zero new supply-chain surface (same precedent).
+hayro-jpeg2000 = "0.3"
 # VLM enhancer over OpenAI-compatible services (G8b, user-approved 2026-06-10).
 ureq = { version = "2", features = ["json"] }
 base64 = "0.22"

@@ -14,28 +14,97 @@ use crate::quality::{self, PageAssessment, QualityFlag};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Page-parallel enhancement cap. Enhancement is CPU-bound (det conv net +
-/// per-line rec) and pages are independent, so it parallelizes like the
-/// deterministic parse — but each in-flight scan buffer is ~100MB, so memory,
-/// not cores, is the binding constraint. 8 sits past the efficiency knee
-/// measured on an 18-core box (8→18 threads only lifts 5.5×→10×) while keeping
-/// peak buffer memory bounded.
-// TODO: make this adaptive to available memory instead of a fixed cap.
-const MAX_PAGE_PARALLELISM: usize = 8;
+/// Per-in-flight-page scan-buffer budget. Enhancement is CPU-bound (det conv
+/// net + per-line rec) and pages are independent, so it parallelizes like the
+/// deterministic parse — but each in-flight scan buffer is ~100MB, so *memory*,
+/// not cores, is the binding constraint on how many pages may be in flight.
+const PER_PAGE_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Fallback parallelism when physical memory can't be queried — the historical
+/// fixed cap that sat past the efficiency knee on an 18-core box (8→18 threads
+/// only lifts 5.5×→10×) while keeping peak buffer memory bounded.
+const FALLBACK_PARALLELISM: usize = 8;
+
+/// Choose the page-parallel enhancement width from cores and physical RAM.
+///
+/// The old fixed cap of 8 left ~2× throughput on the table on big-RAM/high-core
+/// boxes (where 18 threads is safe) yet could still over-commit memory on a
+/// low-RAM/high-core box. Instead we let *memory* decide: budget half of
+/// physical RAM to scan buffers (leaving the rest for models + the OS) and fit
+/// as many ~100MB pages as that allows, never exceeding the core count.
+///
+/// Pure so it can be unit-tested without a real machine. `total_ram` is `None`
+/// when the platform query failed → fall back to the historical 8. An explicit
+/// `DOCPARSE_OCR_PARALLELISM` override (see [`ocr_pool`]) bypasses this entirely.
+fn desired_parallelism(cores: usize, total_ram: Option<u64>) -> usize {
+    let cores = cores.max(1);
+    match total_ram {
+        Some(ram) => {
+            let budget = ram / 2;
+            let by_mem = (budget / PER_PAGE_BUDGET_BYTES).max(1) as usize;
+            by_mem.min(cores)
+        }
+        None => cores.min(FALLBACK_PARALLELISM),
+    }
+}
+
+/// Total physical RAM in bytes, or `None` if the platform can't report it.
+/// Uses `libc` (already in-tree, same supply-chain surface as the `--stats`
+/// `getrusage` path) rather than a heavier system-info crate.
+fn total_physical_ram() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut mem: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // hw.memsize is the physical RAM size in bytes.
+        let name = c"hw.memsize";
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut mem as *mut u64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && mem > 0).then_some(mem)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+        (pages > 0 && page_size > 0).then(|| pages as u64 * page_size as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Read the `DOCPARSE_OCR_PARALLELISM` override, if set to a positive integer.
+fn parallelism_override() -> Option<usize> {
+    std::env::var("DOCPARSE_OCR_PARALLELISM")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
 
 /// Shared, bounded worker pool for page-parallel enhancement — built once and
 /// reused so concurrent callers (e.g. the REST/MCP server handling parallel
-/// requests, each via `spawn_blocking`) share `MAX_PAGE_PARALLELISM` workers
-/// rather than each spawning its own pool (8×N thread blow-up + per-call build
-/// churn). Returns `None` if the OS refuses the threads, in which case `apply`
-/// degrades to serial instead of panicking.
+/// requests, each via `spawn_blocking`) share one set of workers rather than
+/// each spawning its own pool (thread blow-up + per-call build churn). The
+/// width adapts to physical memory ([`desired_parallelism`]), overridable via
+/// `DOCPARSE_OCR_PARALLELISM`. Returns `None` if the OS refuses the threads, in
+/// which case `apply` degrades to serial instead of panicking.
 fn ocr_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::thread::available_parallelism()
+        let cores = std::thread::available_parallelism()
             .map(|c| c.get())
-            .unwrap_or(1)
-            .clamp(1, MAX_PAGE_PARALLELISM);
+            .unwrap_or(1);
+        let threads = parallelism_override()
+            .map(|n| n.min(cores))
+            .unwrap_or_else(|| desired_parallelism(cores, total_physical_ram()));
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -221,6 +290,33 @@ pub fn report_json(routes: &[PageRoute]) -> String {
 mod tests {
     use super::*;
     use crate::ir::{BBox, Element, Page, TextChunk};
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn parallelism_scales_with_ram_but_never_exceeds_cores() {
+        // Big-RAM/high-core box: fit far more than 18 pages, so cores bind.
+        assert_eq!(desired_parallelism(18, Some(32 * GB)), 18);
+        // Modest 4-core/8GB box: 4GB budget / 100MB ≈ 40 pages → cores bind.
+        assert_eq!(desired_parallelism(4, Some(8 * GB)), 4);
+    }
+
+    #[test]
+    fn parallelism_is_memory_bound_when_ram_is_tight() {
+        // 16 cores but only ~512MB: budget 256MB / 100MB = 2 pages in flight.
+        assert_eq!(desired_parallelism(16, Some(512 * 1024 * 1024)), 2);
+        // Always at least one page, even on a sliver of RAM.
+        assert_eq!(desired_parallelism(8, Some(64 * 1024 * 1024)), 1);
+    }
+
+    #[test]
+    fn parallelism_falls_back_to_fixed_cap_without_ram_info() {
+        // Unknown RAM → historical fixed cap of 8, still bounded by cores.
+        assert_eq!(desired_parallelism(18, None), FALLBACK_PARALLELISM);
+        assert_eq!(desired_parallelism(2, None), 2);
+        // Degenerate zero-core report still yields a usable width.
+        assert_eq!(desired_parallelism(0, Some(32 * GB)), 1);
+    }
 
     /// Stub OCR: "recovers" text from a no-text page with low confidence.
     struct StubOcr;

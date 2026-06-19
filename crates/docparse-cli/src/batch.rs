@@ -8,15 +8,21 @@
 //! report (human table → stderr, optional JSON / CSV → file) summarizes pages,
 //! size, time, and per-file status.
 //!
-//! **Sequential by design.** Each file already parses page-parallel (and OCR
-//! runs on a memory-bounded pool); stacking file-level parallelism on top would
-//! blow that memory bound. So files run one at a time, every core already busy
-//! within a file. A bad file is recorded as an error row and never aborts the
-//! batch — the file-level analogue of the "bad page → empty Page, never panic"
-//! invariant.
+//! **Serial by default, opt-in file-level parallelism (`--jobs N`).** Each file
+//! already parses page-parallel (and OCR runs on a memory-bounded pool), so the
+//! default is one file at a time with every core already busy within a file.
+//! `--jobs N` adds file-level parallelism for *deterministic* batches (lots of
+//! small digital PDFs, where per-file page parallelism can't saturate cores);
+//! it is force-disabled whenever a model flag is set, because per-page scan
+//! buffers + ~700MB models would multiply across files and blow the memory
+//! bound (see [`effective_jobs`]). A bad file is recorded as an error row and
+//! never aborts the batch — the file-level analogue of the "bad page → empty
+//! Page, never panic" invariant.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use rayon::prelude::*;
 
 use crate::{
     parse_and_enhance, parsers_with, progress::Reporter, render_doc, Cli, Format, RunModels,
@@ -72,15 +78,28 @@ pub fn run(cli: &Cli, reporter: &Reporter) -> anyhow::Result<()> {
     // no-model run never touches them), not once per file.
     let models = RunModels::from_cli(cli);
 
+    // File-level parallelism (--jobs), force-disabled for model batches.
+    let cores = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(1);
+    let jobs = effective_jobs(cli.jobs, cores, files.len(), any_model_flag(cli));
+    if cli.jobs > 1 && any_model_flag(cli) {
+        eprintln!(
+            "note: --jobs {} ignored — a model flag is set; files run serially to bound memory",
+            cli.jobs
+        );
+    }
+
     let bar = reporter.files_bar(files.len() as u64);
     let started = Instant::now();
-    let mut stats = Vec::with_capacity(files.len());
 
-    for inp in &files {
+    // Parse one input into a FileStat (parse + write are independent per file,
+    // so this is safe to run concurrently). Quiet pipeline (reporter = None):
+    // the file bar + report are the UI. A parse failure becomes an error row;
+    // the batch never aborts. The bar (thread-safe) ticks as each file lands.
+    let process = |inp: &BatchInput| -> FileStat {
         let bytes = std::fs::metadata(&inp.path).map(|m| m.len()).unwrap_or(0);
         let t = Instant::now();
-        // Quiet pipeline (reporter = None): the file bar + report are the UI.
-        // A parse failure becomes an error row; the batch never aborts.
         let stat = match parse_and_enhance(&inp.path, cli, &models, None) {
             Ok(doc) => FileStat {
                 path: inp.path.clone(),
@@ -101,15 +120,31 @@ pub fn run(cli: &Cli, reporter: &Reporter) -> anyhow::Result<()> {
                 error: Some(short_err(&e)),
             },
         };
-        // Stream a per-file event as each file completes (--progress json).
-        if reporter.json() {
-            let mut ev = file_value(&stat);
-            ev["event"] = serde_json::Value::String("file".into());
-            reporter.emit(&ev);
-        }
-        stats.push(stat);
         if let Some(b) = &bar {
             b.inc(1);
+        }
+        stat
+    };
+
+    // Indexed collection preserves input order regardless of completion order,
+    // so the report / JSON events are deterministic. jobs==1 keeps the exact
+    // serial path (output byte-identical to before --jobs existed).
+    let stats: Vec<FileStat> = if jobs > 1 {
+        match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
+            Ok(pool) => pool.install(|| files.par_iter().map(&process).collect()),
+            Err(_) => files.iter().map(&process).collect(), // OS refused threads
+        }
+    } else {
+        files.iter().map(&process).collect()
+    };
+
+    // Per-file events stream after collection (order-stable, no interleaving
+    // across threads on stderr) — schema matches --report-json's file objects.
+    if reporter.json() {
+        for stat in &stats {
+            let mut ev = file_value(stat);
+            ev["event"] = serde_json::Value::String("file".into());
+            reporter.emit(&ev);
         }
     }
     if let Some(b) = &bar {
@@ -254,6 +289,28 @@ fn collect_dir(
 /// First line of an error chain — keeps the report row to one line.
 fn short_err(e: &anyhow::Error) -> String {
     e.to_string().lines().next().unwrap_or("error").to_string()
+}
+
+/// Whether any enhancement model is enabled — file-level parallelism must stay
+/// off in that case (per-page scan buffers + ~700MB models multiply per file).
+fn any_model_flag(cli: &Cli) -> bool {
+    cli.ocr
+        || cli.layout
+        || cli.table_model.is_some()
+        || cli.formula_model.is_some()
+        || cli.transcribe_model.is_some()
+        || cli.vlm_describe
+        || cli.vlm_tables
+}
+
+/// Resolve `--jobs` to an actual worker count: forced to 1 for model batches
+/// (memory), otherwise the request clamped to both the core count and the file
+/// count (no point spawning more workers than files). Pure for testability.
+fn effective_jobs(requested: usize, cores: usize, files: usize, has_model: bool) -> usize {
+    if has_model {
+        return 1;
+    }
+    requested.max(1).min(cores.max(1)).min(files.max(1))
 }
 
 // --- report rendering -------------------------------------------------------
@@ -424,6 +481,19 @@ mod tests {
             secs: 0.1,
             error: error.map(|e| e.to_string()),
         }
+    }
+
+    #[test]
+    fn effective_jobs_forces_serial_for_model_batches() {
+        // A model flag pins jobs to 1 no matter what was requested.
+        assert_eq!(effective_jobs(8, 16, 100, true), 1);
+        // Deterministic: request honored but clamped to cores and file count.
+        assert_eq!(effective_jobs(8, 16, 100, false), 8);
+        assert_eq!(effective_jobs(32, 4, 100, false), 4); // core-bound
+        assert_eq!(effective_jobs(8, 16, 3, false), 3); // file-bound
+                                                        // Default / degenerate requests yield at least one worker.
+        assert_eq!(effective_jobs(1, 16, 100, false), 1);
+        assert_eq!(effective_jobs(0, 16, 100, false), 1);
     }
 
     /// A unique scratch dir under the system temp, following the repo's

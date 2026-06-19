@@ -687,6 +687,7 @@ dependencies = [
  "docparse-xlsx",
  "indicatif",
  "libc",
+ "rayon",
  "serde_json",
  "tokio",
 ]
@@ -698,6 +699,7 @@ dependencies = [
  "anyhow",
  "chardetng",
  "encoding_rs",
+ "libc",
  "rayon",
  "serde",
  "serde_json",
@@ -782,6 +784,7 @@ dependencies = [
  "docparse-core",
  "hayro-ccitt",
  "hayro-jbig2",
+ "hayro-jpeg2000",
  "lopdf",
  "rayon",
 ]
@@ -1309,6 +1312,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c75ab947623ef4ccaa7acf0579edf7cbb5a73838e3839a7be73335e522f433a1"
 dependencies = [
  "fearless_simd",
+ "image",
+ "moxcms",
 ]
 
 [[package]]

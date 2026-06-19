@@ -213,6 +213,15 @@ struct Cli {
     #[arg(short, long)]
     recursive: bool,
 
+    /// In batch mode, process up to N files in parallel (default 1 = serial).
+    /// Only applies to deterministic batches: when any model flag (--ocr,
+    /// --layout, --table-model, --formula-model, --transcribe-model, --vlm-*)
+    /// is set, jobs is forced to 1 to keep peak memory bounded (per-page scan
+    /// buffers + ~700MB models would multiply across files). Capped at the
+    /// core count.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    jobs: usize,
+
     /// In batch mode, also write the aggregate report as JSON to this file.
     #[arg(long, value_name = "FILE")]
     report_json: Option<PathBuf>,
