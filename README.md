@@ -115,6 +115,24 @@ mkdir -p .claude/skills
 ln -s "$(pwd)/skills/docparse-document-intelligence" .claude/skills/   # or ~/.claude/skills (global), ~/.cursor/skills (Cursor)
 ```
 
+## 📦 OKF — knowledge bundles for agents
+
+docparse-rs is a **first-class producer for [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf)** (OKF v0.1, Google Cloud) — the vendor-neutral, git-native way to ship parsed documents to any knowledge base or agent. `-f okf` turns a document's **structure tree** into a directory of Markdown + YAML-frontmatter *concept* files (one per section, nested to mirror the outline) that any OKF-aware tool mounts with **zero adaptation** — no bespoke chunk JSON, no vector-store glue.
+
+```bash
+docparse report.pdf -f okf            # → report-okf/  (one concept .md per section)
+docparse report.pdf -f okf --okf-tar | tar x -C kb/   # stream a tar to a knowledge base
+git -C report-okf add . && git commit -m "knowledge: report"   # versionable, diff-able
+```
+
+What makes docparse-rs's OKF distinctive — and fills the gap left by heavier producers (llmsherpa, Docling) that need Python/JVM + models + a running server:
+
+- **Citable** — every concept's `resource` carries `page` + `bbox`, so answers trace back to the exact spot in the source.
+- **Deterministic** — same source ⇒ byte-identical bundle (timestamps come from file mtime, never the wall clock), so `git diff` is meaningful and re-exports are reproducible.
+- **Zero-dependency** — one Rust binary, no model download or service to deliver a bundle.
+
+Also available as the MCP `export_okf` tool and `POST /parse?format=okf` (deterministic `application/x-tar`). See [agent integration →](docs/agent-integration.md).
+
 ## 📊 Quality
 
 Scored on **[OmniDocBench](https://github.com/opendatalab/OmniDocBench)** (CVPR 2025) against **human ground truth**, using the embedded UniRec models:
