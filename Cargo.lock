@@ -738,6 +738,7 @@ name = "docparse-html"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "docparse-core",
  "ego-tree",
  "scraper",

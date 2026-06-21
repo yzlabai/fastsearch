@@ -10,3 +10,4 @@ docparse-core = { path = "../docparse-core" }
 anyhow.workspace = true
 scraper.workspace = true
 ego-tree = "0.9"
+base64.workspace = true

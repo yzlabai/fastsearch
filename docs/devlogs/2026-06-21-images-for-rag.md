@@ -78,7 +78,25 @@
 - 真实端到端：python-pptx 造含图 deck → `-f chunks --image-dir`：得 image chunk、PNG 经 Encoded 导出 `p1-1.png`、context 取到标题。
 - 全量 34 套绿、clippy 0、fmt。**排查记录**：首次端到端"无 image"实为跑了未重建的旧 CLI binary（rebuild 后正常）——非逻辑问题。
 
+## 提交 5：HTML 抽图（alt 即图说）
+
+HTML `<img>` 的 `alt` 是天然图说——直接作 caption，对 RAG 检索价值高。
+
+**改动**
+- [core/synth.rs](../../crates/docparse-core/src/synth.rs)：`PageBuilder::image` 加 `caption: Option<(String, &'static str)>` 参数（文本+来源），直接落到 `ImageChunk.caption`/`caption_source`。DOCX/PPTX 传 `None`（仍走 chunk 期 "Figure N" 绑定）。
+- [html/lib.rs](../../crates/docparse-html/src/lib.rs)：
+  - `parse()` 透传文件目录作 base dir；`walk` 携 base 递归，加 `<img>` 分支。
+  - `image_bytes`：`data:` URI（base64 解码，取 mime）/ 文件相对路径（`base.join`，读盘，mime 由后缀）；远程 `http(s)://` 与协议相对 `//` **不抓取**（离线、确定性）。
+  - 尺寸由 `width`/`height` 属性 px→pt（×0.75，CSS px=1/96in）；缺省 240×180pt。`alt` → caption（`caption_source="alt"`）。
+  - 新依赖 `base64`（workspace 既有）。
+- 文档口径全改 **PDF + DOCX + PPTX + HTML**。
+
+**测试**
+- 单测：data:URI+alt→Encoded image；远程 URL 跳过；相对路径经 base dir 读盘；无 base 跳过相对图。
+- 真实端到端：含图 html → image chunk（caption=alt、context=周边段落、PNG 经 Encoded 导出）。
+- 全量 34 套绿、clippy 0、fmt。
+
 ## 后续（仍未做）
 
-- DOCX/PPTX 表格单元格内图片；**HTML 抽图**（`<img>` data: URI 自洽；相对路径需 base dir 接线；远程 URL 不取，离线信封外）。
+- DOCX/PPTX 表格单元格内图片。
 - 版面模型 `RegionKind::Caption` 区域绑定（当前 caption 走文本 pattern + 邻接；模型路径需把 tag 透到 Block 层）。

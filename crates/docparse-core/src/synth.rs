@@ -131,7 +131,10 @@ impl PageBuilder {
     /// Add an already-encoded image (PNG/JPEG/… `data`) at the current flow
     /// position. `width_pt`/`height_pt` are the on-page size (converted from the
     /// source's EMU/px by the backend), capped to the content box. `media_type`
-    /// is the source MIME (drives export/embed). Empty `data` is skipped.
+    /// is the source MIME (drives export/embed). `caption` is an optional
+    /// `(text, source)` description carried straight onto the chunk — backends
+    /// with an in-document caption (HTML `alt`) supply it; OOXML pass `None` and
+    /// let the chunker bind an adjacent "Figure N" line. Empty `data` is skipped.
     /// Coordinates are synthetic — useful for ordering/citation, not fidelity.
     pub fn image(
         &mut self,
@@ -139,6 +142,7 @@ impl PageBuilder {
         width_pt: f32,
         height_pt: f32,
         media_type: impl Into<String>,
+        caption: Option<(String, &'static str)>,
     ) {
         if data.is_empty() {
             return;
@@ -150,6 +154,10 @@ impl PageBuilder {
         self.ensure(h);
         let y1 = self.y;
         let y0 = self.y - h;
+        let (caption, caption_source) = match caption {
+            Some((c, s)) => (Some(c), Some(s.to_string())),
+            None => (None, None),
+        };
         self.cur.push(Element::Image(ImageChunk {
             bbox: BBox {
                 x0: self.margin,
@@ -167,8 +175,8 @@ impl PageBuilder {
             file: None,
             data_base64: None,
             data_media_type: Some(media_type.into()),
-            caption: None,
-            caption_source: None,
+            caption,
+            caption_source,
         }));
         self.y = y0 - Self::PARA_SPACING * 12.0;
     }

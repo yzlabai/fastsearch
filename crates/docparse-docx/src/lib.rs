@@ -94,6 +94,7 @@ fn document_pages(docx: &Docx) -> Vec<Page> {
                         emu_to_pt(w_emu),
                         emu_to_pt(h_emu),
                         image_mime_from_path(path),
+                        None,
                     );
                 }
             }

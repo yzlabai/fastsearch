@@ -187,7 +187,7 @@ fn parse_slide(
                         let (data, path) = bytes;
                         let w = if pic_cx > 0 { emu_to_pt(pic_cx) } else { 216.0 };
                         let h = if pic_cy > 0 { emu_to_pt(pic_cy) } else { 144.0 };
-                        b.image(data.clone(), w, h, image_mime_from_path(path));
+                        b.image(data.clone(), w, h, image_mime_from_path(path), None);
                     }
                 }
                 b"p" => {

@@ -128,13 +128,15 @@ docparse report.pdf -f chunks   -o /tmp/report.chunks.json
   to the same convention.
 - **Citation:** `page` + `bbox` point straight back to the source location;
   `heading_path` gives each chunk its section context for retrieval/filtering.
-- **Image chunks** (`"kind": "image"`, PDF + DOCX + PPTX): the page-covering figures.
+- **Image chunks** (`"kind": "image"`, PDF + DOCX + PPTX + HTML): the page-covering figures.
   `text` carries the caption + surrounding context (the searchable field), and an
   `image` object carries `{ file?, data_base64?, media_type?, caption?, caption_source? }`
   for rendering & citation. Caption binds the adjacent "Figure N" line for free
-  (`caption_source: "caption-line"`); `--vlm-describe` writes a neural description
-  (`"vlm:<model>"`). Pass `--image-dir <dir>` (or `--image-embed`) so the chunk's
-  `image.file`/`data_base64` is populated for the consumer to display.
+  (`caption_source: "caption-line"`), or the HTML `alt` text (`"alt"`);
+  `--vlm-describe` writes a neural description (`"vlm:<model>"`). Pass
+  `--image-dir <dir>` (or `--image-embed`) so the chunk's `image.file`/
+  `data_base64` is populated for the consumer to display. (HTML resolves
+  `data:` URIs and file-relative `<img>` paths; remote URLs aren't fetched.)
 - In `-f json`, elements replaced by a model carry a `source` tag
   (`ocr:ppocr`, `table:unirec-0.1b`, `formula:unirec-0.1b`, `vlm:<model>`,
   `layout:<model>`) so provenance stays visible.

@@ -1,6 +1,6 @@
 # 文档内嵌图片 → 可被 RAG 召回与引用
 
-> **状态：已实施（2026-06-21）**，见 [devlog](../devlogs/2026-06-21-images-for-rag.md)。§3 范围全部完成 + **PPTX 抽图已补**（commit 4）。仍列入后续："表格单元格内图片 / HTML 抽图 / 版面 Caption 区域绑定"。
+> **状态：已实施（2026-06-21）**，见 [devlog](../devlogs/2026-06-21-images-for-rag.md)。§3 范围全部完成 + **PPTX（commit 4）+ HTML（commit 5）抽图已补**。图片→RAG 现覆盖 PDF / DOCX / PPTX / HTML。仍列入后续："表格单元格内图片 / 版面 Caption 区域绑定"。
 >
 > 让 PDF/DOCX 等文档中的图片在 RAG 链路里既能**被检索召回**、又能**在生成结果中渲染/溯源**。
 

@@ -5,10 +5,16 @@
 //! coordinates, so we fabricate PDF-convention geometry and let the shared
 //! reading-order/output layers handle the rest. Inline formatting is flattened
 //! to text; scripts/styles are dropped.
+//!
+//! `<img>` images are flowed as `ImageChunk`s with the `alt` text as their
+//! caption (the searchable field for RAG). Bytes come from `data:` URIs
+//! (decoded) or from a relative path resolved against the HTML file's directory;
+//! remote `http(s)://` images are not fetched (skipped).
 
+use base64::Engine;
 use docparse_core::ir::Document;
 use docparse_core::parser::DocumentParser;
-use docparse_core::synth::{PageBuilder, SpanCell};
+use docparse_core::synth::{image_mime_from_path, PageBuilder, SpanCell};
 use ego_tree::NodeRef;
 use scraper::node::Node;
 use scraper::Html;
@@ -35,17 +41,27 @@ impl DocumentParser for HtmlParser {
         // Decode honoring <meta charset> (H7) — `read_to_string` would reject
         // any non-UTF-8 page outright (legacy GBK/Shift-JIS/Windows-1252).
         let content = docparse_core::textio::decode_html(&std::fs::read(path)?);
-        let mut doc = parse_str(&content);
+        // The file's directory resolves relative <img src> paths.
+        let mut doc = parse_html(&content, path.parent());
         doc.source = path.display().to_string();
         Ok(doc)
     }
 }
 
-/// Parse an HTML string into a [`Document`] (source left as "<html>").
+/// Parse an HTML string into a [`Document`] (source left as "<html>"). Relative
+/// `<img>` paths can't be resolved without a base directory, so only `data:`
+/// URIs yield image bytes here; use [`HtmlParser::parse`] for file-relative
+/// images.
 pub fn parse_str(html: &str) -> Document {
+    parse_html(html, None)
+}
+
+/// Parse HTML, resolving relative `<img>` paths against `base` (the HTML file's
+/// directory) when given.
+fn parse_html(html: &str, base: Option<&Path>) -> Document {
     let dom = Html::parse_document(html);
     let mut b = PageBuilder::letter();
-    walk(dom.tree.root(), &mut b);
+    walk(dom.tree.root(), &mut b, base);
     Document {
         source: "<html>".to_string(),
         provenance: Some(docparse_core::ir::Provenance::new(
@@ -69,7 +85,7 @@ fn heading_size(tag: &str) -> Option<f32> {
     })
 }
 
-fn walk(node: NodeRef<Node>, b: &mut PageBuilder) {
+fn walk(node: NodeRef<Node>, b: &mut PageBuilder, base: Option<&Path>) {
     for child in node.children() {
         let Node::Element(el) = child.value() else {
             continue;
@@ -93,10 +109,75 @@ fn walk(node: NodeRef<Node>, b: &mut PageBuilder) {
             // A stray <li> outside any list: treat as a bullet.
             "li" => b.list_item(format!("• {}", collect_text(child)), 12.0),
             "table" => b.table_spanned(parse_table(child), 12.0),
+            "img" => emit_image(el, b, base),
             // Containers: recurse to preserve document order.
-            _ => walk(child, b),
+            _ => walk(child, b, base),
         }
     }
+}
+
+/// Flow an `<img>` as an image element: resolve its `src` to bytes (`data:` URI
+/// or a `base`-relative file; remote URLs skipped), size from `width`/`height`
+/// attrs (CSS px → pt), and carry `alt` as the caption.
+fn emit_image(el: &scraper::node::Element, b: &mut PageBuilder, base: Option<&Path>) {
+    let Some((bytes, mime)) = image_bytes(el, base) else {
+        return;
+    };
+    let w = px_attr(el, "width").unwrap_or(240.0);
+    let h = px_attr(el, "height").unwrap_or(180.0);
+    let caption = el
+        .attr("alt")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| (s.to_string(), "alt"));
+    b.image(bytes, w, h, mime, caption);
+}
+
+/// Resolve an `<img src>` to `(bytes, mime)`: decode a `data:` URI, or read a
+/// relative path against `base`. Remote `http(s)://` (and protocol-relative
+/// `//`) sources are not fetched — they yield `None`.
+fn image_bytes(el: &scraper::node::Element, base: Option<&Path>) -> Option<(Vec<u8>, String)> {
+    let src = el.attr("src")?.trim();
+    if let Some(rest) = src.strip_prefix("data:") {
+        // data:[<mime>][;base64],<payload> — only base64 image payloads.
+        let (header, payload) = rest.split_once(',')?;
+        if !header.contains("base64") {
+            return None;
+        }
+        let mime = header
+            .split(';')
+            .next()
+            .filter(|m| !m.is_empty())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .ok()?;
+        (!bytes.is_empty()).then_some((bytes, mime))
+    } else if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("//") {
+        None // remote: not fetched (offline, deterministic)
+    } else {
+        // Relative/local path, resolved against the HTML file's directory.
+        let base = base?;
+        let clean = src.split(['?', '#']).next().unwrap_or(src);
+        let bytes = std::fs::read(base.join(clean)).ok()?;
+        (!bytes.is_empty()).then_some((bytes, image_mime_from_path(clean)))
+    }
+}
+
+/// A pixel-valued HTML length attribute (`width`/`height`) → PDF points
+/// (CSS px = 1/96 in, pt = 1/72 in, so pt = px × 0.75). Bare number or `…px`.
+fn px_attr(el: &scraper::node::Element, name: &str) -> Option<f32> {
+    let v = el.attr(name)?.trim();
+    let digits: String = v
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    digits
+        .parse::<f32>()
+        .ok()
+        .filter(|n| *n > 0.0)
+        .map(|px| px * 0.75)
 }
 
 /// Emit each direct `<li>` of a list as a tagged list item: bullets get `• `,
@@ -180,7 +261,72 @@ fn parse_table(table: NodeRef<Node>) -> Vec<Vec<SpanCell>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use docparse_core::ir::Element;
+    use docparse_core::ir::{Element, ImageKind};
+
+    /// A 1×1 PNG, base64-encoded — enough to exercise the decode/passthrough.
+    const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    fn first_image(doc: &Document) -> Option<&docparse_core::ir::ImageChunk> {
+        doc.pages
+            .iter()
+            .flat_map(|p| &p.elements)
+            .find_map(|e| match e {
+                Element::Image(i) => Some(i),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn data_uri_image_becomes_image_element_with_alt_caption() {
+        let html = format!(
+            "<p>before</p><img src=\"data:image/png;base64,{PNG_B64}\" alt=\"A red square\" width=\"320\" height=\"240\"><p>after</p>"
+        );
+        let doc = parse_str(&html);
+        let img = first_image(&doc).expect("an image element from the data URI");
+        assert_eq!(img.kind, ImageKind::Encoded);
+        assert_eq!(img.data_media_type.as_deref(), Some("image/png"));
+        assert_eq!(img.caption.as_deref(), Some("A red square"));
+        assert_eq!(img.caption_source.as_deref(), Some("alt"));
+        assert!(!img.data.is_empty());
+    }
+
+    #[test]
+    fn remote_image_is_not_fetched() {
+        let doc = parse_str("<img src=\"https://example.com/x.png\" alt=\"remote\">");
+        assert!(
+            first_image(&doc).is_none(),
+            "remote URLs must not be fetched"
+        );
+    }
+
+    #[test]
+    fn relative_image_resolved_against_base_dir() {
+        let dir = std::env::temp_dir().join("docparse_html_relimg_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(PNG_B64)
+            .unwrap();
+        std::fs::write(dir.join("pic.png"), &png).unwrap();
+        let html_path = dir.join("doc.html");
+        std::fs::write(
+            &html_path,
+            "<img src=\"pic.png\" alt=\"local\" width=\"320\" height=\"240\">",
+        )
+        .unwrap();
+        let doc = HtmlParser.parse(&html_path).unwrap();
+        let img = first_image(&doc).expect("an image element from the relative path");
+        assert_eq!(img.data, png);
+        assert_eq!(img.data_media_type.as_deref(), Some("image/png"));
+        assert_eq!(img.caption.as_deref(), Some("local"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_str_without_base_skips_relative_image() {
+        // No base dir → a relative <img> can't be read; only data: URIs work.
+        let doc = parse_str("<img src=\"pic.png\" alt=\"x\">");
+        assert!(first_image(&doc).is_none());
+    }
 
     #[test]
     fn headings_and_paragraphs() {
