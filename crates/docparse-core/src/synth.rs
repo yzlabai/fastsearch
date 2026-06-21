@@ -250,6 +250,32 @@ impl PageBuilder {
     }
 }
 
+/// EMU (English Metric Units, 914400 per inch) → PDF points (72 per inch).
+/// OOXML drawing sizes (DOCX `wp:extent`, PPTX `a:ext`) are in EMU; the
+/// synthetic OOXML backends share this conversion.
+pub fn emu_to_pt(emu: u32) -> f32 {
+    emu as f32 / 12700.0
+}
+
+/// MIME type from an image path's extension (the form OOXML media targets —
+/// `word/media/imageN.png`, `ppt/media/imageN.jpeg` — and HTML `img` srcs carry).
+/// Defaults to `application/octet-stream`.
+pub fn image_mime_from_path(path: &str) -> String {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "webp" => "image/webp",
+        "emf" => "image/x-emf",
+        "wmf" => "image/x-wmf",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 /// A source cell in a SPARSE span grid: covered positions are omitted and the
 /// anchor carries its spans (the shape HTML `colspan`/`rowspan` and a
 /// normalized DOCX `gridSpan`/`vMerge` produce). Expanded into the IR's flat

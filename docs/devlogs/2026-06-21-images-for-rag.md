@@ -62,7 +62,23 @@
 - 文本三件套（lorem/bialetti/1901）回归未变。
 - schema：`SCHEMA_VERSION` 0.7.0→0.8.0；`ImageChunk` 加 caption/caption_source、`ImageKind` 加 Encoded、`Chunk` 加 image —— 均为**新增可选字段/枚举变体，向后兼容**。
 
-## 后续（计划里"不做什么"或新发现）
+## 提交 4：PPTX 抽图 + 共享 helper 去重
 
-- 表格单元格内图片、PPTX/HTML 抽图（同 `PageBuilder::image` + `Encoded` 模式可加）。
+接续后续清单，把 PPTX 拉齐到 DOCX 的抽图能力，并消除重复。
+
+**改动**
+- [core/synth.rs](../../crates/docparse-core/src/synth.rs)：把 `emu_to_pt`、`image_mime_from_path` 提为 **pub 共享 helper**（合成 OOXML 后端通用：EMU→pt、路径后缀→MIME）。
+- [docx/lib.rs](../../crates/docparse-docx/src/lib.rs)：删本地 `emu_to_pt`/`mime_from_path`，改用 synth 共享版（去重，单一真源）。
+- [pptx/lib.rs](../../crates/docparse-pptx/src/lib.rs)：
+  - `load_media` 预载所有 `ppt/media/*` 字节；`slide_rels_path` + `parse_rels` + `resolve_target` 解析每张 slide 的 `_rels/slideN.xml.rels`（rId→相对 Target→规范化包内路径，处理 `.`/`..`/绝对 `/`）。
+  - `parse_slide` 扩展事件机：`<p:pic>` 内捕获 xfrm `<a:ext cx cy>`（EMU）+ `<a:blip r:embed>` 的 rId，在 `</p:pic>` 处按 rId→path→bytes 内联调 `PageBuilder::image`（流位置正确；无 ext 兜底 3in×2in）。
+
+**测试**
+- 单测：`resolve_target` 相对/绝对解析；`slide_picture_becomes_image_element`（真 zip：slide+rels+media → ImageKind::Encoded、字节一致、image/png、EMU→pt 尺寸）。
+- 真实端到端：python-pptx 造含图 deck → `-f chunks --image-dir`：得 image chunk、PNG 经 Encoded 导出 `p1-1.png`、context 取到标题。
+- 全量 34 套绿、clippy 0、fmt。**排查记录**：首次端到端"无 image"实为跑了未重建的旧 CLI binary（rebuild 后正常）——非逻辑问题。
+
+## 后续（仍未做）
+
+- DOCX/PPTX 表格单元格内图片；**HTML 抽图**（`<img>` data: URI 自洽；相对路径需 base dir 接线；远程 URL 不取，离线信封外）。
 - 版面模型 `RegionKind::Caption` 区域绑定（当前 caption 走文本 pattern + 邻接；模型路径需把 tag 透到 Block 层）。

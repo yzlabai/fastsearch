@@ -12,7 +12,7 @@
 
 use docparse_core::ir::{Document, Page, Provenance};
 use docparse_core::parser::DocumentParser;
-use docparse_core::synth::{PageBuilder, SpanCell};
+use docparse_core::synth::{emu_to_pt, image_mime_from_path, PageBuilder, SpanCell};
 use docx_rs::{
     DocumentChild, Docx, DrawingData, Level, Numberings, Paragraph, ParagraphChild, Pic, RunChild,
     Table, TableCell, TableCellContent, TableChild, TableRowChild,
@@ -93,7 +93,7 @@ fn document_pages(docx: &Docx) -> Vec<Page> {
                         img.0.clone(),
                         emu_to_pt(w_emu),
                         emu_to_pt(h_emu),
-                        mime_from_path(path),
+                        image_mime_from_path(path),
                     );
                 }
             }
@@ -178,28 +178,6 @@ fn paragraph_pics(p: &Paragraph) -> Vec<&Pic> {
         }
     }
     pics
-}
-
-/// EMU (English Metric Units, 914400 per inch) → PDF points (72 per inch).
-fn emu_to_pt(emu: u32) -> f32 {
-    emu as f32 / 12700.0
-}
-
-/// MIME type from a `word/media/imageN.ext` path's extension.
-fn mime_from_path(path: &str) -> String {
-    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "bmp" => "image/bmp",
-        "tif" | "tiff" => "image/tiff",
-        "webp" => "image/webp",
-        "emf" => "image/x-emf",
-        "wmf" => "image/x-wmf",
-        _ => "application/octet-stream",
-    }
-    .to_string()
 }
 
 /// Concatenate a paragraph's run text.

@@ -128,7 +128,7 @@ docparse report.pdf -f chunks   -o /tmp/report.chunks.json
   to the same convention.
 - **Citation:** `page` + `bbox` point straight back to the source location;
   `heading_path` gives each chunk its section context for retrieval/filtering.
-- **Image chunks** (`"kind": "image"`, PDF + DOCX): the page-covering figures.
+- **Image chunks** (`"kind": "image"`, PDF + DOCX + PPTX): the page-covering figures.
   `text` carries the caption + surrounding context (the searchable field), and an
   `image` object carries `{ file?, data_base64?, media_type?, caption?, caption_source? }`
   for rendering & citation. Caption binds the adjacent "Figure N" line for free

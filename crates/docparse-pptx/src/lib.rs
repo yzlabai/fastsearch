@@ -5,10 +5,11 @@
 use anyhow::Context;
 use docparse_core::ir::{Document, Provenance};
 use docparse_core::parser::DocumentParser;
-use docparse_core::synth::{PageBuilder, SpanCell};
+use docparse_core::synth::{emu_to_pt, image_mime_from_path, PageBuilder, SpanCell};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
-use std::io::Read;
+use std::collections::HashMap;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 pub struct PptxParser;
@@ -52,11 +53,26 @@ pub fn parse_bytes(buf: &[u8]) -> anyhow::Result<Document> {
         .collect();
     slides.sort();
 
+    // Pre-load embedded media (rId is resolved per slide via its .rels).
+    let media = load_media(&mut zip);
+
     let mut b = PageBuilder::letter();
     for (_, name) in slides {
         let mut xml = String::new();
         zip.by_name(&name)?.read_to_string(&mut xml)?;
-        parse_slide(&xml, &mut b);
+        // Resolve this slide's rId → media path map from its .rels (if any).
+        let rid_to_path = match slide_rels_path(&name) {
+            Some(rp) => match zip.by_name(&rp) {
+                Ok(mut f) => {
+                    let mut s = String::new();
+                    let _ = f.read_to_string(&mut s);
+                    parse_rels(&s, &name)
+                }
+                Err(_) => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
+        parse_slide(&xml, &rid_to_path, &media, &mut b);
         b.page_break();
     }
     Ok(Document {
@@ -67,8 +83,14 @@ pub fn parse_bytes(buf: &[u8]) -> anyhow::Result<Document> {
 }
 
 /// Walk one slide's DrawingML: `a:p` paragraphs (heading-sized for title
-/// placeholders), `a:tbl` tables.
-fn parse_slide(xml: &str, b: &mut PageBuilder) {
+/// placeholders), `a:tbl` tables, `p:pic` pictures (resolved to media bytes via
+/// `rid_to_path` + `media`).
+fn parse_slide(
+    xml: &str,
+    rid_to_path: &HashMap<String, String>,
+    media: &HashMap<String, Vec<u8>>,
+    b: &mut PageBuilder,
+) {
     let mut r = Reader::from_str(xml);
     r.config_mut().trim_text(true);
 
@@ -83,10 +105,35 @@ fn parse_slide(xml: &str, b: &mut PageBuilder) {
     let mut col_span = 1u32;
     let mut row_span = 1u32;
     let mut covered = false;
+    // picture state of the current <p:pic>: its xfrm extent (EMU) + blip rId.
+    let mut in_pic = false;
+    let mut pic_cx = 0u32;
+    let mut pic_cy = 0u32;
+    let mut pic_rid: Option<String> = None;
+    let mut got_ext = false;
 
     loop {
         match r.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match e.local_name().as_ref() {
+                b"pic" => {
+                    in_pic = true;
+                    pic_cx = 0;
+                    pic_cy = 0;
+                    pic_rid = None;
+                    got_ext = false;
+                }
+                // The picture's xfrm extent (first <a:ext> inside the <p:pic>).
+                b"ext" if in_pic && !got_ext => {
+                    pic_cx = attr_u32(&e, b"cx").unwrap_or(0);
+                    pic_cy = attr_u32(&e, b"cy").unwrap_or(0);
+                    got_ext = true;
+                }
+                // <a:blip r:embed="rIdN"/> names the media relationship.
+                b"blip" if in_pic => {
+                    if let Some(id) = attr_str(&e, b"embed") {
+                        pic_rid = Some(id);
+                    }
+                }
                 b"ph" => {
                     // <p:ph type="title|ctrTitle"> marks the shape as a title.
                     if let Some(t) = e
@@ -127,6 +174,22 @@ fn parse_slide(xml: &str, b: &mut PageBuilder) {
                 }
             }
             Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"pic" => {
+                    in_pic = false;
+                    // Resolve the blip's rId to media bytes and place the image
+                    // at this flow position. Missing extent → a sane default box.
+                    if let Some(bytes) = pic_rid
+                        .take()
+                        .and_then(|rid| rid_to_path.get(&rid))
+                        .and_then(|path| media.get(path).map(|b| (b, path)))
+                        .filter(|(b, _)| !b.is_empty())
+                    {
+                        let (data, path) = bytes;
+                        let w = if pic_cx > 0 { emu_to_pt(pic_cx) } else { 216.0 };
+                        let h = if pic_cy > 0 { emu_to_pt(pic_cy) } else { 144.0 };
+                        b.image(data.clone(), w, h, image_mime_from_path(path));
+                    }
+                }
                 b"p" => {
                     if table.is_none() && !para.trim().is_empty() {
                         b.paragraph(para.trim(), if in_title { 18.0 } else { 11.0 });
@@ -186,10 +249,90 @@ fn attr_flag(e: &BytesStart, name: &[u8]) -> bool {
         .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Read an unprefixed attribute of `e` as an owned string (e.g. relationship
+/// `Id`/`Target`, blip `embed`).
+fn attr_str(e: &BytesStart, name: &[u8]) -> Option<String> {
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.local_name().as_ref() == name)
+        .and_then(|a| a.unescape_value().ok())
+        .map(|v| v.into_owned())
+}
+
+/// Load every `ppt/media/*` archive entry into a path → bytes map.
+fn load_media<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> HashMap<String, Vec<u8>> {
+    let names: Vec<String> = (0..zip.len())
+        .filter_map(|i| {
+            let n = zip.by_index(i).ok()?.name().to_string();
+            n.starts_with("ppt/media/").then_some(n)
+        })
+        .collect();
+    let mut map = HashMap::new();
+    for n in names {
+        if let Ok(mut f) = zip.by_name(&n) {
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_ok() {
+                map.insert(n, buf);
+            }
+        }
+    }
+    map
+}
+
+/// The rels path for a slide: `ppt/slides/slide1.xml` → `ppt/slides/_rels/slide1.xml.rels`.
+fn slide_rels_path(slide_name: &str) -> Option<String> {
+    let (dir, file) = slide_name.rsplit_once('/')?;
+    Some(format!("{dir}/_rels/{file}.rels"))
+}
+
+/// Parse a `.rels` document into rId → resolved-media-path. Targets are resolved
+/// relative to the slide's directory (e.g. `../media/image1.jpeg` from
+/// `ppt/slides/…` → `ppt/media/image1.jpeg`).
+fn parse_rels(xml: &str, slide_name: &str) -> HashMap<String, String> {
+    let base_dir = slide_name.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let mut map = HashMap::new();
+    let mut r = Reader::from_str(xml);
+    loop {
+        match r.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e))
+                if e.local_name().as_ref() == b"Relationship" =>
+            {
+                if let (Some(id), Some(target)) = (attr_str(&e, b"Id"), attr_str(&e, b"Target")) {
+                    if let Some(path) = resolve_target(base_dir, &target) {
+                        map.insert(id, path);
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    map
+}
+
+/// Resolve a relationship `Target` against the referencing part's directory,
+/// collapsing `.`/`..`. An absolute target (`/ppt/…`) is taken as package-root.
+fn resolve_target(base_dir: &str, target: &str) -> Option<String> {
+    if let Some(abs) = target.strip_prefix('/') {
+        return Some(abs.to_string());
+    }
+    let mut parts: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in target.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_bytes;
-    use docparse_core::ir::Element;
+    use super::{parse_bytes, resolve_target};
+    use docparse_core::ir::{Element, ImageKind};
     use std::io::Write;
 
     fn pptx_with(slides: &[&str]) -> Vec<u8> {
@@ -201,6 +344,68 @@ mod tests {
             zw.write_all(s.as_bytes()).unwrap();
         }
         zw.finish().unwrap().into_inner()
+    }
+
+    /// Build a PPTX zip from arbitrary (path, bytes) entries.
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::SimpleFileOptions = Default::default();
+        for (name, data) in entries {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn rels_target_resolves_relative_to_slide_dir() {
+        assert_eq!(
+            resolve_target("ppt/slides", "../media/image1.png").as_deref(),
+            Some("ppt/media/image1.png")
+        );
+        assert_eq!(
+            resolve_target("ppt/slides", "/ppt/media/x.jpeg").as_deref(),
+            Some("ppt/media/x.jpeg")
+        );
+    }
+
+    #[test]
+    fn slide_picture_becomes_image_element() {
+        let png = vec![137u8, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]; // PNG sig + payload
+        let slide = r#"<p:sld xmlns:a="a" xmlns:p="p" xmlns:r="r"><p:pic>
+            <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm></p:spPr>
+            <p:blipFill><a:blip r:embed="rId2"/></p:blipFill></p:pic></p:sld>"#;
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#;
+        let buf = zip_bytes(&[
+            ("ppt/slides/slide1.xml", slide.as_bytes()),
+            ("ppt/slides/_rels/slide1.xml.rels", rels.as_bytes()),
+            ("ppt/media/image1.png", &png),
+        ]);
+        let doc = parse_bytes(&buf).unwrap();
+        let img = doc
+            .pages
+            .iter()
+            .flat_map(|p| &p.elements)
+            .find_map(|e| match e {
+                Element::Image(i) => Some(i),
+                _ => None,
+            })
+            .expect("an image element from the slide picture");
+        assert_eq!(img.kind, ImageKind::Encoded);
+        assert_eq!(img.data, png);
+        assert_eq!(img.data_media_type.as_deref(), Some("image/png"));
+        // 1in × 0.5in (EMU) → 72pt × 36pt.
+        assert!(
+            (img.bbox.width() - 72.0).abs() < 1.0,
+            "w={}",
+            img.bbox.width()
+        );
+        assert!(
+            (img.bbox.height() - 36.0).abs() < 1.0,
+            "h={}",
+            img.bbox.height()
+        );
     }
 
     #[test]

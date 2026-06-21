@@ -50,7 +50,7 @@
 
 - **坐标系**：PDF 用户空间——原点左下、y 向上、单位 pt。无真实坐标的格式（DOCX/HTML/MD…）用合成布局折算到同一约定。
 - **引用**：`page` + `bbox` 可直接回指原文位置；`heading_path` 给检索块层级语境；`section_id` 把块挂回结构树（parent-document / auto-merging 检索）。`heading_path` 由真实标题层级（tagged H1–H6 / 字号档位）建树后导出，非字号近似。
-- **图片块**（`kind=image`，PDF + DOCX 的整版图）：`text` = 图说 ⊕ 周边上下文（可检索字段），`image` 载荷给渲染/引用。图说就近绑定文档内 "Figure N" 行（零模型）；`--vlm-describe` 升级为神经描述。要拿到 `image.file`/`data_base64` 需加 `--image-dir`/`--image-embed`。
+- **图片块**（`kind=image`，PDF + DOCX + PPTX 的整版图）：`text` = 图说 ⊕ 周边上下文（可检索字段），`image` 载荷给渲染/引用。图说就近绑定文档内 "Figure N" 行（零模型）；`--vlm-describe` 升级为神经描述。要拿到 `image.file`/`data_base64` 需加 `--image-dir`/`--image-embed`。
 - json 格式里被模型替换的元素带 `source`（如 `table:unirec-0.1b`、`formula:unirec-0.1b`、`vlm:<model>`、`layout:<model>`）——溯源可见，确定性结果仍独立成立。
 
 ## 3. MCP 工具（`docparse mcp`）

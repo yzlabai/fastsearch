@@ -49,7 +49,7 @@ output formats are shared by every backend.
 | `--vlm-model NAME` | Vision model name as the service knows it. | Required by `--vlm-*`. |
 | `--vlm-api-key TOKEN` | Bearer token, if the service requires one. | Optional. |
 | `--image-embed` | Embed image payloads as base64 in JSON (`data_base64` + `data_media_type`). | Decodes embedded images ≥16 px a side. |
-| `--image-dir DIR` | Export embedded images to `DIR` (PDF rasters ≥16 px as JPEG/PNG; DOCX media verbatim). JSON/chunks gain a `file` path, Markdown references them, and `-f chunks` emits page-covering figures as `image` chunks (caption + context). | **PDF + DOCX.** |
+| `--image-dir DIR` | Export embedded images to `DIR` (PDF rasters ≥16 px as JPEG/PNG; DOCX/PPTX media verbatim). JSON/chunks gain a `file` path, Markdown references them, and `-f chunks` emits page-covering figures as `image` chunks (caption + context). | **PDF + DOCX + PPTX.** |
 
 > PDF-only enhancers are silently skipped for non-PDF inputs.
 
