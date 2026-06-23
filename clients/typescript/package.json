@@ -3,6 +3,27 @@
   "version": "0.1.0",
   "description": "Thin TypeScript client for the docparse pure-Rust document parser (subprocess CLI or REST), with LangChain.js and Vercel AI SDK adapters",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/yzlabai/docparse-rs/tree/main/clients/typescript",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yzlabai/docparse-rs.git",
+    "directory": "clients/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/yzlabai/docparse-rs/issues"
+  },
+  "keywords": [
+    "docparse",
+    "pdf",
+    "document-parsing",
+    "rag",
+    "chunking",
+    "ocr",
+    "langchain",
+    "llamaindex",
+    "markdown",
+    "ai"
+  ],
   "type": "module",
   "engines": {
     "node": ">=18"
@@ -27,7 +48,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test \"test/*.test.js\""
+    "test": "npm run build && node --test \"test/*.test.js\"",
+    "prepublishOnly": "npm run build"
   },
   "comment:dependencies": "Deliberately ZERO runtime dependencies. The subprocess client wraps the docparse binary; the HTTP client uses global fetch/FormData (Node >=18). Framework hosts are optional peers, imported lazily.",
   "peerDependencies": {

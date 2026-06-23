@@ -205,4 +205,21 @@ curl -LsSf https://github.com/yzlabai/docparse-rs/releases/latest/download/docpa
 ---
 
 ## 实施记录
-（动手后回写：preflight 核名结果、各渠道首发版本与遇到的坑、CI 是否绿、最终验收 T1–T7 结果。）
+
+### 2026-06-23 · npm 首发 ✅ `docparse-client@0.1.0`
+- **Preflight**：`docparse-client` 在 npm 未被占（404）→ 用 unscoped 名。
+- **Prep（已落地）**：[clients/typescript/package.json](../../clients/typescript/package.json) 补 `repository`/`homepage`/`bugs`/`keywords` + `prepublishOnly: npm run build`。`node_modules`/`dist` 本就未被 git 跟踪（已有 [clients/typescript/.gitignore](../../clients/typescript/.gitignore)），原计划 §3.4 的"node_modules 出库"一项**实为多余，已勾销**。
+- **验收（T5）**：`npm test`（指 `DOCPARSE_BIN=../../target/release/docparse`）3/3 绿；`npm publish --dry-run` 包内 **10 文件 6.5kB**，仅 `dist/`+README+package.json（无 src/node_modules/test）。
+- **坑**：
+  1. 本机 npm registry 默认指向 `registry.npmmirror.com`（只读镜像）→ 发布须 `--registry https://registry.npmjs.org`（未改用户全局默认，仅本次覆盖）。
+  2. `prepublishOnly` 起初设为 `build && test`，但 E2E test 依赖外部 `docparse` 二进制，发布环境无二进制会 ENOENT 阻塞发布 → 改为仅 `build`（tsc 兼有类型检查）；E2E 套件单独跑。
+  3. 账号开了 2FA，`npm publish` 非交互未弹 OTP → 由用户 `npm publish ... --otp=<TOTP>` 完成。
+- **已上线**：`npm view docparse-client --registry https://registry.npmjs.org` → 0.1.0，deps none，keywords/repo 正确。`npm install docparse-client` 全网可用。
+- README TS 片段同步：加 `npm install docparse-client`，并修正一处语法 bug（`new DocparseClient.chunks()` → `new DocparseClient().chunks()`）。
+
+### 待续
+- PyPI `docparse-client`（§3.3，纯 client，尚未发——README 暂不写 `pip install docparse-client`）。
+- GitHub Release 二进制（§1，打 `v0.1.0` tag；client 用户仍需二进制在 PATH）。
+- crates.io（§2/§3.2.1，需先补 17 crate 元数据 + PPV2 护栏）。
+- MCP registry（§3.5，后续批）。
+- CI 自动化 + capabilities/status 安装矩阵。

@@ -115,9 +115,9 @@ docs = DocparseLoader("paper.pdf").load   # one Document per chunk, page + bbox 
 ```
 
 ```ts
-// TypeScript / Node (clients/typescript — zero-dependency, LangChain.js + Vercel AI SDK adapters)
+// TypeScript / Node — `npm install docparse-client` (zero-dependency, LangChain.js + Vercel AI SDK adapters)
 import { DocparseClient } from 'docparse-client';
-const chunks = await new DocparseClient.chunks('paper.pdf');   // text + page + bbox + breadcrumb
+const chunks = await new DocparseClient().chunks('paper.pdf');   // text + page + bbox + breadcrumb
 ```
 
 **Agent Skill** — a [SKILL.md](skills/docparse-document-intelligence/SKILL.md) bundle that teaches a coding agent (Claude Code / Cursor) to drive the `docparse` CLI: format selection, OCR/table/formula decision matrix, and a parse → self-check (`--quality`/`--profile`) → refine loop. Symlink it where the agent looks for skills:
