@@ -112,3 +112,6 @@ targets = [
 install-path = "CARGO_HOME"
 install-updater = false
 pr-run-mode = "plan"
+# Bundle the English README + Apache NOTICE in every archive. Without this,
+# auto-includes picked up README.zh.md (Chinese) and dropped README.md.
+include = ["README.md", "NOTICE"]
