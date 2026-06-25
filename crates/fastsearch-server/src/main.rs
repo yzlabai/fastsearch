@@ -7,6 +7,9 @@
 //!   （tenant 留空=管理员/无租户限制）。未设则建一个 dev key `dev`（无租户限制）。
 //! - `FASTSEARCH_RATE_LIMIT`：`capacity,refill_per_sec`（每 key 令牌桶）；未设=不限流。
 //! - `FASTSEARCH_AUDIT`：设为 `1`/`stderr` 则每个成功请求向 stderr 输出一行审计 JSON。
+//! - `FASTSEARCH_EMBEDDER` = `hash`|`ollama`|`openai`（+ `FASTSEARCH_EMBED_*`）：真语义嵌入后端。
+//! - `FASTSEARCH_CDC=1`（+ `DATABASE_URL`，可选 `FASTSEARCH_CDC_SLOT`/`_PUBLICATION`/`_INTERVAL_MS`）：
+//!   起后台 CDC 同步循环（崩溃安全、落盘续传），从 PG 真源把变更同步到派生索引。
 
 use fastsearch_engine::Engine;
 use fastsearch_server::{router, AuditSink, Principal, ServerState};
@@ -73,8 +76,17 @@ async fn main() -> anyhow::Result<()> {
         tokenizer,
         ..Default::default()
     };
-    std::fs::create_dir_all(data.join("text"))?;
-    let engine = Engine::open_or_create(&data.join("text"), cfg)?;
+    // 打开数据目录下的派生索引（落盘恢复）：text + vector.bin + checkpoint.json。
+    let (mut engine, start_lsn) = Engine::open(&data, cfg)?;
+
+    // 嵌入后端配置（FASTSEARCH_EMBEDDER=ollama|openai；默认 hash→不嵌入）。
+    let ecfg = fastsearch_embed::EmbedderConfig::from_env();
+    let embed_on = matches!(ecfg.kind, fastsearch_embed::EmbedderKind::Http(_));
+    if embed_on {
+        // CDC 落地路径用引擎自身的 embedder 嵌入 passage。
+        engine.set_embedder(fastsearch_embed::build_embedder(&ecfg));
+    }
+
     let mut state = ServerState::new(engine, keys);
 
     // 限流：FASTSEARCH_RATE_LIMIT="capacity,refill_per_sec"
@@ -99,9 +111,8 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_audit(sink);
         eprintln!("audit log on (stderr JSON)");
     }
-    // 嵌入后端：FASTSEARCH_EMBEDDER=ollama|openai 时开启真语义混合（默认 hash→不嵌入，纯全文）。
-    let ecfg = fastsearch_embed::EmbedderConfig::from_env();
-    if matches!(ecfg.kind, fastsearch_embed::EmbedderKind::Http(_)) {
+    // query 侧嵌入（与 CDC sink 的 engine.embedder 同配置、独立实例）。
+    if embed_on {
         state = state.with_embedder(std::sync::Arc::from(fastsearch_embed::build_embedder(
             &ecfg,
         )));
@@ -110,6 +121,38 @@ async fn main() -> anyhow::Result<()> {
             ecfg.kind, ecfg.url, ecfg.model, ecfg.dim
         );
     }
+
+    // 后台 CDC 同步循环：FASTSEARCH_CDC=1 + DATABASE_URL（+ 可选 SLOT/PUBLICATION/INTERVAL_MS）。
+    if matches!(std::env::var("FASTSEARCH_CDC").as_deref(), Ok("1")) {
+        match std::env::var("DATABASE_URL") {
+            Ok(url) => {
+                let rcfg = fastsearch_sync::replication::ReplicationConfig {
+                    url,
+                    slot: std::env::var("FASTSEARCH_CDC_SLOT")
+                        .unwrap_or_else(|_| "fastsearch_slot".into()),
+                    publication: std::env::var("FASTSEARCH_CDC_PUBLICATION")
+                        .unwrap_or_else(|_| "fastsearch_pub".into()),
+                };
+                let interval_ms: u64 = std::env::var("FASTSEARCH_CDC_INTERVAL_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+                fastsearch_sync::replication::ensure_slot(&rcfg).await?;
+                eprintln!(
+                    "cdc on: slot={} publication={} interval={interval_ms}ms (resume lsn={start_lsn:?})",
+                    rcfg.slot, rcfg.publication
+                );
+                state.spawn_cdc(
+                    rcfg,
+                    data.clone(),
+                    start_lsn,
+                    std::time::Duration::from_millis(interval_ms),
+                );
+            }
+            Err(_) => eprintln!("FASTSEARCH_CDC=1 但未设 DATABASE_URL，跳过 CDC"),
+        }
+    }
+
     let app = router(state);
 
     let addr = format!("127.0.0.1:{port}");
