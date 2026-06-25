@@ -6,7 +6,8 @@
 //!
 //! 三种检索模式全可用：keyword / vector / **hybrid（keyword∥vector → core::fuse 融合）**。
 //! 过滤与 ACL 在两路各自做真预过滤（不可绕过）；分面（kind/doc_id）、高亮、**rerank**
-//! （req.rerank 时宽召回后重排）、**auto-merging**（req.auto_merge 时同 section 归并）均已接入。
+//! （req.rerank 时宽召回后重排）、**auto-merging**（req.auto_merge 同 section 归并）、
+//! **分组折叠**（req.collapse 每 doc/section 限 N 条）均已接入。
 
 use fastsearch_core::{
     fuse, AclFilter, Chunk, ChunkKind, Citation, GlobalId, Scored, SearchMode, SearchRequest,
@@ -299,6 +300,10 @@ impl Engine {
                     .then_with(|| a.id.cmp(&b.id))
             });
         }
+        // 分组折叠：按最终排名，每组（doc_id/section_id）至多保留 max_per_group 条。
+        if let Some(c) = &req.collapse {
+            hits = collapse_groups(hits, &c.field, c.max_per_group);
+        }
         hits.truncate(req.top_k);
         Ok((hits, facets))
     }
@@ -358,6 +363,28 @@ fn auto_merge(hits: Vec<SearchHit>) -> Vec<SearchHit> {
                 rep.insert(key, out.len());
                 out.push(h);
             }
+        }
+    }
+    out
+}
+
+/// 按最终排名折叠分组：每个分组键至多保留 `max_per_group` 条（高分者优先）。
+/// `field` 支持 `doc_id` / `section_id`；其他值视为不折叠（原样返回）。保序、确定性。
+fn collapse_groups(hits: Vec<SearchHit>, field: &str, max_per_group: usize) -> Vec<SearchHit> {
+    if field != "doc_id" && field != "section_id" {
+        return hits; // 未知折叠字段：不折叠
+    }
+    let mut out: Vec<SearchHit> = Vec::with_capacity(hits.len());
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for h in hits {
+        let key = match field {
+            "doc_id" => h.id.doc_id.clone(),
+            _ => h.citation.section_id.to_string(),
+        };
+        let n = counts.entry(key).or_insert(0);
+        if *n < max_per_group {
+            *n += 1;
+            out.push(h);
         }
     }
     out
@@ -520,6 +547,45 @@ mod tests {
                 assert!(h.merged_chunk_ids.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn collapse_caps_hits_per_doc() {
+        let mut e = engine();
+        // 3 条 a.pdf + 2 条 b.pdf，都含 "data"
+        for id in 1..=3 {
+            e.ingest(
+                "kb",
+                &chunk("a.pdf", id, ChunkKind::Paragraph, "data here", 1),
+            )
+            .unwrap();
+        }
+        for id in 1..=2 {
+            e.ingest(
+                "kb",
+                &chunk("b.pdf", id, ChunkKind::Paragraph, "data here", 1),
+            )
+            .unwrap();
+        }
+        e.commit().unwrap();
+        // 不折叠：5 条
+        assert_eq!(e.search(&req("data"), None).unwrap().len(), 5);
+        // 折叠 doc_id，每组最多 1 → 2 条（a.pdf 1 + b.pdf 1）
+        let mut r = req("data");
+        r.collapse = Some(fastsearch_core::Collapse {
+            field: "doc_id".into(),
+            max_per_group: 1,
+        });
+        let hits = e.search(&r, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        let docs: std::collections::HashSet<_> = hits.iter().map(|h| h.id.doc_id.clone()).collect();
+        assert_eq!(docs.len(), 2);
+        // 每组最多 2 → 4 条
+        r.collapse = Some(fastsearch_core::Collapse {
+            field: "doc_id".into(),
+            max_per_group: 2,
+        });
+        assert_eq!(e.search(&r, None).unwrap().len(), 4);
     }
 
     #[test]

@@ -14,4 +14,4 @@ pub use error::{CoreError, Result};
 pub use filter::{AclFilter, FieldSource, FieldValue, Filter};
 pub use fusion::{fuse, Fusion, Scored};
 pub use model::{BBox, Chunk, ChunkKind, Citation, GlobalId, ImageMeta};
-pub use query::{RerankSpec, SearchMode, SearchRequest};
+pub use query::{Collapse, RerankSpec, SearchMode, SearchRequest};

@@ -27,6 +27,19 @@ fn default_rerank_top_k() -> usize {
     20
 }
 
+/// 分组折叠：每个分组键最多保留 `max_per_group` 条（按最终排名取高分者），
+/// 防单文档/单段刷屏。`field` 当前支持 `doc_id` / `section_id`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Collapse {
+    pub field: String,
+    #[serde(default = "default_collapse_max")]
+    pub max_per_group: usize,
+}
+
+fn default_collapse_max() -> usize {
+    1
+}
+
 /// 结构化检索请求。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchRequest {
@@ -50,6 +63,9 @@ pub struct SearchRequest {
     pub rerank: Option<RerankSpec>,
     #[serde(default)]
     pub auto_merge: bool,
+    /// 分组折叠（None=不折叠）。
+    #[serde(default)]
+    pub collapse: Option<Collapse>,
     #[serde(default)]
     pub highlight: bool,
     /// 请求分面的字段（当前支持 `kind` / `doc_id`）。
@@ -79,6 +95,7 @@ impl Default for SearchRequest {
             top_k: default_top_k(),
             rerank: None,
             auto_merge: false,
+            collapse: None,
             highlight: false,
             facets: Vec::new(),
             explain: false,
@@ -116,6 +133,13 @@ impl SearchRequest {
         if let Some(r) = &self.rerank {
             if r.top_k == 0 {
                 return Err(CoreError::InvalidRequest("rerank.top_k must be > 0".into()));
+            }
+        }
+        if let Some(c) = &self.collapse {
+            if c.max_per_group == 0 {
+                return Err(CoreError::InvalidRequest(
+                    "collapse.max_per_group must be > 0".into(),
+                ));
             }
         }
         Ok(())
