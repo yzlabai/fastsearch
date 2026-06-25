@@ -78,12 +78,15 @@ pub const COLUMNS: &[&str] = &[
     "acl",
 ];
 
-/// 参数化 INSERT；jsonb 列用文本占位 + `::jsonb` 转换（免依赖 serde_json ToSql 特性）。
+/// 参数化 INSERT；jsonb 列以文本传参 + `::text::jsonb` 转换（免依赖 serde_json 的
+/// tokio-postgres ToSql 特性）。**必须先 `::text` 再 `::jsonb`**：否则 PG 会把参数类型
+/// 推断为 jsonb，tokio-postgres 拒收 String（WrongType）；`$7::text` 强制参数推断为 text，
+/// 运行时再 text→jsonb。
 pub fn insert_sql(table: &str) -> String {
     format!(
         "INSERT INTO {table} \
          (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, image_meta, tenant, acl) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13)"
+         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11::text::jsonb, $12, $13)"
     )
 }
 
@@ -222,8 +225,8 @@ mod tests {
     fn insert_and_delete_sql_shape() {
         let ins = insert_sql("t");
         assert!(ins.contains("$13"));
-        assert!(ins.contains("$7::jsonb")); // bbox
-        assert!(ins.contains("$11::jsonb")); // image_meta
+        assert!(ins.contains("$7::text::jsonb")); // bbox（先 ::text 再 ::jsonb，见 insert_sql 注释）
+        assert!(ins.contains("$11::text::jsonb")); // image_meta
         assert!(!ins.contains("$14")); // exactly 13 params
         let del = delete_doc_sql("t");
         assert_eq!(del, "DELETE FROM t WHERE collection = $1 AND doc_id = $2");
