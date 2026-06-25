@@ -41,18 +41,25 @@ async fn connect(url: &str) -> Result<Client> {
     Ok(client)
 }
 
-/// 幂等创建 pgoutput 逻辑复制 slot（已存在则跳过）。
-pub async fn ensure_slot(cfg: &ReplicationConfig) -> Result<()> {
+/// 幂等创建 pgoutput 逻辑复制 slot。**新建**时返回 `Some(consistent_point)`（一致点 LSN，
+/// 初始快照与增量的衔接点）；**已存在**返回 `None`。WHERE 假时函数不求值（不建 slot）。
+pub async fn ensure_slot(cfg: &ReplicationConfig) -> Result<Option<Lsn>> {
     let client = connect(&cfg.url).await?;
-    client
-        .execute(
-            "SELECT pg_create_logical_replication_slot($1, 'pgoutput') \
+    let rows = client
+        .query(
+            "SELECT (pg_create_logical_replication_slot($1, 'pgoutput')).lsn::text AS lsn \
              WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
             &[&cfg.slot],
         )
         .await
         .context("create logical replication slot")?;
-    Ok(())
+    match rows.first() {
+        Some(r) => {
+            let lsn_text: String = r.get(0);
+            Ok(Some(Lsn(parse_pg_lsn(&lsn_text)?)))
+        }
+        None => Ok(None),
+    }
 }
 
 /// 删除 slot（测试清理用；不存在则忽略）。

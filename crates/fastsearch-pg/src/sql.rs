@@ -104,6 +104,15 @@ pub fn fetch_doc_sql(table: &str) -> String {
     )
 }
 
+/// 全表读取（初始快照 bootstrap 用），按 (collection, doc_id, chunk_id) 升序、确定性。
+pub fn fetch_all_sql(table: &str) -> String {
+    format!(
+        "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
+         section_id, char_len, image_meta::text, tenant, acl \
+         FROM {table} ORDER BY collection, doc_id, chunk_id"
+    )
+}
+
 fn kind_to_str(k: ChunkKind) -> String {
     // 复用 core 的 serde（snake_case）：序列化成裸字符串。
     match serde_json::to_value(k) {

@@ -210,21 +210,43 @@ impl Engine {
         Ok(())
     }
 
+    /// **初始快照 bootstrap**：把已有 PG 行（`(collection, chunk)`）逐条 `apply_upsert`
+    /// （经 embedder 嵌入 passage → 写向量索引），再 `persist(data_dir, lsn)`。`lsn` 传 slot
+    /// 一致点 → 之后从该 LSN 起增量；幂等保证重叠窗口不产生重复（见
+    /// [计划](../../docs/plans/2026-06-25-初始快照-bootstrap.md)）。返回导入条数。
+    pub fn bootstrap_snapshot(
+        &mut self,
+        rows: &[(String, Chunk)],
+        data_dir: &Path,
+        lsn: Lsn,
+    ) -> Result<usize> {
+        use fastsearch_sync::IndexSink;
+        for (collection, chunk) in rows {
+            self.apply_upsert(collection, chunk)
+                .map_err(|e| EngineError::Cdc(format!("bootstrap apply: {e}")))?;
+        }
+        self.persist(data_dir, lsn)?;
+        Ok(rows.len())
+    }
+
     /// **崩溃安全地**消费一批 CDC 变更并落地（生产 CDC 主循环的一拍）：
-    /// `peek`（不推进 slot）→ 幂等应用（`apply_upsert` 含嵌入）→ `persist`（索引+检查点
-    /// 落盘）→ **落盘成功后才** `advance_slot`。任意环节崩溃都不丢/不重（见
-    /// [计划](../../docs/plans/2026-06-25-派生索引持久化与崩溃安全.md)）。返回应用条数。
+    /// `peek`（不推进 slot）→ 幂等应用全部（`apply_upsert` 含嵌入）→ `persist`（索引 +
+    /// 检查点=slot 高水位）→ **落盘成功后才** `advance_slot`。返回应用条数。
+    ///
+    /// **不靠 LSN 水位跳过**：`pg_logical_slot_peek` 的逐行 lsn 对一个事务的 Begin/Insert
+    /// 报的是事务起点（首事务等于 slot 一致点），用它做水位会误跳首批。正确性靠：① slot
+    /// 在 `advance` 前不重投；② 应用按 `GlobalId` upsert/delete **幂等**——崩溃重投同结果。
+    /// 故每拍用 `Applier::new(Lsn(0))` 应用全部 peek 到的变更。
     pub async fn consume_once(
         &mut self,
         cfg: &ReplicationConfig,
-        applier: &mut Applier,
         data_dir: &Path,
     ) -> Result<usize> {
         let (events, slot_lsn) = peek_with_lsn(cfg)
             .await
             .map_err(|e| EngineError::Cdc(format!("peek: {e}")))?;
         if events.is_empty() {
-            // 可能有非数据消息推进了 WAL：仍把 slot 推到已查看的最高位，避免空转重读。
+            // 仅非数据消息推进了 WAL：把 slot 推到已查看最高位，避免空转重读。
             if slot_lsn > Lsn(0) {
                 advance_slot(cfg, slot_lsn)
                     .await
@@ -232,12 +254,12 @@ impl Engine {
             }
             return Ok(0);
         }
+        let mut applier = Applier::new(Lsn(0)); // 不跳过：应用全部（见上）
         let applied = applier
             .apply_batch(self, &events)
             .map_err(|e| EngineError::Cdc(format!("apply: {e}")))?;
-        // 先落盘（索引 + 检查点=数据水位，供幂等续传），后推进 slot —— 崩溃安全铁律。
-        // slot 推进到**最高行 LSN**（含 Commit），否则下次 peek 会重复返回该事务。
-        self.persist(data_dir, applier.applied_lsn())?;
+        // 先落盘（索引 + 检查点=slot 高水位，含 Commit），后推进 slot —— 崩溃安全铁律。
+        self.persist(data_dir, slot_lsn)?;
         advance_slot(cfg, slot_lsn)
             .await
             .map_err(|e| EngineError::Cdc(format!("advance: {e}")))?;

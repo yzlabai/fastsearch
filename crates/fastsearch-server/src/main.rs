@@ -87,6 +87,57 @@ async fn main() -> anyhow::Result<()> {
         engine.set_embedder(fastsearch_embed::build_embedder(&ecfg));
     }
 
+    // CDC 设置（在建 state 前——bootstrap 需 &mut engine）。slot 位置由 PG 服务端持久，
+    // 故只需 (rcfg, interval)。返回 None 表示不开 CDC。
+    let cdc: Option<(
+        fastsearch_sync::replication::ReplicationConfig,
+        std::time::Duration,
+    )> = if matches!(std::env::var("FASTSEARCH_CDC").as_deref(), Ok("1")) {
+        match std::env::var("DATABASE_URL") {
+            Ok(url) => {
+                let rcfg = fastsearch_sync::replication::ReplicationConfig {
+                    url: url.clone(),
+                    slot: std::env::var("FASTSEARCH_CDC_SLOT")
+                        .unwrap_or_else(|_| "fastsearch_slot".into()),
+                    publication: std::env::var("FASTSEARCH_CDC_PUBLICATION")
+                        .unwrap_or_else(|_| "fastsearch_pub".into()),
+                };
+                let interval_ms: u64 = std::env::var("FASTSEARCH_CDC_INTERVAL_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+                let created = fastsearch_sync::replication::ensure_slot(&rcfg).await?;
+                // 首启（引擎无检查点）+ 新建 slot → 初始快照导入存量（从一致点）。
+                if start_lsn == fastsearch_sync::Lsn(0) {
+                    match created {
+                        Some(consistent) => {
+                            let store =
+                                fastsearch_pg::PgStore::connect(fastsearch_pg::PgConfig::new(url))
+                                    .await?;
+                            let rows = store.fetch_all_chunks().await?;
+                            if !rows.is_empty() {
+                                let n = engine.bootstrap_snapshot(&rows, &data, consistent)?;
+                                eprintln!(
+                                    "cdc bootstrap: imported {n} existing row(s) at {consistent:?}"
+                                );
+                            }
+                        }
+                        None => eprintln!(
+                            "warning: slot 已存在但引擎无检查点，跳过快照、从 slot 现位增量"
+                        ),
+                    }
+                }
+                Some((rcfg, std::time::Duration::from_millis(interval_ms)))
+            }
+            Err(_) => {
+                eprintln!("FASTSEARCH_CDC=1 但未设 DATABASE_URL，跳过 CDC");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut state = ServerState::new(engine, keys);
 
     // 限流：FASTSEARCH_RATE_LIMIT="capacity,refill_per_sec"
@@ -122,35 +173,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 后台 CDC 同步循环：FASTSEARCH_CDC=1 + DATABASE_URL（+ 可选 SLOT/PUBLICATION/INTERVAL_MS）。
-    if matches!(std::env::var("FASTSEARCH_CDC").as_deref(), Ok("1")) {
-        match std::env::var("DATABASE_URL") {
-            Ok(url) => {
-                let rcfg = fastsearch_sync::replication::ReplicationConfig {
-                    url,
-                    slot: std::env::var("FASTSEARCH_CDC_SLOT")
-                        .unwrap_or_else(|_| "fastsearch_slot".into()),
-                    publication: std::env::var("FASTSEARCH_CDC_PUBLICATION")
-                        .unwrap_or_else(|_| "fastsearch_pub".into()),
-                };
-                let interval_ms: u64 = std::env::var("FASTSEARCH_CDC_INTERVAL_MS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1000);
-                fastsearch_sync::replication::ensure_slot(&rcfg).await?;
-                eprintln!(
-                    "cdc on: slot={} publication={} interval={interval_ms}ms (resume lsn={start_lsn:?})",
-                    rcfg.slot, rcfg.publication
-                );
-                state.spawn_cdc(
-                    rcfg,
-                    data.clone(),
-                    start_lsn,
-                    std::time::Duration::from_millis(interval_ms),
-                );
-            }
-            Err(_) => eprintln!("FASTSEARCH_CDC=1 但未设 DATABASE_URL，跳过 CDC"),
-        }
+    // 启动后台 CDC 同步循环（若已配置）。
+    if let Some((rcfg, interval)) = cdc {
+        eprintln!(
+            "cdc on: slot={} publication={} interval={:?}",
+            rcfg.slot, rcfg.publication, interval
+        );
+        state.spawn_cdc(rcfg, data.clone(), interval);
     }
 
     let app = router(state);

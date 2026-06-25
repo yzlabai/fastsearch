@@ -21,6 +21,7 @@ fastsearch-engine.workspace = true
 fastsearch-text.workspace = true
 fastsearch-embed = { path = "../fastsearch-embed" }
 fastsearch-sync = { path = "../fastsearch-sync" }
+fastsearch-pg = { path = "../fastsearch-pg" }
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true

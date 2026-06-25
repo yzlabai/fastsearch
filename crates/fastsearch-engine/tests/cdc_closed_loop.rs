@@ -182,20 +182,16 @@ async fn cdc_consume_persist_crashsafe() {
     let cfg = TextIndexConfig::default();
     // Hash 嵌入：离线、确定性（不需 Ollama），8 维。
     let hash_cfg = fastsearch_embed::EmbedderConfig::hash(8);
-    let persisted_lsn;
     {
         let (mut e, lsn0) = Engine::open(data.path(), cfg).expect("open");
         assert_eq!(lsn0, Lsn(0)); // 首启无检查点
         e.set_embedder(fastsearch_embed::build_embedder(&hash_cfg));
-        let mut applier = Applier::new(lsn0);
         let n = e
-            .consume_once(&rcfg, &mut applier, data.path())
+            .consume_once(&rcfg, data.path())
             .await
             .expect("consume_once");
         assert_eq!(n, 2);
-        persisted_lsn = applier.applied_lsn();
-        assert!(persisted_lsn > Lsn(0));
-    } // drop engine（模拟重启）
+    } // drop engine（释放 Tantivy 写锁，模拟重启）
 
     // slot 已推进：再 peek 应为空（不重发已确认的变更）。
     let again = fastsearch_sync::replication::peek_changes(&rcfg)
@@ -206,9 +202,12 @@ async fn cdc_consume_persist_crashsafe() {
         "advanced slot should yield no changes, got {again:?}"
     );
 
-    // 重开：检查点续传 + 向量在（无需重嵌）。
+    // 重开：检查点续传（applied_lsn=slot 高水位>0）+ 向量在（无需重嵌）。
     let (e2, lsn) = Engine::open(data.path(), TextIndexConfig::default()).expect("reopen");
-    assert_eq!(lsn, persisted_lsn, "applied_lsn 应从 checkpoint 恢复");
+    assert!(
+        lsn > Lsn(0),
+        "applied_lsn 应从 checkpoint 恢复为 slot 高水位"
+    );
     // 向量路：两 chunk 都已嵌入落盘 → vector 检索两条都在。
     let qv = fastsearch_embed::Embedder::embed(
         &*fastsearch_embed::build_embedder(&hash_cfg),
@@ -229,15 +228,118 @@ async fn cdc_consume_persist_crashsafe() {
     assert_eq!(hits.len(), 2, "两 chunk 向量都应已持久化");
     assert!(hits.iter().all(|h| h.vector.is_some()));
 
-    // 幂等：无新变更，consume_once 返回 0（peek 空）。
+    // 幂等：无新变更（slot 已 advance），consume_once 返回 0（peek 空）。
     let mut e3 = e2;
     e3.set_embedder(fastsearch_embed::build_embedder(&hash_cfg));
-    let mut applier2 = Applier::new(lsn);
     let n2 = e3
-        .consume_once(&rcfg, &mut applier2, data.path())
+        .consume_once(&rcfg, data.path())
         .await
         .expect("consume_once again");
     assert_eq!(n2, 0);
+
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
+/// 初始快照 bootstrap + 无缝衔接（env-gated：仅需 PG）：先写**存量**→建 slot 取一致点→
+/// fetch_all→bootstrap_snapshot→检索命中存量；再写增量→consume_once→共可检索（不丢/不重）。
+#[tokio::test]
+async fn cdc_initial_snapshot_bootstrap() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_initial_snapshot_bootstrap: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_bootstrap_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+    };
+    reset(&url, slot).await;
+
+    let mut store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("ensure_schema");
+
+    // **先写存量**（在建 slot 之前）——这正是 bootstrap 要解决的：slot 之前的数据。
+    store
+        .upsert_doc(
+            "kb",
+            "rep.pdf",
+            &[
+                chunk("rep.pdf", 1, "alpha existing"),
+                chunk("rep.pdf", 2, "beta existing"),
+            ],
+        )
+        .await
+        .expect("upsert existing");
+
+    // 建 slot → 取一致点 LSN（新建返回 Some）。
+    let consistent = ensure_slot(&rcfg).await.expect("ensure_slot");
+    assert!(
+        consistent.is_some(),
+        "newly created slot should return consistent lsn"
+    );
+    let consistent = consistent.unwrap();
+    assert!(consistent > Lsn(0));
+    // 再调一次 → None（已存在，幂等）。
+    assert!(ensure_slot(&rcfg).await.expect("ensure_slot2").is_none());
+
+    // 全表读 → bootstrap 进引擎（Hash 嵌入，离线确定性）。
+    let rows = store.fetch_all_chunks().await.expect("fetch_all");
+    assert_eq!(rows.len(), 2);
+    let data = tempfile::tempdir().unwrap();
+    let (mut engine, lsn0) = Engine::open(data.path(), TextIndexConfig::default()).expect("open");
+    assert_eq!(lsn0, Lsn(0));
+    engine.set_embedder(fastsearch_embed::build_embedder(
+        &fastsearch_embed::EmbedderConfig::hash(8),
+    ));
+    let imported = engine
+        .bootstrap_snapshot(&rows, data.path(), consistent)
+        .expect("bootstrap");
+    assert_eq!(imported, 2);
+
+    // 存量可检索（keyword）。
+    let hits = engine
+        .search(
+            &SearchRequest {
+                query: "existing".into(),
+                mode: SearchMode::Keyword,
+                top_k: 5,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("search");
+    assert_eq!(hits.len(), 2, "bootstrap 应导入两条存量");
+
+    // 无缝衔接：bootstrap 后再写增量 → consume_once 拉到 1 条 → 共 3 条。
+    store
+        .upsert_doc(
+            "kb",
+            "more.pdf",
+            &[chunk("more.pdf", 1, "gamma incremental")],
+        )
+        .await
+        .expect("upsert incremental");
+    let n = engine
+        .consume_once(&rcfg, data.path())
+        .await
+        .expect("consume_once");
+    assert_eq!(n, 1, "增量应只看到 bootstrap 之后的 1 条");
+    let all = engine
+        .search(
+            &SearchRequest {
+                query: "existing incremental".into(),
+                mode: SearchMode::Keyword,
+                top_k: 10,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("search all");
+    assert_eq!(all.len(), 3, "存量 2 + 增量 1 = 3，均可检索（不丢/不重）");
 
     drop_slot(&rcfg).await.expect("drop_slot");
 }

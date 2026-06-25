@@ -15,7 +15,6 @@ use fastsearch_core::{AclFilter, Chunk, GlobalId, SearchMode, SearchRequest};
 use fastsearch_embed::{EmbedKind, Embedder};
 use fastsearch_engine::Engine;
 use fastsearch_sync::replication::ReplicationConfig;
-use fastsearch_sync::{Applier, Lsn};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -193,27 +192,22 @@ impl ServerState {
     }
 
     /// 启动**后台 CDC 同步循环**：每 `interval` 拍调一次 `engine.consume_once`
-    /// （peek→应用→落盘→advance，崩溃安全）。`start_lsn` 来自 `Engine::open` 的检查点。
+    /// （peek→应用→落盘→advance，崩溃安全）。slot 位置由 PG 服务端持久，无需传 LSN。
     /// 注意：consume 期间持有引擎锁（与检索串行）——v1 可接受，低延迟化待引擎并发优化。
     /// 嵌入由引擎自身的 embedder 负责（需在建 state 前 `engine.set_embedder`）。
     pub fn spawn_cdc(
         &self,
         cfg: ReplicationConfig,
         data_dir: std::path::PathBuf,
-        start_lsn: Lsn,
         interval: std::time::Duration,
     ) {
         let engine = self.engine.clone();
         tokio::spawn(async move {
-            let mut applier = Applier::new(start_lsn);
             loop {
                 {
                     let mut e = engine.lock().await;
-                    match e.consume_once(&cfg, &mut applier, &data_dir).await {
-                        Ok(n) if n > 0 => eprintln!(
-                            "cdc: applied {n} change(s), lsn={:?}",
-                            applier.applied_lsn()
-                        ),
+                    match e.consume_once(&cfg, &data_dir).await {
+                        Ok(n) if n > 0 => eprintln!("cdc: applied {n} change(s)"),
                         Ok(_) => {}
                         Err(err) => eprintln!("cdc error: {err}"),
                     }

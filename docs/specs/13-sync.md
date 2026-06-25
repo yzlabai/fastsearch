@@ -52,10 +52,11 @@ impl Applier {
 - **提交边界**：apply_batch 末尾调用 `sink.commit()`（成功后才认为 applied_lsn 持久化点推进——持久化由调用方负责）。
 - **健壮**：sink 错误向上传播，不静默吞；applied_lsn 仅在 apply 成功后推进。
 
-## 4. 快照 + 增量（集成层）
+## 4. 快照 + 增量（集成层）—— ✅ 已实现（2026-06-25，Docker 验证）
 
-- `initial_snapshot(pg, sink, collections)`：从 pg 全量读 → sink.apply_upsert → commit；返回 snapshot 起点 LSN（实际 LSN 由复制协议在创建 slot 时给出；MVP 集成测试用 pg_current_wal_lsn 近似）。
-- `stream(pg_repl_conn, applier, sink)`：从 slot 解码 pgoutput → ChangeEvent → applier.apply。**env-gated**。
+- **初始快照 bootstrap**：`ensure_slot -> Option<Lsn>`（新建返回一致点）；`pg::fetch_all_chunks` 全表读；`engine::bootstrap_snapshot(rows, data, consistent)` 逐行 apply_upsert（含嵌入）+ persist；server 首启 + 新建 slot 时自动 bootstrap 存量、再起增量。**正确性=一致点 + 幂等重叠**（不用 EXPORT_SNAPSHOT），详见 [计划](../plans/2026-06-25-初始快照-bootstrap.md)。
+- **增量消费**：`engine::consume_once`（peek→应用全部→persist→advance）。**关键修正**：peek 逐行 lsn 对首事务等于一致点，故 consume_once **不靠 LSN 水位跳过**，靠 slot-advance 不重投 + GlobalId 幂等。
+- 低延迟流式 `START_REPLICATION`（替代 SQL 轮询）仍为后续。
 
 ## 5. 依赖
 

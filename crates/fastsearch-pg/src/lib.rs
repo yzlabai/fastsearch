@@ -107,6 +107,15 @@ impl PgStore {
         let rows = self.client.query(&q, &[&collection, &doc_id]).await?;
         rows.iter().map(row_to_chunk).collect()
     }
+
+    /// 全表读取 `(collection, Chunk)`（初始快照 bootstrap 用）。v1 全量；超大表分页为后续。
+    pub async fn fetch_all_chunks(&self) -> Result<Vec<(String, Chunk)>> {
+        let q = sql::fetch_all_sql(&self.cfg.table);
+        let rows = self.client.query(&q, &[]).await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get::<_, String>("collection")?, row_to_chunk(r)?)))
+            .collect()
+    }
 }
 
 /// tokio_postgres::Row → Chunk（经 ChunkRow）。
