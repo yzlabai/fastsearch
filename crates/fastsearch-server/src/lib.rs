@@ -214,9 +214,108 @@ pub fn router(state: ServerState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ready" }))
         .route("/metrics", get(metrics))
+        .route("/openapi.json", get(openapi))
         .route("/v1/search", post(search))
         .route("/v1/index", post(index))
         .with_state(state)
+}
+
+/// OpenAPI 3.0 契约（手写、随 API 演进维护）。供 SDK 生成 / 文档 / 契约校验（F54）。
+async fn openapi() -> Json<Value> {
+    Json(openapi_spec())
+}
+
+fn openapi_spec() -> Value {
+    let api_key = json!({ "type": "apiKey", "in": "header", "name": "X-API-Key" });
+    let hit = json!({
+        "type": "object",
+        "properties": {
+            "citation_id": {"type": "string", "description": "collection:doc_id:chunk_id"},
+            "score": {"type": "number"},
+            "bm25": {"type": ["number", "null"]},
+            "vector": {"type": ["number", "null"]},
+            "rerank": {"type": ["number", "null"]},
+            "doc_id": {"type": "string"},
+            "chunk_id": {"type": "integer"},
+            "page": {"type": "integer"},
+            "bbox": {"type": "object"},
+            "heading_path": {"type": "array", "items": {"type": "string"}},
+            "section_id": {"type": "integer"},
+            "highlight": {"type": ["string", "null"]},
+            "merged_chunk_ids": {"type": "array", "items": {"type": "integer"}}
+        }
+    });
+    json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "fastsearch REST API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "混合检索引擎 REST 接口。认证：X-API-Key 或 Authorization: Bearer。\
+                ACL 由认证身份服务端注入，客户端不可绕过。"
+        },
+        "components": {
+            "securitySchemes": { "ApiKeyAuth": api_key },
+            "schemas": {
+                "SearchRequest": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["keyword", "vector", "hybrid"], "default": "hybrid"},
+                        "filter": {"type": ["object", "null"], "description": "core::Filter AST"},
+                        "vector": {"type": ["array", "null"], "items": {"type": "number"}},
+                        "candidates": {"type": "integer", "default": 150},
+                        "top_k": {"type": "integer", "default": 20},
+                        "rerank": {"type": ["object", "null"]},
+                        "auto_merge": {"type": "boolean", "default": false},
+                        "collapse": {"type": ["object", "null"], "description": "{field, max_per_group}"},
+                        "highlight": {"type": "boolean", "default": false},
+                        "facets": {"type": "array", "items": {"type": "string"}}
+                    }
+                },
+                "Hit": hit,
+                "IndexRequest": {
+                    "type": "object",
+                    "required": ["collection", "doc_id", "chunks"],
+                    "properties": {
+                        "collection": {"type": "string"},
+                        "doc_id": {"type": "string"},
+                        "chunks": {"type": "array", "items": {"type": "object"}}
+                    }
+                }
+            }
+        },
+        "security": [{ "ApiKeyAuth": [] }],
+        "paths": {
+            "/v1/search": {
+                "post": {
+                    "summary": "混合检索",
+                    "requestBody": {"required": true, "content": {"application/json":
+                        {"schema": {"$ref": "#/components/schemas/SearchRequest"}}}},
+                    "responses": {
+                        "200": {"description": "命中 + 分面", "content": {"application/json": {"schema": {"type": "object",
+                            "properties": {
+                                "hits": {"type": "array", "items": {"$ref": "#/components/schemas/Hit"}},
+                                "facets": {"type": "object"}
+                            }}}}},
+                        "401": {"description": "认证失败"},
+                        "429": {"description": "限流"}
+                    }
+                }
+            },
+            "/v1/index": {
+                "post": {
+                    "summary": "灌入一个 doc 的 chunks（doc 级替换）",
+                    "requestBody": {"required": true, "content": {"application/json":
+                        {"schema": {"$ref": "#/components/schemas/IndexRequest"}}}},
+                    "responses": {"200": {"description": "{indexed: n}"}, "401": {"description": "认证失败"}}
+                }
+            },
+            "/healthz": {"get": {"summary": "存活探针", "security": [], "responses": {"200": {"description": "ok"}}}},
+            "/readyz": {"get": {"summary": "就绪探针", "security": [], "responses": {"200": {"description": "ready"}}}},
+            "/metrics": {"get": {"summary": "Prometheus 指标", "security": [], "responses": {"200": {"description": "text/plain"}}}}
+        }
+    })
 }
 
 async fn metrics(State(s): State<ServerState>) -> String {
@@ -723,6 +822,28 @@ mod tests {
         assert_eq!(evs[0].tenant.as_deref(), Some("acme"));
         assert_eq!(evs[0].hits, Some(1));
         assert_eq!(evs[0].status, 200);
+    }
+
+    #[tokio::test]
+    async fn openapi_served_no_auth() {
+        let app = app_with_data().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["openapi"], "3.0.3");
+        assert!(v["paths"]["/v1/search"]["post"].is_object());
+        assert!(v["paths"]["/v1/index"]["post"].is_object());
+        assert!(v["components"]["schemas"]["SearchRequest"].is_object());
+        // 版本来自 crate 版本，非空
+        assert!(v["info"]["version"].as_str().unwrap().len() >= 3);
     }
 
     #[test]
