@@ -108,3 +108,4 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 **迭代记录：**
 - 2026-06-24 v1（完成）：schema + BM25 + jieba + 过滤 + ACL 强制 + upsert/delete + 确定性。10 测试绿。
 - 2026-06-25：`Ne`/`Not` 索引侧精确补集翻译（`exact_translate`/`complement`），+1 端到端测试（Ne/Not/Not(And)/Not(Exists 退化）。
+- 2026-06-25：**查询能力补全**——短语 `"a b"` 与邻近 `"a b"~N` 经 Tantivy parser 已支持（加回归测试确认）；新增**末词前缀** `term*`（search-as-you-type）：`build_text_query` 识别末词 `*`、用 `RegexQuery` 在 text 字段前缀匹配（前词照常 parse、Should 合并），含引号时不启用。+1 测试（短语/slop/前缀/多词前缀/无匹配）。

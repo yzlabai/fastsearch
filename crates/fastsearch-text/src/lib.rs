@@ -16,7 +16,7 @@ use fastsearch_core::{AclFilter, Chunk, ChunkKind, Citation, Filter, GlobalId};
 use query_build::{acl_query, stored_row, translate};
 use schema::{build_schema, Fields};
 use tantivy::collector::TopDocs;
-use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, RegexQuery, TermQuery};
 use tantivy::schema::{IndexRecordOption, Value};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
@@ -43,6 +43,18 @@ pub struct TextIndex {
     cfg: TextIndexConfig,
     writer: IndexWriter,
     reader: IndexReader,
+}
+
+/// 转义正则元字符（用于把用户前缀安全嵌入 `RegexQuery` 模式）。
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if ".+*?()[]{}^$|\\".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn kind_str(k: ChunkKind) -> &'static str {
@@ -166,6 +178,50 @@ impl TextIndex {
         Ok(())
     }
 
+    /// 构造正文查询：短语 `"a b"`、邻近 `"a b"~N`、布尔走 Tantivy `QueryParser`；
+    /// **末词带 `*` 的前缀查询**（search-as-you-type，如 `数据 检索*`）由本方法识别并
+    /// 用 `RegexQuery` 在 text 字段做前缀匹配（前词照常 parse），两路 Should 合并。
+    /// 含引号（短语）时不启用前缀逻辑，整串交给 parser。
+    fn build_text_query(&self, query: &str) -> Result<Box<dyn Query>> {
+        let parser = |q: &str| -> Result<Box<dyn Query>> {
+            let mut qp =
+                QueryParser::for_index(&self.index, vec![self.fields.text, self.fields.heading]);
+            qp.set_field_boost(self.fields.heading, self.cfg.heading_boost);
+            qp.parse_query(q)
+                .map(|b| b as Box<dyn Query>)
+                .map_err(|e| TextError::QueryParse(e.to_string()))
+        };
+
+        let trimmed = query.trim();
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let last = tokens.last().copied().unwrap_or("");
+        let is_prefix = !trimmed.contains('"')
+            && last.len() > 1
+            && last.ends_with('*')
+            && !last[..last.len() - 1].contains('*');
+        if !is_prefix {
+            return parser(trimmed);
+        }
+
+        // 末词前缀（小写化以对齐 default 分词器；正则元字符转义）。
+        let prefix = last[..last.len() - 1].to_lowercase();
+        let pat = format!("{}.*", regex_escape(&prefix));
+        let prefix_q: Box<dyn Query> = Box::new(
+            RegexQuery::from_pattern(&pat, self.fields.text)
+                .map_err(|e| TextError::QueryParse(format!("prefix regex: {e}")))?,
+        );
+        let head = &tokens[..tokens.len() - 1];
+        if head.is_empty() {
+            Ok(prefix_q)
+        } else {
+            // 前词正常解析 + 末词前缀，Should 合并（与 parser 默认 OR 语义一致）。
+            Ok(Box::new(BooleanQuery::new(vec![
+                (Occur::Should, parser(&head.join(" "))?),
+                (Occur::Should, prefix_q),
+            ])))
+        }
+    }
+
     /// 检索：BM25 + 可选过滤 + 可选 ACL，返回带引用的 top-k。
     ///
     /// 预过滤（SUPERSET 翻译）缩小候选，post-filter（core eval + ACL visible）保证
@@ -183,11 +239,7 @@ impl TextIndex {
         let text_q: Box<dyn Query> = if empty_query {
             Box::new(AllQuery)
         } else {
-            let mut qp =
-                QueryParser::for_index(&self.index, vec![self.fields.text, self.fields.heading]);
-            qp.set_field_boost(self.fields.heading, self.cfg.heading_boost);
-            qp.parse_query(query)
-                .map_err(|e| TextError::QueryParse(e.to_string()))?
+            self.build_text_query(query)?
         };
 
         // 高亮：从 text 查询构造 SnippetGenerator（空查询无命中词，不高亮）。
@@ -321,6 +373,41 @@ mod tests {
         assert_eq!(hits[0].citation.page, 5);
         assert_eq!(hits[0].citation.bbox.x1, 3.0);
         assert_eq!(hits[0].citation.heading_path, vec!["第3章", "财务"]);
+    }
+
+    #[test]
+    fn phrase_slop_prefix_queries() {
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "quick brown fox", 1),
+        )
+        .unwrap();
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "brown quick fox", 2),
+        )
+        .unwrap();
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 3, ChunkKind::Paragraph, "browser engine", 3),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        let n = |q: &str| idx.search(q, None, None, 10, false).unwrap().len();
+
+        // 短语：仅匹配连续 "quick brown"（chunk 1）
+        assert_eq!(n("\"quick brown\""), 1);
+        // 邻近 slop=2：chunk 1（quick _ fox）与 chunk 2（quick fox）都在 2 词内
+        assert_eq!(n("\"quick fox\"~2"), 2);
+        // 前缀 brow*：brown(1,2) + browser(3) → 3 条
+        assert_eq!(n("brow*"), 3);
+        // 多词 + 末词前缀：engine 命中 3，brow* 命中 1/2/3 → 仍 3（Should 合并）
+        assert_eq!(n("engine brow*"), 3);
+        // 前词 + 前缀缩小：'fox brow*' → fox(1,2) ∪ brow*(1,2,3) = 3
+        assert_eq!(n("fox brow*"), 3);
+        // 无匹配前缀
+        assert_eq!(n("zzz*"), 0);
     }
 
     #[test]
