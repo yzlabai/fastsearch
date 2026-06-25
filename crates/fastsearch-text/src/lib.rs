@@ -415,6 +415,65 @@ mod tests {
     }
 
     #[test]
+    fn filter_ne_and_not_translate_to_complement() {
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert("kb", &chunk("a.pdf", 1, ChunkKind::Table, "data here", 1))
+            .unwrap();
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "data here", 1),
+        )
+        .unwrap();
+        idx.upsert("kb", &chunk("a.pdf", 3, ChunkKind::Code, "data here", 1))
+            .unwrap();
+        idx.commit().unwrap();
+        let table = || fastsearch_core::FieldValue::Str("table".into());
+
+        // Ne(kind, table) → 排除 chunk 1，留 2/3
+        let ne = Filter::Ne("kind".into(), table());
+        let mut got: Vec<u64> = idx
+            .search("data", Some(&ne), None, 10, false)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.chunk_id)
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 3]);
+
+        // Not(Eq(kind, table)) 等价
+        let not = Filter::Not(Box::new(Filter::Eq("kind".into(), table())));
+        let mut got2: Vec<u64> = idx
+            .search("data", Some(&not), None, 10, false)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.chunk_id)
+            .collect();
+        got2.sort_unstable();
+        assert_eq!(got2, vec![2, 3]);
+
+        // Not(And(Eq kind=table, page>=1)) → 同样只排除 chunk 1（精确补集）
+        let not_and = Filter::Not(Box::new(Filter::And(vec![
+            Filter::Eq("kind".into(), table()),
+            Filter::Gte("page".into(), fastsearch_core::FieldValue::Int(1)),
+        ])));
+        let mut got3: Vec<u64> = idx
+            .search("data", Some(&not_and), None, 10, false)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.chunk_id)
+            .collect();
+        got3.sort_unstable();
+        assert_eq!(got3, vec![2, 3]);
+
+        // Not(Exists(tenant))：不可精确翻译 → 退化 AllQuery，靠后过滤；所有行无 tenant → 全留
+        let not_exists = Filter::Not(Box::new(Filter::Exists("tenant".into())));
+        let got4 = idx
+            .search("data", Some(&not_exists), None, 10, false)
+            .unwrap();
+        assert_eq!(got4.len(), 3);
+    }
+
+    #[test]
     fn acl_blocks_unauthorized() {
         let mut idx = ram(TokenizerKind::Default);
         let mut c1 = chunk("a.pdf", 1, ChunkKind::Paragraph, "secret data", 1);

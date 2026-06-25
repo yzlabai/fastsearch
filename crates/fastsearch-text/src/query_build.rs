@@ -55,10 +55,16 @@ pub fn translate(filter: &Filter, f: &Fields) -> Box<dyn Query> {
                 .collect();
             Box::new(BooleanQuery::new(clauses))
         }
-        // Not/Ne/Exists/HeadingPrefix：保守不约束，交给后过滤精确判定。
-        Filter::Not(_) | Filter::Ne(_, _) | Filter::Exists(_) | Filter::HeadingPrefix(_) => {
-            Box::new(AllQuery)
-        }
+        // Ne/Not：若内层能**精确**翻译，取其补集（MustNot 精确集 = 精确补集，仍是
+        // 合法 SUPERSET，post-filter 再兜底）；否则保守不约束。
+        Filter::Ne(field, val) => exact_eq(field, val, f)
+            .map(complement)
+            .unwrap_or_else(|| Box::new(AllQuery)),
+        Filter::Not(inner) => exact_translate(inner, f)
+            .map(complement)
+            .unwrap_or_else(|| Box::new(AllQuery)),
+        // Exists/HeadingPrefix：无廉价精确索引侧表达，保守不约束，交给后过滤。
+        Filter::Exists(_) | Filter::HeadingPrefix(_) => Box::new(AllQuery),
         Filter::Eq(field, val) => eq_query(field, val, f),
         Filter::In(field, vals) => {
             let clauses = vals
@@ -82,21 +88,33 @@ pub fn translate(filter: &Filter, f: &Fields) -> Box<dyn Query> {
     }
 }
 
+/// 补集查询：`MustNot(q) AND AllQuery` = 精确排除 q 命中的文档。
+fn complement(q: Box<dyn Query>) -> Box<dyn Query> {
+    Box::new(BooleanQuery::new(vec![
+        (Occur::MustNot, q),
+        (Occur::Must, Box::new(AllQuery)),
+    ]))
+}
+
 fn eq_query(field: &str, val: &FieldValue, f: &Fields) -> Box<dyn Query> {
+    exact_eq(field, val, f).unwrap_or_else(|| Box::new(AllQuery))
+}
+
+/// 当且仅当 `field==val` 能**精确**翻译成索引侧查询时返回 Some（用于取补集）。
+/// 未索引字段 / 类型不符 → None（调用方退化为不约束）。
+fn exact_eq(field: &str, val: &FieldValue, f: &Fields) -> Option<Box<dyn Query>> {
     match (field, val) {
-        ("kind", FieldValue::Str(s)) => term_str(f.kind, s),
-        ("doc_id", FieldValue::Str(s)) => term_str(f.doc_id, s),
-        ("collection", FieldValue::Str(s)) => term_str(f.collection, s),
-        ("tenant", FieldValue::Str(s)) => term_str(f.tenant, s),
-        ("page", v) => match field_as_u64(v) {
-            Some(n) => u64_range(f.page, Bound::Included(n), Bound::Included(n)),
-            None => Box::new(AllQuery),
-        },
-        ("section_id", v) => match field_as_u64(v) {
-            Some(n) => u64_range(f.section_id, Bound::Included(n), Bound::Included(n)),
-            None => Box::new(AllQuery),
-        },
-        _ => Box::new(AllQuery),
+        ("kind", FieldValue::Str(s)) => Some(term_str(f.kind, s)),
+        ("doc_id", FieldValue::Str(s)) => Some(term_str(f.doc_id, s)),
+        ("collection", FieldValue::Str(s)) => Some(term_str(f.collection, s)),
+        ("tenant", FieldValue::Str(s)) => Some(term_str(f.tenant, s)),
+        ("page", v) => {
+            field_as_u64(v).map(|n| u64_range(f.page, Bound::Included(n), Bound::Included(n)))
+        }
+        ("section_id", v) => {
+            field_as_u64(v).map(|n| u64_range(f.section_id, Bound::Included(n), Bound::Included(n)))
+        }
+        _ => None,
     }
 }
 
@@ -106,17 +124,69 @@ fn range_query(
     f: &Fields,
     mk: impl Fn(u64) -> (Bound<u64>, Bound<u64>),
 ) -> Box<dyn Query> {
+    exact_range(field, val, f, mk).unwrap_or_else(|| Box::new(AllQuery))
+}
+
+/// 精确范围查询（仅 page/section_id 数值字段），否则 None。
+fn exact_range(
+    field: &str,
+    val: &FieldValue,
+    f: &Fields,
+    mk: impl Fn(u64) -> (Bound<u64>, Bound<u64>),
+) -> Option<Box<dyn Query>> {
     let tf = match field {
         "page" => f.page,
         "section_id" => f.section_id,
-        _ => return Box::new(AllQuery),
+        _ => return None,
     };
-    match field_as_u64(val) {
-        Some(n) => {
-            let (lo, hi) = mk(n);
-            u64_range(tf, lo, hi)
+    field_as_u64(val).map(|n| {
+        let (lo, hi) = mk(n);
+        u64_range(tf, lo, hi)
+    })
+}
+
+/// 当且仅当整个子过滤能**精确**翻译（无 match-all 兜底）时返回 Some。
+/// 供 `Not(inner)` 取精确补集用；任一子谓词不可精确翻译 → None。
+fn exact_translate(filter: &Filter, f: &Fields) -> Option<Box<dyn Query>> {
+    match filter {
+        Filter::Eq(field, val) => exact_eq(field, val, f),
+        Filter::Ne(field, val) => exact_eq(field, val, f).map(complement),
+        Filter::In(field, vals) => {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(vals.len());
+            for v in vals {
+                clauses.push((Occur::Should, exact_eq(field, v, f)?));
+            }
+            Some(Box::new(BooleanQuery::new(clauses)))
         }
-        None => Box::new(AllQuery),
+        Filter::Gt(field, val) => {
+            exact_range(field, val, f, |v| (Bound::Excluded(v), Bound::Unbounded))
+        }
+        Filter::Gte(field, val) => {
+            exact_range(field, val, f, |v| (Bound::Included(v), Bound::Unbounded))
+        }
+        Filter::Lt(field, val) => {
+            exact_range(field, val, f, |v| (Bound::Unbounded, Bound::Excluded(v)))
+        }
+        Filter::Lte(field, val) => {
+            exact_range(field, val, f, |v| (Bound::Unbounded, Bound::Included(v)))
+        }
+        Filter::And(subs) => {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(subs.len());
+            for s in subs {
+                clauses.push((Occur::Must, exact_translate(s, f)?));
+            }
+            Some(Box::new(BooleanQuery::new(clauses)))
+        }
+        Filter::Or(subs) => {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(subs.len());
+            for s in subs {
+                clauses.push((Occur::Should, exact_translate(s, f)?));
+            }
+            Some(Box::new(BooleanQuery::new(clauses)))
+        }
+        Filter::Not(inner) => exact_translate(inner, f).map(complement),
+        // 这两者无精确索引侧表达。
+        Filter::Exists(_) | Filter::HeadingPrefix(_) => None,
     }
 }
 

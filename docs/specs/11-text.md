@@ -103,7 +103,8 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 - ⚠️ **k1/b 暂未实际生效**：Tantivy 0.26 的 `QueryParser` 用默认 BM25（k1=1.2,b=0.75）；`TextIndexConfig` 已留 k1/b 字段但未接入打分。"beat ParadeDB 的 k1/b 可调"需后续迭代用自定义 `Weight`/`Similarity` 实现 → **列入 P3 调优档**。
 - ✅ **高亮（snippet）已实现**（2026-06-25）：`search(..., highlight)` 用 Tantivy `SnippetGenerator` 产出 HTML 片段（命中词包 `<b>`），text 字段加 STORED；engine/server 已透出，活服务验证通过。
 - ✅ **分面（facets）已实现**（2026-06-25，在 engine 层）：`engine.search_with_facets` 按 `req.facets`（当前 `kind`/`doc_id`）在候选集上计数、确定性排序；server 响应含 `facets`，活服务验证通过。byte 位置高亮、更多分面字段/直方图、icu/lindera 分词、HeadingPrefix 索引侧前缀 → 后续迭代。
-- 预过滤目前对 page/section_id/kind/doc_id/tenant/ACL 是真索引侧过滤；Not/Ne/Exists/HeadingPrefix 靠 over-fetch + 精确后过滤（正确但选择性极强时可能需调大 over-fetch）。
+- 预过滤目前对 page/section_id/kind/doc_id/tenant/ACL 是真索引侧过滤；**`Ne`/`Not` 已升级为索引侧精确补集**（2026-06-25）：内层能精确翻译时取 `MustNot(精确查询)`（= 精确补集，仍是合法 SUPERSET，post-filter 兜底；见 `query_build::exact_translate`）；`Exists`/`HeadingPrefix` 及不可精确翻译的内层仍退化 AllQuery + 后过滤。
 
 **迭代记录：**
 - 2026-06-24 v1（完成）：schema + BM25 + jieba + 过滤 + ACL 强制 + upsert/delete + 确定性。10 测试绿。
+- 2026-06-25：`Ne`/`Not` 索引侧精确补集翻译（`exact_translate`/`complement`），+1 端到端测试（Ne/Not/Not(And)/Not(Exists 退化）。
