@@ -12,6 +12,7 @@
 use fastsearch_core::{
     fuse, AclFilter, Chunk, ChunkKind, Citation, GlobalId, Scored, SearchMode, SearchRequest,
 };
+use fastsearch_embed::{EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
 use fastsearch_vector::{MemVectorIndex, VecMeta, VectorBackend};
@@ -81,6 +82,9 @@ pub struct Engine {
     text: TextIndex,
     vector: MemVectorIndex,
     reranker: Box<dyn Reranker + Send + Sync>,
+    /// 可选嵌入后端：设置后，**CDC 应用路径**（`IndexSink::apply_upsert`）会自动嵌入
+    /// chunk 正文并写向量索引（None=仅全文）。详见 `set_embedder`。
+    embedder: Option<Box<dyn Embedder + Send + Sync>>,
 }
 
 impl Engine {
@@ -89,6 +93,7 @@ impl Engine {
             text: TextIndex::create_in_ram(cfg)?,
             vector: MemVectorIndex::new(),
             reranker: Box::new(LexicalOverlapReranker),
+            embedder: None,
         })
     }
 
@@ -97,12 +102,19 @@ impl Engine {
             text: TextIndex::open_or_create(dir, cfg)?,
             vector: MemVectorIndex::new(),
             reranker: Box::new(LexicalOverlapReranker),
+            embedder: None,
         })
     }
 
     /// 替换 reranker（接入真 cross-encoder 时用）。
     pub fn set_reranker(&mut self, reranker: Box<dyn Reranker + Send + Sync>) {
         self.reranker = reranker;
+    }
+
+    /// 设置嵌入后端：开启后 **CDC 落地（`apply_upsert`）自动嵌入 chunk 正文 → 写向量索引**，
+    /// 使"PG 写 → 复制 → 解码 → 嵌入 → 派生 BM25+向量"主循环完整成立。None=仅全文。
+    pub fn set_embedder(&mut self, embedder: Box<dyn Embedder + Send + Sync>) {
+        self.embedder = Some(embedder);
     }
 
     /// 灌入一个 chunk（仅全文，不提交）。
@@ -438,6 +450,17 @@ fn collapse_groups(hits: Vec<SearchHit>, field: &str, max_per_group: usize) -> V
 impl fastsearch_sync::IndexSink for Engine {
     fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()> {
         self.text.upsert(collection, chunk)?;
+        // 配了嵌入后端则同步写向量索引（CDC 主循环：复制→解码→嵌入→派生向量）。
+        if let Some(emb) = &self.embedder {
+            let v = emb
+                .embed(std::slice::from_ref(&chunk.text), EmbedKind::Passage)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+            self.vector
+                .upsert(chunk.global_id(collection), v, vec_meta(collection, chunk))
+                .map_err(|e| anyhow::anyhow!("vector upsert: {e}"))?;
+        }
         Ok(())
     }
     fn apply_delete(&mut self, gid: &GlobalId) -> anyhow::Result<()> {

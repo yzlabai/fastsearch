@@ -12,6 +12,16 @@ use fastsearch_pg::{PgConfig, PgStore};
 use fastsearch_sync::replication::{drop_slot, ensure_slot, pull_changes, ReplicationConfig};
 use fastsearch_sync::{Applier, Lsn};
 use fastsearch_text::TextIndexConfig;
+use std::sync::OnceLock;
+
+/// 两个集成测试共享同名 publication/表，必须串行（否则并发 reset 互相踩）。
+static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+async fn serial_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 fn chunk(doc: &str, id: u64, text: &str) -> Chunk {
     Chunk {
@@ -63,6 +73,7 @@ async fn cdc_closed_loop_pg_to_search() {
         eprintln!("skip cdc_closed_loop_pg_to_search: DATABASE_URL not set");
         return;
     };
+    let _guard = serial_guard().await;
     let slot = "fastsearch_cdc_test";
     let rcfg = ReplicationConfig {
         url: url.clone(),
@@ -131,5 +142,88 @@ async fn cdc_closed_loop_pg_to_search() {
     assert_eq!(engine.search(&req2, None).unwrap()[0].id.chunk_id, 3);
 
     // 7) 清理 slot（避免 WAL 滞留）。
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
+/// 完整产品主循环（双 env-gated：需 PG + 本地 Ollama）：
+///
+///   写 PG → 逻辑复制 → pgoutput 解码 → **CDC 落地时自动嵌入** → 派生 BM25+向量 →
+///   语义查询（词面不重叠）走 vector 命中
+///
+/// 设 `DATABASE_URL` 与 `FASTSEARCH_EMBED_TEST_URL` 才跑；缺任一则跳过。
+#[tokio::test]
+async fn cdc_embed_hybrid_full_loop() {
+    let (Ok(url), Ok(emb_url)) = (
+        std::env::var("DATABASE_URL"),
+        std::env::var("FASTSEARCH_EMBED_TEST_URL"),
+    ) else {
+        eprintln!("skip cdc_embed_hybrid_full_loop: need DATABASE_URL + FASTSEARCH_EMBED_TEST_URL");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_embed_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+    };
+    reset(&url, slot).await;
+
+    let mut store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("ensure_schema");
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+
+    // 写 PG：语义可区分两段（盈利能力 vs 停车）。
+    let mut a = chunk("rep.pdf", 1, "本季度公司盈利能力显著改善，净利润增长。");
+    a.heading_path = vec!["财务".into()];
+    let mut b = chunk("rep.pdf", 2, "新办公楼的访客停车位安排与门禁说明。");
+    b.heading_path = vec!["行政".into()];
+    store
+        .upsert_doc("kb", "rep.pdf", &[a, b])
+        .await
+        .expect("upsert_doc");
+
+    // CDC 拉取。
+    let events = pull_changes(&rcfg).await.expect("pull_changes");
+    assert_eq!(events.len(), 2);
+
+    // 引擎 + Ollama 嵌入后端：apply_upsert 会自动嵌入 → 写向量索引。
+    let mut ecfg = fastsearch_embed::EmbedderConfig::from_env();
+    ecfg.url = emb_url;
+    if !matches!(ecfg.kind, fastsearch_embed::EmbedderKind::Http(_)) {
+        ecfg.kind = fastsearch_embed::EmbedderKind::Http(fastsearch_embed::HttpProtocol::Ollama);
+    }
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+    engine.set_embedder(fastsearch_embed::build_embedder(&ecfg));
+    let mut applier = Applier::new(Lsn(0));
+    applier
+        .apply_batch(&mut engine, &events)
+        .expect("apply_batch");
+
+    // 语义查询（与 chunk1 词面几乎不重叠）：先嵌入 query，再走 vector 模式。
+    let qv = fastsearch_embed::Embedder::embed(
+        &*fastsearch_embed::build_embedder(&ecfg),
+        &["企业的赚钱能力如何".to_string()],
+        fastsearch_embed::EmbedKind::Query,
+    )
+    .expect("embed query")
+    .remove(0);
+    let req = SearchRequest {
+        query: "企业的赚钱能力如何".into(),
+        mode: SearchMode::Vector,
+        vector: Some(qv),
+        top_k: 5,
+        ..Default::default()
+    };
+    let hits = engine.search(&req, None).expect("search");
+    assert!(!hits.is_empty(), "vector search returned no hits");
+    assert_eq!(
+        hits[0].id.chunk_id, 1,
+        "semantically closest chunk should rank first"
+    );
+    assert!(hits[0].vector.is_some(), "vector score present");
+
     drop_slot(&rcfg).await.expect("drop_slot");
 }

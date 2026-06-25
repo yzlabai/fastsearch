@@ -55,6 +55,7 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 - [x] v1 完成：Engine + `IndexSink` 适配 + 全文/向量/**真混合**排序管线 + 9 端到端测试绿（含 CDC→索引→检索、ACL 强制、doc 级替换、过滤、real_hybrid 融合、vector_only、校验失败）。clippy 净、fmt 净。
 - [x] v1.1：接入 fastsearch-vector，mode=Hybrid 走 keyword∥vector → core::fuse；mode=Vector 纯向量；过滤/ACL 两路各自真预过滤。
 - [x] v1.2：`engine::golden::run(set, cfg, mode, k)` —— 把 eval `GoldenSet` 语料灌入内存引擎、对每个查询跑真实检索、用判定算 `Metrics`，承接 eval 的"跑检索"那步（eval 不反依赖 engine，分层不破）。配套 `tests/relevance_gate.rs` 回归门禁（见 [eval spec §6 v2](18-eval.md)）。
+- [x] v1.6（**完整产品主循环，PG+Ollama 双 env 验证 done**，2026-06-25）：`set_embedder` —— 设置后 **CDC 落地路径 `IndexSink::apply_upsert` 自动嵌入 chunk 正文 → 写向量索引**。至此 `PG 写 → 逻辑复制 → pgoutput 解码 → 嵌入 → 派生 BM25+向量 → 混合检索` 主循环完整成立。env-gated 全链路测试 `cdc_embed_hybrid_full_loop`（写 PG → CDC → 嵌入 → 语义 vector 检索词面不重叠查询命中）；两 CDC 集成测试经静态 `tokio::Mutex` 串行（共享 publication/表）。
 - [x] v1.5：**more_like_this**（`Engine::more_like_this(gid, top_k, acl)`）—— 取种子 chunk 正文（`TextIndex::stored_text`）净化成 keyword 查询（剔元字符、取前 20 词）反查相似、排除种子自身、ACL 强制。REST `POST /v1/similar`（按 citation_id）。+2 单测（engine/server）。
 - [x] v1.4：**分组折叠**（`req.collapse: Collapse{field,max_per_group}`，core 新增类型 + 校验）—— 按最终排名每组（`doc_id`/`section_id`）至多保留 N 条，防单文档/单段刷屏；保序、确定性；未知 field 不折叠。server 经 SearchRequest serde 透传。+1 单测。
 - [x] v1.3：**auto-merging**（`req.auto_merge`）—— 融合后、rerank 前，把同 `(doc_id, section_id)`（`section_id!=0`）的多个命中片段归并为组内最高排名的代表，被并入的兄弟 chunk_id 记入 `SearchHit.merged_chunk_ids`（升序、答案层可解析整段全部引用）；保序、确定性。`section_id==0` 视为"无段"不并。server 响应透出 `merged_chunk_ids`。+2 单测。
