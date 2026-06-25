@@ -28,6 +28,8 @@ pub struct TextHit {
     pub id: GlobalId,
     pub score: f32,
     pub citation: Citation,
+    /// chunk 类型（用于分面）。
+    pub kind: String,
     /// 高亮片段（HTML，命中词包 `<b>`）；未请求高亮或无命中词时为 None。
     pub highlight: Option<String>,
 }
@@ -246,6 +248,7 @@ impl TextIndex {
                 },
                 score,
                 citation,
+                kind: row.kind,
                 highlight,
             });
             if hits.len() >= k {

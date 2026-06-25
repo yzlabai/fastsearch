@@ -101,7 +101,8 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 
 **已知限制 / 下一迭代（诚实记账）：**
 - ⚠️ **k1/b 暂未实际生效**：Tantivy 0.26 的 `QueryParser` 用默认 BM25（k1=1.2,b=0.75）；`TextIndexConfig` 已留 k1/b 字段但未接入打分。"beat ParadeDB 的 k1/b 可调"需后续迭代用自定义 `Weight`/`Similarity` 实现 → **列入 P3 调优档**。
-- ✅ **高亮（snippet）已实现**（2026-06-25）：`search(..., highlight)` 用 Tantivy `SnippetGenerator` 产出 HTML 片段（命中词包 `<b>`），text 字段加 STORED；engine/server 已透出，活服务验证通过。byte 位置、分面聚合、icu/lindera 分词、HeadingPrefix 索引侧前缀 → 后续迭代。
+- ✅ **高亮（snippet）已实现**（2026-06-25）：`search(..., highlight)` 用 Tantivy `SnippetGenerator` 产出 HTML 片段（命中词包 `<b>`），text 字段加 STORED；engine/server 已透出，活服务验证通过。
+- ✅ **分面（facets）已实现**（2026-06-25，在 engine 层）：`engine.search_with_facets` 按 `req.facets`（当前 `kind`/`doc_id`）在候选集上计数、确定性排序；server 响应含 `facets`，活服务验证通过。byte 位置高亮、更多分面字段/直方图、icu/lindera 分词、HeadingPrefix 索引侧前缀 → 后续迭代。
 - 预过滤目前对 page/section_id/kind/doc_id/tenant/ACL 是真索引侧过滤；Not/Ne/Exists/HeadingPrefix 靠 over-fetch + 精确后过滤（正确但选择性极强时可能需调大 over-fetch）。
 
 **迭代记录：**

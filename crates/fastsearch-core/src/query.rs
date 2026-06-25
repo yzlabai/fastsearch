@@ -52,6 +52,9 @@ pub struct SearchRequest {
     pub auto_merge: bool,
     #[serde(default)]
     pub highlight: bool,
+    /// 请求分面的字段（当前支持 `kind` / `doc_id`）。
+    #[serde(default)]
+    pub facets: Vec<String>,
     #[serde(default)]
     pub explain: bool,
 }
@@ -77,6 +80,7 @@ impl Default for SearchRequest {
             rerank: None,
             auto_merge: false,
             highlight: false,
+            facets: Vec::new(),
             explain: false,
         }
     }

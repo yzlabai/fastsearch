@@ -141,6 +141,23 @@ impl Engine {
     /// - mode=Hybrid：两路并行 + 融合（无 `req.vector` 时退化为全文）。
     /// - `fuse` 自带"一路空退化"，故统一调用。
     pub fn search(&self, req: &SearchRequest, acl: Option<&AclFilter>) -> Result<Vec<SearchHit>> {
+        Ok(self.run(req, acl)?.0)
+    }
+
+    /// 同 [`Engine::search`]，外加按 `req.facets` 计算分面计数（当前支持 `kind`/`doc_id`）。
+    pub fn search_with_facets(
+        &self,
+        req: &SearchRequest,
+        acl: Option<&AclFilter>,
+    ) -> Result<(Vec<SearchHit>, Facets)> {
+        self.run(req, acl)
+    }
+
+    fn run(
+        &self,
+        req: &SearchRequest,
+        acl: Option<&AclFilter>,
+    ) -> Result<(Vec<SearchHit>, Facets)> {
         req.validate()?;
         let candidates = req.candidates.max(req.top_k);
 
@@ -173,6 +190,9 @@ impl Engine {
         } else {
             vec![]
         };
+
+        // 分面：在（keyword）候选集上按字段计数（kind / doc_id）。
+        let facets = compute_facets(&req.facets, &kw_hits);
 
         // 查找表：引用 / 各路分
         let mut kw_score: HashMap<GlobalId, f32> = HashMap::new();
@@ -230,8 +250,35 @@ impl Engine {
             })
             .collect();
         hits.truncate(req.top_k);
-        Ok(hits)
+        Ok((hits, facets))
     }
+}
+
+/// 分面结果：字段 → [(值, 计数)]（按计数降序、值升序，确定性）。
+pub type Facets = std::collections::BTreeMap<String, Vec<(String, u64)>>;
+
+fn compute_facets(fields: &[String], hits: &[TextHit]) -> Facets {
+    let mut out = Facets::new();
+    for field in fields {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for h in hits {
+            let val = match field.as_str() {
+                "kind" => Some(h.kind.clone()),
+                "doc_id" => Some(h.id.doc_id.clone()),
+                _ => None, // v1 仅支持 kind/doc_id
+            };
+            if let Some(v) = val {
+                *counts.entry(v).or_insert(0) += 1;
+            }
+        }
+        if counts.is_empty() {
+            continue;
+        }
+        let mut pairs: Vec<(String, u64)> = counts.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out.insert(field.clone(), pairs);
+    }
+    out
 }
 
 /// CDC 落地：sync 的变更应用到 text 索引。放在 engine 而非 text，避免 text 反依赖 sync。
@@ -488,6 +535,33 @@ mod tests {
         let c2 = hits.iter().find(|h| h.id.chunk_id == 2).unwrap();
         assert!(c1.bm25.is_some()); // c1 有 keyword 分
         assert!(c2.vector.is_some()); // c2 有 vector 分
+    }
+
+    #[test]
+    fn facets_count_over_results() {
+        let mut e = engine();
+        e.ingest("kb", &chunk("a.pdf", 1, ChunkKind::Table, "data here", 1))
+            .unwrap();
+        e.ingest("kb", &chunk("a.pdf", 2, ChunkKind::Table, "data here", 2))
+            .unwrap();
+        e.ingest(
+            "kb",
+            &chunk("b.pdf", 3, ChunkKind::Paragraph, "data here", 1),
+        )
+        .unwrap();
+        e.commit().unwrap();
+        let mut r = req("data");
+        r.facets = vec!["kind".into(), "doc_id".into()];
+        let (hits, facets) = e.search_with_facets(&r, None).unwrap();
+        assert_eq!(hits.len(), 3);
+        // kind: table=2, paragraph=1（降序）
+        let kind = &facets["kind"];
+        assert_eq!(kind[0], ("table".into(), 2));
+        assert_eq!(kind[1], ("paragraph".into(), 1));
+        // doc_id: a.pdf=2, b.pdf=1
+        let doc = &facets["doc_id"];
+        assert_eq!(doc[0], ("a.pdf".into(), 2));
+        assert_eq!(doc[1], ("b.pdf".into(), 1));
     }
 
     #[test]

@@ -115,8 +115,8 @@ async fn search(
     let acl = acl_for(&principal);
 
     let engine = s.engine.lock().await;
-    let hits = engine
-        .search(&req, Some(&acl)) // ACL 强制注入，客户端不可绕过
+    let (hits, facets) = engine
+        .search_with_facets(&req, Some(&acl)) // ACL 强制注入，客户端不可绕过
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     s.metrics.searches.fetch_add(1, Ordering::Relaxed);
 
@@ -138,7 +138,19 @@ async fn search(
             })
         })
         .collect();
-    Ok(Json(json!({ "hits": arr })))
+    // 分面 → {field: [{value, count}]}
+    let facets_json: Value = facets
+        .into_iter()
+        .map(|(field, pairs)| {
+            let vals: Vec<Value> = pairs
+                .into_iter()
+                .map(|(v, c)| json!({ "value": v, "count": c }))
+                .collect();
+            (field, Value::Array(vals))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into();
+    Ok(Json(json!({ "hits": arr, "facets": facets_json })))
 }
 
 #[derive(Deserialize)]
