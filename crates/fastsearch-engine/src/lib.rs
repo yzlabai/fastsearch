@@ -6,7 +6,7 @@
 //!
 //! 三种检索模式全可用：keyword / vector / **hybrid（keyword∥vector → core::fuse 融合）**。
 //! 过滤与 ACL 在两路各自做真预过滤（不可绕过）；分面（kind/doc_id）、高亮、**rerank**
-//! （req.rerank 时宽召回后重排）已接入。auto-merging（section 归并）为后续迭代。
+//! （req.rerank 时宽召回后重排）、**auto-merging**（req.auto_merge 时同 section 归并）均已接入。
 
 use fastsearch_core::{
     fuse, AclFilter, Chunk, ChunkKind, Citation, GlobalId, Scored, SearchMode, SearchRequest,
@@ -70,6 +70,9 @@ pub struct SearchHit {
     pub rerank: Option<f64>,
     /// 高亮片段（HTML）；仅 keyword 命中且 req.highlight 时有值。
     pub highlight: Option<String>,
+    /// auto-merge 时被并入本代表命中的同 section 兄弟 chunk_id（升序）；未归并为空。
+    /// 答案层可据此解析整段的全部引用。
+    pub merged_chunk_ids: Vec<u64>,
 }
 
 /// 端到端检索引擎。
@@ -263,9 +266,17 @@ impl Engine {
                     vector: vec_score.get(&s.id).copied(),
                     rerank: None,
                     highlight: highlight.get(&s.id).cloned(),
+                    merged_chunk_ids: Vec::new(),
                 })
             })
             .collect();
+
+        // auto-merging：同 (doc_id, section_id) 的多个命中片段归并为最高排名的代表，
+        // 其余兄弟 chunk_id 记入代表的 merged_chunk_ids 后移除（保序、确定性）。
+        // 仅对 section_id != 0（真段）归并；section_id==0 视为"无段"不并。
+        if req.auto_merge {
+            hits = auto_merge(hits);
+        }
 
         // rerank：宽召回后重排（req.rerank 存在时）。对候选文本打分、按 rerank 分降序、
         // 同分按 gid，再截 top_k。rerank 分写入命中（透明）；原 bm25/vector/fused 保留。
@@ -316,6 +327,38 @@ fn compute_facets(fields: &[String], hits: &[TextHit]) -> Facets {
         let mut pairs: Vec<(String, u64)> = counts.into_iter().collect();
         pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         out.insert(field.clone(), pairs);
+    }
+    out
+}
+
+/// 把同 `(doc_id, section_id)`（`section_id != 0`）的多个命中片段归并为组内最高排名的
+/// 代表命中：被并入的兄弟 chunk_id 记入代表的 `merged_chunk_ids`（升序去重）后移除。
+/// 输入须已按最终排名排序（代表 = 组内首个出现者）；输出保序、确定性。
+fn auto_merge(hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    let mut out: Vec<SearchHit> = Vec::with_capacity(hits.len());
+    // (doc_id, section_id) → out 中代表命中的下标。
+    let mut rep: HashMap<(String, u64), usize> = HashMap::new();
+    for h in hits {
+        let sec = h.citation.section_id;
+        if sec == 0 {
+            out.push(h); // 无段，不参与归并
+            continue;
+        }
+        let key = (h.id.doc_id.clone(), sec);
+        match rep.get(&key) {
+            Some(&idx) => {
+                // 已有代表：把本命中并入（记录 chunk_id），丢弃本命中。
+                let cid = h.id.chunk_id;
+                let merged = &mut out[idx].merged_chunk_ids;
+                if let Err(pos) = merged.binary_search(&cid) {
+                    merged.insert(pos, cid);
+                }
+            }
+            None => {
+                rep.insert(key, out.len());
+                out.push(h);
+            }
+        }
     }
     out
 }
@@ -426,6 +469,73 @@ mod tests {
             query: query.into(),
             ..Default::default()
         }
+    }
+
+    fn chunk_sec(doc: &str, id: u64, text: &str, section_id: u64) -> Chunk {
+        Chunk {
+            section_id,
+            ..chunk(doc, id, ChunkKind::Paragraph, text, 1)
+        }
+    }
+
+    #[test]
+    fn auto_merge_collapses_same_section() {
+        let mut e = engine();
+        // 同 doc 同 section 3 个片段；另一 section 1 个；另一 doc 同 section 号 1 个。
+        e.ingest("kb", &chunk_sec("a.pdf", 1, "data alpha", 10))
+            .unwrap();
+        e.ingest("kb", &chunk_sec("a.pdf", 2, "data beta", 10))
+            .unwrap();
+        e.ingest("kb", &chunk_sec("a.pdf", 3, "data gamma", 10))
+            .unwrap();
+        e.ingest("kb", &chunk_sec("a.pdf", 4, "data delta", 11))
+            .unwrap();
+        e.ingest("kb", &chunk_sec("b.pdf", 9, "data epsilon", 10))
+            .unwrap();
+        e.commit().unwrap();
+
+        // 不归并：5 条
+        let plain = e.search(&req("data"), None).unwrap();
+        assert_eq!(plain.len(), 5);
+
+        // 归并：a.pdf§10 三条→1 代表，a.pdf§11 一条，b.pdf§10 一条 → 共 3 条
+        let mut r = req("data");
+        r.auto_merge = true;
+        let merged = e.search(&r, None).unwrap();
+        assert_eq!(merged.len(), 3);
+        // 找 a.pdf§10 的代表：应携带另外两个兄弟 chunk_id（升序）
+        let rep = merged
+            .iter()
+            .find(|h| h.id.doc_id == "a.pdf" && h.citation.section_id == 10)
+            .unwrap();
+        let mut others: Vec<u64> = [1u64, 2, 3]
+            .into_iter()
+            .filter(|c| *c != rep.id.chunk_id)
+            .collect();
+        others.sort_unstable();
+        assert_eq!(rep.merged_chunk_ids, others);
+        // 其余两条不携带归并
+        for h in &merged {
+            if !(h.id.doc_id == "a.pdf" && h.citation.section_id == 10) {
+                assert!(h.merged_chunk_ids.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn auto_merge_keeps_section_zero_separate() {
+        let mut e = engine();
+        // section_id=0 视为"无段"，不应被归并到一起。
+        e.ingest("kb", &chunk_sec("a.pdf", 1, "data one", 0))
+            .unwrap();
+        e.ingest("kb", &chunk_sec("a.pdf", 2, "data two", 0))
+            .unwrap();
+        e.commit().unwrap();
+        let mut r = req("data");
+        r.auto_merge = true;
+        let merged = e.search(&r, None).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|h| h.merged_chunk_ids.is_empty()));
     }
 
     #[test]

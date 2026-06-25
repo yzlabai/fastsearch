@@ -136,6 +136,7 @@ async fn search(
                 "heading_path": h.citation.heading_path,
                 "section_id": h.citation.section_id,
                 "highlight": h.highlight,
+                "merged_chunk_ids": h.merged_chunk_ids,
             })
         })
         .collect();
