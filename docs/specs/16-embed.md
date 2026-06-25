@@ -47,7 +47,11 @@ impl HashEmbedder { pub fn new(dim: usize) -> Self; }
 ## 6. 验收标准与状态
 
 - [x] v1 完成：Embedder trait + EmbedKind + HashEmbedder（确定性/L2 归一化/前缀）+ 5 单测绿。clippy 净、fmt 净。
+- [x] v1.1（**可配置 HTTP 嵌入后端，本地 Ollama 实网验证 done**，2026-06-25）：`HttpEmbedder` + `EmbedderConfig`/`build_embedder`/`from_env`。
+  - 两协议：**Ollama** 原生 `/api/embed`（`{model,input}`→`{embeddings}`）与 **OpenAI 兼容** `/v1/embeddings`（`{data:[{embedding,index}]}`，按 index 排序）——后者覆盖 TEI/vLLM/LM Studio/llama.cpp-server/OpenAI。同步阻塞（`ureq`，纯 Rust）契合同步 trait；server 在 `spawn_blocking` 调用。
+  - 可配置：`url/model/dim/api_key/query_prefix/passage_prefix/timeout`；**维度与 PG 向量列必须一致**（响应维度不符即报错，含诊断）。环境变量 `FASTSEARCH_EMBEDDER=hash|ollama|openai` + `FASTSEARCH_EMBED_*`。
+  - 纯逻辑（请求体/响应解析/维度·条数校验/前缀/端点）+8 单测；**实网 env-gated**：本机 Ollama `nomic-embed-text-v2-moe`(768) 验证连通/维度/确定性/**语义性**（cos(相关)=0.31 > cos(无关)=0.18）。
 
 **已知限制 / 下一迭代：**
-- HashEmbedder **非语义**——只用于离线/CI 跑通与 fallback。真语义嵌入需 **Candle（纯 Rust，include_bytes 静态链 e5-small）或 ort（ONNX）+ 模型下载**，作为 opt-in feature 在下一迭代加（重依赖，按 docparse 模型 opt-in 哲学，首次用时下载）。
-- 接入 engine 的"自动嵌入回填"（CDC 后对新 chunk 生成向量）待与 vector/sync 串联。
+- HashEmbedder **非语义**，仅离线/CI/fallback；真语义经 HTTP 后端（Ollama/OpenAI 兼容）接入——**这是默认推荐路径**（绕开重依赖与模型下载）。Candle/ort **编译内置**模型作为"无外部服务"opt-in 档为后续可选。
+- **未接入管线**：ingest 自动嵌入 chunk、query 自动嵌入（CLI/server 在调 engine 前 embed）是下一步；当前向量仍由 `ingest_vector`/`req.vector` 外部传入。换嵌入模型维度变化时需同步 PG `vector_dim` 并重建派生索引。

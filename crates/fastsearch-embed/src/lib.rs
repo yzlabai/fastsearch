@@ -5,6 +5,13 @@
 //!
 //! [`HashEmbedder`] 是**确定性、零依赖**的 hashing bag-of-words 嵌入：让全链路
 //! 离线/CI 可跑、可作 fallback。**非语义模型**——语义相似度需真模型。
+//!
+//! 真语义嵌入经**可配置 HTTP 后端**接入（[`HttpEmbedder`]）：本地 **Ollama** 或任意
+//! **OpenAI 兼容** `/v1/embeddings` 端点；用 [`EmbedderConfig`]/[`build_embedder`] 选择，
+//! [`EmbedderConfig::from_env`] 读环境变量。
+
+mod http;
+pub use http::{build_embedder, EmbedderConfig, EmbedderKind, HttpEmbedder, HttpProtocol};
 
 use std::hash::{Hash, Hasher};
 
