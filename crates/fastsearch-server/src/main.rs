@@ -5,12 +5,15 @@
 //! - `FASTSEARCH_PORT`：监听端口（默认 8642）。
 //! - `FASTSEARCH_KEYS`：API Key 表，格式 `key=tenant:tag1,tag2;key2=:public`
 //!   （tenant 留空=管理员/无租户限制）。未设则建一个 dev key `dev`（无租户限制）。
+//! - `FASTSEARCH_RATE_LIMIT`：`capacity,refill_per_sec`（每 key 令牌桶）；未设=不限流。
+//! - `FASTSEARCH_AUDIT`：设为 `1`/`stderr` 则每个成功请求向 stderr 输出一行审计 JSON。
 
 use fastsearch_engine::Engine;
-use fastsearch_server::{router, Principal, ServerState};
+use fastsearch_server::{router, AuditSink, Principal, ServerState};
 use fastsearch_text::{TextIndexConfig, TokenizerKind};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn parse_keys(spec: &str) -> HashMap<String, Principal> {
     let mut keys = HashMap::new();
@@ -72,7 +75,31 @@ async fn main() -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(data.join("text"))?;
     let engine = Engine::open_or_create(&data.join("text"), cfg)?;
-    let app = router(ServerState::new(engine, keys));
+    let mut state = ServerState::new(engine, keys);
+
+    // 限流：FASTSEARCH_RATE_LIMIT="capacity,refill_per_sec"
+    if let Ok(spec) = std::env::var("FASTSEARCH_RATE_LIMIT") {
+        if let Some((cap, refill)) = spec.split_once(',') {
+            if let (Ok(cap), Ok(refill)) = (cap.trim().parse(), refill.trim().parse()) {
+                state = state.with_rate_limit(cap, refill);
+                eprintln!("rate limit on: capacity={cap}, refill={refill}/s per key");
+            }
+        }
+    }
+    // 审计：FASTSEARCH_AUDIT=1|stderr → stderr JSON 一行一事件
+    if matches!(
+        std::env::var("FASTSEARCH_AUDIT").as_deref(),
+        Ok("1") | Ok("stderr")
+    ) {
+        let sink: AuditSink = Arc::new(|ev| {
+            if let Ok(line) = serde_json::to_string(&ev) {
+                eprintln!("{line}");
+            }
+        });
+        state = state.with_audit(sink);
+        eprintln!("audit log on (stderr JSON)");
+    }
+    let app = router(state);
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;

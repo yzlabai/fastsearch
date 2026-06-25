@@ -60,12 +60,69 @@ impl Metrics {
     }
 }
 
+/// 令牌桶（按调用方 key 分桶）。`check` 同步、无 await，故用 std Mutex。
+struct Bucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+/// 简单令牌桶限流：每个 key 一桶，容量 `capacity`、每秒回填 `refill_per_sec`。
+pub struct RateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    buckets: std::sync::Mutex<HashMap<String, Bucket>>,
+}
+
+impl RateLimiter {
+    /// 取 1 个令牌；足够则放行并返回 true，否则 false（限流）。
+    fn check(&self, key: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self.buckets.lock().unwrap();
+        let b = map.entry(key.to_string()).or_insert(Bucket {
+            tokens: self.capacity,
+            last: now,
+        });
+        let elapsed = now.duration_since(b.last).as_secs_f64();
+        b.tokens = (b.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        b.last = now;
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// 一条审计事件（谁/在哪个入口/查了什么/命中多少/结果状态）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditEvent {
+    pub endpoint: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hits: Option<usize>,
+    pub status: u16,
+}
+
+/// 审计 sink：服务把每条 [`AuditEvent`] 交给它（落 stderr / 日志系统 / 测试捕获）。
+pub type AuditSink = Arc<dyn Fn(AuditEvent) + Send + Sync>;
+
 /// 服务状态（可 Clone：内部 Arc 共享）。
 #[derive(Clone)]
 pub struct ServerState {
     engine: Arc<Mutex<Engine>>,
     keys: Arc<HashMap<String, Principal>>,
     metrics: Arc<Metrics>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    audit: Option<AuditSink>,
 }
 
 impl ServerState {
@@ -74,8 +131,54 @@ impl ServerState {
             engine: Arc::new(Mutex::new(engine)),
             keys: Arc::new(keys),
             metrics: Arc::new(Metrics::default()),
+            rate_limiter: None,
+            audit: None,
         }
     }
+
+    /// 开启限流（每 key 令牌桶：容量 + 每秒回填）。
+    pub fn with_rate_limit(mut self, capacity: f64, refill_per_sec: f64) -> Self {
+        self.rate_limiter = Some(Arc::new(RateLimiter {
+            capacity,
+            refill_per_sec,
+            buckets: std::sync::Mutex::new(HashMap::new()),
+        }));
+        self
+    }
+
+    /// 设置审计 sink（每个成功请求发一条 [`AuditEvent`]）。
+    pub fn with_audit(mut self, sink: AuditSink) -> Self {
+        self.audit = Some(sink);
+        self
+    }
+
+    /// 限流判定：放行 true，限流 false（并计数）。无限流器时恒放行。
+    fn allow(&self, key: &str) -> bool {
+        match &self.rate_limiter {
+            Some(rl) if !rl.check(key) => {
+                self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn emit_audit(&self, ev: AuditEvent) {
+        if let Some(sink) = &self.audit {
+            sink(ev);
+        }
+    }
+}
+
+/// 从请求头取原始 key 字符串（用于限流分桶；无则 `"anon"`）。
+fn rate_key(headers: &HeaderMap) -> String {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "anon".to_string())
 }
 
 /// 从请求头解析 Principal：`Authorization: Bearer <k>` 或 `X-API-Key: <k>`。纯函数。
@@ -196,6 +299,9 @@ async fn search(
 ) -> ApiResult {
     let started = std::time::Instant::now();
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -248,6 +354,16 @@ async fn search(
         })
         .collect::<serde_json::Map<_, _>>()
         .into();
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/search",
+        tenant: principal.tenant.clone(),
+        tags: principal.tags.clone(),
+        query: Some(req.query.clone()),
+        collection: None,
+        doc_id: None,
+        hits: Some(arr.len()),
+        status: 200,
+    });
     Ok(Json(json!({ "hits": arr, "facets": facets_json })))
 }
 
@@ -264,7 +380,10 @@ async fn index(
     Json(body): Json<IndexBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    principal_from_headers(&headers, &s.keys).ok_or_else(|| {
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
             StatusCode::UNAUTHORIZED,
@@ -286,6 +405,16 @@ async fn index(
     engine.commit().map_err(&err500)?;
     let n = body.chunks.len();
     s.metrics.indexed.fetch_add(n as u64, Ordering::Relaxed);
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/index",
+        tenant: principal.tenant.clone(),
+        tags: principal.tags.clone(),
+        query: None,
+        collection: Some(body.collection.clone()),
+        doc_id: Some(body.doc_id.clone()),
+        hits: Some(n),
+        status: 200,
+    });
     Ok(Json(json!({ "indexed": n })))
 }
 
@@ -533,6 +662,67 @@ mod tests {
         assert!(text.contains("fastsearch_search_latency_seconds_count 1"));
         assert!(text.contains("fastsearch_search_latency_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(text.contains("# TYPE fastsearch_search_latency_seconds histogram"));
+    }
+
+    async fn engine_with_data() -> Engine {
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine
+            .ingest("kb", &chunk(1, "secret alpha", vec!["team-a"]))
+            .unwrap();
+        engine.commit().unwrap();
+        engine
+    }
+
+    fn search_req(key: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/search")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::from(r#"{"query":"secret","top_k":5}"#))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429() {
+        // 容量 1、无回填 → 同 key 第二次必 429。
+        let state = ServerState::new(engine_with_data().await, keys()).with_rate_limit(1.0, 0.0);
+        let app = router(state);
+        let r1 = app.clone().oneshot(search_req("k-team-a")).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let r2 = app.clone().oneshot(search_req("k-team-a")).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+        // 指标计数
+        let m = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let text =
+            String::from_utf8(m.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(text.contains("fastsearch_rate_limited_total 1"));
+    }
+
+    #[tokio::test]
+    async fn audit_sink_receives_event() {
+        let captured: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let cap2 = captured.clone();
+        let sink: AuditSink = Arc::new(move |ev| cap2.lock().unwrap().push(ev));
+        let state = ServerState::new(engine_with_data().await, keys()).with_audit(sink);
+        let app = router(state);
+        app.oneshot(search_req("k-team-a")).await.unwrap();
+        let evs = captured.lock().unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].endpoint, "/v1/search");
+        assert_eq!(evs[0].query.as_deref(), Some("secret"));
+        assert_eq!(evs[0].tenant.as_deref(), Some("acme"));
+        assert_eq!(evs[0].hits, Some(1));
+        assert_eq!(evs[0].status, 200);
     }
 
     #[test]
