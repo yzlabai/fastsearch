@@ -17,7 +17,8 @@ use query_build::{acl_query, stored_row, translate};
 use schema::{build_schema, Fields};
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery};
-use tantivy::schema::IndexRecordOption;
+use tantivy::schema::{IndexRecordOption, Value};
+use tantivy::snippet::SnippetGenerator;
 use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 use tokenizer::JiebaTokenizer;
 
@@ -27,6 +28,8 @@ pub struct TextHit {
     pub id: GlobalId,
     pub score: f32,
     pub citation: Citation,
+    /// 高亮片段（HTML，命中词包 `<b>`）；未请求高亮或无命中词时为 None。
+    pub highlight: Option<String>,
 }
 
 /// 派生全文索引。
@@ -169,9 +172,11 @@ impl TextIndex {
         filter: Option<&Filter>,
         acl: Option<&AclFilter>,
         k: usize,
+        highlight: bool,
     ) -> Result<Vec<TextHit>> {
         let searcher = self.reader.searcher();
-        let text_q: Box<dyn Query> = if query.trim().is_empty() {
+        let empty_query = query.trim().is_empty();
+        let text_q: Box<dyn Query> = if empty_query {
             Box::new(AllQuery)
         } else {
             let mut qp =
@@ -179,6 +184,13 @@ impl TextIndex {
             qp.set_field_boost(self.fields.heading, self.cfg.heading_boost);
             qp.parse_query(query)
                 .map_err(|e| TextError::QueryParse(e.to_string()))?
+        };
+
+        // 高亮：从 text 查询构造 SnippetGenerator（空查询无命中词，不高亮）。
+        let snippet_gen: Option<SnippetGenerator> = if highlight && !empty_query {
+            SnippetGenerator::create(&searcher, &*text_q, self.fields.text).ok()
+        } else {
+            None
         };
 
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, text_q)];
@@ -207,6 +219,16 @@ impl TextIndex {
                     continue;
                 }
             }
+            // 高亮片段：从存储的 text 生成（命中词包 <b>）；无命中词 → None。
+            let highlight = snippet_gen.as_ref().and_then(|g| {
+                let text = doc.get_first(self.fields.text).and_then(|v| v.as_str())?;
+                let snip = g.snippet(text);
+                if snip.fragment().is_empty() {
+                    None
+                } else {
+                    Some(snip.to_html())
+                }
+            });
             let citation = Citation {
                 collection: row.collection.clone(),
                 doc_id: row.doc_id.clone(),
@@ -224,6 +246,7 @@ impl TextIndex {
                 },
                 score,
                 citation,
+                highlight,
             });
             if hits.len() >= k {
                 break;
@@ -282,7 +305,7 @@ mod tests {
         )
         .unwrap();
         idx.commit().unwrap();
-        let hits = idx.search("alpha", None, None, 10).unwrap();
+        let hits = idx.search("alpha", None, None, 10, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id.chunk_id, 1);
         assert_eq!(hits[0].citation.page, 5);
@@ -301,9 +324,33 @@ mod tests {
         )
         .unwrap();
         idx.commit().unwrap();
-        let hits = idx.search("beta", None, None, 10).unwrap();
+        let hits = idx.search("beta", None, None, 10, false).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].id.chunk_id, 2); // 词频高的在前
+    }
+
+    #[test]
+    fn highlight_wraps_match() {
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert(
+            "kb",
+            &chunk(
+                "a.pdf",
+                1,
+                ChunkKind::Paragraph,
+                "the quick brown fox jumps",
+                1,
+            ),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        // 不要高亮 → None
+        let no = idx.search("brown", None, None, 10, false).unwrap();
+        assert!(no[0].highlight.is_none());
+        // 要高亮 → 命中词包 <b>
+        let hi = idx.search("brown", None, None, 10, true).unwrap();
+        let h = hi[0].highlight.as_ref().unwrap();
+        assert!(h.contains("<b>brown</b>"), "highlight was: {h}");
     }
 
     #[test]
@@ -326,7 +373,7 @@ mod tests {
         )
         .unwrap();
         idx.commit().unwrap();
-        let hits = idx.search("毛利率", None, None, 10).unwrap();
+        let hits = idx.search("毛利率", None, None, 10, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id.chunk_id, 1);
     }
@@ -352,7 +399,7 @@ mod tests {
             ),
             Filter::Gte("page".into(), fastsearch_core::FieldValue::Int(10)),
         ]);
-        let hits = idx.search("data", Some(&f), None, 10).unwrap();
+        let hits = idx.search("data", Some(&f), None, 10, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id.chunk_id, 1);
     }
@@ -374,7 +421,7 @@ mod tests {
             tenant: Some("acme".into()),
             allowed_tags: vec!["team-a".into()],
         };
-        let hits = idx.search("secret", None, Some(&acl), 10).unwrap();
+        let hits = idx.search("secret", None, Some(&acl), 10, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id.chunk_id, 1);
     }
@@ -388,8 +435,14 @@ mod tests {
         idx.upsert("kb", &chunk("a.pdf", 1, ChunkKind::Paragraph, "newword", 1))
             .unwrap();
         idx.commit().unwrap();
-        assert_eq!(idx.search("oldword", None, None, 10).unwrap().len(), 0);
-        assert_eq!(idx.search("newword", None, None, 10).unwrap().len(), 1);
+        assert_eq!(
+            idx.search("oldword", None, None, 10, false).unwrap().len(),
+            0
+        );
+        assert_eq!(
+            idx.search("newword", None, None, 10, false).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -404,7 +457,7 @@ mod tests {
         idx.commit().unwrap();
         idx.delete_by_doc("kb", "a.pdf").unwrap();
         idx.commit().unwrap();
-        let hits = idx.search("term", None, None, 10).unwrap();
+        let hits = idx.search("term", None, None, 10, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id.doc_id, "b.pdf");
     }
@@ -420,8 +473,8 @@ mod tests {
             .unwrap();
         }
         idx.commit().unwrap();
-        let a = idx.search("same", None, None, 10).unwrap();
-        let b = idx.search("same", None, None, 10).unwrap();
+        let a = idx.search("same", None, None, 10, false).unwrap();
+        let b = idx.search("same", None, None, 10, false).unwrap();
         let ga: Vec<_> = a.iter().map(|h| h.id.chunk_id).collect();
         let gb: Vec<_> = b.iter().map(|h| h.id.chunk_id).collect();
         assert_eq!(ga, gb);

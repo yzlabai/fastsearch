@@ -62,6 +62,8 @@ pub struct SearchHit {
     pub bm25: Option<f32>,
     /// 向量相似分（hybrid 路；vector 后端落地前为 None）。
     pub vector: Option<f64>,
+    /// 高亮片段（HTML）；仅 keyword 命中且 req.highlight 时有值。
+    pub highlight: Option<String>,
 }
 
 /// 端到端检索引擎。
@@ -148,8 +150,13 @@ impl Engine {
 
         // keyword 召回
         let kw_hits: Vec<TextHit> = if want_kw {
-            self.text
-                .search(&req.query, req.filter.as_ref(), acl, candidates)?
+            self.text.search(
+                &req.query,
+                req.filter.as_ref(),
+                acl,
+                candidates,
+                req.highlight,
+            )?
         } else {
             vec![]
         };
@@ -170,9 +177,13 @@ impl Engine {
         // 查找表：引用 / 各路分
         let mut kw_score: HashMap<GlobalId, f32> = HashMap::new();
         let mut citation: HashMap<GlobalId, Citation> = HashMap::new();
+        let mut highlight: HashMap<GlobalId, String> = HashMap::new();
         for h in &kw_hits {
             kw_score.insert(h.id.clone(), h.score);
             citation.insert(h.id.clone(), h.citation.clone());
+            if let Some(hl) = &h.highlight {
+                highlight.insert(h.id.clone(), hl.clone());
+            }
         }
         let mut vec_score: HashMap<GlobalId, f64> = HashMap::new();
         for s in &vec_scored {
@@ -214,6 +225,7 @@ impl Engine {
                     citation: c.clone(),
                     bm25: kw_score.get(&s.id).copied(),
                     vector: vec_score.get(&s.id).copied(),
+                    highlight: highlight.get(&s.id).cloned(),
                 })
             })
             .collect();
@@ -303,6 +315,22 @@ mod tests {
         assert_eq!(hits[0].citation.page, 5);
         assert!(hits[0].bm25.is_some());
         assert_eq!(hits[0].vector, None);
+        assert!(hits[0].highlight.is_none()); // 默认不高亮
+    }
+
+    #[test]
+    fn highlight_when_requested() {
+        let mut e = engine();
+        e.ingest(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha beta gamma", 5),
+        )
+        .unwrap();
+        e.commit().unwrap();
+        let mut r = req("beta");
+        r.highlight = true;
+        let hits = e.search(&r, None).unwrap();
+        assert!(hits[0].highlight.as_ref().unwrap().contains("<b>beta</b>"));
     }
 
     #[test]

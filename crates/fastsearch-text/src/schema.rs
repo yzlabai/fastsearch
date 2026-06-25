@@ -64,10 +64,16 @@ pub struct Fields {
 pub fn build_schema(tokenizer: TokenizerKind) -> (Schema, Fields) {
     let mut sb = Schema::builder();
 
-    let text_indexing = TextFieldIndexing::default()
-        .set_tokenizer(tokenizer.name())
-        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-    let text_opts = TextOptions::default().set_indexing_options(text_indexing);
+    let text_indexing = || {
+        TextFieldIndexing::default()
+            .set_tokenizer(tokenizer.name())
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+    };
+    // text 额外 STORED：高亮（SnippetGenerator）需要原文。heading 不存（省空间）。
+    let text_opts = TextOptions::default()
+        .set_indexing_options(text_indexing())
+        .set_stored();
+    let heading_opts = TextOptions::default().set_indexing_options(text_indexing());
 
     // 过滤/分面字段额外加 STORED，便于检索后精确 post-filter（core Filter::eval）。
     // TextOptions/NumericOptions 非 Copy，每次取一份。
@@ -78,8 +84,8 @@ pub fn build_schema(tokenizer: TokenizerKind) -> (Schema, Fields) {
         gid: sb.add_text_field("gid", STRING | STORED),
         collection: sb.add_text_field("collection", str_fast_stored()),
         doc_id: sb.add_text_field("doc_id", str_fast_stored()),
-        text: sb.add_text_field("text", text_opts.clone()),
-        heading: sb.add_text_field("heading", text_opts),
+        text: sb.add_text_field("text", text_opts),
+        heading: sb.add_text_field("heading", heading_opts),
         kind: sb.add_text_field("kind", str_fast_stored()),
         page: sb.add_u64_field("page", u64_fast_stored()),
         section_id: sb.add_u64_field("section_id", u64_fast_stored()),

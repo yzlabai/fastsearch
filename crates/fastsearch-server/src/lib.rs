@@ -134,6 +134,7 @@ async fn search(
                 "bbox": h.citation.bbox,
                 "heading_path": h.citation.heading_path,
                 "section_id": h.citation.section_id,
+                "highlight": h.highlight,
             })
         })
         .collect();
