@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use fastsearch_core::{AclFilter, Chunk, SearchRequest};
+use fastsearch_core::{AclFilter, Chunk, GlobalId, SearchRequest};
 use fastsearch_engine::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -216,6 +216,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/metrics", get(metrics))
         .route("/openapi.json", get(openapi))
         .route("/v1/search", post(search))
+        .route("/v1/similar", post(similar))
         .route("/v1/index", post(index))
         .with_state(state)
 }
@@ -311,6 +312,16 @@ fn openapi_spec() -> Value {
                     "responses": {"200": {"description": "{indexed: n}"}, "401": {"description": "认证失败"}}
                 }
             },
+            "/v1/similar": {
+                "post": {
+                    "summary": "more_like_this：按 citation_id 反查相似",
+                    "requestBody": {"required": true, "content": {"application/json":
+                        {"schema": {"type": "object", "required": ["citation_id"], "properties": {
+                            "citation_id": {"type": "string"}, "top_k": {"type": "integer", "default": 10}}}}}},
+                    "responses": {"200": {"description": "命中列表"}, "400": {"description": "非法 citation_id"},
+                        "401": {"description": "认证失败"}}
+                }
+            },
             "/healthz": {"get": {"summary": "存活探针", "security": [], "responses": {"200": {"description": "ok"}}}},
             "/readyz": {"get": {"summary": "就绪探针", "security": [], "responses": {"200": {"description": "ready"}}}},
             "/metrics": {"get": {"summary": "Prometheus 指标", "security": [], "responses": {"200": {"description": "text/plain"}}}}
@@ -391,6 +402,29 @@ async fn metrics(State(s): State<ServerState>) -> String {
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
+/// 命中列表 → JSON 数组（search / similar 共用）。
+fn hits_json(hits: &[fastsearch_engine::SearchHit]) -> Vec<Value> {
+    hits.iter()
+        .map(|h| {
+            json!({
+                "citation_id": h.citation.citation_id(),
+                "score": h.score,
+                "bm25": h.bm25,
+                "vector": h.vector,
+                "rerank": h.rerank,
+                "doc_id": h.id.doc_id,
+                "chunk_id": h.id.chunk_id,
+                "page": h.citation.page,
+                "bbox": h.citation.bbox,
+                "heading_path": h.citation.heading_path,
+                "section_id": h.citation.section_id,
+                "highlight": h.highlight,
+                "merged_chunk_ids": h.merged_chunk_ids,
+            })
+        })
+        .collect()
+}
+
 async fn search(
     State(s): State<ServerState>,
     headers: HeaderMap,
@@ -421,26 +455,7 @@ async fn search(
     s.metrics
         .observe_search_latency(started.elapsed().as_secs_f64());
 
-    let arr: Vec<Value> = hits
-        .iter()
-        .map(|h| {
-            json!({
-                "citation_id": h.citation.citation_id(),
-                "score": h.score,
-                "bm25": h.bm25,
-                "vector": h.vector,
-                "rerank": h.rerank,
-                "doc_id": h.id.doc_id,
-                "chunk_id": h.id.chunk_id,
-                "page": h.citation.page,
-                "bbox": h.citation.bbox,
-                "heading_path": h.citation.heading_path,
-                "section_id": h.citation.section_id,
-                "highlight": h.highlight,
-                "merged_chunk_ids": h.merged_chunk_ids,
-            })
-        })
-        .collect();
+    let arr = hits_json(&hits);
     // 分面 → {field: [{value, count}]}
     let facets_json: Value = facets
         .into_iter()
@@ -464,6 +479,58 @@ async fn search(
         status: 200,
     });
     Ok(Json(json!({ "hits": arr, "facets": facets_json })))
+}
+
+#[derive(Deserialize)]
+struct SimilarBody {
+    citation_id: String,
+    #[serde(default = "default_similar_k")]
+    top_k: usize,
+}
+fn default_similar_k() -> usize {
+    10
+}
+
+/// more_like_this：按种子 citation_id 反查相似命中（ACL 强制注入，不可绕过）。
+async fn similar(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<SimilarBody>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
+        s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
+        (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid API key".into(),
+        )
+    })?;
+    let acl = acl_for(&principal);
+    let gid =
+        GlobalId::parse(&body.citation_id).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let engine = s.engine.lock().await;
+    let hits = engine
+        .more_like_this(&gid, body.top_k, Some(&acl))
+        .map_err(|e| {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+    s.metrics.searches.fetch_add(1, Ordering::Relaxed);
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/similar",
+        tenant: principal.tenant.clone(),
+        tags: principal.tags.clone(),
+        query: Some(body.citation_id.clone()),
+        collection: None,
+        doc_id: None,
+        hits: Some(hits.len()),
+        status: 200,
+    });
+    Ok(Json(json!({ "hits": hits_json(&hits) })))
 }
 
 #[derive(Deserialize)]
@@ -822,6 +889,41 @@ mod tests {
         assert_eq!(evs[0].tenant.as_deref(), Some("acme"));
         assert_eq!(evs[0].hits, Some(1));
         assert_eq!(evs[0].status, 200);
+    }
+
+    #[tokio::test]
+    async fn similar_endpoint_excludes_seed() {
+        // 灌入两条共享词 + 一条无关，对种子求相似。
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        for (id, txt) in [
+            (1, "alpha beta gamma"),
+            (2, "beta gamma delta"),
+            (3, "zzz qqq"),
+        ] {
+            engine
+                .ingest("kb", &chunk(id, txt, vec!["team-a"]))
+                .unwrap();
+        }
+        engine.commit().unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/similar")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"citation_id":"kb:rep.pdf:1","top_k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let hits = v["hits"].as_array().unwrap();
+        // 不含种子 chunk 1；含相似 chunk 2
+        assert!(hits.iter().all(|h| h["chunk_id"] != 1));
+        assert!(hits.iter().any(|h| h["chunk_id"] == 2));
     }
 
     #[tokio::test]

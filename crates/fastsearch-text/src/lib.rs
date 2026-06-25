@@ -178,6 +178,27 @@ impl TextIndex {
         Ok(())
     }
 
+    /// 按 global_id 取已索引的正文（STORED 字段）；不存在返回 None。
+    /// 供 more_like_this 等需要"种子文本"的能力使用。
+    pub fn stored_text(&self, gid: &GlobalId) -> Result<Option<String>> {
+        let searcher = self.reader.searcher();
+        let q = TermQuery::new(
+            Term::from_field_text(self.fields.gid, &gid.to_citation_id()),
+            IndexRecordOption::Basic,
+        );
+        let top = searcher.search(&q, &TopDocs::with_limit(1).order_by_score())?;
+        match top.first() {
+            Some((_s, addr)) => {
+                let doc: TantivyDocument = searcher.doc(*addr)?;
+                Ok(doc
+                    .get_first(self.fields.text)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// 构造正文查询：短语 `"a b"`、邻近 `"a b"~N`、布尔走 Tantivy `QueryParser`；
     /// **末词带 `*` 的前缀查询**（search-as-you-type，如 `数据 检索*`）由本方法识别并
     /// 用 `RegexQuery` 在 text 字段做前缀匹配（前词照常 parse），两路 Should 合并。

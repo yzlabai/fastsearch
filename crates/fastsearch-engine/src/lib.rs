@@ -171,6 +171,35 @@ impl Engine {
         self.run(req, acl)
     }
 
+    /// more_like_this：以种子 chunk 的正文反查相似命中（keyword 模式），排除种子自身。
+    /// 种子不存在 → 返回空。ACL 照常强制（不可绕过）。
+    pub fn more_like_this(
+        &self,
+        gid: &GlobalId,
+        top_k: usize,
+        acl: Option<&AclFilter>,
+    ) -> Result<Vec<SearchHit>> {
+        let seed_text = match self.text.stored_text(gid)? {
+            Some(t) => t,
+            None => return Ok(vec![]),
+        };
+        let query = mlt_query(&seed_text);
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        let req = SearchRequest {
+            query,
+            mode: SearchMode::Keyword,
+            top_k: top_k + 1, // 多取一条，扣掉种子自身
+            candidates: (top_k + 1).max(SearchRequest::default().candidates),
+            ..Default::default()
+        };
+        let mut hits = self.run(&req, acl)?.0;
+        hits.retain(|h| &h.id != gid);
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
     fn run(
         &self,
         req: &SearchRequest,
@@ -368,6 +397,21 @@ fn auto_merge(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     out
 }
 
+/// 把种子正文净化成 keyword 查询：剔除 Tantivy 查询元字符（保留字母/数字/CJK/空白），
+/// 取前 `MLT_TERMS` 个词。避免长文本/特殊字符破坏 QueryParser。
+const MLT_TERMS: usize = 20;
+fn mlt_query(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    cleaned
+        .split_whitespace()
+        .take(MLT_TERMS)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// 按最终排名折叠分组：每个分组键至多保留 `max_per_group` 条（高分者优先）。
 /// `field` 支持 `doc_id` / `section_id`；其他值视为不折叠（原样返回）。保序、确定性。
 fn collapse_groups(hits: Vec<SearchHit>, field: &str, max_per_group: usize) -> Vec<SearchHit> {
@@ -547,6 +591,63 @@ mod tests {
                 assert!(h.merged_chunk_ids.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn more_like_this_finds_similar_excludes_seed() {
+        let mut e = engine();
+        e.ingest(
+            "kb",
+            &chunk(
+                "a.pdf",
+                1,
+                ChunkKind::Paragraph,
+                "machine learning models",
+                1,
+            ),
+        )
+        .unwrap();
+        e.ingest(
+            "kb",
+            &chunk(
+                "a.pdf",
+                2,
+                ChunkKind::Paragraph,
+                "learning models tuning",
+                2,
+            ),
+        )
+        .unwrap();
+        e.ingest(
+            "kb",
+            &chunk(
+                "a.pdf",
+                3,
+                ChunkKind::Paragraph,
+                "cooking recipes dinner",
+                3,
+            ),
+        )
+        .unwrap();
+        e.commit().unwrap();
+        let seed = GlobalId {
+            collection: "kb".into(),
+            doc_id: "a.pdf".into(),
+            chunk_id: 1,
+        };
+        let hits = e.more_like_this(&seed, 10, None).unwrap();
+        // 不含种子自身
+        assert!(hits.iter().all(|h| h.id.chunk_id != 1));
+        // chunk 2（共享 learning/models）应命中，chunk 3（无重叠）不该在最前
+        assert!(hits.iter().any(|h| h.id.chunk_id == 2));
+        assert_eq!(hits[0].id.chunk_id, 2);
+        // 种子不存在 → 空
+        let missing = GlobalId {
+            collection: "kb".into(),
+            doc_id: "a.pdf".into(),
+            chunk_id: 999,
+        };
+        assert!(e.more_like_this(&missing, 10, None).unwrap().is_empty());
     }
 
     #[test]
