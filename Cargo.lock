@@ -648,6 +648,7 @@ dependencies = [
  "anyhow",
  "axum",
  "fastsearch-core",
+ "fastsearch-embed",
  "fastsearch-engine",
  "fastsearch-text",
  "http-body-util",

@@ -11,7 +11,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use fastsearch_core::{AclFilter, Chunk, GlobalId, SearchRequest};
+use fastsearch_core::{AclFilter, Chunk, GlobalId, SearchMode, SearchRequest};
+use fastsearch_embed::{EmbedKind, Embedder};
 use fastsearch_engine::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -123,6 +124,8 @@ pub struct ServerState {
     metrics: Arc<Metrics>,
     rate_limiter: Option<Arc<RateLimiter>>,
     audit: Option<AuditSink>,
+    /// 真语义嵌入后端（None=不嵌入，检索退化为 keyword）。
+    embedder: Option<Arc<dyn Embedder + Send + Sync>>,
 }
 
 impl ServerState {
@@ -133,7 +136,25 @@ impl ServerState {
             metrics: Arc::new(Metrics::default()),
             rate_limiter: None,
             audit: None,
+            embedder: None,
         }
+    }
+
+    /// 设置嵌入后端：ingest 自动嵌入 passage、search 自动嵌入 query（开启真混合）。
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder + Send + Sync>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// 在引擎锁外、`spawn_blocking` 里算嵌入（HTTP 阻塞调用不卡 async 运行时、不持锁）。
+    async fn embed(&self, texts: Vec<String>, kind: EmbedKind) -> Result<Vec<Vec<f32>>, String> {
+        let Some(emb) = self.embedder.clone() else {
+            return Ok(vec![]);
+        };
+        tokio::task::spawn_blocking(move || emb.embed(&texts, kind))
+            .await
+            .map_err(|e| format!("embed task join: {e}"))?
+            .map_err(|e| format!("embed: {e}"))
     }
 
     /// 开启限流（每 key 令牌桶：容量 + 每秒回填）。
@@ -444,6 +465,20 @@ async fn search(
     })?;
     let acl = acl_for(&principal);
 
+    // 真混合：mode 需要向量、客户端未传 vector、且配了嵌入后端 → 锁外嵌入 query。
+    let mut req = req;
+    let needs_vec = matches!(req.mode, SearchMode::Hybrid | SearchMode::Vector);
+    if needs_vec && req.vector.is_none() && s.embedder.is_some() {
+        match s.embed(vec![req.query.clone()], EmbedKind::Query).await {
+            Ok(mut v) if !v.is_empty() => req.vector = Some(v.remove(0)),
+            Ok(_) => {}
+            Err(e) => {
+                s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
+            }
+        }
+    }
+
     let engine = s.engine.lock().await;
     let (hits, facets) = engine
         .search_with_facets(&req, Some(&acl)) // ACL 强制注入，客户端不可绕过
@@ -561,12 +596,28 @@ async fn index(
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     };
 
+    // 锁外嵌入每个 chunk 的正文（passage）；无嵌入后端则空向量、退化为纯全文。
+    let vectors: Vec<Vec<f32>> = if s.embedder.is_some() {
+        let texts: Vec<String> = body.chunks.iter().map(|c| c.text.clone()).collect();
+        s.embed(texts, EmbedKind::Passage).await.map_err(|e| {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?
+    } else {
+        vec![]
+    };
+
     let mut engine = s.engine.lock().await;
     engine
         .remove_doc(&body.collection, &body.doc_id)
         .map_err(&err500)?;
-    for c in &body.chunks {
-        engine.ingest(&body.collection, c).map_err(&err500)?;
+    for (i, c) in body.chunks.iter().enumerate() {
+        match vectors.get(i) {
+            Some(v) => engine
+                .ingest_vector(&body.collection, c, v.clone())
+                .map_err(&err500)?,
+            None => engine.ingest(&body.collection, c).map_err(&err500)?,
+        }
     }
     engine.commit().map_err(&err500)?;
     let n = body.chunks.len();
@@ -946,6 +997,76 @@ mod tests {
         assert!(v["components"]["schemas"]["SearchRequest"].is_object());
         // 版本来自 crate 版本，非空
         assert!(v["info"]["version"].as_str().unwrap().len() >= 3);
+    }
+
+    /// 真语义混合（env-gated，需本地 Ollama）：经 server 灌入带嵌入的 passage，再用
+    /// **语义相关但词面不重叠**的查询走 vector 模式，断言语义最近的 chunk 居首。
+    /// 例：`FASTSEARCH_EMBED_TEST_URL=http://localhost:11434 FASTSEARCH_EMBED_MODEL=nomic-embed-text-v2-moe \
+    ///      FASTSEARCH_EMBED_DIM=768 cargo test -p fastsearch-server semantic_hybrid -- --nocapture`
+    #[tokio::test]
+    async fn semantic_hybrid_via_server_gated() {
+        let Ok(url) = std::env::var("FASTSEARCH_EMBED_TEST_URL") else {
+            eprintln!("skip semantic_hybrid_via_server_gated: FASTSEARCH_EMBED_TEST_URL not set");
+            return;
+        };
+        let mut ecfg = fastsearch_embed::EmbedderConfig::from_env();
+        ecfg.url = url;
+        if !matches!(ecfg.kind, fastsearch_embed::EmbedderKind::Http(_)) {
+            ecfg.kind =
+                fastsearch_embed::EmbedderKind::Http(fastsearch_embed::HttpProtocol::Ollama);
+        }
+        let embedder = Arc::from(fastsearch_embed::build_embedder(&ecfg));
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let state = ServerState::new(engine, keys()).with_embedder(embedder);
+        let app = router(state);
+
+        // 灌入两段：A=盈利能力，B=停车安排（公开 acl）。
+        let body = r#"{"collection":"kb","doc_id":"rep.pdf","chunks":[
+            {"doc_id":"rep.pdf","chunk_id":1,"kind":"paragraph","text":"本季度公司盈利能力显著改善，净利润增长。","page":1,
+             "bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":18,"acl":["team-a"],"tenant":"acme"},
+            {"doc_id":"rep.pdf","chunk_id":2,"kind":"paragraph","text":"新办公楼的访客停车位安排与门禁说明。","page":2,
+             "bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":17,"acl":["team-a"],"tenant":"acme"}]}"#;
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // 语义查询（与 A 词面几乎不重叠）走 vector 模式 → A 应居首。
+        let q = r#"{"query":"企业的赚钱能力如何","mode":"vector","top_k":5}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(q))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let hits = v["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "vector search returned no hits");
+        assert_eq!(
+            hits[0]["chunk_id"], 1,
+            "semantically closest chunk should rank first"
+        );
+        assert!(
+            hits[0]["vector"].as_f64().is_some(),
+            "vector score should be present"
+        );
     }
 
     #[test]

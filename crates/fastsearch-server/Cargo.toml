@@ -19,6 +19,7 @@ path = "src/lib.rs"
 fastsearch-core.workspace = true
 fastsearch-engine.workspace = true
 fastsearch-text.workspace = true
+fastsearch-embed = { path = "../fastsearch-embed" }
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true

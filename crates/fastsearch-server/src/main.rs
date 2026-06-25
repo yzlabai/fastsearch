@@ -99,6 +99,17 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_audit(sink);
         eprintln!("audit log on (stderr JSON)");
     }
+    // 嵌入后端：FASTSEARCH_EMBEDDER=ollama|openai 时开启真语义混合（默认 hash→不嵌入，纯全文）。
+    let ecfg = fastsearch_embed::EmbedderConfig::from_env();
+    if matches!(ecfg.kind, fastsearch_embed::EmbedderKind::Http(_)) {
+        state = state.with_embedder(std::sync::Arc::from(fastsearch_embed::build_embedder(
+            &ecfg,
+        )));
+        eprintln!(
+            "embedder on: {:?} url={} model={} dim={}",
+            ecfg.kind, ecfg.url, ecfg.model, ecfg.dim
+        );
+    }
     let app = router(state);
 
     let addr = format!("127.0.0.1:{port}");
