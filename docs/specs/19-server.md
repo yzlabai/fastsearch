@@ -53,5 +53,6 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 
 - [x] v1 完成：router + API-Key 认证 + **ACL 服务端注入不可绕过** + /v1/search + /v1/index + /healthz /readyz /metrics + 6 测试绿（HTTP oneshot：健康/认证 401/**acl_not_bypassable**/index→search/坏 body 400/纯函数）。clippy 净、fmt 净。
 - [x] 可运行二进制 `fastsearch-server`（main.rs，端口 + key 配置）。
+- [x] v1.1：Prometheus 指标完善 —— counters（requests/searches/indexed/**errors/unauthorized/rate_limited**）带标准 `# HELP`/`# TYPE`，+ **检索延迟直方图** `fastsearch_search_latency_seconds`（累积 le 桶 + _sum + _count）。+1 测试（指标含直方图与未授权计数）。
 
-**已知限制 / 下一迭代：** MCP 工具面、限流/admission control、完整 Prometheus 指标、RBAC 策略引擎、TLS（交网关）、并发优化（当前 Mutex 串行；后续 RwLock/副本）。
+**已知限制 / 下一迭代：** MCP 工具面、RBAC 策略引擎、TLS（交网关）、并发优化（当前 Mutex 串行；后续 RwLock/副本）。

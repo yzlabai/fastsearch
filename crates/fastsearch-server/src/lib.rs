@@ -27,11 +27,37 @@ pub struct Principal {
     pub tags: Vec<String>,
 }
 
+/// 检索延迟直方图桶上界（秒，升序）。
+const LAT_BUCKETS: [f64; 11] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+
 #[derive(Default)]
 struct Metrics {
     requests: AtomicU64,
     searches: AtomicU64,
     indexed: AtomicU64,
+    errors: AtomicU64,
+    unauthorized: AtomicU64,
+    rate_limited: AtomicU64,
+    /// 累积桶计数：`lat_buckets[i]` = 延迟 ≤ `LAT_BUCKETS[i]` 的检索数。
+    lat_buckets: [AtomicU64; LAT_BUCKETS.len()],
+    lat_sum_micros: AtomicU64,
+    lat_count: AtomicU64,
+}
+
+impl Metrics {
+    /// 记录一次检索延迟（秒）到累积直方图。
+    fn observe_search_latency(&self, secs: f64) {
+        self.lat_count.fetch_add(1, Ordering::Relaxed);
+        self.lat_sum_micros
+            .fetch_add((secs * 1e6) as u64, Ordering::Relaxed);
+        for (i, ub) in LAT_BUCKETS.iter().enumerate() {
+            if secs <= *ub {
+                self.lat_buckets[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// 服务状态（可 Clone：内部 Arc 共享）。
@@ -92,12 +118,73 @@ pub fn router(state: ServerState) -> Router {
 
 async fn metrics(State(s): State<ServerState>) -> String {
     let m = &s.metrics;
-    format!(
-        "fastsearch_requests_total {}\nfastsearch_searches_total {}\nfastsearch_indexed_total {}\n",
-        m.requests.load(Ordering::Relaxed),
-        m.searches.load(Ordering::Relaxed),
-        m.indexed.load(Ordering::Relaxed),
-    )
+    let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let mut out = String::new();
+    let counter = |out: &mut String, name: &str, help: &str, v: u64| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"
+        ));
+    };
+    counter(
+        &mut out,
+        "fastsearch_requests_total",
+        "Total HTTP requests handled.",
+        g(&m.requests),
+    );
+    counter(
+        &mut out,
+        "fastsearch_searches_total",
+        "Total successful searches.",
+        g(&m.searches),
+    );
+    counter(
+        &mut out,
+        "fastsearch_indexed_total",
+        "Total chunks indexed.",
+        g(&m.indexed),
+    );
+    counter(
+        &mut out,
+        "fastsearch_errors_total",
+        "Total requests answered with 5xx.",
+        g(&m.errors),
+    );
+    counter(
+        &mut out,
+        "fastsearch_unauthorized_total",
+        "Total requests rejected for auth.",
+        g(&m.unauthorized),
+    );
+    counter(
+        &mut out,
+        "fastsearch_rate_limited_total",
+        "Total requests rejected by rate limit.",
+        g(&m.rate_limited),
+    );
+
+    // 检索延迟直方图（Prometheus 累积 le 桶）。
+    out.push_str(
+        "# HELP fastsearch_search_latency_seconds Search latency in seconds.\n\
+         # TYPE fastsearch_search_latency_seconds histogram\n",
+    );
+    for (i, ub) in LAT_BUCKETS.iter().enumerate() {
+        out.push_str(&format!(
+            "fastsearch_search_latency_seconds_bucket{{le=\"{ub}\"}} {}\n",
+            g(&m.lat_buckets[i])
+        ));
+    }
+    let count = g(&m.lat_count);
+    out.push_str(&format!(
+        "fastsearch_search_latency_seconds_bucket{{le=\"+Inf\"}} {count}\n"
+    ));
+    out.push_str(&format!(
+        "fastsearch_search_latency_seconds_sum {}\n",
+        g(&m.lat_sum_micros) as f64 / 1e6
+    ));
+    out.push_str(&format!(
+        "fastsearch_search_latency_seconds_count {count}\n"
+    ));
+    out
 }
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
@@ -107,18 +194,27 @@ async fn search(
     headers: HeaderMap,
     Json(req): Json<SearchRequest>,
 ) -> ApiResult {
+    let started = std::time::Instant::now();
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    let principal = principal_from_headers(&headers, &s.keys).ok_or((
-        StatusCode::UNAUTHORIZED,
-        "missing or invalid API key".into(),
-    ))?;
+    let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
+        s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
+        (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid API key".into(),
+        )
+    })?;
     let acl = acl_for(&principal);
 
     let engine = s.engine.lock().await;
     let (hits, facets) = engine
         .search_with_facets(&req, Some(&acl)) // ACL 强制注入，客户端不可绕过
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
     s.metrics.searches.fetch_add(1, Ordering::Relaxed);
+    s.metrics
+        .observe_search_latency(started.elapsed().as_secs_f64());
 
     let arr: Vec<Value> = hits
         .iter()
@@ -168,23 +264,26 @@ async fn index(
     Json(body): Json<IndexBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    principal_from_headers(&headers, &s.keys).ok_or((
-        StatusCode::UNAUTHORIZED,
-        "missing or invalid API key".into(),
-    ))?;
+    principal_from_headers(&headers, &s.keys).ok_or_else(|| {
+        s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
+        (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid API key".into(),
+        )
+    })?;
+    let err500 = |e: fastsearch_engine::EngineError| {
+        s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    };
 
     let mut engine = s.engine.lock().await;
     engine
         .remove_doc(&body.collection, &body.doc_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(&err500)?;
     for c in &body.chunks {
-        engine
-            .ingest(&body.collection, c)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        engine.ingest(&body.collection, c).map_err(&err500)?;
     }
-    engine
-        .commit()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    engine.commit().map_err(&err500)?;
     let n = body.chunks.len();
     s.metrics.indexed.fetch_add(n as u64, Ordering::Relaxed);
     Ok(Json(json!({ "indexed": n })))
@@ -388,6 +487,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_counters_and_histogram() {
+        let app = app_with_data().await;
+        // 一次成功检索
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer k-team-a")
+                    .body(Body::from(r#"{"query":"secret","top_k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 一次未授权
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("fastsearch_searches_total 1"));
+        assert!(text.contains("fastsearch_unauthorized_total 1"));
+        assert!(text.contains("fastsearch_search_latency_seconds_count 1"));
+        assert!(text.contains("fastsearch_search_latency_seconds_bucket{le=\"+Inf\"} 1"));
+        assert!(text.contains("# TYPE fastsearch_search_latency_seconds histogram"));
     }
 
     #[test]
