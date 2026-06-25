@@ -7,7 +7,8 @@
 //! 纯函数、确定性、不 panic。gid 用 [`GlobalId`]；相关度等级 `grade`（0=不相关，
 //! 越大越相关）。
 
-use fastsearch_core::GlobalId;
+use fastsearch_core::{Chunk, GlobalId};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// 一个查询的相关性判定：gid → 相关度等级。
@@ -53,7 +54,7 @@ impl RankedResults {
 }
 
 /// 各指标的均值（@k）。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Metrics {
     pub ndcg: f64,
     pub recall: f64,
@@ -188,6 +189,53 @@ pub fn assert_no_regression(baseline: &Metrics, current: &Metrics, tol: f64) -> 
     Ok(())
 }
 
+/// golden 集（JSON 可加载）：一份固定语料 + 一组带相关性判定的查询。
+///
+/// 把"语料 + 判定"放在一起，便于 engine 把 `corpus` 灌入索引、对每个 `queries`
+/// 跑真实检索、再用 [`judgments`](GoldenSet::judgments) 与判定算指标做 CI 回归门禁
+/// （F39 闭环）。eval 自身**不跑检索**（那是 engine 的事，守住分层），只负责
+/// 加载 golden、提供指标与门禁。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenSet {
+    /// 语料所属集合（参与 `GlobalId` 与 citation_id）。
+    pub collection: String,
+    /// 待灌入索引的 chunk 语料（复用 [`Chunk`] 的 schema，与 docparse 对齐）。
+    pub corpus: Vec<Chunk>,
+    /// 带相关性判定的查询。
+    pub queries: Vec<GoldenQuery>,
+}
+
+/// golden 集里的一条查询及其相关性判定。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenQuery {
+    /// 查询串（原样喂给引擎）。
+    pub query: String,
+    /// 相关性判定：`citation_id`（`collection:doc_id:chunk_id`）→ 等级（0=不相关，越大越相关）。
+    /// 用完整 citation_id 以规避 doc_id 含 `:` 的歧义。
+    pub relevant: HashMap<String, u8>,
+}
+
+impl GoldenSet {
+    /// 从 JSON 文本加载（语料 + 判定）。schema 错误返回 [`serde_json::Error`]。
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+
+    /// 把所有查询的判定汇成 [`Judgments`]（query → gid→grade）。
+    /// `relevant` 的 key 须为合法 citation_id，否则返回 [`CoreError`](fastsearch_core::CoreError)。
+    pub fn judgments(&self) -> fastsearch_core::Result<Judgments> {
+        let mut j = Judgments::new();
+        for q in &self.queries {
+            let mut grades = Grades::new();
+            for (cid, grade) in &q.relevant {
+                grades.insert(GlobalId::parse(cid)?, *grade);
+            }
+            j.add(q.query.clone(), grades);
+        }
+        Ok(j)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +318,43 @@ mod tests {
         let m = evaluate(&RankedResults::new(), &Judgments::new(), 5);
         assert_eq!(m.ndcg, 0.0);
         assert_eq!(m.mrr, 0.0);
+    }
+
+    #[test]
+    fn golden_set_loads_and_builds_judgments() {
+        let json = r#"{
+            "collection": "kb",
+            "corpus": [
+                {"doc_id":"d1","chunk_id":0,"kind":"paragraph","text":"hello world",
+                 "page":1,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":11}
+            ],
+            "queries": [
+                {"query":"hello","relevant":{"kb:d1:0":3,"kb:d1:7":1}}
+            ]
+        }"#;
+        let set = GoldenSet::from_json(json).unwrap();
+        assert_eq!(set.collection, "kb");
+        assert_eq!(set.corpus.len(), 1);
+        assert_eq!(set.corpus[0].doc_id, "d1");
+        let j = set.judgments().unwrap();
+        let g = j.get("hello").unwrap();
+        let gid_d1_0 = GlobalId {
+            collection: "kb".into(),
+            doc_id: "d1".into(),
+            chunk_id: 0,
+        };
+        assert_eq!(g.get(&gid_d1_0), Some(&3));
+        assert_eq!(g.len(), 2);
+    }
+
+    #[test]
+    fn golden_set_rejects_bad_citation() {
+        let json = r#"{
+            "collection":"kb","corpus":[],
+            "queries":[{"query":"x","relevant":{"not-a-citation":1}}]
+        }"#;
+        let set = GoldenSet::from_json(json).unwrap();
+        assert!(set.judgments().is_err());
     }
 
     #[test]

@@ -51,5 +51,8 @@ pub fn recall_at_k(...) -> f64; pub fn mrr(...) -> f64; pub fn precision_at_k(..
 ## 6. 验收标准与状态
 
 - [x] v1 完成：nDCG@k / recall@k / precision@k / MRR + evaluate（多 query 均值）+ assert_no_regression 门禁 + 7 单测绿（含手算对照、完美/逆序、边界）。clippy 净、fmt 净。
+- [x] v2 完成（F39 闭环）：**golden 集 JSON 加载** `GoldenSet { collection, corpus: Vec<Chunk>, queries: Vec<GoldenQuery{query, relevant: cid→grade}> }`（复用 `Chunk` serde + `GlobalId::parse` 解 citation_id key）+ `from_json` / `judgments()`；`Metrics` 加 serde 便于落 baseline。**接入 engine 跑真检索**落在 `engine::golden::run`（守住分层：eval 不跑检索）。**CI 回归门禁**：固定 golden 集（`crates/fastsearch-engine/tests/golden/zh_finance.json` 中文财报语料 + Jieba）+ 提交 baseline，`relevance_gate.rs::no_regression_against_baseline` 断言不掉点（tol 0.02）；改语料/排序后用 `--ignored` 的 `probe_print_metrics` 重算 baseline。eval +2 单测（加载/坏 citation），engine +1 门禁测试。
 
-**下一迭代：** golden 集 JSON 加载格式；接入 engine 跑真实检索算指标；CI 里对固定 golden 集做回归门禁（F39 完整闭环）。
+**已知限制 / 下一迭代：**
+- 门禁用 `SearchMode::Keyword`（确定性、零重依赖，适合 CI）；hybrid/vector 门禁待真语义嵌入落地（HashEmbedder 非语义，纳入门禁无意义）。
+- golden 集仍小（演示闭环为主）；扩充语料/查询、CLI 暴露 `fastsearch eval`、CI workflow 显式跑门禁为后续。

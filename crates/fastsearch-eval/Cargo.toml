@@ -9,3 +9,5 @@ description = "Relevance evaluation harness for fastsearch: nDCG/recall/MRR/prec
 
 [dependencies]
 fastsearch-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true

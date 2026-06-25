@@ -342,6 +342,53 @@ impl fastsearch_sync::IndexSink for Engine {
     }
 }
 
+/// 相关性评测闭环（F39）：把 [`GoldenSet`](fastsearch_eval::GoldenSet) 语料灌入引擎、
+/// 对每个查询跑**真实检索**、用判定算指标。eval crate 只管指标与门禁、不跑检索（守住
+/// 分层）；"跑检索"这步落在 engine 这里。
+///
+/// CI 回归门禁的用法：固定 golden 集 + 提交的 baseline [`Metrics`](fastsearch_eval::Metrics)
+/// → `run()` 算当前指标 → [`assert_no_regression`](fastsearch_eval::assert_no_regression)。
+pub mod golden {
+    use crate::{Engine, Result};
+    use fastsearch_core::{SearchMode, SearchRequest};
+    use fastsearch_eval::{evaluate, GoldenSet, Metrics, RankedResults};
+    use fastsearch_text::TextIndexConfig;
+
+    /// 把 golden 语料灌入一个内存引擎，对每个查询跑 `mode` 检索取 top-`k`，算指标均值。
+    ///
+    /// - 确定性：`mode=Keyword` 不需要嵌入，CI 可零重依赖跑（推荐做门禁）。
+    /// - `cfg` 决定分词等索引参数（中文 golden 用 `TokenizerKind::Jieba`）。
+    /// - 判定 key 非法 citation_id → 返回 [`EngineError::Core`](crate::EngineError::Core)。
+    pub fn run(
+        set: &GoldenSet,
+        cfg: TextIndexConfig,
+        mode: SearchMode,
+        k: usize,
+    ) -> Result<Metrics> {
+        let mut engine = Engine::create_in_ram(cfg)?;
+        for c in &set.corpus {
+            engine.ingest(&set.collection, c)?;
+        }
+        engine.commit()?;
+
+        let judg = set.judgments()?;
+        let mut results = RankedResults::new();
+        for q in &set.queries {
+            let req = SearchRequest {
+                query: q.query.clone(),
+                mode,
+                top_k: k,
+                // candidates 必须 >= top_k（见 SearchRequest::validate）。
+                candidates: k.max(SearchRequest::default().candidates),
+                ..Default::default()
+            };
+            let hits = engine.search(&req, None)?;
+            results.set(q.query.clone(), hits.into_iter().map(|h| h.id).collect());
+        }
+        Ok(evaluate(&results, &judg, k))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

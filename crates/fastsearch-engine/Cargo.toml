@@ -13,8 +13,10 @@ fastsearch-text.workspace = true
 fastsearch-vector.workspace = true
 fastsearch-rerank = { path = "../fastsearch-rerank" }
 fastsearch-sync = { path = "../fastsearch-sync" }
+fastsearch-eval = { path = "../fastsearch-eval" }
 anyhow.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+serde_json.workspace = true

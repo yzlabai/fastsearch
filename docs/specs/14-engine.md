@@ -54,6 +54,7 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 
 - [x] v1 完成：Engine + `IndexSink` 适配 + 全文/向量/**真混合**排序管线 + 9 端到端测试绿（含 CDC→索引→检索、ACL 强制、doc 级替换、过滤、real_hybrid 融合、vector_only、校验失败）。clippy 净、fmt 净。
 - [x] v1.1：接入 fastsearch-vector，mode=Hybrid 走 keyword∥vector → core::fuse；mode=Vector 纯向量；过滤/ACL 两路各自真预过滤。
+- [x] v1.2：`engine::golden::run(set, cfg, mode, k)` —— 把 eval `GoldenSet` 语料灌入内存引擎、对每个查询跑真实检索、用判定算 `Metrics`，承接 eval 的"跑检索"那步（eval 不反依赖 engine，分层不破）。配套 `tests/relevance_gate.rs` 回归门禁（见 [eval spec §6 v2](18-eval.md)）。
 
 **已知限制 / 下一迭代：**
 - auto-merging（section 归并）、rerank 钩子待 P3。

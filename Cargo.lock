@@ -580,10 +580,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fastsearch-core",
+ "fastsearch-eval",
  "fastsearch-rerank",
  "fastsearch-sync",
  "fastsearch-text",
  "fastsearch-vector",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -593,6 +595,8 @@ name = "fastsearch-eval"
 version = "0.1.0"
 dependencies = [
  "fastsearch-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
