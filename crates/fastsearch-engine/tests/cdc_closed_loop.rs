@@ -1,0 +1,135 @@
+//! CDC 端到端闭环（env-gated，需活 PG，`wal_level=logical`）：
+//!
+//!   写 PG（真源 PgStore）→ 逻辑复制 slot（pgoutput）→ pull_changes 解码 →
+//!   Applier 应用到 Engine（IndexSink）→ 检索命中
+//!
+//! 未设 `DATABASE_URL` 则跳过（不算失败）。本测试自清理（重置 slot/publication/表），
+//! 与运行顺序无关。
+
+use fastsearch_core::{BBox, Chunk, ChunkKind, SearchMode, SearchRequest};
+use fastsearch_engine::Engine;
+use fastsearch_pg::{PgConfig, PgStore};
+use fastsearch_sync::replication::{drop_slot, ensure_slot, pull_changes, ReplicationConfig};
+use fastsearch_sync::{Applier, Lsn};
+use fastsearch_text::TextIndexConfig;
+
+fn chunk(doc: &str, id: u64, text: &str) -> Chunk {
+    Chunk {
+        doc_id: doc.into(),
+        chunk_id: id,
+        kind: ChunkKind::Paragraph,
+        text: text.into(),
+        page: id as u32,
+        bbox: BBox {
+            x0: 1.0,
+            y0: 2.0,
+            x1: 3.0,
+            y1: 4.0,
+        },
+        heading_path: vec!["chapter".into(), "sec".into()],
+        section_id: 7,
+        char_len: text.len() as u32,
+        image_meta: None,
+        tenant: None,
+        acl: vec!["public".into()],
+    }
+}
+
+/// 直连跑建表前的清理 SQL（重置共享对象，保证幂等/隔离）。
+async fn reset(url: &str, slot: &str) {
+    let (client, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+        .await
+        .expect("connect for reset");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    // slot 先删（drop 表/publication 不影响 slot）。
+    let _ = client
+        .execute(
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name=$1",
+            &[&slot],
+        )
+        .await;
+    let _ = client
+        .batch_execute(
+            "DROP PUBLICATION IF EXISTS fastsearch_pub; DROP TABLE IF EXISTS fastsearch_chunks;",
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn cdc_closed_loop_pg_to_search() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_closed_loop_pg_to_search: DATABASE_URL not set");
+        return;
+    };
+    let slot = "fastsearch_cdc_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+    };
+
+    // 0) 清理：重置 slot/publication/表，保证与运行顺序无关。
+    reset(&url, slot).await;
+
+    // 1) 真源 schema（建表 + publication FOR TABLE fastsearch_chunks）。
+    let mut store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("ensure_schema");
+
+    // 2) 先建 slot（之后的写入才会被捕获）。
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+
+    // 3) 写 PG（真源）：doc 级替换写 3 个 chunk。
+    let chunks = vec![
+        chunk("rep.pdf", 1, "gross margin improved this year"),
+        chunk("rep.pdf", 2, "revenue grew by eighteen percent"),
+        chunk("rep.pdf", 3, "chip research investment increased"),
+    ];
+    let n = store
+        .upsert_doc("kb", "rep.pdf", &chunks)
+        .await
+        .expect("upsert_doc");
+    assert_eq!(n, 3);
+
+    // 4) CDC：从 slot 拉取并解码变更（应为 3 条 Upsert）。
+    let events = pull_changes(&rcfg).await.expect("pull_changes");
+    let upserts = events.len();
+    assert_eq!(upserts, 3, "expected 3 upsert events, got {events:?}");
+
+    // 5) 应用到 Engine（IndexSink）+ 提交。
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+    let mut applier = Applier::new(Lsn(0));
+    let applied = applier
+        .apply_batch(&mut engine, &events)
+        .expect("apply_batch");
+    assert_eq!(applied, 3);
+
+    // 6) 检索命中（闭环验证：PG 写的内容能在引擎检索到，带正确引用）。
+    let req = SearchRequest {
+        query: "revenue".into(),
+        mode: SearchMode::Keyword,
+        top_k: 5,
+        ..Default::default()
+    };
+    let hits = engine.search(&req, None).expect("search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id.doc_id, "rep.pdf");
+    assert_eq!(hits[0].id.chunk_id, 2);
+    assert_eq!(hits[0].citation.page, 2);
+    assert_eq!(hits[0].citation.heading_path, vec!["chapter", "sec"]);
+
+    // 另一个词验证多 chunk 都进了索引
+    let req2 = SearchRequest {
+        query: "chip".into(),
+        mode: SearchMode::Keyword,
+        top_k: 5,
+        ..Default::default()
+    };
+    assert_eq!(engine.search(&req2, None).unwrap()[0].id.chunk_id, 3);
+
+    // 7) 清理 slot（避免 WAL 滞留）。
+    drop_slot(&rcfg).await.expect("drop_slot");
+}

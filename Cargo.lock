@@ -582,6 +582,7 @@ dependencies = [
  "anyhow",
  "fastsearch-core",
  "fastsearch-eval",
+ "fastsearch-pg",
  "fastsearch-rerank",
  "fastsearch-sync",
  "fastsearch-text",
@@ -589,6 +590,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -639,7 +642,12 @@ name = "fastsearch-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "fastsearch-core",
+ "fastsearch-pg",
+ "futures-util",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

@@ -9,4 +9,12 @@ description = "CDC apply orchestration for fastsearch: idempotent, LSN-checkpoin
 
 [dependencies]
 fastsearch-core.workspace = true
+fastsearch-pg = { path = "../fastsearch-pg" }
 anyhow.workspace = true
+tokio-postgres.workspace = true
+tokio.workspace = true
+bytes = "1"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

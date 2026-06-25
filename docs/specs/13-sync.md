@@ -79,9 +79,23 @@ impl Applier {
 - 状态：
   - [x] v1 完成：Change 模型 + IndexSink trait + Applier（幂等/LSN 水位/批量/替换语义/错误不推进水位）+ 5 单测绿。clippy 净、fmt 净。
   - [x] v1.1：**pgoutput 二进制解码**（`pgoutput` 模块）—— 大端游标解析 Begin/Commit/Origin/Relation/Type/Insert/Update/Delete/Truncate + TupleData（null/unchanged-toast/text）；越界/未知 tag/非法 utf8 均返回 Err 不 panic；`Relation::pair` 按列名配对取值。纯函数、+5 单测（对构造字节）。**这是线缆层里最易出微妙 bug 的部分，先做透**。
+  - [x] v1.2（**CDC 闭环真 PG 验证 done**，2026-06-25）：`replication` 模块 —— `ensure_slot`/`drop_slot`/`pull_changes(cfg)`。
+    - **传输选型**：tokio-postgres 0.7.18 **无** `START_REPLICATION`/`copy_both` API，故改用逻辑解码 SQL 函数 `pg_logical_slot_get_binary_changes`（普通连接拉取 pgoutput 二进制；消费即推进 slot、崩溃从 slot 续传）——一种合法的轮询式 CDC 消费。低延迟 COPY 流式为后续可选。
+    - **映射**：Relation 缓存 + Insert/Update→`Upsert`、Delete→`Delete`（PK→GlobalId）；行→Chunk 复用 `fastsearch_pg::ChunkRow::to_chunk`；含 `pg_lsn` 文本解析、Postgres `text[]` 数组字面量解析（+3 单测）。
+    - **端到端闭环**（`fastsearch-engine/tests/cdc_closed_loop.rs`，env-gated）：写 PgStore → slot 捕获 → `pull_changes` 解码 → `Applier` 应用到 `Engine` → 检索命中（引用正确）。Docker pgvector 上全绿、可幂等重跑。
 
-**已知限制 / 下一迭代（线缆层剩余，env-gated）：**
-- **复制连接 + 流式读取尚未实现**（`待运行验证`）：tokio-postgres 复制模式（START_REPLICATION）+ CopyData/XLogData 拆封 → `pgoutput::parse_message` → 映射 `Change` → `Applier`；slot 生命周期 + 心跳（standby status update）+ LSN 反馈。需活 PG 的 env-gated 集成测试。
-- **pgoutput → `Change` 映射**：需把 Relation+Tuple 按 fastsearch_chunks 列约定解析成 `Chunk`（复用 pg `ChunkRow` 的值解析），与连接层同批落地。
+**复测配方（Docker）：**
+```bash
+docker run -d --name fs-pg -e POSTGRES_PASSWORD=pw -e POSTGRES_USER=fs -e POSTGRES_DB=fsdb \
+  -p 55432:5432 pgvector/pgvector:pg17 \
+  -c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8
+export DATABASE_URL="postgres://fs:pw@localhost:55432/fsdb"
+cargo test -p fastsearch-pg integration_roundtrip          # 真源写/替换/读回
+cargo test -p fastsearch-engine --test cdc_closed_loop      # CDC 闭环
+```
+
+**已知限制 / 下一迭代：**
+- 低延迟**流式**消费（`START_REPLICATION` COPY + keepalive/standby 反馈）：当前用 SQL 轮询，足够正确性与中低频；流式待换支持复制协议的客户端（或自实现 wire）。
+- slot 生命周期监控（`max_slot_wal_keep_size`、滞留告警）、初始快照 + 无缝切换（B3）待续。
 - `initial_snapshot`/`stream` 集成函数待线缆层落地后补。
 - IndexSink 由 fastsearch-engine 的适配器桥接 TextIndex（避免 text 反向依赖 sync）。

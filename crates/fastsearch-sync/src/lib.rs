@@ -12,6 +12,7 @@
 //! - **不静默吞错**：sink 错误向上传播，applied_lsn 仅在成功后推进。
 
 pub mod pgoutput;
+pub mod replication;
 
 use fastsearch_core::{Chunk, GlobalId};
 
