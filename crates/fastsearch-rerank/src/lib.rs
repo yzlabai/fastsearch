@@ -2,8 +2,8 @@
 //!
 //! 排序管线"宽召回 → rerank → top-K"的最后一环。提供 [`Reranker`] trait 与一个
 //! **确定性、零依赖**的词项重叠基线 [`LexicalOverlapReranker`]（可测、作 fallback）。
-//! 真神经 cross-encoder（bge-reranker，Candle/ort）为 opt-in 下一迭代。
-//! 详见 [spec](../../docs/specs/21-rerank.md)。
+//! 架构决策：RAG 主路径默认不上神经 rerank（答案层 LLM 已做联合打分）；trait 为可选
+//! 精度档，服务无-LLM 入口时优先纯 Rust 轻量 LTR。详见 [spec](../../docs/specs/21-rerank.md)。
 
 use std::collections::HashSet;
 

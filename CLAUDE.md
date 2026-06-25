@@ -48,7 +48,7 @@ docparse chunks → Postgres(真源: chunks 表 + 元数据 + ACL + pgvector 向
 | `core` | 纯逻辑：文档模型 / 查询·过滤 AST / 融合(RRF·归一化·加权) / 引用 / **ACL** | 无后端依赖；`Filter::eval`、`AclFilter::visible`、`fuse` 是确定性的（同分按 `GlobalId` tie-break） |
 | `text` | Tantivy BM25 + 分词(jieba/default) + 过滤 + 高亮 | 见下"预过滤策略"；`text` 字段 STORED 供高亮/rerank |
 | `vector` | 向量后端 **trait** + `MemVectorIndex`(暴力余弦) | **filter-aware 真预过滤**（打分前过滤，超 pgvector 后过滤坑）；HNSW/量化待迭代 |
-| `embed` / `rerank` | `Embedder` / `Reranker` trait + 确定性基线 | HashEmbedder / LexicalOverlapReranker 非语义，仅离线/CI 跑通；真模型(Candle/ONNX)为 opt-in 下一迭代 |
+| `embed` / `rerank` | `Embedder` / `Reranker` trait + 确定性基线 + 可配置 HTTP 嵌入后端 | HashEmbedder/LexicalOverlap 非语义，仅离线/CI/fallback；**真语义嵌入经 `HttpEmbedder`（Ollama / OpenAI 兼容）接入，不做进程内模型推理**；rerank：RAG 主路径默认不上神经 rerank（答案层 LLM 兜底），可选 LTR 供无-LLM 入口 |
 | `pg` | Postgres 真源：DDL + Chunk↔行映射 + doc 级替换写路径 | DDL 在 `sql.rs`，**只用 pgvector + 逻辑复制**；集成测试 env-gated |
 | `sync` | CDC apply 编排：幂等 + LSN 水位续传 + 替换语义 | `IndexSink` trait；pgoutput 线缆层待迭代（v1 只做正确性核心） |
 | `engine` | 整合 text+vector+rerank+sync sink → 端到端排序管线 | `run()` 是管线主体；`search`/`search_with_facets`；实现 `sync::IndexSink`（适配器，避免 text 反依赖 sync） |
@@ -64,7 +64,7 @@ docparse chunks → Postgres(真源: chunks 表 + 元数据 + ACL + pgvector 向
 3. **ACL 不可绕过**：ACL 只来自认证身份，服务端在过滤期强制注入（`engine.search` 的 `acl` 参数），客户端不能在请求体里传或放宽。新增检索入口必须走这条。
 4. **确定性**：融合/检索同分按 `GlobalId` 升序 tie-break；同输入+同稳定索引→同结果。
 5. **预过滤策略（text/vector）**：把过滤翻译成 **SUPERSET** 后端查询（不可翻译子句→match-all，保召回）+ 用 `core::Filter::eval`/`AclFilter::visible` 做**精确后过滤**（保精度/不越权）；over-fetch 抵消截断。改过滤逻辑两端都要守。
-6. **重依赖 opt-in、诚实记账**：Candle 嵌入 / HNSW / CDC 线缆层等未落地的，文档与状态如实标 `下一迭代`/`待运行验证`，别写"已完成"（见 AI_AGENT_DEV_SPEC）。
+6. **重依赖 opt-in、诚实记账**：HNSW/量化、流式 CDC、神经 rerank 等未落地的，文档与状态如实标 `下一迭代`/`待运行验证`，别写"已完成"（见 AI_AGENT_DEV_SPEC）。真语义嵌入经外部 HTTP 服务（Ollama/OpenAI 兼容），不引进程内模型推理依赖。
 
 ## 数据模型锚点
 

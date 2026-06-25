@@ -1,7 +1,7 @@
 //! # fastsearch-embed
 //!
-//! 嵌入后端抽象 + 离线确定性基线。真神经模型（Candle/ort + bge/e5）为下一迭代
-//! （重依赖 + 模型下载）。详见 [spec](../../docs/specs/16-embed.md)。
+//! 嵌入后端抽象 + 离线确定性基线 + 可配置 HTTP 后端。真语义嵌入经 [`HttpEmbedder`]
+//! （Ollama / OpenAI 兼容）接入——**不做进程内模型推理**。详见 [spec](../../docs/specs/16-embed.md)。
 //!
 //! [`HashEmbedder`] 是**确定性、零依赖**的 hashing bag-of-words 嵌入：让全链路
 //! 离线/CI 可跑、可作 fallback。**非语义模型**——语义相似度需真模型。

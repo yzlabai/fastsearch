@@ -8,10 +8,12 @@
 排序管线的"宽召回 → rerank → top-K"最后一环。
 
 - `Reranker` trait：对 (query, 候选文本列表) 打分重排。
-- `LexicalOverlapReranker`：**确定性、零依赖**的词项重叠（Jaccard）reranker——可测、作基线/fallback。真 cross-encoder（bge-reranker，Candle/ort）为 opt-in 下一迭代。
+- `LexicalOverlapReranker`：**确定性、零依赖**的词项重叠（Jaccard）reranker——可测、作基线/fallback。
 - 引擎集成：`req.rerank` 存在时，对融合后的候选取文本 → rerank → 重排 top-K。
 
-**不做**：神经 cross-encoder 推理（下一迭代）；rerank 的批处理/缓存（后续）。
+**架构决策（2026-06-25，从第一性原理）**：**RAG 主路径默认不上神经 cross-encoder**。理由：rerank 本质是"用不可索引的高保真打分器只重排 N 个候选"，而本产品答案层是**外部 LLM**——它读 top-K 时本就做全交叉注意力的联合打分（最高保真），检索侧再放神经 rerank 多为**重复劳动**。正确做法：stage-1 拉满 recall@N（融合 + 真语义嵌入）+ 略大 top-K 交给 LLM 做最终精排。`Reranker` trait 保留为**可选精度档**，服务"无 LLM 兜底"的入口（CLI/库/REST 直接给人/非-LLM 客户端看精确 top-3），届时优先**纯 Rust 轻量 LTR**（特征化、可解释、用 eval golden 训练），而非神经 cross-encoder。
+
+**不做**：进程内神经 cross-encoder（Candle/ort）；rerank 批处理/缓存（后续）。
 
 ## 2. 公开接口
 
@@ -44,4 +46,4 @@ pub struct LexicalOverlapReranker;
 
 - [x] v1 完成：Reranker trait + LexicalOverlapReranker（3 单测）+ 引擎接入（`set_reranker`、req.rerank 时宽召回后重排、rerank 分写入命中）+ engine/server 透出 + 活服务验证（"apple banana" → chunk2 rerank=1.0 居首）。clippy 净、fmt 净。
 
-**下一迭代：** 神经 cross-encoder（bge-reranker-v2-m3，Candle/ort，opt-in `set_reranker`）；rerank 批处理/缓存；top-K 两段式（先 fused top-N 再 rerank）。
+**下一迭代（仅"无 LLM 兜底"入口需要时）：** 纯 Rust **轻量 LTR**（线性/小 GBDT over bm25/vector/heading 命中/精确短语/proximity 等特征，用 eval golden 训练，确定性、可解释、可 CI）经 `set_reranker` 注入；rerank 批处理/缓存。**不做**进程内神经 cross-encoder。

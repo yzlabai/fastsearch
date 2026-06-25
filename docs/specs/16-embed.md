@@ -8,10 +8,10 @@
 嵌入后端抽象 + 离线基线实现。
 
 - `Embedder` trait：`dim()` + `embed(texts, kind: Query|Passage)`。
-- `HashEmbedder`：**确定性、零依赖**的 hashing bag-of-words 嵌入（固定维、L2 归一化）。用途：① 让全链路离线/CI 可跑（无需下模型）；② 作为 fallback。**非语义模型**——真正语义嵌入需 Candle/ort + 模型（下一迭代）。
+- `HashEmbedder`：**确定性、零依赖**的 hashing bag-of-words 嵌入（固定维、L2 归一化）。用途：① 让全链路离线/CI 可跑（无需下模型）；② 作为 fallback。**非语义模型**——真正语义嵌入经**可配置 HTTP 后端**（`HttpEmbedder`：Ollama / OpenAI 兼容）接入。
 - query/passage 前缀（e5 风格）：embed 按 kind 加前缀再编码。
 
-**不做**：真神经模型推理（Candle/ort + bge/e5，下一迭代，重依赖 + 模型下载）；rerank（rerank 模块）。
+**不做**：**进程内模型推理（Candle/ort 编译内置）**——真语义统一委托外部 HTTP 服务（`HttpEmbedder`），不引重依赖/不打包模型；rerank（rerank 模块）。
 
 ## 2. 公开接口
 
@@ -53,5 +53,5 @@ impl HashEmbedder { pub fn new(dim: usize) -> Self; }
   - 纯逻辑（请求体/响应解析/维度·条数校验/前缀/端点）+8 单测；**实网 env-gated**：本机 Ollama `nomic-embed-text-v2-moe`(768) 验证连通/维度/确定性/**语义性**（cos(相关)=0.31 > cos(无关)=0.18）。
 
 **已知限制 / 下一迭代：**
-- HashEmbedder **非语义**，仅离线/CI/fallback；真语义经 HTTP 后端（Ollama/OpenAI 兼容）接入——**这是默认推荐路径**（绕开重依赖与模型下载）。Candle/ort **编译内置**模型作为"无外部服务"opt-in 档为后续可选。
+- HashEmbedder **非语义**，仅离线/CI/fallback；真语义经 HTTP 后端（Ollama/OpenAI 兼容）接入——**这是默认且唯一推荐路径**（绕开重依赖与模型下载）。**进程内模型推理（Candle/ort）已决定不做**（2026-06-25）。
 - **未接入管线**：ingest 自动嵌入 chunk、query 自动嵌入（CLI/server 在调 engine 前 embed）是下一步；当前向量仍由 `ingest_vector`/`req.vector` 外部传入。换嵌入模型维度变化时需同步 PG `vector_dim` 并重建派生索引。
