@@ -18,7 +18,8 @@ REST 服务（四张脸之一）+ 安全 + 基础可观测。
 
 ```rust
 pub struct Principal { pub tenant: Option<String>, pub tags: Vec<String> }
-pub struct ServerState { engine: Arc<RwLock<Engine>>, keys: HashMap<String, Principal>, metrics }
+// 现状：engine 用 Arc<Mutex<Engine>>（写/CDC 与检索串行）；RwLock/副本去串行为未来优化。
+pub struct ServerState { engine: Arc<Mutex<Engine>>, keys, metrics, rate_limiter, audit, embedder }
 pub fn router(state) -> axum::Router;
 pub fn principal_from_headers(headers, keys) -> Option<Principal>;  // 纯, 可测
 pub fn acl_for(principal) -> AclFilter;                              // 纯, 可测

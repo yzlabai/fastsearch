@@ -63,4 +63,5 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 
 **已知限制 / 下一迭代：**
 - ✅ auto-merging（section 归并）已实现（v1.3）；rerank 钩子已接入（宽召回→rerank→top-K）。
-- 向量经 `ingest_vector` 灌入；CDC 自动 embedding 回填待 embed 模块（P2）。
+- ✅ CDC 自动 embedding 已实现（v1.6：`set_embedder` → `apply_upsert` 嵌入 passage → 写向量索引）；向量也可经 `ingest_vector` 直接灌入。
+- search_after 深分页（A8b）、单集合重建（A14）、引擎并发去串行（Mutex→RwLock/副本）为后续；其中并发去串行影响 server CDC 与检索的串行（见 19-server）。
