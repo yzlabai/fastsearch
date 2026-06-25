@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use fastsearch_cli::{cmd_index, cmd_search, IndexOpts, SearchOpts};
+use fastsearch_cli::{cmd_eval, cmd_index, cmd_search, EvalOpts, IndexOpts, SearchOpts};
+use fastsearch_core::SearchMode;
 use fastsearch_text::TokenizerKind;
 use std::io::Read;
 use std::path::PathBuf;
@@ -52,6 +53,21 @@ enum Command {
         /// 以 JSON 输出。
         #[arg(long)]
         json: bool,
+    },
+    /// 相关性评测：对 golden 集跑检索算 nDCG/recall/MRR/precision；给 --baseline 则做回归门禁。
+    Eval {
+        /// golden 集 JSON 路径。
+        #[arg(long)]
+        golden: PathBuf,
+        /// baseline 指标 JSON；给定则掉点超容差时以非零退出。
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        #[arg(long, default_value_t = 0.02)]
+        tol: f64,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, value_enum, default_value_t = Tok::Jieba)]
+        tokenizer: Tok,
     },
 }
 
@@ -152,6 +168,33 @@ fn main() -> Result<()> {
                 }
                 if hits.is_empty() {
                     eprintln!("(no hits)");
+                }
+            }
+        }
+        Command::Eval {
+            golden,
+            baseline,
+            tol,
+            k,
+            tokenizer,
+        } => {
+            let opts = EvalOpts {
+                golden,
+                baseline,
+                tol,
+                k,
+                tokenizer: tokenizer.into(),
+                mode: SearchMode::Keyword,
+            };
+            let (m, gate) = cmd_eval(&opts)?;
+            println!("{}", serde_json::to_string_pretty(&m)?);
+            if let Some(res) = gate {
+                match res {
+                    Ok(()) => eprintln!("gate: OK (no regression within tol)"),
+                    Err(e) => {
+                        eprintln!("gate: FAIL — {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }

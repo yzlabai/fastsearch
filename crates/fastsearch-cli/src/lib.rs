@@ -190,6 +190,50 @@ pub fn cmd_search(opts: &SearchOpts) -> Result<Vec<SearchHit>> {
     Ok(engine.search(&req, None)?)
 }
 
+/// eval 选项。
+pub struct EvalOpts {
+    /// golden 集 JSON 路径（`GoldenSet` 格式）。
+    pub golden: PathBuf,
+    /// 可选 baseline 指标 JSON（`Metrics` 格式）；给定则做回归门禁。
+    pub baseline: Option<PathBuf>,
+    /// 容差（任一指标比 baseline 掉超过此值 → 回归）。
+    pub tol: f64,
+    /// @k。
+    pub k: usize,
+    /// 索引分词器（中文 golden 用 jieba）。
+    pub tokenizer: TokenizerKind,
+    /// 检索模式（默认 keyword，确定性、无需嵌入）。
+    pub mode: SearchMode,
+}
+
+/// 对 golden 集跑真实检索、算相关性指标；给定 baseline 时做回归门禁。
+///
+/// 返回 `(Metrics, gate)`，`gate=Some(Err)` 表示掉点超容差（调用方据此置退出码）。
+pub fn cmd_eval(opts: &EvalOpts) -> Result<(fastsearch_eval::Metrics, Option<Result<(), String>>)> {
+    let json = std::fs::read_to_string(&opts.golden)
+        .with_context(|| format!("reading golden {}", opts.golden.display()))?;
+    let set = fastsearch_eval::GoldenSet::from_json(&json)
+        .with_context(|| format!("parsing golden {}", opts.golden.display()))?;
+    let cfg = TextIndexConfig {
+        tokenizer: opts.tokenizer,
+        ..Default::default()
+    };
+    let metrics = fastsearch_engine::golden::run(&set, cfg, opts.mode, opts.k)?;
+    let gate = match &opts.baseline {
+        Some(p) => {
+            let b = std::fs::read_to_string(p)
+                .with_context(|| format!("reading baseline {}", p.display()))?;
+            let baseline: fastsearch_eval::Metrics = serde_json::from_str(&b)
+                .with_context(|| format!("parsing baseline {}", p.display()))?;
+            Some(fastsearch_eval::assert_no_regression(
+                &baseline, &metrics, opts.tol,
+            ))
+        }
+        None => None,
+    };
+    Ok((metrics, gate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +357,53 @@ mod tests {
         };
         assert_eq!(cmd_search(&s("oldword")).unwrap().len(), 0);
         assert_eq!(cmd_search(&s("newword")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn eval_runs_and_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("g.json");
+        std::fs::write(
+            &golden,
+            r#"{
+              "collection":"kb",
+              "corpus":[
+                {"doc_id":"d","chunk_id":0,"kind":"paragraph","text":"毛利率 提升 至 42%",
+                 "page":1,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":10},
+                {"doc_id":"d","chunk_id":1,"kind":"paragraph","text":"员工 休假 政策",
+                 "page":1,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":7}
+              ],
+              "queries":[{"query":"毛利率","relevant":{"kb:d:0":3}}]
+            }"#,
+        )
+        .unwrap();
+        let opts = EvalOpts {
+            golden: golden.clone(),
+            baseline: None,
+            tol: 0.02,
+            k: 5,
+            tokenizer: TokenizerKind::Jieba,
+            mode: SearchMode::Keyword,
+        };
+        let (m, gate) = cmd_eval(&opts).unwrap();
+        assert!(gate.is_none());
+        // 唯一相关项在 top-1 → 各指标满分。
+        assert!((m.mrr - 1.0).abs() < 1e-9);
+        assert!((m.ndcg - 1.0).abs() < 1e-9);
+
+        // baseline 比当前高 → 门禁失败。
+        let base = dir.path().join("b.json");
+        std::fs::write(
+            &base,
+            r#"{"ndcg":1.0,"recall":1.0,"mrr":1.0,"precision":1.0}"#,
+        )
+        .unwrap();
+        let opts2 = EvalOpts {
+            baseline: Some(base),
+            ..opts
+        };
+        let (_m, gate2) = cmd_eval(&opts2).unwrap();
+        // precision@5 = 1/5 < baseline 1.0 → 回归。
+        assert!(gate2.unwrap().is_err());
     }
 }

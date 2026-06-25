@@ -19,6 +19,7 @@ path = "src/lib.rs"
 fastsearch-core.workspace = true
 fastsearch-engine.workspace = true
 fastsearch-text.workspace = true
+fastsearch-eval = { path = "../fastsearch-eval" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -59,6 +59,7 @@ pub fn build_filter(kind, page_min, page_max) -> Option<Filter>;
 ## 7. 验收标准与状态
 
 - [x] v1 完成：index/search 子命令 + docparse 解析（数组/NDJSON）+ 落盘 keyword 检索 + doc 级替换 + kind/page 过滤 + JSON/表格输出。5 单测绿 + **真二进制端到端验证**（index→search→引用→过滤全部正确）。clippy 净、fmt 净。
+- [x] v1.1：`eval` 子命令（`cmd_eval`/`EvalOpts`）—— 对 golden 集跑真实检索算 nDCG/recall/MRR/precision，给 `--baseline` 则做回归门禁（掉点超 `--tol` 时非零退出，CI 可用）。复用 `eval::GoldenSet` + `engine::golden::run`（mode=Keyword，确定性）。+1 单测；**真二进制验证**：`fastsearch eval --golden …zh_finance.json --baseline …baseline.json` 输出指标且 `gate: OK`、exit 0。
 
 **已知限制 / 下一迭代：**
 - 跨调用为 keyword（向量索引未落盘）；hybrid 待向量持久化迭代。
