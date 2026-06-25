@@ -608,6 +608,7 @@ dependencies = [
  "fastsearch-sync",
  "fastsearch-text",
  "fastsearch-vector",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -690,6 +691,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fastsearch-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

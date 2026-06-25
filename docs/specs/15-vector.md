@@ -56,8 +56,9 @@ pub struct VecMeta { pub kind, doc_id, collection, tenant, page, section_id, hea
 ## 6. 验收标准与状态
 
 - [x] v1 完成：VectorBackend trait + MemVectorIndex（filter-aware 余弦，真预过滤）+ 7 单测绿（余弦排序/预过滤/ACL/覆盖/删除/维度校验/零向量）。clippy 净、fmt 净。已接入 engine 做真混合融合（engine 9 测试含 real_hybrid/vector_only）。
+- [x] v1.1（2026-06-25）：**持久化** `MemVectorIndex::save/load`（JSON 快照 + 原子写 tmp→fsync→rename；存归一化向量，load 行为不变）+ `len/is_empty/dim`。+2 单测（往返、缺文件→空）。供 engine 落盘恢复（不重嵌）。压缩二进制格式（bincode）为后续优化。
 
 **已知限制 / 下一迭代：**
 - 暴力余弦 O(n)：中小集合够用，大库需 **HNSW（hnsw_rs）+ RaBitQ/int8 量化 + 全精度重排**（下一迭代）。
 - **pgvector 直查档 (a)**（托管省事档，ANN 在 PG 跑）待 P2 接 pg。
-- 向量目前由 `engine.ingest_vector` 灌入；CDC 的向量同步（embeddings 回填）待 embed 模块（P2）。
+- 向量经 CDC 落地路径自动嵌入（`engine.set_embedder` + `apply_upsert`）或 `ingest_vector` 灌入。

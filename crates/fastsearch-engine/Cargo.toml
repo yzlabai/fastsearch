@@ -17,6 +17,8 @@ fastsearch-eval = { path = "../fastsearch-eval" }
 fastsearch-embed = { path = "../fastsearch-embed" }
 anyhow.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -10,3 +10,8 @@ description = "Vector backend for fastsearch: filter-aware ANN (true pre-filteri
 [dependencies]
 fastsearch-core.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

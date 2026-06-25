@@ -14,9 +14,13 @@ use fastsearch_core::{
 };
 use fastsearch_embed::{EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
+use fastsearch_sync::replication::{advance_slot, peek_with_lsn, ReplicationConfig};
+use fastsearch_sync::{Applier, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
 use fastsearch_vector::{MemVectorIndex, VecMeta, VectorBackend};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -29,8 +33,64 @@ pub enum EngineError {
     Vector(String),
     #[error("rerank error: {0}")]
     Rerank(String),
+    #[error("persist error: {0}")]
+    Persist(String),
+    #[error("cdc error: {0}")]
+    Cdc(String),
 }
 pub type Result<T> = std::result::Result<T, EngineError>;
+
+fn vector_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join("vector.bin")
+}
+
+/// CDC 检查点：派生索引落盘时一并记录的水位（崩溃后从此续传）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Checkpoint {
+    schema_version: u32,
+    /// 已持久化进派生索引的 LSN 水位。
+    applied_lsn: u64,
+    /// 向量维度（用于检测换模型/换维度需重建）。
+    vector_dim: Option<usize>,
+}
+
+impl Checkpoint {
+    fn path(data_dir: &Path) -> std::path::PathBuf {
+        data_dir.join("checkpoint.json")
+    }
+
+    fn load(data_dir: &Path) -> Result<Self> {
+        let p = Self::path(data_dir);
+        if !p.exists() {
+            return Ok(Self::default());
+        }
+        let bytes =
+            std::fs::read(&p).map_err(|e| EngineError::Persist(format!("read checkpoint: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| EngineError::Persist(format!("parse checkpoint: {e}")))
+    }
+
+    /// 原子写：tmp → fsync → rename。
+    fn save(&self, data_dir: &Path) -> Result<()> {
+        let p = Self::path(data_dir);
+        let mut tmp = p.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        let bytes = serde_json::to_vec(self)
+            .map_err(|e| EngineError::Persist(format!("ser checkpoint: {e}")))?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| EngineError::Persist(format!("create checkpoint tmp: {e}")))?;
+            f.write_all(&bytes)
+                .and_then(|_| f.sync_all())
+                .map_err(|e| EngineError::Persist(format!("write checkpoint: {e}")))?;
+        }
+        std::fs::rename(&tmp, &p)
+            .map_err(|e| EngineError::Persist(format!("rename checkpoint: {e}")))?;
+        Ok(())
+    }
+}
 
 fn kind_str(k: ChunkKind) -> &'static str {
     match k {
@@ -104,6 +164,84 @@ impl Engine {
             reranker: Box::new(LexicalOverlapReranker),
             embedder: None,
         })
+    }
+
+    /// 打开**数据目录**下的完整派生索引（落盘恢复）：`<data>/text`（Tantivy mmap）+
+    /// `<data>/vector.bin`（向量快照）+ `<data>/checkpoint.json`（CDC 水位）。返回引擎与
+    /// 已持久化的 `applied_lsn`（无检查点则 0），供 `Applier::new` 续传。
+    pub fn open(data_dir: &Path, cfg: TextIndexConfig) -> Result<(Self, Lsn)> {
+        let text_dir = data_dir.join("text");
+        std::fs::create_dir_all(&text_dir)
+            .map_err(|e| EngineError::Persist(format!("create data dir: {e}")))?;
+        let text = TextIndex::open_or_create(&text_dir, cfg)?;
+        let vector = MemVectorIndex::load(&vector_path(data_dir))
+            .map_err(|e| EngineError::Vector(e.to_string()))?;
+        let cp = Checkpoint::load(data_dir)?;
+        // 维度漂移（换了嵌入模型）告警——可见、不静默。
+        if let (Some(saved), Some(cur)) = (cp.vector_dim, vector.dim()) {
+            if saved != cur {
+                eprintln!("warning: checkpoint vector_dim {saved} != loaded {cur}");
+            }
+        }
+        Ok((
+            Engine {
+                text,
+                vector,
+                reranker: Box::new(LexicalOverlapReranker),
+                embedder: None,
+            },
+            Lsn(cp.applied_lsn),
+        ))
+    }
+
+    /// 持久化派生索引 + 检查点（先落盘、后由调用方推进 slot——崩溃安全的前提）：
+    /// `text.commit()` → 向量原子落盘 → `checkpoint.json` 原子写入 `applied_lsn`。
+    pub fn persist(&mut self, data_dir: &Path, applied_lsn: Lsn) -> Result<()> {
+        self.text.commit()?;
+        self.vector
+            .save(&vector_path(data_dir))
+            .map_err(|e| EngineError::Vector(e.to_string()))?;
+        Checkpoint {
+            schema_version: 1,
+            applied_lsn: applied_lsn.0,
+            vector_dim: self.vector.dim(),
+        }
+        .save(data_dir)?;
+        Ok(())
+    }
+
+    /// **崩溃安全地**消费一批 CDC 变更并落地（生产 CDC 主循环的一拍）：
+    /// `peek`（不推进 slot）→ 幂等应用（`apply_upsert` 含嵌入）→ `persist`（索引+检查点
+    /// 落盘）→ **落盘成功后才** `advance_slot`。任意环节崩溃都不丢/不重（见
+    /// [计划](../../docs/plans/2026-06-25-派生索引持久化与崩溃安全.md)）。返回应用条数。
+    pub async fn consume_once(
+        &mut self,
+        cfg: &ReplicationConfig,
+        applier: &mut Applier,
+        data_dir: &Path,
+    ) -> Result<usize> {
+        let (events, slot_lsn) = peek_with_lsn(cfg)
+            .await
+            .map_err(|e| EngineError::Cdc(format!("peek: {e}")))?;
+        if events.is_empty() {
+            // 可能有非数据消息推进了 WAL：仍把 slot 推到已查看的最高位，避免空转重读。
+            if slot_lsn > Lsn(0) {
+                advance_slot(cfg, slot_lsn)
+                    .await
+                    .map_err(|e| EngineError::Cdc(format!("advance: {e}")))?;
+            }
+            return Ok(0);
+        }
+        let applied = applier
+            .apply_batch(self, &events)
+            .map_err(|e| EngineError::Cdc(format!("apply: {e}")))?;
+        // 先落盘（索引 + 检查点=数据水位，供幂等续传），后推进 slot —— 崩溃安全铁律。
+        // slot 推进到**最高行 LSN**（含 Commit），否则下次 peek 会重复返回该事务。
+        self.persist(data_dir, applier.applied_lsn())?;
+        advance_slot(cfg, slot_lsn)
+            .await
+            .map_err(|e| EngineError::Cdc(format!("advance: {e}")))?;
+        Ok(applied)
     }
 
     /// 替换 reranker（接入真 cross-encoder 时用）。
@@ -921,6 +1059,42 @@ mod tests {
         let c2 = hits.iter().find(|h| h.id.chunk_id == 2).unwrap();
         assert!(c1.bm25.is_some()); // c1 有 keyword 分
         assert!(c2.vector.is_some()); // c2 有 vector 分
+    }
+
+    #[test]
+    fn persist_load_roundtrip_keeps_vectors_and_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TextIndexConfig::default();
+        // 首启：空，lsn=0
+        let (mut e, lsn0) = Engine::open(dir.path(), cfg).unwrap();
+        assert_eq!(lsn0, Lsn(0));
+        e.ingest_vector(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha", 1),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        e.ingest_vector(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "beta", 2),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
+        e.persist(dir.path(), Lsn(42)).unwrap();
+        drop(e);
+
+        // 重开：检查点续传 + 向量在（无需重嵌）
+        let (e2, lsn) = Engine::open(dir.path(), TextIndexConfig::default()).unwrap();
+        assert_eq!(lsn, Lsn(42));
+        let mut r = req("");
+        r.mode = SearchMode::Vector;
+        r.vector = Some(vec![1.0, 0.0]);
+        let hits = e2.search(&r, None).unwrap();
+        assert_eq!(hits[0].id.chunk_id, 1);
+        assert!(hits[0].vector.is_some());
+        // 文本也在（keyword 路）
+        let kw = e2.search(&req("beta"), None).unwrap();
+        assert_eq!(kw[0].id.chunk_id, 2);
     }
 
     #[test]

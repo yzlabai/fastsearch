@@ -9,10 +9,12 @@
 use fastsearch_core::{
     AclFilter, BBox, Citation, FieldSource, FieldValue, Filter, GlobalId, Scored,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// 随向量存储的元数据：用于 filter/ACL 判定（实现 [`FieldSource`]）与组装引用。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VecMeta {
     pub collection: String,
     pub doc_id: String,
@@ -96,6 +98,91 @@ impl MemVectorIndex {
     pub fn citation(&self, gid: &GlobalId) -> Option<Citation> {
         self.entries.get(gid).map(|e| e.meta.citation())
     }
+
+    /// 条目数。
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 向量维度（空索引为 None）。
+    pub fn dim(&self) -> Option<usize> {
+        self.dim
+    }
+
+    /// 原子落盘：写临时文件 → fsync → rename（rename 原子，防写一半崩坏）。
+    /// 存的是**已归一化**向量，load 回来 search 行为不变。
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let snap = Snapshot {
+            dim: self.dim,
+            entries: self
+                .entries
+                .iter()
+                .map(|(gid, e)| SnapEntry {
+                    gid: gid.clone(),
+                    vector: e.vector.clone(),
+                    meta: e.meta.clone(),
+                })
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&snap)?;
+        let tmp = tmp_path(path);
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?; // 落盘后再 rename，保证 rename 后内容已持久
+        }
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// 从快照加载（文件不存在 → 返回空索引，便于首启）。
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let bytes = std::fs::read(path)?;
+        let snap: Snapshot = serde_json::from_slice(&bytes)?;
+        let mut entries = HashMap::with_capacity(snap.entries.len());
+        for e in snap.entries {
+            entries.insert(
+                e.gid,
+                Entry {
+                    vector: e.vector,
+                    meta: e.meta,
+                },
+            );
+        }
+        Ok(MemVectorIndex {
+            dim: snap.dim,
+            entries,
+        })
+    }
+}
+
+/// 临时文件路径（同目录，便于同盘原子 rename）。
+fn tmp_path(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    std::path::PathBuf::from(s)
+}
+
+/// 落盘快照 DTO（`HashMap<GlobalId,_>` 的 JSON key 须为字符串，故 entries 用 Vec 对）。
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    dim: Option<usize>,
+    entries: Vec<SnapEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapEntry {
+    gid: GlobalId,
+    vector: Vec<f32>,
+    meta: VecMeta,
 }
 
 fn normalize(v: &[f32]) -> Vec<f32> {
@@ -211,6 +298,38 @@ mod tests {
                 y1: 1.0,
             },
         }
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let v = idx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vector.bin");
+        v.save(&path).unwrap();
+        // 临时文件应已被 rename 掉（不残留）
+        assert!(!tmp_path(&path).exists());
+        let loaded = MemVectorIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.dim(), Some(2));
+        // 搜索结果与原索引一致（向量已归一化存储，load 不改变行为）。
+        let q = vec![1.0, 0.0];
+        let a = v.search(&q, 3, None, None).unwrap();
+        let b = loaded.search(&q, 3, None, None).unwrap();
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.id, y.id);
+            assert!((x.score - y.score).abs() < 1e-9);
+        }
+        // 元数据/引用保留
+        assert_eq!(loaded.citation(&gid("a", 3)).unwrap().page, 12);
+    }
+
+    #[test]
+    fn load_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = MemVectorIndex::load(&dir.path().join("nope.bin")).unwrap();
+        assert!(loaded.is_empty());
+        assert_eq!(loaded.dim(), None);
     }
 
     fn idx() -> MemVectorIndex {

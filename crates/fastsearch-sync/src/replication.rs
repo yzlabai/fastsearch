@@ -69,35 +69,74 @@ pub async fn drop_slot(cfg: &ReplicationConfig) -> Result<()> {
     Ok(())
 }
 
-/// 从 slot 拉取并**消费**全部待处理变更（推进 slot），解码 + 映射成有序
-/// `ChangeEvent`（LSN 升序）。Relation 缓存在本次拉取内维护。
+/// 从 slot 拉取并**消费**（`get`，立即推进 slot）全部待处理变更。
+///
+/// ⚠️ **仅供"无持久化"的闭环演示/测试**：get 拉取即推进 slot，若"拉取后、派生索引落盘前"
+/// 崩溃会丢这批变更。生产用 [`peek_changes`] + 落盘后 [`advance_slot`]（见
+/// [持久化与崩溃安全计划](../../../docs/plans/2026-06-25-派生索引持久化与崩溃安全.md)）。
 pub async fn pull_changes(cfg: &ReplicationConfig) -> Result<Vec<ChangeEvent>> {
+    Ok(fetch_changes(cfg, "pg_logical_slot_get_binary_changes")
+        .await?
+        .0)
+}
+
+/// 从 slot **查看**（`peek`，**不推进** slot）全部待处理变更。落盘后须显式
+/// [`advance_slot`] 才推进——这是崩溃安全的关键（不丢/不重）。
+pub async fn peek_changes(cfg: &ReplicationConfig) -> Result<Vec<ChangeEvent>> {
+    Ok(fetch_changes(cfg, "pg_logical_slot_peek_binary_changes")
+        .await?
+        .0)
+}
+
+/// 同 [`peek_changes`]，外加**所有行的最高 LSN**（含 Begin/Commit 等非数据消息）——
+/// 这是 `advance_slot` 应推进到的位置（仅推到最后一条数据变更会漏掉更高的 Commit LSN，
+/// 导致下次 peek 重复返回该事务）。
+pub async fn peek_with_lsn(cfg: &ReplicationConfig) -> Result<(Vec<ChangeEvent>, Lsn)> {
+    fetch_changes(cfg, "pg_logical_slot_peek_binary_changes").await
+}
+
+/// 显式推进 slot 的 confirmed_flush 到 `lsn`（持久化派生索引**之后**才调用）。
+pub async fn advance_slot(cfg: &ReplicationConfig, lsn: Lsn) -> Result<()> {
     let client = connect(&cfg.url).await?;
-    // 逻辑解码 SQL 函数；options 为 VARIADIC 文本（pgoutput 协议参数）。slot/publication
-    // 来自受控配置，单引号转义防注入。
+    let lsn_text = format_pg_lsn(lsn.0);
+    // `$2::text::pg_lsn`：先 ::text 强制参数推断为 text，运行时再转 pg_lsn——否则 PG 把
+    // 参数推断为 pg_lsn，tokio-postgres 拒收 String（同 pg 层 jsonb 的坑）。
+    client
+        .execute(
+            "SELECT pg_replication_slot_advance($1, $2::text::pg_lsn)",
+            &[&cfg.slot, &lsn_text],
+        )
+        .await
+        .context("pg_replication_slot_advance")?;
+    Ok(())
+}
+
+/// 用逻辑解码函数 `func`（get 或 peek）取变更并解码 + 映射成有序 `ChangeEvent`。
+/// `func` 为受控字面量（非用户输入）；slot/publication 单引号转义。
+async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<ChangeEvent>, Lsn)> {
+    let client = connect(&cfg.url).await?;
     let sql = format!(
-        "SELECT lsn::text, data FROM pg_logical_slot_get_binary_changes(\
+        "SELECT lsn::text, data FROM {func}(\
          '{slot}', NULL, NULL, 'proto_version', '1', 'publication_names', '{pubn}')",
         slot = esc(&cfg.slot),
         pubn = esc(&cfg.publication),
     );
-    let rows = client
-        .query(&sql, &[])
-        .await
-        .context("get_binary_changes")?;
+    let rows = client.query(&sql, &[]).await.context(func.to_string())?;
 
     let mut relations: HashMap<u32, Relation> = HashMap::new();
     let mut out = Vec::new();
+    let mut max_lsn = Lsn(0);
     for row in &rows {
         let lsn_text: String = row.get(0);
         let data: Vec<u8> = row.get(1);
         let lsn = Lsn(parse_pg_lsn(&lsn_text)?);
+        max_lsn = max_lsn.max(lsn); // 含 Begin/Commit 等非数据行：slot 推进位置
         let pg = pgoutput::parse_message(&data)?;
         if let Some(change) = map(&mut relations, pg)? {
             out.push(ChangeEvent { change, lsn });
         }
     }
-    Ok(out)
+    Ok((out, max_lsn))
 }
 
 /// pgoutput 消息 → 可选 Change。Relation 入缓存；Insert/Update→Upsert，Delete→Delete；
@@ -189,6 +228,11 @@ fn row_to_gid(rel: &Relation, tuple: &TupleData) -> Result<GlobalId> {
     })
 }
 
+/// u64 → `pg_lsn` 文本形式 `X/Y`（高32位/低32位，大写十六进制）。
+fn format_pg_lsn(v: u64) -> String {
+    format!("{:X}/{:X}", v >> 32, v & 0xFFFF_FFFF)
+}
+
 /// 解析 `pg_lsn` 文本形式 `X/Y`（高32位/低32位，十六进制）→ u64。
 fn parse_pg_lsn(s: &str) -> Result<u64> {
     let (hi, lo) = s.split_once('/').context("bad pg_lsn (no '/')")?;
@@ -252,6 +296,13 @@ mod tests {
         assert_eq!(parse_pg_lsn("0/16B3748").unwrap(), 0x16B3748);
         assert_eq!(parse_pg_lsn("1/0").unwrap(), 1u64 << 32);
         assert!(parse_pg_lsn("bogus").is_err());
+    }
+
+    #[test]
+    fn pg_lsn_format_roundtrip() {
+        for v in [0u64, 0x16B3748, 1u64 << 32, (3u64 << 32) | 0xABCDEF] {
+            assert_eq!(parse_pg_lsn(&format_pg_lsn(v)).unwrap(), v);
+        }
     }
 
     #[test]

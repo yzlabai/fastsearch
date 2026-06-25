@@ -145,6 +145,103 @@ async fn cdc_closed_loop_pg_to_search() {
     drop_slot(&rcfg).await.expect("drop_slot");
 }
 
+/// 崩溃安全的 CDC 消费 + 派生索引持久化（env-gated：仅需 PG；用 Hash 嵌入→离线确定性）：
+///
+///   peek（不推进 slot）→ 应用（apply_upsert 含嵌入）→ persist（索引+检查点落盘）→
+///   落盘后 advance_slot；重启从检查点续传、向量不重嵌、不丢不重。
+#[tokio::test]
+async fn cdc_consume_persist_crashsafe() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_consume_persist_crashsafe: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_persist_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+    };
+    reset(&url, slot).await;
+
+    let mut store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("ensure_schema");
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+    store
+        .upsert_doc(
+            "kb",
+            "rep.pdf",
+            &[chunk("rep.pdf", 1, "alpha"), chunk("rep.pdf", 2, "beta")],
+        )
+        .await
+        .expect("upsert_doc");
+
+    let data = tempfile::tempdir().unwrap();
+    let cfg = TextIndexConfig::default();
+    // Hash 嵌入：离线、确定性（不需 Ollama），8 维。
+    let hash_cfg = fastsearch_embed::EmbedderConfig::hash(8);
+    let persisted_lsn;
+    {
+        let (mut e, lsn0) = Engine::open(data.path(), cfg).expect("open");
+        assert_eq!(lsn0, Lsn(0)); // 首启无检查点
+        e.set_embedder(fastsearch_embed::build_embedder(&hash_cfg));
+        let mut applier = Applier::new(lsn0);
+        let n = e
+            .consume_once(&rcfg, &mut applier, data.path())
+            .await
+            .expect("consume_once");
+        assert_eq!(n, 2);
+        persisted_lsn = applier.applied_lsn();
+        assert!(persisted_lsn > Lsn(0));
+    } // drop engine（模拟重启）
+
+    // slot 已推进：再 peek 应为空（不重发已确认的变更）。
+    let again = fastsearch_sync::replication::peek_changes(&rcfg)
+        .await
+        .expect("peek");
+    assert!(
+        again.is_empty(),
+        "advanced slot should yield no changes, got {again:?}"
+    );
+
+    // 重开：检查点续传 + 向量在（无需重嵌）。
+    let (e2, lsn) = Engine::open(data.path(), TextIndexConfig::default()).expect("reopen");
+    assert_eq!(lsn, persisted_lsn, "applied_lsn 应从 checkpoint 恢复");
+    // 向量路：两 chunk 都已嵌入落盘 → vector 检索两条都在。
+    let qv = fastsearch_embed::Embedder::embed(
+        &*fastsearch_embed::build_embedder(&hash_cfg),
+        &["alpha".to_string()],
+        fastsearch_embed::EmbedKind::Query,
+    )
+    .unwrap()
+    .remove(0);
+    let mut r = SearchRequest {
+        query: String::new(),
+        mode: SearchMode::Vector,
+        vector: Some(qv),
+        top_k: 5,
+        ..Default::default()
+    };
+    r.candidates = 150;
+    let hits = e2.search(&r, None).expect("vector search");
+    assert_eq!(hits.len(), 2, "两 chunk 向量都应已持久化");
+    assert!(hits.iter().all(|h| h.vector.is_some()));
+
+    // 幂等：无新变更，consume_once 返回 0（peek 空）。
+    let mut e3 = e2;
+    e3.set_embedder(fastsearch_embed::build_embedder(&hash_cfg));
+    let mut applier2 = Applier::new(lsn);
+    let n2 = e3
+        .consume_once(&rcfg, &mut applier2, data.path())
+        .await
+        .expect("consume_once again");
+    assert_eq!(n2, 0);
+
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
 /// 完整产品主循环（双 env-gated：需 PG + 本地 Ollama）：
 ///
 ///   写 PG → 逻辑复制 → pgoutput 解码 → **CDC 落地时自动嵌入** → 派生 BM25+向量 →
