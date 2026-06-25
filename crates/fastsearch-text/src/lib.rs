@@ -30,6 +30,8 @@ pub struct TextHit {
     pub citation: Citation,
     /// chunk 类型（用于分面）。
     pub kind: String,
+    /// 命中正文（用于 rerank / 上层展示）。
+    pub text: String,
     /// 高亮片段（HTML，命中词包 `<b>`）；未请求高亮或无命中词时为 None。
     pub highlight: Option<String>,
 }
@@ -221,10 +223,14 @@ impl TextIndex {
                     continue;
                 }
             }
+            let text = doc
+                .get_first(self.fields.text)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             // 高亮片段：从存储的 text 生成（命中词包 <b>）；无命中词 → None。
             let highlight = snippet_gen.as_ref().and_then(|g| {
-                let text = doc.get_first(self.fields.text).and_then(|v| v.as_str())?;
-                let snip = g.snippet(text);
+                let snip = g.snippet(&text);
                 if snip.fragment().is_empty() {
                     None
                 } else {
@@ -249,6 +255,7 @@ impl TextIndex {
                 score,
                 citation,
                 kind: row.kind,
+                text,
                 highlight,
             });
             if hits.len() >= k {

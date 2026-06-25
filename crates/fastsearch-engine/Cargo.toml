@@ -11,6 +11,7 @@ description = "fastsearch query/ingest orchestration: ties core fusion + text in
 fastsearch-core.workspace = true
 fastsearch-text.workspace = true
 fastsearch-vector.workspace = true
+fastsearch-rerank = { path = "../fastsearch-rerank" }
 fastsearch-sync = { path = "../fastsearch-sync" }
 anyhow.workspace = true
 thiserror.workspace = true

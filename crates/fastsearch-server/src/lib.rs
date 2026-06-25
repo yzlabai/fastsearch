@@ -128,6 +128,7 @@ async fn search(
                 "score": h.score,
                 "bm25": h.bm25,
                 "vector": h.vector,
+                "rerank": h.rerank,
                 "doc_id": h.id.doc_id,
                 "chunk_id": h.id.chunk_id,
                 "page": h.citation.page,

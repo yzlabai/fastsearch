@@ -580,6 +580,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fastsearch-core",
+ "fastsearch-rerank",
  "fastsearch-sync",
  "fastsearch-text",
  "fastsearch-vector",
@@ -603,6 +604,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "fastsearch-rerank"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

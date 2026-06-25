@@ -5,11 +5,13 @@
 //! 详见 [spec](../../docs/specs/14-engine.md)。
 //!
 //! 三种检索模式全可用：keyword / vector / **hybrid（keyword∥vector → core::fuse 融合）**。
-//! 过滤与 ACL 在两路各自做真预过滤（不可绕过）。rerank/auto-merging 为后续迭代。
+//! 过滤与 ACL 在两路各自做真预过滤（不可绕过）；分面（kind/doc_id）、高亮、**rerank**
+//! （req.rerank 时宽召回后重排）已接入。auto-merging（section 归并）为后续迭代。
 
 use fastsearch_core::{
     fuse, AclFilter, Chunk, ChunkKind, Citation, GlobalId, Scored, SearchMode, SearchRequest,
 };
+use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
 use fastsearch_vector::{MemVectorIndex, VecMeta, VectorBackend};
 use std::collections::HashMap;
@@ -23,6 +25,8 @@ pub enum EngineError {
     Core(#[from] fastsearch_core::CoreError),
     #[error("vector error: {0}")]
     Vector(String),
+    #[error("rerank error: {0}")]
+    Rerank(String),
 }
 pub type Result<T> = std::result::Result<T, EngineError>;
 
@@ -62,6 +66,8 @@ pub struct SearchHit {
     pub bm25: Option<f32>,
     /// 向量相似分（hybrid 路；vector 后端落地前为 None）。
     pub vector: Option<f64>,
+    /// rerank 分（req.rerank 存在时）。
+    pub rerank: Option<f64>,
     /// 高亮片段（HTML）；仅 keyword 命中且 req.highlight 时有值。
     pub highlight: Option<String>,
 }
@@ -70,6 +76,7 @@ pub struct SearchHit {
 pub struct Engine {
     text: TextIndex,
     vector: MemVectorIndex,
+    reranker: Box<dyn Reranker + Send + Sync>,
 }
 
 impl Engine {
@@ -77,6 +84,7 @@ impl Engine {
         Ok(Engine {
             text: TextIndex::create_in_ram(cfg)?,
             vector: MemVectorIndex::new(),
+            reranker: Box::new(LexicalOverlapReranker),
         })
     }
 
@@ -84,7 +92,13 @@ impl Engine {
         Ok(Engine {
             text: TextIndex::open_or_create(dir, cfg)?,
             vector: MemVectorIndex::new(),
+            reranker: Box::new(LexicalOverlapReranker),
         })
+    }
+
+    /// 替换 reranker（接入真 cross-encoder 时用）。
+    pub fn set_reranker(&mut self, reranker: Box<dyn Reranker + Send + Sync>) {
+        self.reranker = reranker;
     }
 
     /// 灌入一个 chunk（仅全文，不提交）。
@@ -198,9 +212,11 @@ impl Engine {
         let mut kw_score: HashMap<GlobalId, f32> = HashMap::new();
         let mut citation: HashMap<GlobalId, Citation> = HashMap::new();
         let mut highlight: HashMap<GlobalId, String> = HashMap::new();
+        let mut text_map: HashMap<GlobalId, String> = HashMap::new();
         for h in &kw_hits {
             kw_score.insert(h.id.clone(), h.score);
             citation.insert(h.id.clone(), h.citation.clone());
+            text_map.insert(h.id.clone(), h.text.clone());
             if let Some(hl) = &h.highlight {
                 highlight.insert(h.id.clone(), hl.clone());
             }
@@ -245,10 +261,33 @@ impl Engine {
                     citation: c.clone(),
                     bm25: kw_score.get(&s.id).copied(),
                     vector: vec_score.get(&s.id).copied(),
+                    rerank: None,
                     highlight: highlight.get(&s.id).cloned(),
                 })
             })
             .collect();
+
+        // rerank：宽召回后重排（req.rerank 存在时）。对候选文本打分、按 rerank 分降序、
+        // 同分按 gid，再截 top_k。rerank 分写入命中（透明）；原 bm25/vector/fused 保留。
+        if req.rerank.is_some() {
+            let texts: Vec<String> = hits
+                .iter()
+                .map(|h| text_map.get(&h.id).cloned().unwrap_or_default())
+                .collect();
+            let scores = self
+                .reranker
+                .rerank(&req.query, &texts)
+                .map_err(|e| EngineError::Rerank(e.to_string()))?;
+            for (h, sc) in hits.iter_mut().zip(scores) {
+                h.rerank = Some(sc);
+            }
+            hits.sort_by(|a, b| {
+                b.rerank
+                    .partial_cmp(&a.rerank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
         hits.truncate(req.top_k);
         Ok((hits, facets))
     }
@@ -535,6 +574,34 @@ mod tests {
         let c2 = hits.iter().find(|h| h.id.chunk_id == 2).unwrap();
         assert!(c1.bm25.is_some()); // c1 有 keyword 分
         assert!(c2.vector.is_some()); // c2 有 vector 分
+    }
+
+    #[test]
+    fn rerank_reorders_by_overlap() {
+        use fastsearch_core::RerankSpec;
+        let mut e = engine();
+        // 两 chunk 都含 "apple"，但 chunk 2 与 query "apple banana" 词项更重叠
+        e.ingest(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "apple cherry date", 1),
+        )
+        .unwrap();
+        e.ingest(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "apple banana", 2),
+        )
+        .unwrap();
+        e.commit().unwrap();
+        let mut r = req("apple banana");
+        r.rerank = Some(RerankSpec {
+            model: "lexical".into(),
+            top_k: 10,
+        });
+        let hits = e.search(&r, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        // chunk 2（与 query 完全重叠）应被 rerank 提前
+        assert_eq!(hits[0].id.chunk_id, 2);
+        assert!(hits[0].rerank.unwrap() > hits[1].rerank.unwrap());
     }
 
     #[test]

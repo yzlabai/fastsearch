@@ -1,0 +1,11 @@
+[package]
+name = "fastsearch-rerank"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reranker trait for fastsearch + a deterministic lexical-overlap baseline (neural cross-encoder to follow)."
+
+[dependencies]
+anyhow.workspace = true
