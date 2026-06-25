@@ -11,6 +11,8 @@
 //! - **替换语义**：`DeleteDoc` 后跟同 doc `Upsert` 序列 = doc_id 级替换。
 //! - **不静默吞错**：sink 错误向上传播，applied_lsn 仅在成功后推进。
 
+pub mod pgoutput;
+
 use fastsearch_core::{Chunk, GlobalId};
 
 /// 复制日志序号。

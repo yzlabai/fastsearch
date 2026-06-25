@@ -78,8 +78,10 @@ impl Applier {
 - 单元测试全绿、clippy 净、fmt 净。
 - 状态：
   - [x] v1 完成：Change 模型 + IndexSink trait + Applier（幂等/LSN 水位/批量/替换语义/错误不推进水位）+ 5 单测绿。clippy 净、fmt 净。
+  - [x] v1.1：**pgoutput 二进制解码**（`pgoutput` 模块）—— 大端游标解析 Begin/Commit/Origin/Relation/Type/Insert/Update/Delete/Truncate + TupleData（null/unchanged-toast/text）；越界/未知 tag/非法 utf8 均返回 Err 不 panic；`Relation::pair` 按列名配对取值。纯函数、+5 单测（对构造字节）。**这是线缆层里最易出微妙 bug 的部分，先做透**。
 
-**已知限制 / 下一迭代：**
-- **pgoutput 流式解码 + 复制连接尚未实现**（CDC 的"线缆层"）——v1 只做了"正确性核心"（apply 编排），这是 CDC 最容易出微妙 bug 的部分，已用 mock sink 测透。线缆层（tokio-postgres 复制模式 + pgoutput 二进制解码 + slot 生命周期 + 心跳）列入下一迭代，env-gated 集成测试。
+**已知限制 / 下一迭代（线缆层剩余，env-gated）：**
+- **复制连接 + 流式读取尚未实现**（`待运行验证`）：tokio-postgres 复制模式（START_REPLICATION）+ CopyData/XLogData 拆封 → `pgoutput::parse_message` → 映射 `Change` → `Applier`；slot 生命周期 + 心跳（standby status update）+ LSN 反馈。需活 PG 的 env-gated 集成测试。
+- **pgoutput → `Change` 映射**：需把 Relation+Tuple 按 fastsearch_chunks 列约定解析成 `Chunk`（复用 pg `ChunkRow` 的值解析），与连接层同批落地。
 - `initial_snapshot`/`stream` 集成函数待线缆层落地后补。
 - IndexSink 由 fastsearch-engine 的适配器桥接 TextIndex（避免 text 反向依赖 sync）。
