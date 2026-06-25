@@ -1,0 +1,28 @@
+[package]
+name = "fastsearch-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "fastsearch command-line interface: ingest docparse chunks and search."
+
+[[bin]]
+name = "fastsearch"
+path = "src/main.rs"
+
+[lib]
+name = "fastsearch_cli"
+path = "src/lib.rs"
+
+[dependencies]
+fastsearch-core.workspace = true
+fastsearch-engine.workspace = true
+fastsearch-text.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

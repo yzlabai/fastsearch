@@ -1,0 +1,12 @@
+[package]
+name = "fastsearch-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CDC apply orchestration for fastsearch: idempotent, LSN-checkpointed application of Postgres changes to derived indexes."
+
+[dependencies]
+fastsearch-core.workspace = true
+anyhow.workspace = true

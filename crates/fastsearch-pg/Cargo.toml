@@ -1,0 +1,18 @@
+[package]
+name = "fastsearch-pg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Postgres source-of-truth layer for fastsearch: schema/DDL, chunk<->row mapping, write path (pgvector, logical-replication ready)."
+
+[dependencies]
+fastsearch-core.workspace = true
+tokio-postgres.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

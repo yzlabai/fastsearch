@@ -1,0 +1,19 @@
+[package]
+name = "fastsearch-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "fastsearch query/ingest orchestration: ties core fusion + text index + CDC sink into an end-to-end engine."
+
+[dependencies]
+fastsearch-core.workspace = true
+fastsearch-text.workspace = true
+fastsearch-vector.workspace = true
+fastsearch-sync = { path = "../fastsearch-sync" }
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

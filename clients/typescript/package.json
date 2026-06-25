@@ -1,0 +1,17 @@
+{
+  "name": "fastsearch-client",
+  "version": "0.1.0",
+  "description": "Zero-dependency TypeScript client for the fastsearch REST API (hybrid search over docparse chunks).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": ["search", "rag", "hybrid-search", "bm25", "vector-search"],
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

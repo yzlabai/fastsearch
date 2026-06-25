@@ -1,0 +1,12 @@
+[package]
+name = "fastsearch-vector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Vector backend for fastsearch: filter-aware ANN (true pre-filtering), brute-force baseline; HNSW/quantization to follow."
+
+[dependencies]
+fastsearch-core.workspace = true
+anyhow.workspace = true

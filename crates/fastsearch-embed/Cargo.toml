@@ -1,0 +1,11 @@
+[package]
+name = "fastsearch-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Embedding backend trait for fastsearch + a deterministic dependency-free baseline (real Candle/ONNX models to follow)."
+
+[dependencies]
+anyhow.workspace = true

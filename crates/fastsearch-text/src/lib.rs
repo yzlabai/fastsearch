@@ -1,0 +1,429 @@
+//! # fastsearch-text
+//!
+//! 引擎侧派生全文索引（Tantivy/BM25）。schema 构建、CJK 分词、upsert/delete、
+//! 带过滤与 ACL 的检索，返回带引用（page+bbox+heading_path）的命中。
+//! 详见 [spec](../../docs/specs/11-text.md)。
+
+mod error;
+mod query_build;
+mod schema;
+mod tokenizer;
+
+pub use error::{Result, TextError};
+pub use schema::{TextIndexConfig, TokenizerKind};
+
+use fastsearch_core::{AclFilter, Chunk, ChunkKind, Citation, Filter, GlobalId};
+use query_build::{acl_query, stored_row, translate};
+use schema::{build_schema, Fields};
+use tantivy::collector::TopDocs;
+use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::schema::IndexRecordOption;
+use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
+use tokenizer::JiebaTokenizer;
+
+/// 一条全文命中。
+#[derive(Debug, Clone)]
+pub struct TextHit {
+    pub id: GlobalId,
+    pub score: f32,
+    pub citation: Citation,
+}
+
+/// 派生全文索引。
+pub struct TextIndex {
+    index: Index,
+    fields: Fields,
+    cfg: TextIndexConfig,
+    writer: IndexWriter,
+    reader: IndexReader,
+}
+
+fn kind_str(k: ChunkKind) -> &'static str {
+    match k {
+        ChunkKind::Heading => "heading",
+        ChunkKind::Paragraph => "paragraph",
+        ChunkKind::Table => "table",
+        ChunkKind::Code => "code",
+        ChunkKind::ListItem => "list_item",
+        ChunkKind::Image => "image",
+    }
+}
+
+impl TextIndex {
+    /// 内存索引（测试/瞬态用）。
+    pub fn create_in_ram(cfg: TextIndexConfig) -> Result<Self> {
+        let (schema, fields) = build_schema(cfg.tokenizer);
+        let index = Index::create_in_ram(schema);
+        Self::finish(index, fields, cfg)
+    }
+
+    /// 打开或在目录创建（mmap，落盘）。
+    pub fn open_or_create(dir: &std::path::Path, cfg: TextIndexConfig) -> Result<Self> {
+        let (schema, fields) = build_schema(cfg.tokenizer);
+        let mmap = tantivy::directory::MmapDirectory::open(dir)
+            .map_err(|e| TextError::QueryParse(format!("open dir: {e}")))?;
+        let index = Index::open_or_create(mmap, schema)?;
+        Self::finish(index, fields, cfg)
+    }
+
+    fn finish(index: Index, fields: Fields, cfg: TextIndexConfig) -> Result<Self> {
+        index.tokenizers().register("jieba", JiebaTokenizer::new());
+        let writer = index.writer(50_000_000)?;
+        let reader = index.reader()?;
+        Ok(TextIndex {
+            index,
+            fields,
+            cfg,
+            writer,
+            reader,
+        })
+    }
+
+    /// upsert：同 gid 覆盖（先按 gid 删，再加）。
+    pub fn upsert(&mut self, collection: &str, chunk: &Chunk) -> Result<()> {
+        let gid = chunk.global_id(collection).to_citation_id();
+        self.writer
+            .delete_term(Term::from_field_text(self.fields.gid, &gid));
+        let f = &self.fields;
+        let mut doc = TantivyDocument::default();
+        doc.add_text(f.gid, &gid);
+        doc.add_text(f.collection, collection);
+        doc.add_text(f.doc_id, &chunk.doc_id);
+        doc.add_text(f.text, &chunk.text);
+        doc.add_text(f.heading, chunk.heading_path.join(" "));
+        doc.add_text(f.kind, kind_str(chunk.kind));
+        doc.add_u64(f.page, chunk.page as u64);
+        doc.add_u64(f.section_id, chunk.section_id);
+        doc.add_u64(f.chunk_id, chunk.chunk_id);
+        if let Some(t) = &chunk.tenant {
+            doc.add_text(f.tenant, t);
+        }
+        for a in &chunk.acl {
+            doc.add_text(f.acl, a);
+        }
+        doc.add_text(f.heading_path, serde_json::to_string(&chunk.heading_path)?);
+        doc.add_text(f.bbox, serde_json::to_string(&chunk.bbox)?);
+        self.writer.add_document(doc)?;
+        Ok(())
+    }
+
+    /// 按 global_id 删除。
+    pub fn delete_by_global_id(&mut self, gid: &GlobalId) -> Result<()> {
+        self.writer.delete_term(Term::from_field_text(
+            self.fields.gid,
+            &gid.to_citation_id(),
+        ));
+        Ok(())
+    }
+
+    /// 删除某 `(collection, doc_id)` 的全部 chunk（doc_id 级替换）。
+    ///
+    /// Tantivy 仅支持按 term 删除，故先检索（已提交部分）出该 doc 的全部 gid 再
+    /// 逐个删除，避免跨集合误删同名 doc_id。
+    pub fn delete_by_doc(&mut self, collection: &str, doc_id: &str) -> Result<()> {
+        let searcher = self.reader.searcher();
+        let q = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.collection, collection),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.doc_id, doc_id),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        let top = searcher.search(&q, &TopDocs::with_limit(100_000).order_by_score())?;
+        for (_score, addr) in top {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            if let Some(gid) = doc
+                .get_first(self.fields.gid)
+                .and_then(|v| tantivy::schema::Value::as_str(&v))
+            {
+                self.writer
+                    .delete_term(Term::from_field_text(self.fields.gid, gid));
+            }
+        }
+        Ok(())
+    }
+
+    /// 提交并刷新 reader（提交后立即可见）。
+    pub fn commit(&mut self) -> Result<()> {
+        self.writer.commit()?;
+        self.reader.reload()?;
+        Ok(())
+    }
+
+    /// 检索：BM25 + 可选过滤 + 可选 ACL，返回带引用的 top-k。
+    ///
+    /// 预过滤（SUPERSET 翻译）缩小候选，post-filter（core eval + ACL visible）保证
+    /// 精确与不越权。over-fetch 抵消后过滤截断。
+    pub fn search(
+        &self,
+        query: &str,
+        filter: Option<&Filter>,
+        acl: Option<&AclFilter>,
+        k: usize,
+    ) -> Result<Vec<TextHit>> {
+        let searcher = self.reader.searcher();
+        let text_q: Box<dyn Query> = if query.trim().is_empty() {
+            Box::new(AllQuery)
+        } else {
+            let mut qp =
+                QueryParser::for_index(&self.index, vec![self.fields.text, self.fields.heading]);
+            qp.set_field_boost(self.fields.heading, self.cfg.heading_boost);
+            qp.parse_query(query)
+                .map_err(|e| TextError::QueryParse(e.to_string()))?
+        };
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, text_q)];
+        if let Some(f) = filter {
+            clauses.push((Occur::Must, translate(f, &self.fields)));
+        }
+        if let Some(a) = acl {
+            clauses.push((Occur::Must, acl_query(a, &self.fields)));
+        }
+        let q = BooleanQuery::new(clauses);
+
+        let overfetch = (k * 4).max(k + 16);
+        let top = searcher.search(&q, &TopDocs::with_limit(overfetch).order_by_score())?;
+
+        let mut hits = Vec::with_capacity(k);
+        for (score, addr) in top {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            let row = stored_row(&doc, &self.fields);
+            if let Some(f) = filter {
+                if !f.eval(&row) {
+                    continue;
+                }
+            }
+            if let Some(a) = acl {
+                if !a.visible(&row) {
+                    continue;
+                }
+            }
+            let citation = Citation {
+                collection: row.collection.clone(),
+                doc_id: row.doc_id.clone(),
+                chunk_id: row.chunk_id,
+                page: row.page as u32,
+                bbox: row.bbox,
+                heading_path: row.heading.clone(),
+                section_id: row.section_id,
+            };
+            hits.push(TextHit {
+                id: GlobalId {
+                    collection: row.collection,
+                    doc_id: row.doc_id,
+                    chunk_id: row.chunk_id,
+                },
+                score,
+                citation,
+            });
+            if hits.len() >= k {
+                break;
+            }
+        }
+        Ok(hits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastsearch_core::BBox;
+
+    fn chunk(doc: &str, id: u64, kind: ChunkKind, text: &str, page: u32) -> Chunk {
+        Chunk {
+            doc_id: doc.into(),
+            chunk_id: id,
+            kind,
+            text: text.into(),
+            page,
+            bbox: BBox {
+                x0: 1.0,
+                y0: 2.0,
+                x1: 3.0,
+                y1: 4.0,
+            },
+            heading_path: vec!["第3章".into(), "财务".into()],
+            section_id: 7,
+            char_len: text.chars().count() as u32,
+            image_meta: None,
+            tenant: None,
+            acl: vec!["public".into()],
+        }
+    }
+
+    fn ram(tok: TokenizerKind) -> TextIndex {
+        TextIndex::create_in_ram(TextIndexConfig {
+            tokenizer: tok,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn index_search_returns_citation() {
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha beta gamma", 5),
+        )
+        .unwrap();
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "beta delta", 6),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        let hits = idx.search("alpha", None, None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.chunk_id, 1);
+        assert_eq!(hits[0].citation.page, 5);
+        assert_eq!(hits[0].citation.bbox.x1, 3.0);
+        assert_eq!(hits[0].citation.heading_path, vec!["第3章", "财务"]);
+    }
+
+    #[test]
+    fn bm25_orders_more_relevant_first() {
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert("kb", &chunk("a.pdf", 1, ChunkKind::Paragraph, "beta", 1))
+            .unwrap();
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "beta beta beta", 1),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        let hits = idx.search("beta", None, None, 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id.chunk_id, 2); // 词频高的在前
+    }
+
+    #[test]
+    fn chinese_jieba_search() {
+        let mut idx = ram(TokenizerKind::Jieba);
+        idx.upsert(
+            "kb",
+            &chunk(
+                "a.pdf",
+                1,
+                ChunkKind::Table,
+                "本季度毛利率因成本上升而下降",
+                23,
+            ),
+        )
+        .unwrap();
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "公司发布新产品", 3),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        let hits = idx.search("毛利率", None, None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.chunk_id, 1);
+    }
+
+    #[test]
+    fn filter_kind_and_page() {
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert("kb", &chunk("a.pdf", 1, ChunkKind::Table, "data here", 12))
+            .unwrap();
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "data here", 12),
+        )
+        .unwrap();
+        idx.upsert("kb", &chunk("a.pdf", 3, ChunkKind::Table, "data here", 5))
+            .unwrap();
+        idx.commit().unwrap();
+        // kind=table AND page>=10  → 只剩 chunk 1
+        let f = Filter::And(vec![
+            Filter::Eq(
+                "kind".into(),
+                fastsearch_core::FieldValue::Str("table".into()),
+            ),
+            Filter::Gte("page".into(), fastsearch_core::FieldValue::Int(10)),
+        ]);
+        let hits = idx.search("data", Some(&f), None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.chunk_id, 1);
+    }
+
+    #[test]
+    fn acl_blocks_unauthorized() {
+        let mut idx = ram(TokenizerKind::Default);
+        let mut c1 = chunk("a.pdf", 1, ChunkKind::Paragraph, "secret data", 1);
+        c1.tenant = Some("acme".into());
+        c1.acl = vec!["team-a".into()];
+        let mut c2 = chunk("a.pdf", 2, ChunkKind::Paragraph, "secret data", 1);
+        c2.tenant = Some("acme".into());
+        c2.acl = vec!["team-b".into()];
+        idx.upsert("kb", &c1).unwrap();
+        idx.upsert("kb", &c2).unwrap();
+        idx.commit().unwrap();
+        // 调用者 acme / team-a → 只能看到 chunk 1
+        let acl = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        let hits = idx.search("secret", None, Some(&acl), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.chunk_id, 1);
+    }
+
+    #[test]
+    fn upsert_overwrites() {
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert("kb", &chunk("a.pdf", 1, ChunkKind::Paragraph, "oldword", 1))
+            .unwrap();
+        idx.commit().unwrap();
+        idx.upsert("kb", &chunk("a.pdf", 1, ChunkKind::Paragraph, "newword", 1))
+            .unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.search("oldword", None, None, 10).unwrap().len(), 0);
+        assert_eq!(idx.search("newword", None, None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_by_doc_removes_all() {
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert("kb", &chunk("a.pdf", 1, ChunkKind::Paragraph, "term", 1))
+            .unwrap();
+        idx.upsert("kb", &chunk("a.pdf", 2, ChunkKind::Paragraph, "term", 2))
+            .unwrap();
+        idx.upsert("kb", &chunk("b.pdf", 1, ChunkKind::Paragraph, "term", 1))
+            .unwrap();
+        idx.commit().unwrap();
+        idx.delete_by_doc("kb", "a.pdf").unwrap();
+        idx.commit().unwrap();
+        let hits = idx.search("term", None, None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.doc_id, "b.pdf");
+    }
+
+    #[test]
+    fn deterministic_results() {
+        let mut idx = ram(TokenizerKind::Default);
+        for i in 1..=5 {
+            idx.upsert(
+                "kb",
+                &chunk("a.pdf", i, ChunkKind::Paragraph, "same text", 1),
+            )
+            .unwrap();
+        }
+        idx.commit().unwrap();
+        let a = idx.search("same", None, None, 10).unwrap();
+        let b = idx.search("same", None, None, 10).unwrap();
+        let ga: Vec<_> = a.iter().map(|h| h.id.chunk_id).collect();
+        let gb: Vec<_> = b.iter().map(|h| h.id.chunk_id).collect();
+        assert_eq!(ga, gb);
+    }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "fastsearch-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "fastsearch REST server: API-key auth + non-bypassable per-document ACL + basic observability."
+
+[[bin]]
+name = "fastsearch-server"
+path = "src/main.rs"
+
+[lib]
+name = "fastsearch_server"
+path = "src/lib.rs"
+
+[dependencies]
+fastsearch-core.workspace = true
+fastsearch-engine.workspace = true
+fastsearch-text.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+http-body-util.workspace = true
