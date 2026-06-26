@@ -1,0 +1,48 @@
+{
+  "name": "fastsearch-kb-agent-example",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "知识库 Agent 例子：Hono + SQLite/Drizzle + Vercel AI SDK + Vite/React/shadcnUI，检索后端用 fastsearch REST，LLM 用 DeepSeek。",
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c green,cyan \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch src/server/index.ts",
+    "dev:web": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "db:generate": "drizzle-kit generate",
+    "db:studio": "drizzle-kit studio",
+    "typecheck": "tsc -b --noEmit",
+    "test:e2e": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/deepseek": "^3.0.0",
+    "@ai-sdk/react": "^4.0.3",
+    "@hono/node-server": "^2.0.6",
+    "ai": "^7.0.2",
+    "better-sqlite3": "^12.11.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.12.27",
+    "lucide-react": "^1.21.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "tailwind-merge": "^3.6.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^26.0.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "concurrently": "^10.0.3",
+    "drizzle-kit": "^0.31.10",
+    "tailwindcss": "^4.3.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0"
+  }
+}
