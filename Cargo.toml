@@ -12,6 +12,7 @@ members = [
     "crates/fastsearch-eval",
     "crates/fastsearch-server",
     "crates/fastsearch-rerank",
+    "crates/fastsearch-mcp",
 ]
 
 [workspace.package]

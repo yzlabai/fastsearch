@@ -923,6 +923,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastsearch-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fastsearch-core",
+ "fastsearch-engine",
+ "fastsearch-text",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fastsearch-pg"
 version = "0.1.0"
 dependencies = [

@@ -37,7 +37,7 @@ docparse chunks → Postgres(真源: chunks 表 + 元数据 + ACL + pgvector 向
    fastsearch 引擎（无状态, 可多副本）  ← fastsearch-engine 编排
      派生 BM25 倒排(Tantivy/mmap) + 向量 ANN(filter-aware) + 元数据/ACL
    排序管线：ACL 强制注入 → keyword∥vector 召回 → 融合 → rerank → 高亮/分面 → top-K
-   四张脸：CLI · 库 · REST · MCP(待)
+   四张脸：CLI · 库 · REST · MCP（stdio+JSON-RPC，工具 search/resolve_citation，ACL 服务端注入）
 答案层(外部 LLM)：resolve_citation(id) → {page,bbox} → 深链/高亮
 ```
 
@@ -55,7 +55,8 @@ docparse chunks → Postgres(真源: chunks 表 + 元数据 + ACL + pgvector 向
 | `eval` | 相关性评测：nDCG/recall/MRR + `assert_no_regression`(CI 门禁) | 纯函数 |
 | `server` | REST(axum) + API-Key 认证 + **ACL 服务端注入不可绕过** + /metrics | `principal_from_headers`→`acl_for`→`engine.search(req, Some(acl))`；客户端无法传/绕过 ACL |
 | `cli` | `fastsearch` 二进制：吃 docparse chunks → 落盘 text 索引 → 检索 | 逻辑在 lib，main 是壳 |
-| `clients/{python,ts}` | 零依赖 SDK（封装 REST） | — |
+| `mcp` | 第四张脸：MCP（stdio+JSON-RPC）暴露 `search`/`resolve_citation` 工具 | 逻辑在 lib（`McpServer::handle` 纯函数可单测），main 是 stdio 壳；**ACL 服务端注入不可绕过** |
+| `clients/{python,ts}` | 零依赖 SDK（封装 REST）+ LangChain/LlamaIndex 适配 | — |
 
 ## 关键不变量（跨 crate 都要守）
 

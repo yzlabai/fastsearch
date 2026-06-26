@@ -1,0 +1,24 @@
+[package]
+name = "fastsearch-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "fastsearch MCP server: exposes hybrid search as Model Context Protocol tools over stdio (server-side non-bypassable ACL)."
+
+[[bin]]
+name = "fastsearch-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "fastsearch_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+fastsearch-core.workspace = true
+fastsearch-engine.workspace = true
+fastsearch-text.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
