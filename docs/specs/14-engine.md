@@ -1,7 +1,8 @@
 # spec · fastsearch-engine
 
 > 模块 #4.5（整合层），依赖：fastsearch-core、fastsearch-text、fastsearch-sync。阶段 P1→P2。
-> 上游：[产品设计 §3.4 排序管线](../plans/2026-06-24-产品设计文档.md)。状态：**开发中**。
+> 上游：[产品设计 §3.4 排序管线](../plans/2026-06-24-产品设计文档.md)。状态：**已完成 v2.3**
+> （三向量后端档 + 深分页 + 重建 + 媒资解析 + 多模态 + 崩溃安全 CDC）。
 
 ## 1. 目的与范围
 
@@ -60,8 +61,18 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 - [x] v1.5：**more_like_this**（`Engine::more_like_this(gid, top_k, acl)`）—— 取种子 chunk 正文（`TextIndex::stored_text`）净化成 keyword 查询（剔元字符、取前 20 词）反查相似、排除种子自身、ACL 强制。REST `POST /v1/similar`（按 citation_id）。+2 单测（engine/server）。
 - [x] v1.4：**分组折叠**（`req.collapse: Collapse{field,max_per_group}`，core 新增类型 + 校验）—— 按最终排名每组（`doc_id`/`section_id`）至多保留 N 条，防单文档/单段刷屏；保序、确定性；未知 field 不折叠。server 经 SearchRequest serde 透传。+1 单测。
 - [x] v1.3：**auto-merging**（`req.auto_merge`）—— 融合后、rerank 前，把同 `(doc_id, section_id)`（`section_id!=0`）的多个命中片段归并为组内最高排名的代表，被并入的兄弟 chunk_id 记入 `SearchHit.merged_chunk_ids`（升序、答案层可解析整段全部引用）；保序、确定性。`section_id==0` 视为"无段"不并。server 响应透出 `merged_chunk_ids`。+2 单测。
+- [x] v2.0（2026-06-26）：**多向量后端**——`vector` 字段改 `VectorStore` 门面（Brute/HNSW），
+  `create_in_ram_with(cfg, backend)` 选档，`Checkpoint.vector_backend` 记录/`open_with` 恢复；
+  **pgvector 直查**经 `set_pg_vector(Arc<PgStore>)`：`run()` 向量召回用 `block_in_place` 桥接 PG
+  异步 ANN（要求 multi-thread runtime），命中引用取 PG 真实 page/bbox。
+- [x] v2.1（A8b）：**深分页 `search_after`**——`SearchHit::cursor()`（排序键 bits+citation_id）+
+  `run()` 末端按"严格在游标之后"过滤后截 top_k；与 fusion/rerank 最终排序一致、平铺无重叠/遗漏。
+- [x] v2.2（A14）：**单集合原地重建** `rebuild_from(rows)`——清空 text+vector → 从真源重灌 → commit。
+- [x] v2.3（MM6）：**媒资解析** `resolve_citation(cid, acl) -> Option<ResolvedAsset{fetch,time,media_type}}`
+  （`AssetFetch::DocRender/SignedUrl/InlineBytes`），ACL 强制（不可见/不存在均 None=404）。
+- [x] 多模态（MM1-7）：`vec_meta` 透出 modality/time/media；分面支持 modality；kind Audio/Video。
 
 **已知限制 / 下一迭代：**
-- ✅ auto-merging（section 归并）已实现（v1.3）；rerank 钩子已接入（宽召回→rerank→top-K）。
-- ✅ CDC 自动 embedding 已实现（v1.6：`set_embedder` → `apply_upsert` 嵌入 passage → 写向量索引）；向量也可经 `ingest_vector` 直接灌入。
-- search_after 深分页（A8b）、单集合重建（A14）、引擎并发去串行（Mutex→RwLock/副本）为后续；其中并发去串行影响 server CDC 与检索的串行（见 19-server）。
+- ✅ auto-merging（v1.3）、rerank 钩子、CDC 自动 embedding（v1.6）、search_after（v2.1）、单集合重建（v2.2）均已实现。
+- 引擎并发去串行（Mutex→RwLock/副本）为后续——影响 server CDC 与检索的串行（见 19-server / [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。
+- pgvector 直查的 **CDC 自动写穿**（嵌入→PG embedding 列）下一迭代（见 [B6 设计](../plans/2026-06-26-B6-pgvector直查档设计.md)）。

@@ -1,18 +1,20 @@
 # spec · fastsearch-server
 
 > 模块 #9，依赖：core、engine。阶段 P4。上游：[产品设计 §3.6/§3.8/§4](../plans/2026-06-24-产品设计文档.md)、需求 F43–F46/F50/F54。
-> 状态：**开发中**。
+> 状态：**已完成 v1.6**（认证/ACL 不可绕过 + 指标/限流/审计 + 嵌入 + CDC 生命周期 +
+> 媒资网关 + 深分页 + 多向量后端 env）。MCP 第四张脸已独立成 `fastsearch-mcp` crate。
 
 ## 1. 目的与范围
 
 REST 服务（四张脸之一）+ 安全 + 基础可观测。
 
-- 端点：`GET /healthz` `/readyz` `/metrics`；`POST /v1/search`；`POST /v1/index`。
+- 端点：`GET /healthz` `/readyz` `/metrics` `/openapi.json`；`POST /v1/search`（含 `search_after` 深分页，命中带 `cursor`）；`POST /v1/similar`（按 citation_id more_like_this）；`GET /v1/asset/{cid}`（媒资 ACL 网关）；`POST /v1/index`。
 - **认证（F43）**：API Key（`Authorization: Bearer <k>` 或 `X-API-Key`）→ Principal{tenant, tags}；缺/错 → 401。
-- **逐文档 ACL（F44，安全核心）**：Principal → `AclFilter`，**服务端注入**给 engine.search；**客户端无法在请求里传 ACL/越权**。
-- 可观测（F50 v1）：请求计数 + 简单 `/metrics` 文本。
+- **逐文档 ACL（F44，安全核心）**：Principal → `AclFilter`，**服务端注入**给 engine.search/resolve_citation；**客户端无法在请求里传 ACL/越权**（含 /v1/asset：越权/不存在均 404，不泄漏存在性）。
+- 可观测（F50）：counters + 延迟直方图 `/metrics`（Prometheus 文本）；限流（令牌桶 429）；审计（可插拔 sink）。
+- 向量后端：`FASTSEARCH_VECTOR_BACKEND=brute|hnsw|pgvector`（pgvector 直查需 `DATABASE_URL`，见 [B6 设计](../plans/2026-06-26-B6-pgvector直查档设计.md)）。
 
-**不做**：MCP（后续）、RBAC 细粒度策略引擎、TLS 终止（交给网关）、限流（后续）、完整 Prometheus 指标（先计数器）。
+**不做**：RBAC 细粒度策略引擎、TLS 终止（交给网关）。（MCP 工具面已实现，见 `fastsearch-mcp`；限流/完整指标已实现。）
 
 ## 2. 接口与状态
 
@@ -60,4 +62,9 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - [x] v1.3：**OpenAPI 3.0 契约**导出 `GET /openapi.json`（手写、随 API 维护）—— 描述 /v1/search、/v1/index、健康/指标端点 + SearchRequest/Hit/IndexRequest schema + ApiKey 安全方案；version 取 crate 版本。供 SDK 生成/契约校验（F54）。+1 测试（免认证可取、含关键 path/schema）。
 - [x] v1.2：**限流/admission control**（`with_rate_limit(capacity, refill_per_sec)`，每 key 令牌桶，超限 429 + 计数）+ **审计日志**（`with_audit(sink)`，每个成功请求发 `AuditEvent{endpoint,tenant,tags,query,collection,doc_id,hits,status}`）。二进制经 `FASTSEARCH_RATE_LIMIT="cap,refill"` / `FASTSEARCH_AUDIT=1`（stderr JSON）接入。+2 测试，活服务验证（cap=2→`200 429 429`，审计 JSON 落 stderr）。
 
-**已知限制 / 下一迭代：** MCP 工具面、RBAC 策略引擎、TLS（交网关）、并发优化（当前 Mutex 串行；后续 RwLock/副本）。
+- [x] v1.6（2026-06-26）：**媒资 ACL 网关** `GET /v1/asset/{cid}`（`principal→acl_for→resolve_citation`；
+  DocRender JSON / 302 SignedUrl / InlineBytes 字节；越权/不存在 404 不泄漏存在性，+测试 `asset_acl_not_bypassable`）；
+  **深分页** `search_after` 经 serde 透传 + 响应每命中带 `cursor`（+REST 翻页测试）；media/time 透出命中；
+  `FASTSEARCH_VECTOR_BACKEND=hnsw|pgvector`（首启选档 / pgvector `set_pg_vector`）。OpenAPI 同步新端点。
+
+**已知限制 / 下一迭代：** RBAC 细粒度策略引擎、TLS（交网关）、并发优化（当前 Mutex 串行；后续 RwLock/副本，见 [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。MCP 工具面已独立实现（`fastsearch-mcp`）。
