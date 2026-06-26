@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+mod hnsw;
+pub use hnsw::{HnswParams, HnswVectorIndex};
+
 /// 随向量存储的元数据：用于 filter/ACL 判定（实现 [`FieldSource`]）与组装引用。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VecMeta {
@@ -208,7 +211,7 @@ struct SnapEntry {
     meta: VecMeta,
 }
 
-fn normalize(v: &[f32]) -> Vec<f32> {
+pub(crate) fn normalize(v: &[f32]) -> Vec<f32> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm <= f32::EPSILON || !norm.is_finite() {
         return vec![0.0; v.len()];
@@ -216,7 +219,7 @@ fn normalize(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / norm).collect()
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 

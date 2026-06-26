@@ -12,6 +12,7 @@ fastsearch-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+hnsw_rs = { version = "0.3.4", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
