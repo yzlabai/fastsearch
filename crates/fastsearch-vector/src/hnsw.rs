@@ -14,18 +14,28 @@
 //! 这是 ANN 固有性质；默认的暴力 [`MemVectorIndex`](crate::MemVectorIndex) 仍**完全确定**。
 //! HNSW 是 opt-in 规模档，其近似/非确定是明示取舍（要确定就用默认档）。
 //!
-//! 已实现（A9 step 2+4）：f32 增量 insert + 墓碑删除 + over-fetch 后过滤 + 全精度重排 +
-//! 持久化（存向量数据、load 重建图）。量化（int8）/接 engine 配置开关 为后续步骤。
+//! 已实现（A9 step 2/3/4/6）：增量 insert + 墓碑删除 + over-fetch 后过滤 + **u8 量化图**
+//! （省 ~4× 图内存）+ **全精度 f32 重排**（量化误差兜底，recall@10≈0.99）+ 持久化（存 f32、
+//! load 重建图）+ 小集合回退暴力 + 接 engine。RaBitQ / filtered-traversal 为下一迭代。
 
 use crate::{dot, normalize, tmp_path, VecMeta, VectorBackend};
 use fastsearch_core::{AclFilter, Citation, Filter, GlobalId, Scored};
-use hnsw_rs::prelude::{DistCosine, Hnsw};
+use hnsw_rs::prelude::{DistL2, Hnsw};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
 /// 活条目数 ≤ 此值时检索回退暴力精确（保召回=1.0、确定）；超过才用 HNSW 近似图。
 const BRUTE_FALLBACK_MAX: usize = 1000;
+
+/// 把**归一化** f32 分量（∈[-1,1]）对称量化到 u8（∈[0,255]）：图存 u8（省 ~4× 图内存），
+/// 全精度重排仍用旁挂 f32。仿射平移对所有向量一致 → u8 L2 序与原始一致（modulo 取整）。
+fn quantize_u8(normalized: &[f32]) -> Vec<u8> {
+    normalized
+        .iter()
+        .map(|&x| (((x + 1.0) * 127.5).round().clamp(0.0, 255.0)) as u8)
+        .collect()
+}
 
 /// HNSW 构建/检索参数。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -61,9 +71,10 @@ struct HnswEntry {
 }
 
 /// HNSW 后端：增量插入、墓碑删除、over-fetch + 精确后过滤 + 全精度重排。
+/// 图存 **u8 量化**向量（省内存）；`entries` 旁挂 **f32** 全精度向量供精排/小集合暴力。
 pub struct HnswVectorIndex {
     params: HnswParams,
-    hnsw: Hnsw<'static, f32, DistCosine>,
+    hnsw: Hnsw<'static, u8, DistL2>,
     /// 内部 DataId(usize) → 条目；墓碑为 None（向量仍留图中，检索时跳过）。
     entries: Vec<Option<HnswEntry>>,
     gid_to_id: HashMap<GlobalId, usize>,
@@ -73,12 +84,12 @@ pub struct HnswVectorIndex {
 impl HnswVectorIndex {
     pub fn new(params: HnswParams) -> Self {
         // max_elements 仅为分配提示（非硬上限），增量插入可超出。
-        let hnsw = Hnsw::<f32, DistCosine>::new(
+        let hnsw = Hnsw::<u8, DistL2>::new(
             params.max_nb_connection,
             10_000,
             params.max_layer,
             params.ef_construction,
-            DistCosine {},
+            DistL2 {},
         );
         HnswVectorIndex {
             params,
@@ -106,12 +117,12 @@ impl HnswVectorIndex {
         self.entries.clear();
         self.gid_to_id.clear();
         self.dim = None;
-        self.hnsw = Hnsw::<f32, DistCosine>::new(
+        self.hnsw = Hnsw::<u8, DistL2>::new(
             self.params.max_nb_connection,
             10_000,
             self.params.max_layer,
             self.params.ef_construction,
-            DistCosine {},
+            DistL2 {},
         );
     }
 
@@ -225,7 +236,8 @@ impl VectorBackend for HnswVectorIndex {
         }
         let id = self.entries.len();
         let normalized = normalize(&vector);
-        self.hnsw.insert((normalized.as_slice(), id));
+        // 图存 u8 量化向量；entries 存 f32 供全精度重排。
+        self.hnsw.insert((quantize_u8(&normalized).as_slice(), id));
         self.entries.push(Some(HnswEntry {
             gid: gid.clone(),
             vector: normalized,
@@ -279,10 +291,10 @@ impl VectorBackend for HnswVectorIndex {
         if self.gid_to_id.len() <= BRUTE_FALLBACK_MAX {
             return Ok(self.brute_search(&q, k, filter, acl));
         }
-        // over-fetch：向 HNSW 多要候选，抵消后过滤损耗（强过滤仍可能不足，见模块文档）。
+        // over-fetch：向 HNSW 多要候选，抵消后过滤 + u8 量化损耗（全精度重排兜底）。
         let want = k.saturating_mul(self.params.over_fetch).max(k);
         let ef = self.params.ef_search.max(want);
-        let neighbours = self.hnsw.search(q.as_slice(), want, ef);
+        let neighbours = self.hnsw.search(quantize_u8(&q).as_slice(), want, ef);
 
         let mut scored: Vec<Scored> = neighbours
             .into_iter()
@@ -358,6 +370,16 @@ mod tests {
                 ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0
             })
             .collect()
+    }
+
+    #[test]
+    fn quantize_u8_boundaries() {
+        // 归一化分量 [-1,1] → u8 [0,255]，对称、单调。
+        assert_eq!(quantize_u8(&[-1.0, 0.0, 1.0]), vec![0u8, 128, 255]);
+        let q = quantize_u8(&[-0.5, 0.5]);
+        assert!(q[0] < 128 && q[1] > 128);
+        // 越界裁剪（理论上归一化向量不越界，防御性）
+        assert_eq!(quantize_u8(&[-2.0, 2.0]), vec![0u8, 255]);
     }
 
     #[test]
