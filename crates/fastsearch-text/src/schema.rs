@@ -25,9 +25,13 @@ impl TokenizerKind {
 /// 索引配置。
 #[derive(Debug, Clone, Copy)]
 pub struct TextIndexConfig {
+    /// BM25 `k1`/`b`（词频饱和 / 长度归一）。**注意：当前尚未生效**——Tantivy 0.26 把
+    /// BM25 参数硬编码（k1=1.2,b=0.75），未暴露可配置入口；要让这两个值真生效需自定义
+    /// `Scorer` 重算打分（看板 A11，`下一迭代`）。保留字段以锁定预期 API 形态，避免后续破坏性变更。
     pub k1: f32,
     pub b: f32,
     pub tokenizer: TokenizerKind,
+    /// heading 字段查询加权（**已生效**，见 `lib.rs` `set_field_boost`）。
     pub heading_boost: f32,
 }
 
