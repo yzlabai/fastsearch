@@ -258,6 +258,24 @@ impl Engine {
         Ok(rows.len())
     }
 
+    /// **单集合原地重建**（坏索引/索引损坏 → 从真源 PG 重灌）：清空派生 text+vector 索引，
+    /// 用传入的 `rows`（PG 全表/单集合快照，真源）经 `apply_upsert` 重灌（含嵌入），统一
+    /// `commit` 成一次可见切换。**派生可重建**不变量的运维出口；不触 PG，调用方负责 fetch。
+    ///
+    /// 换分词器属"换 schema"，走另一条路（用新 `TextIndexConfig` 新建 Engine + `bootstrap_snapshot`）——
+    /// 本方法保持同 schema。返回重灌条数。
+    pub fn rebuild_from(&mut self, rows: &[(String, Chunk)]) -> Result<usize> {
+        use fastsearch_sync::IndexSink;
+        self.text.clear()?;
+        self.vector.clear();
+        for (collection, chunk) in rows {
+            self.apply_upsert(collection, chunk)
+                .map_err(|e| EngineError::Cdc(format!("rebuild apply: {e}")))?;
+        }
+        self.text.commit()?;
+        Ok(rows.len())
+    }
+
     /// **崩溃安全地**消费一批 CDC 变更并落地（生产 CDC 主循环的一拍）：
     /// `peek`（不推进 slot）→ 幂等应用全部（`apply_upsert` 含嵌入）→ `persist`（索引 +
     /// 检查点=slot 高水位）→ **落盘成功后才** `advance_slot`。返回应用条数。
@@ -809,6 +827,37 @@ mod tests {
             section_id,
             ..chunk(doc, id, ChunkKind::Paragraph, text, 1)
         }
+    }
+
+    #[test]
+    fn rebuild_from_truth_replaces_index() {
+        let mut e = engine();
+        // 旧（可能损坏/过期）索引：含一条将被真源剔除的 chunk。
+        e.ingest(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "old apple", 1),
+        )
+        .unwrap();
+        e.ingest(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "stale banana", 1),
+        )
+        .unwrap();
+        e.commit().unwrap();
+        assert_eq!(e.search(&req("banana"), None).unwrap().len(), 1);
+
+        // 从真源重灌：a/2 已不在真源，a/1 内容更新。
+        let rows = vec![(
+            "kb".to_string(),
+            chunk("a.pdf", 1, ChunkKind::Paragraph, "new apple cherry", 1),
+        )];
+        let n = e.rebuild_from(&rows).unwrap();
+        assert_eq!(n, 1);
+        // 过期 chunk 已消失；重灌内容可检索。
+        assert_eq!(e.search(&req("banana"), None).unwrap().len(), 0);
+        let hits = e.search(&req("cherry"), None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.chunk_id, 1);
     }
 
     #[test]

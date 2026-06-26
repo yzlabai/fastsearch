@@ -185,6 +185,13 @@ impl TextIndex {
         Ok(())
     }
 
+    /// 清空全部文档（保持同 schema/分词器），供单集合**原地重建**（坏索引→从真源重灌）。
+    /// 不提交——由调用方在重灌后统一 `commit`，使"清空+重灌"成一次可见切换。
+    pub fn clear(&mut self) -> Result<()> {
+        self.writer.delete_all_documents()?;
+        Ok(())
+    }
+
     /// 按 global_id 取已索引的正文（STORED 字段）；不存在返回 None。
     /// 供 more_like_this 等需要"种子文本"的能力使用。
     pub fn stored_text(&self, gid: &GlobalId) -> Result<Option<String>> {

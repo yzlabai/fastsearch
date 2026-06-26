@@ -130,6 +130,12 @@ impl MemVectorIndex {
         self.dim
     }
 
+    /// 清空全部条目与维度（供单集合原地重建：坏索引→从真源重灌）。
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.dim = None;
+    }
+
     /// 原子落盘：写临时文件 → fsync → rename（rename 原子，防写一半崩坏）。
     /// 存的是**已归一化**向量，load 回来 search 行为不变。
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
