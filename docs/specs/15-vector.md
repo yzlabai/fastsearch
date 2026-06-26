@@ -1,7 +1,8 @@
 # spec · fastsearch-vector
 
 > 模块 #5，依赖：fastsearch-core。阶段 P2。上游：[产品设计 §3.3](../plans/2026-06-24-产品设计文档.md)、需求 F10–F13。
-> 状态：**开发中**。
+> 状态：**已完成 v2.1**（暴力 + HNSW/u8 量化 + pgvector 直查三档）。VecMeta 另含多模态
+> `modality/time/media`（MM1/MM4）。
 
 ## 1. 目的与范围
 
@@ -11,7 +12,10 @@
 - `MemVectorIndex`：内存暴力余弦（精确、filter-aware）——正确、可测、无需模型；适合中小集合，也作正确性基线。
 - **真预过滤**：过滤/ACL 在打分前/打分中施加（非后过滤），这正是超越 pgvector 后过滤召回崩的点。
 
-**不做**：嵌入计算（embed 模块）、量化/HNSW（下一迭代：RaBitQ + hnsw_rs）、pgvector 直查档（下一迭代 (a)）。
+三个后端档（同 `VectorBackend` trait）：`MemVectorIndex`（暴力，默认确定）、`HnswVectorIndex`
+（HNSW+u8 量化，A9，大规模近似）、**pgvector 直查**（ANN 在 PG 跑，B6，经 `fastsearch-pg::PgStore::vector_search`）。
+
+**不做**：嵌入计算（embed 模块）；RaBitQ 量化 / filtered-traversal（下一迭代）；CDC 自动写穿 PG embedding（下一迭代）。
 
 ## 2. 公开接口
 
@@ -41,7 +45,7 @@ pub struct VecMeta { pub kind, doc_id, collection, tenant, page, section_id, hea
 
 ## 4. 依赖
 
-`fastsearch-core`、`anyhow`。（hnsw_rs/量化 下一迭代再加。）
+`fastsearch-core`、`anyhow`、`hnsw_rs`（纯 Rust，无 C 依赖）、`serde(_json)`、`tempfile`。
 
 ## 5. 测试用例
 
@@ -57,8 +61,16 @@ pub struct VecMeta { pub kind, doc_id, collection, tenant, page, section_id, hea
 
 - [x] v1 完成：VectorBackend trait + MemVectorIndex（filter-aware 余弦，真预过滤）+ 7 单测绿（余弦排序/预过滤/ACL/覆盖/删除/维度校验/零向量）。clippy 净、fmt 净。已接入 engine 做真混合融合（engine 9 测试含 real_hybrid/vector_only）。
 - [x] v1.1（2026-06-25）：**持久化** `MemVectorIndex::save/load`（JSON 快照 + 原子写 tmp→fsync→rename；存归一化向量，load 行为不变）+ `len/is_empty/dim`。+2 单测（往返、缺文件→空）。供 engine 落盘恢复（不重嵌）。压缩二进制格式（bincode）为后续优化。
+- [x] v2（2026-06-26，A9）：**HnswVectorIndex**（hnsw_rs，纯 Rust）——增量 insert + 墓碑删除 +
+  over-fetch 后过滤 + **u8 量化图（省 ~4× 图内存）+ 全精度 f32 重排**（recall@10≈0.99）+ 持久化
+  （存向量、load 重建图）+ **小集合回退暴力**（≤1000 精确）。`VectorStore` 门面（在 engine）+
+  `VectorBackendKind` 选档 + 检查点记录/恢复。诚实：HNSW 档近似 + 非确定（hnsw_rs 不可 seed），
+  默认暴力档仍完全确定。
+- [x] v2.1（2026-06-26，B6）：**pgvector 直查档**——`fastsearch-pg::PgStore::vector_search`
+  （filter/ACL→SQL 下推 + iterative scan + Rust 精确后过滤 + 完整引用）；接 engine（block_in_place
+  同步↔异步桥）+ server `FASTSEARCH_VECTOR_BACKEND=pgvector`。Docker 实测。
 
 **已知限制 / 下一迭代：**
-- 暴力余弦 O(n)：中小集合够用，大库需 **HNSW（hnsw_rs）+ RaBitQ/int8 量化 + 全精度重排**（下一迭代）。
-- **pgvector 直查档 (a)**（托管省事档，ANN 在 PG 跑）待 P2 接 pg。
+- RaBitQ 量化 / filtered-traversal（更优压缩/召回）；HNSW 大 N 的 p95 与暴力交叉点实测（见 [容量/SLO](../governance/2026-06-26-容量与SLO.md)）。
+- pgvector 直查的 **CDC 自动写穿**（嵌入→PG embedding 列）下一迭代；当前需 embedding 已在 PG。
 - 向量经 CDC 落地路径自动嵌入（`engine.set_embedder` + `apply_upsert`）或 `ingest_vector` 灌入。
