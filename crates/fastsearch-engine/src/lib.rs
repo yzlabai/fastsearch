@@ -18,7 +18,7 @@ use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
 use fastsearch_sync::replication::{advance_slot, peek_with_lsn, ReplicationConfig};
 use fastsearch_sync::{Applier, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
-use fastsearch_vector::{MemVectorIndex, VecMeta, VectorBackend};
+use fastsearch_vector::{VecMeta, VectorBackend, VectorBackendKind, VectorStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,6 +53,9 @@ struct Checkpoint {
     applied_lsn: u64,
     /// 向量维度（用于检测换模型/换维度需重建）。
     vector_dim: Option<usize>,
+    /// 向量后端名（"brute"/"hnsw"）；open 时据此选 loader。空/缺省视为 brute。
+    #[serde(default)]
+    vector_backend: String,
 }
 
 impl Checkpoint {
@@ -202,7 +205,7 @@ pub enum AssetFetch {
 /// 端到端检索引擎。
 pub struct Engine {
     text: TextIndex,
-    vector: MemVectorIndex,
+    vector: VectorStore,
     reranker: Box<dyn Reranker + Send + Sync>,
     /// 可选嵌入后端：设置后，**CDC 应用路径**（`IndexSink::apply_upsert`）会自动嵌入
     /// chunk 正文并写向量索引（None=仅全文）。详见 `set_embedder`。
@@ -211,9 +214,14 @@ pub struct Engine {
 
 impl Engine {
     pub fn create_in_ram(cfg: TextIndexConfig) -> Result<Self> {
+        Self::create_in_ram_with(cfg, VectorBackendKind::Brute)
+    }
+
+    /// 内存引擎 + 指定向量后端（`Brute` 默认 / `Hnsw` 大规模 opt-in）。
+    pub fn create_in_ram_with(cfg: TextIndexConfig, backend: VectorBackendKind) -> Result<Self> {
         Ok(Engine {
             text: TextIndex::create_in_ram(cfg)?,
-            vector: MemVectorIndex::new(),
+            vector: VectorStore::new(backend),
             reranker: Box::new(LexicalOverlapReranker),
             embedder: None,
         })
@@ -222,7 +230,7 @@ impl Engine {
     pub fn open_or_create(dir: &std::path::Path, cfg: TextIndexConfig) -> Result<Self> {
         Ok(Engine {
             text: TextIndex::open_or_create(dir, cfg)?,
-            vector: MemVectorIndex::new(),
+            vector: VectorStore::new(VectorBackendKind::Brute),
             reranker: Box::new(LexicalOverlapReranker),
             embedder: None,
         })
@@ -236,9 +244,15 @@ impl Engine {
         std::fs::create_dir_all(&text_dir)
             .map_err(|e| EngineError::Persist(format!("create data dir: {e}")))?;
         let text = TextIndex::open_or_create(&text_dir, cfg)?;
-        let vector = MemVectorIndex::load(&vector_path(data_dir))
-            .map_err(|e| EngineError::Vector(e.to_string()))?;
         let cp = Checkpoint::load(data_dir)?;
+        // 据检查点选向量后端 loader（hnsw 的 params 取自快照本身，此处仅定变体）。
+        let kind = if cp.vector_backend == "hnsw" {
+            VectorBackendKind::Hnsw(fastsearch_vector::HnswParams::default())
+        } else {
+            VectorBackendKind::Brute
+        };
+        let vector = VectorStore::load(kind, &vector_path(data_dir))
+            .map_err(|e| EngineError::Vector(e.to_string()))?;
         // 维度漂移（换了嵌入模型）告警——可见、不静默。
         if let (Some(saved), Some(cur)) = (cp.vector_dim, vector.dim()) {
             if saved != cur {
@@ -267,6 +281,7 @@ impl Engine {
             schema_version: 1,
             applied_lsn: applied_lsn.0,
             vector_dim: self.vector.dim(),
+            vector_backend: self.vector.kind_str().to_string(),
         }
         .save(data_dir)?;
         Ok(())
@@ -870,6 +885,45 @@ mod tests {
             section_id,
             ..chunk(doc, id, ChunkKind::Paragraph, text, 1)
         }
+    }
+
+    #[test]
+    fn hnsw_backend_end_to_end() {
+        use fastsearch_vector::HnswParams;
+        let mut e = Engine::create_in_ram_with(
+            TextIndexConfig::default(),
+            VectorBackendKind::Hnsw(HnswParams::default()),
+        )
+        .unwrap();
+        e.ingest_vector(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "x", 1),
+            vec![1.0, 0.0, 0.0],
+        )
+        .unwrap();
+        e.ingest_vector(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "y", 1),
+            vec![0.0, 1.0, 0.0],
+        )
+        .unwrap();
+        e.ingest_vector(
+            "kb",
+            &chunk("a.pdf", 3, ChunkKind::Paragraph, "z", 1),
+            vec![0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        e.commit().unwrap();
+        let r = SearchRequest {
+            query: String::new(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![0.9, 0.1, 0.0]),
+            ..Default::default()
+        };
+        let hits = e.search(&r, None).unwrap();
+        assert!(!hits.is_empty());
+        // 最近 [1,0,0] → chunk 1 居首（HNSW 后端经引擎端到端可用）
+        assert_eq!(hits[0].id.chunk_id, 1);
     }
 
     #[test]

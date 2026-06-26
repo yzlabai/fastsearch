@@ -17,6 +17,119 @@ use std::path::Path;
 mod hnsw;
 pub use hnsw::{HnswParams, HnswVectorIndex};
 
+/// 后端选择（engine 据此建库）。默认 `Brute`（暴力精确、确定）。
+#[derive(Debug, Clone, Copy)]
+pub enum VectorBackendKind {
+    /// 暴力精确（默认，小/中规模、CI、需确定性）。
+    Brute,
+    /// HNSW 近似（大规模 opt-in；近似召回 + 非确定，见 [`HnswVectorIndex`]）。
+    Hnsw(HnswParams),
+}
+
+/// 后端门面：让 engine 用单一类型持有"暴力 / HNSW"二选一，统一 upsert/search/持久化等。
+/// 暴力档完全确定；HNSW 档近似+非确定（明示取舍）。
+pub enum VectorStore {
+    Brute(MemVectorIndex),
+    Hnsw(Box<HnswVectorIndex>),
+}
+
+impl VectorStore {
+    pub fn new(kind: VectorBackendKind) -> Self {
+        match kind {
+            VectorBackendKind::Brute => VectorStore::Brute(MemVectorIndex::new()),
+            VectorBackendKind::Hnsw(p) => VectorStore::Hnsw(Box::new(HnswVectorIndex::new(p))),
+        }
+    }
+
+    /// 后端名（落检查点，open 时据此选 loader）。
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            VectorStore::Brute(_) => "brute",
+            VectorStore::Hnsw(_) => "hnsw",
+        }
+    }
+
+    pub fn citation(&self, gid: &GlobalId) -> Option<Citation> {
+        match self {
+            VectorStore::Brute(m) => m.citation(gid),
+            VectorStore::Hnsw(h) => h.citation(gid),
+        }
+    }
+
+    pub fn dim(&self) -> Option<usize> {
+        match self {
+            VectorStore::Brute(m) => m.dim(),
+            VectorStore::Hnsw(h) => h.dim(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            VectorStore::Brute(m) => m.len(),
+            VectorStore::Hnsw(h) => h.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn clear(&mut self) {
+        match self {
+            VectorStore::Brute(m) => m.clear(),
+            VectorStore::Hnsw(h) => h.clear(),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        match self {
+            VectorStore::Brute(m) => m.save(path),
+            VectorStore::Hnsw(h) => h.save(path),
+        }
+    }
+
+    /// 按后端名加载（`kind` 取自检查点；默认 brute）。文件缺失 → 空库。
+    pub fn load(kind: VectorBackendKind, path: &Path) -> anyhow::Result<Self> {
+        Ok(match kind {
+            VectorBackendKind::Brute => VectorStore::Brute(MemVectorIndex::load(path)?),
+            VectorBackendKind::Hnsw(_) => VectorStore::Hnsw(Box::new(HnswVectorIndex::load(path)?)),
+        })
+    }
+}
+
+impl VectorBackend for VectorStore {
+    fn upsert(&mut self, gid: GlobalId, vector: Vec<f32>, meta: VecMeta) -> anyhow::Result<()> {
+        match self {
+            VectorStore::Brute(m) => m.upsert(gid, vector, meta),
+            VectorStore::Hnsw(h) => h.upsert(gid, vector, meta),
+        }
+    }
+    fn delete(&mut self, gid: &GlobalId) -> anyhow::Result<()> {
+        match self {
+            VectorStore::Brute(m) => m.delete(gid),
+            VectorStore::Hnsw(h) => h.delete(gid),
+        }
+    }
+    fn delete_doc(&mut self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
+        match self {
+            VectorStore::Brute(m) => m.delete_doc(collection, doc_id),
+            VectorStore::Hnsw(h) => h.delete_doc(collection, doc_id),
+        }
+    }
+    fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&Filter>,
+        acl: Option<&AclFilter>,
+    ) -> anyhow::Result<Vec<Scored>> {
+        match self {
+            VectorStore::Brute(m) => m.search(query, k, filter, acl),
+            VectorStore::Hnsw(h) => h.search(query, k, filter, acl),
+        }
+    }
+}
+
 /// 随向量存储的元数据：用于 filter/ACL 判定（实现 [`FieldSource`]）与组装引用。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VecMeta {

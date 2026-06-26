@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// 活条目数 ≤ 此值时检索回退暴力精确（保召回=1.0、确定）；超过才用 HNSW 近似图。
+const BRUTE_FALLBACK_MAX: usize = 1000;
+
 /// HNSW 构建/检索参数。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HnswParams {
@@ -96,6 +99,50 @@ impl HnswVectorIndex {
 
     pub fn dim(&self) -> Option<usize> {
         self.dim
+    }
+
+    /// 清空全部条目 + 重置图（供单集合原地重建）。
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.gid_to_id.clear();
+        self.dim = None;
+        self.hnsw = Hnsw::<f32, DistCosine>::new(
+            self.params.max_nb_connection,
+            10_000,
+            self.params.max_layer,
+            self.params.ef_construction,
+            DistCosine {},
+        );
+    }
+
+    /// 小集合**暴力精确**扫描（保召回=1.0）：免 ANN 抖动 + 规避强过滤下召回坑。
+    /// `query` 须已归一化。
+    fn brute_search(
+        &self,
+        q: &[f32],
+        k: usize,
+        filter: Option<&Filter>,
+        acl: Option<&AclFilter>,
+    ) -> Vec<Scored> {
+        let mut scored: Vec<Scored> = self
+            .entries
+            .iter()
+            .flatten()
+            .filter(|e| filter.is_none_or(|f| f.eval(&e.meta)))
+            .filter(|e| acl.is_none_or(|a| a.visible(&e.meta)))
+            .map(|e| Scored {
+                id: e.gid.clone(),
+                score: dot(q, &e.vector) as f64,
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        scored.truncate(k);
+        scored
     }
 
     /// 取某 gid 的引用（命中组装用）。
@@ -228,6 +275,10 @@ impl VectorBackend for HnswVectorIndex {
             return Ok(vec![]);
         }
         let q = normalize(query);
+        // 小集合回退暴力精确（保召回=1.0、确定）：免 ANN 抖动 + 强过滤召回坑。
+        if self.gid_to_id.len() <= BRUTE_FALLBACK_MAX {
+            return Ok(self.brute_search(&q, k, filter, acl));
+        }
         // over-fetch：向 HNSW 多要候选，抵消后过滤损耗（强过滤仍可能不足，见模块文档）。
         let want = k.saturating_mul(self.params.over_fetch).max(k);
         let ef = self.params.ef_search.max(want);
