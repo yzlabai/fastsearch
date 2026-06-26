@@ -191,7 +191,7 @@ impl MemVectorIndex {
 }
 
 /// 临时文件路径（同目录，便于同盘原子 rename）。
-fn tmp_path(path: &Path) -> std::path::PathBuf {
+pub(crate) fn tmp_path(path: &Path) -> std::path::PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
     std::path::PathBuf::from(s)
@@ -205,10 +205,10 @@ struct Snapshot {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SnapEntry {
-    gid: GlobalId,
-    vector: Vec<f32>,
-    meta: VecMeta,
+pub(crate) struct SnapEntry {
+    pub(crate) gid: GlobalId,
+    pub(crate) vector: Vec<f32>,
+    pub(crate) meta: VecMeta,
 }
 
 pub(crate) fn normalize(v: &[f32]) -> Vec<f32> {
