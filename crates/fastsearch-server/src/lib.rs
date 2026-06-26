@@ -294,7 +294,8 @@ fn openapi_spec() -> Value {
             "heading_path": {"type": "array", "items": {"type": "string"}},
             "section_id": {"type": "integer"},
             "highlight": {"type": ["string", "null"]},
-            "merged_chunk_ids": {"type": "array", "items": {"type": "integer"}}
+            "merged_chunk_ids": {"type": "array", "items": {"type": "integer"}},
+            "cursor": {"type": "string", "description": "深分页游标；作下次 search_after 续取下一页"}
         }
     });
     json!({
@@ -321,6 +322,7 @@ fn openapi_spec() -> Value {
                         "rerank": {"type": ["object", "null"]},
                         "auto_merge": {"type": "boolean", "default": false},
                         "collapse": {"type": ["object", "null"], "description": "{field, max_per_group}"},
+                        "search_after": {"type": ["string", "null"], "description": "深分页游标（取自上一页末条命中的 cursor）"},
                         "highlight": {"type": "boolean", "default": false},
                         "facets": {"type": "array", "items": {"type": "string"}}
                     }
@@ -484,6 +486,8 @@ fn hits_json(hits: &[fastsearch_engine::SearchHit]) -> Vec<Value> {
                 "merged_chunk_ids": h.merged_chunk_ids,
                 "time": h.citation.time,
                 "media": h.citation.media,
+                // 深分页游标：把末条命中的此值作为下次请求的 search_after 即续取下一页。
+                "cursor": h.cursor(),
             })
         })
         .collect()
@@ -1171,6 +1175,74 @@ mod tests {
             hits[0]["vector"].as_f64().is_some(),
             "vector score should be present"
         );
+    }
+
+    #[tokio::test]
+    async fn search_after_paginates_over_rest() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        // 灌 3 条命中同词的 chunk。
+        let body = r#"{"collection":"kb","doc_id":"d.pdf","chunks":[
+            {"doc_id":"d.pdf","chunk_id":1,"kind":"paragraph","text":"data alpha","page":1,
+             "bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":10,"acl":["team-a"],"tenant":"acme"},
+            {"doc_id":"d.pdf","chunk_id":2,"kind":"paragraph","text":"data beta","page":1,
+             "bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":9,"acl":["team-a"],"tenant":"acme"},
+            {"doc_id":"d.pdf","chunk_id":3,"kind":"paragraph","text":"data gamma","page":1,
+             "bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":10,"acl":["team-a"],"tenant":"acme"}]}"#;
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let search = |body: String| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        // 第一页 top_k=2
+        let p1 = body_json(
+            search(r#"{"query":"data","mode":"keyword","top_k":2}"#.into())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let h1 = p1["hits"].as_array().unwrap();
+        assert_eq!(h1.len(), 2);
+        let cursor = h1[1]["cursor"].as_str().unwrap().to_string();
+
+        // 第二页：search_after=上一页末条 cursor → 接续，不与第一页重叠。
+        let p2 = body_json(
+            search(format!(
+                r#"{{"query":"data","mode":"keyword","top_k":2,"search_after":"{cursor}"}}"#
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        let h2 = p2["hits"].as_array().unwrap();
+        assert_eq!(h2.len(), 1); // 共 3 条，第二页剩 1 条
+        let page1_ids: Vec<&str> = h1
+            .iter()
+            .map(|h| h["citation_id"].as_str().unwrap())
+            .collect();
+        let p2_id = h2[0]["citation_id"].as_str().unwrap();
+        assert!(!page1_ids.contains(&p2_id), "第二页不应与第一页重叠");
     }
 
     #[tokio::test]

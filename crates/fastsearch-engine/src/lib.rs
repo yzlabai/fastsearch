@@ -143,6 +143,39 @@ pub struct SearchHit {
     pub merged_chunk_ids: Vec<u64>,
 }
 
+impl SearchHit {
+    /// 最终排名的排序键：有 rerank 用 rerank 分，否则用融合分（与 `run` 末端排序一致）。
+    fn sort_key(&self) -> f64 {
+        self.rerank.unwrap_or(self.score)
+    }
+
+    /// 本命中的**深分页游标**（不透明 token）：把它作为下一页的 `search_after` 即从此条之后续取。
+    /// 编码 = `排序键 bits(16 hex)` + `:` + `citation_id`（精确 round-trip，确定性）。
+    pub fn cursor(&self) -> String {
+        format!(
+            "{:016x}:{}",
+            self.sort_key().to_bits(),
+            self.id.to_citation_id()
+        )
+    }
+}
+
+/// 解析深分页游标 → `(排序键, GlobalId)`。前 16 位十六进制是排序键 bits，其后为 citation_id
+/// （doc_id 可含 `:`，故只在第 17 位的分隔符处切一次）。非法 → InvalidRequest。
+fn parse_cursor(tok: &str) -> Result<(f64, GlobalId)> {
+    let bad = || {
+        EngineError::Core(fastsearch_core::CoreError::InvalidRequest(
+            "invalid search_after cursor".into(),
+        ))
+    };
+    if tok.len() < 18 || tok.as_bytes()[16] != b':' {
+        return Err(bad());
+    }
+    let bits = u64::from_str_radix(&tok[..16], 16).map_err(|_| bad())?;
+    let gid = GlobalId::parse(&tok[17..])?;
+    Ok((f64::from_bits(bits), gid))
+}
+
 /// `resolve_citation` 的结果：如何**安全地**取到这段媒资（已过 ACL）。
 #[derive(Debug, Clone)]
 pub struct ResolvedAsset {
@@ -597,6 +630,16 @@ impl Engine {
         if let Some(c) = &req.collapse {
             hits = collapse_groups(hits, &c.field, c.max_per_group);
         }
+        // 深分页：只保留最终排名中**严格在游标之后**的命中（与 (排序键 desc, gid asc) 一致：
+        // 分更低，或同分而 gid 更大）。深度受 `candidates` 候选窗口约束——游标落在窗口外则
+        // 该页可能短/空，加大 `candidates` 可加深（标准 search_after 取舍，诚实记账）。
+        if let Some(tok) = &req.search_after {
+            let (ck, cgid) = parse_cursor(tok)?;
+            hits.retain(|h| {
+                let k = h.sort_key();
+                k < ck || (k == ck && h.id > cgid)
+            });
+        }
         hits.truncate(req.top_k);
         Ok((hits, facets))
     }
@@ -827,6 +870,81 @@ mod tests {
             section_id,
             ..chunk(doc, id, ChunkKind::Paragraph, text, 1)
         }
+    }
+
+    #[test]
+    fn search_after_tiles_full_ranking() {
+        let mut e = engine();
+        // 混合：一条高 tf（分更高）+ 多条同分（靠 gid tie-break），覆盖游标的"同分"分支。
+        e.ingest(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "data data", 1),
+        )
+        .unwrap();
+        for (doc, id) in [
+            ("a.pdf", 2),
+            ("a.pdf", 3),
+            ("a.pdf", 4),
+            ("b.pdf", 1),
+            ("b.pdf", 2),
+        ] {
+            e.ingest("kb", &chunk(doc, id, ChunkKind::Paragraph, "data", 1))
+                .unwrap();
+        }
+        e.commit().unwrap();
+
+        let full = e.search(&req("data"), None).unwrap();
+        assert_eq!(full.len(), 6);
+        let full_ids: Vec<_> = full.iter().map(|h| h.id.clone()).collect();
+
+        // 逐页 size=2 翻完，应无缝平铺完整排名（无重叠、无遗漏）。
+        let mut paged: Vec<GlobalId> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let r = SearchRequest {
+                query: "data".into(),
+                top_k: 2,
+                search_after: cursor.clone(),
+                ..Default::default()
+            };
+            let page = e.search(&r, None).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= 2);
+            cursor = Some(page.last().unwrap().cursor());
+            paged.extend(page.iter().map(|h| h.id.clone()));
+        }
+        assert_eq!(paged, full_ids, "分页平铺应等于完整排名");
+
+        // 用第 3 条的游标取下一页，应正好接续完整排名的第 4 条起。
+        let after3 = SearchRequest {
+            query: "data".into(),
+            top_k: 10,
+            search_after: Some(full[2].cursor()),
+            ..Default::default()
+        };
+        let tail: Vec<_> = e
+            .search(&after3, None)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.clone())
+            .collect();
+        assert_eq!(tail, full_ids[3..]);
+    }
+
+    #[test]
+    fn search_after_rejects_bad_cursor() {
+        let mut e = engine();
+        e.ingest("kb", &chunk("a.pdf", 1, ChunkKind::Paragraph, "data", 1))
+            .unwrap();
+        e.commit().unwrap();
+        let r = SearchRequest {
+            query: "data".into(),
+            search_after: Some("not-a-valid-cursor".into()),
+            ..Default::default()
+        };
+        assert!(e.search(&r, None).is_err());
     }
 
     #[test]

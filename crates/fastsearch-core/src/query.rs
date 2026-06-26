@@ -66,6 +66,10 @@ pub struct SearchRequest {
     /// 分组折叠（None=不折叠）。
     #[serde(default)]
     pub collapse: Option<Collapse>,
+    /// 深分页游标：只返回最终排名中**严格排在该游标之后**的命中（不透明 token，取自上一页
+    /// 末条命中的 `cursor()`）。None=第一页。深度受 `candidates` 候选窗口约束（见 engine）。
+    #[serde(default)]
+    pub search_after: Option<String>,
     #[serde(default)]
     pub highlight: bool,
     /// 请求分面的字段（当前支持 `kind` / `doc_id`）。
@@ -96,6 +100,7 @@ impl Default for SearchRequest {
             rerank: None,
             auto_merge: false,
             collapse: None,
+            search_after: None,
             highlight: false,
             facets: Vec::new(),
             explain: false,
