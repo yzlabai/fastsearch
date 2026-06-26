@@ -1,0 +1,35 @@
+{
+  "collection": "kb",
+  "corpus": [
+    {
+      "doc_id": "fin2024", "chunk_id": 0, "kind": "image",
+      "text": "图：2024 年营收趋势柱状图，全年营收创历史新高、同比增长 18%。",
+      "page": 1, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 30
+    },
+    {
+      "doc_id": "fin2024", "chunk_id": 1, "kind": "audio",
+      "text": "会议录音转录：本季度公司毛利率提升至 42%，主要由于高端产品占比上升。",
+      "page": 1, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 33
+    },
+    {
+      "doc_id": "launch", "chunk_id": 0, "kind": "video",
+      "text": "视频字幕：新一代旗舰产品发布会现场，演示自研芯片的图形与 AI 性能。",
+      "page": 1, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 32
+    },
+    {
+      "doc_id": "fin2024", "chunk_id": 2, "kind": "paragraph",
+      "text": "公司年度财务报告正文：研发投入占营业收入的 9%。",
+      "page": 2, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 24
+    },
+    {
+      "doc_id": "misc", "chunk_id": 0, "kind": "paragraph",
+      "text": "公司在年度员工大会上公布了新的休假与团建政策。",
+      "page": 1, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 22
+    }
+  ],
+  "queries": [
+    {"query": "营收趋势", "relevant": {"kb:fin2024:0": 3}},
+    {"query": "毛利率", "relevant": {"kb:fin2024:1": 3}},
+    {"query": "产品发布会", "relevant": {"kb:launch:0": 3}}
+  ]
+}
