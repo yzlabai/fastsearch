@@ -3,6 +3,9 @@
 //! CLI 的可测逻辑：docparse chunks 解析 + 落盘 index/search。命令行壳在 `main.rs`。
 //! 详见 [spec](../../docs/specs/17-cli.md)。
 
+#[cfg(feature = "parse")]
+pub mod ingest;
+
 use anyhow::{anyhow, Context, Result};
 use fastsearch_core::{
     BBox, Chunk, ChunkKind, FieldValue, Filter, ImageMeta, SearchMode, SearchRequest,
