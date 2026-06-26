@@ -217,6 +217,14 @@ fn row_to_chunk(rel: &Relation, tuple: &TupleData) -> Result<(String, Chunk)> {
         section_id: get(&m, "section_id")?.parse().context("section_id")?,
         char_len: get(&m, "char_len")?.parse().context("char_len")?,
         image_meta: m.get("image_meta").copied().flatten().map(String::from),
+        // modality 默认 "text"（NOT NULL DEFAULT），media 可空。
+        modality: m
+            .get("modality")
+            .copied()
+            .flatten()
+            .unwrap_or("text")
+            .to_string(),
+        media: m.get("media").copied().flatten().map(String::from),
         tenant: m.get("tenant").copied().flatten().map(String::from),
         acl: parse_pg_array(get(&m, "acl")?),
     };

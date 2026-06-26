@@ -40,6 +40,8 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              section_id bigint NOT NULL DEFAULT 0,\n\
              char_len integer NOT NULL,\n\
              image_meta jsonb,\n\
+             modality text NOT NULL DEFAULT 'text',\n\
+             media jsonb,\n\
              tenant text,\n\
              acl text[] NOT NULL DEFAULT '{{public}}',\n\
              embedding {vectype}({dim}),\n\
@@ -74,6 +76,8 @@ pub const COLUMNS: &[&str] = &[
     "section_id",
     "char_len",
     "image_meta",
+    "modality",
+    "media",
     "tenant",
     "acl",
 ];
@@ -85,8 +89,8 @@ pub const COLUMNS: &[&str] = &[
 pub fn insert_sql(table: &str) -> String {
     format!(
         "INSERT INTO {table} \
-         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, image_meta, tenant, acl) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11::text::jsonb, $12, $13)"
+         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, image_meta, modality, media, tenant, acl) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11::text::jsonb, $12, $13::text::jsonb, $14, $15)"
     )
 }
 
@@ -99,7 +103,7 @@ pub fn delete_doc_sql(table: &str) -> String {
 pub fn fetch_doc_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, image_meta::text, tenant, acl \
+         section_id, char_len, image_meta::text, modality, media::text, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 ORDER BY chunk_id"
     )
 }
@@ -108,7 +112,7 @@ pub fn fetch_doc_sql(table: &str) -> String {
 pub fn fetch_all_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, image_meta::text, tenant, acl \
+         section_id, char_len, image_meta::text, modality, media::text, tenant, acl \
          FROM {table} ORDER BY collection, doc_id, chunk_id"
     )
 }
@@ -141,6 +145,10 @@ pub struct ChunkRow {
     pub section_id: i64,
     pub char_len: i32,
     pub image_meta: Option<String>,
+    /// 模态（由 kind 派生，落列供 SQL 侧过滤）。
+    pub modality: String,
+    /// 媒资引用 JSON（`MediaRef`，不含 inline 字节）。
+    pub media: Option<String>,
     pub tenant: Option<String>,
     pub acl: Vec<String>,
 }
@@ -163,6 +171,8 @@ impl ChunkRow {
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
+            modality: c.kind.modality().as_str().to_string(),
+            media: c.media.as_ref().map(serde_json::to_string).transpose()?,
             tenant: c.tenant.clone(),
             acl: c.acl.clone(),
         })
@@ -171,6 +181,10 @@ impl ChunkRow {
     pub fn to_chunk(&self) -> Result<Chunk> {
         let bbox: BBox = serde_json::from_str(&self.bbox)?;
         let image_meta: Option<ImageMeta> = match &self.image_meta {
+            Some(j) => Some(serde_json::from_str(j)?),
+            None => None,
+        };
+        let media = match &self.media {
             Some(j) => Some(serde_json::from_str(j)?),
             None => None,
         };
@@ -184,7 +198,7 @@ impl ChunkRow {
             heading_path: self.heading_path.clone(),
             section_id: self.section_id as u64,
             char_len: self.char_len as u32,
-            media: None, // 媒资 jsonb 列在 MM2 接入；当前 ChunkRow 不持 media
+            media, // 媒资从 media jsonb 列恢复（modality 在 Chunk 侧由 kind 派生）
             image_meta,
             tenant: self.tenant.clone(),
             acl: self.acl.clone(),
@@ -229,16 +243,20 @@ mod tests {
         assert!(joined.contains("PRIMARY KEY (collection, doc_id, chunk_id)"));
         assert!(joined.contains("halfvec(384)"));
         assert!(joined.contains("acl text[]"));
+        assert!(joined.contains("modality text NOT NULL DEFAULT 'text'"));
+        assert!(joined.contains("media jsonb"));
         assert!(joined.contains("CREATE PUBLICATION fastsearch_pub FOR TABLE fastsearch_chunks"));
     }
 
     #[test]
     fn insert_and_delete_sql_shape() {
         let ins = insert_sql("t");
-        assert!(ins.contains("$13"));
+        assert!(ins.contains("$15"));
         assert!(ins.contains("$7::text::jsonb")); // bbox（先 ::text 再 ::jsonb，见 insert_sql 注释）
         assert!(ins.contains("$11::text::jsonb")); // image_meta
-        assert!(!ins.contains("$14")); // exactly 13 params
+        assert!(ins.contains("$13::text::jsonb")); // media
+        assert!(ins.contains("modality, media")); // 新列入列名
+        assert!(!ins.contains("$16")); // exactly 15 params
         let del = delete_doc_sql("t");
         assert_eq!(del, "DELETE FROM t WHERE collection = $1 AND doc_id = $2");
     }
@@ -253,6 +271,34 @@ mod tests {
         assert_eq!(row.heading_path, vec!["第3章", "财务"]);
         let back = row.to_chunk().unwrap();
         assert_eq!(back, c);
+        // modality 由 kind 派生落列（Table 属文本模态）
+        assert_eq!(row.modality, "text");
+        assert!(row.media.is_none());
+    }
+
+    #[test]
+    fn chunkrow_media_roundtrip() {
+        use fastsearch_core::{AssetPointer, MediaRef, TimeSpan};
+        let mut c = sample();
+        c.kind = ChunkKind::Audio;
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Object {
+                uri: "s3://b/clip.mp3".into(),
+            },
+            media_type: Some("audio/mpeg".into()),
+            time: Some(TimeSpan {
+                start_ms: 1000,
+                end_ms: 5000,
+            }),
+            region: None,
+            caption_source: Some("asr".into()),
+            thumbnail: None,
+        });
+        let row = ChunkRow::from_chunk("kb", &c).unwrap();
+        assert_eq!(row.modality, "audio"); // 由 kind 派生
+        assert!(row.media.is_some());
+        let back = row.to_chunk().unwrap();
+        assert_eq!(back, c); // media 往返一致
     }
 
     #[test]
