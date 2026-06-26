@@ -225,6 +225,12 @@ impl FieldSource for StoredRow {
     fn get(&self, field: &str) -> Option<FieldValue> {
         match field {
             "kind" => Some(FieldValue::Str(self.kind.clone())),
+            // modality 由 kind 派生（text 侧不单存）——与 vector 侧值一致，两端过滤同构。
+            "modality" => Some(FieldValue::Str(
+                fastsearch_core::Modality::of_kind_str(&self.kind)
+                    .as_str()
+                    .to_string(),
+            )),
             "doc_id" => Some(FieldValue::Str(self.doc_id.clone())),
             "collection" => Some(FieldValue::Str(self.collection.clone())),
             "tenant" => self.tenant.clone().map(FieldValue::Str),

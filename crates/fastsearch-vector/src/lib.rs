@@ -7,7 +7,7 @@
 //! 量化 + pgvector 直查档为下一迭代。详见 [spec](../../docs/specs/15-vector.md)。
 
 use fastsearch_core::{
-    AclFilter, BBox, Citation, FieldSource, FieldValue, Filter, GlobalId, Scored,
+    AclFilter, BBox, Citation, FieldSource, FieldValue, Filter, GlobalId, Scored, TimeSpan,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,12 +20,18 @@ pub struct VecMeta {
     pub doc_id: String,
     pub chunk_id: u64,
     pub kind: String,
+    /// 模态（由 kind 派生，落列供过滤下推）。
+    #[serde(default)]
+    pub modality: String,
     pub page: u32,
     pub section_id: u64,
     pub heading_path: Vec<String>,
     pub tenant: Option<String>,
     pub acl: Vec<String>,
     pub bbox: BBox,
+    /// 音视频时间区间（无则 None）。
+    #[serde(default)]
+    pub time: Option<TimeSpan>,
 }
 
 impl VecMeta {
@@ -38,7 +44,7 @@ impl VecMeta {
             bbox: self.bbox,
             heading_path: self.heading_path.clone(),
             section_id: self.section_id,
-            time: None,
+            time: self.time,
             media: None,
         }
     }
@@ -48,11 +54,14 @@ impl FieldSource for VecMeta {
     fn get(&self, field: &str) -> Option<FieldValue> {
         match field {
             "kind" => Some(FieldValue::Str(self.kind.clone())),
+            "modality" => Some(FieldValue::Str(self.modality.clone())),
             "doc_id" => Some(FieldValue::Str(self.doc_id.clone())),
             "collection" => Some(FieldValue::Str(self.collection.clone())),
             "tenant" => self.tenant.clone().map(FieldValue::Str),
             "page" => Some(FieldValue::Int(self.page as i64)),
             "section_id" => Some(FieldValue::Int(self.section_id as i64)),
+            "time_start_ms" => self.time.map(|t| FieldValue::Int(t.start_ms as i64)),
+            "time_end_ms" => self.time.map(|t| FieldValue::Int(t.end_ms as i64)),
             _ => None,
         }
     }
@@ -288,6 +297,9 @@ mod tests {
             doc_id: doc.into(),
             chunk_id: id,
             kind: kind.into(),
+            modality: fastsearch_core::Modality::of_kind_str(kind)
+                .as_str()
+                .to_string(),
             page,
             section_id: 0,
             heading_path: vec![],
@@ -299,6 +311,7 @@ mod tests {
                 x1: 1.0,
                 y1: 1.0,
             },
+            time: None,
         }
     }
 
@@ -324,6 +337,69 @@ mod tests {
         }
         // 元数据/引用保留
         assert_eq!(loaded.citation(&gid("a", 3)).unwrap().page, 12);
+    }
+
+    #[test]
+    fn modality_filter_pushdown() {
+        let mut v = MemVectorIndex::new();
+        v.upsert(
+            gid("a", 1),
+            vec![1.0, 0.0],
+            meta("a", 1, "image", 1, vec!["public"]),
+        )
+        .unwrap();
+        v.upsert(
+            gid("a", 2),
+            vec![0.0, 1.0],
+            meta("a", 2, "paragraph", 1, vec!["public"]),
+        )
+        .unwrap();
+        v.upsert(
+            gid("a", 3),
+            vec![0.9, 0.1],
+            meta("a", 3, "audio", 1, vec!["public"]),
+        )
+        .unwrap();
+        let q = vec![1.0, 0.0];
+        // modality=image → 仅 chunk 1
+        let f = Filter::Eq("modality".into(), FieldValue::Str("image".into()));
+        let hits = v.search(&q, 10, Some(&f), None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.chunk_id, 1);
+        // modality in {audio,video} → 仅 chunk 3
+        let f2 = Filter::In(
+            "modality".into(),
+            vec![
+                FieldValue::Str("audio".into()),
+                FieldValue::Str("video".into()),
+            ],
+        );
+        assert_eq!(v.search(&q, 10, Some(&f2), None).unwrap()[0].id.chunk_id, 3);
+        // modality=text（paragraph 派生）→ 仅 chunk 2
+        let f3 = Filter::Eq("modality".into(), FieldValue::Str("text".into()));
+        assert_eq!(v.search(&q, 10, Some(&f3), None).unwrap()[0].id.chunk_id, 2);
+    }
+
+    #[test]
+    fn time_filter_on_vecmeta() {
+        let mut v = MemVectorIndex::new();
+        let mut m = meta("a", 1, "audio", 1, vec!["public"]);
+        m.time = Some(TimeSpan {
+            start_ms: 1000,
+            end_ms: 5000,
+        });
+        v.upsert(gid("a", 1), vec![1.0, 0.0], m).unwrap();
+        v.upsert(
+            gid("a", 2),
+            vec![1.0, 0.0],
+            meta("a", 2, "audio", 1, vec!["public"]),
+        )
+        .unwrap();
+        // time_start_ms >= 500 → 仅有时间的 chunk 1（chunk 2 无 time → get 返回 None → 不匹配）
+        let f = Filter::Gte("time_start_ms".into(), FieldValue::Int(500));
+        let hits = v.search(&[1.0, 0.0], 10, Some(&f), None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.chunk_id, 1);
     }
 
     #[test]

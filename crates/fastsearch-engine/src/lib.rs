@@ -111,12 +111,14 @@ fn vec_meta(collection: &str, c: &Chunk) -> VecMeta {
         doc_id: c.doc_id.clone(),
         chunk_id: c.chunk_id,
         kind: kind_str(c.kind).to_string(),
+        modality: c.kind.modality().as_str().to_string(),
         page: c.page,
         section_id: c.section_id,
         heading_path: c.heading_path.clone(),
         tenant: c.tenant.clone(),
         acl: c.acl.clone(),
         bbox: c.bbox,
+        time: c.media.as_ref().and_then(|m| m.time),
     }
 }
 
@@ -836,6 +838,40 @@ mod tests {
             chunk_id: 999,
         };
         assert!(e.more_like_this(&missing, 10, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn modality_filter_two_end() {
+        let mut e = engine();
+        // 同文本不同 kind：image / audio / paragraph(text)
+        e.ingest("kb", &chunk("a.pdf", 1, ChunkKind::Image, "data here", 1))
+            .unwrap();
+        e.ingest("kb", &chunk("a.pdf", 2, ChunkKind::Audio, "data here", 2))
+            .unwrap();
+        e.ingest(
+            "kb",
+            &chunk("a.pdf", 3, ChunkKind::Paragraph, "data here", 3),
+        )
+        .unwrap();
+        e.commit().unwrap();
+        // keyword 路 + modality=image → 仅 chunk 1（text 侧 modality 由 kind 派生后过滤）
+        let mut r = req("data");
+        r.filter = Some(Filter::Eq(
+            "modality".into(),
+            FieldValue::Str("image".into()),
+        ));
+        let hits = e.search(&r, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id.chunk_id, 1);
+        // modality=text → 仅 paragraph(chunk 3)
+        let mut r2 = req("data");
+        r2.filter = Some(Filter::Eq(
+            "modality".into(),
+            FieldValue::Str("text".into()),
+        ));
+        let h2 = e.search(&r2, None).unwrap();
+        assert_eq!(h2.len(), 1);
+        assert_eq!(h2[0].id.chunk_id, 3);
     }
 
     #[test]

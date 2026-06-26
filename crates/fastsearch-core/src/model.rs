@@ -62,6 +62,17 @@ impl Modality {
             Modality::Video => "video",
         }
     }
+
+    /// 由 `kind` 的字符串形式派生模态（供只持有 kind 字符串的后端做过滤后过滤）。
+    /// 未知 kind → Text。
+    pub fn of_kind_str(kind: &str) -> Modality {
+        match kind {
+            "image" => Modality::Image,
+            "audio" => Modality::Audio,
+            "video" => Modality::Video,
+            _ => Modality::Text,
+        }
+    }
 }
 
 /// 音视频时间区间（毫秒）。用于深链与时间过滤。
