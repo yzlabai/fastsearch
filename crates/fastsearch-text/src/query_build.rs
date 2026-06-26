@@ -105,6 +105,7 @@ fn eq_query(field: &str, val: &FieldValue, f: &Fields) -> Box<dyn Query> {
 fn exact_eq(field: &str, val: &FieldValue, f: &Fields) -> Option<Box<dyn Query>> {
     match (field, val) {
         ("kind", FieldValue::Str(s)) => Some(term_str(f.kind, s)),
+        ("modality", FieldValue::Str(s)) => Some(term_str(f.modality, s)),
         ("doc_id", FieldValue::Str(s)) => Some(term_str(f.doc_id, s)),
         ("collection", FieldValue::Str(s)) => Some(term_str(f.collection, s)),
         ("tenant", FieldValue::Str(s)) => Some(term_str(f.tenant, s)),

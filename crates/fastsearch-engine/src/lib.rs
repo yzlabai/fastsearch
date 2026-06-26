@@ -526,8 +526,13 @@ fn compute_facets(fields: &[String], hits: &[TextHit]) -> Facets {
         for h in hits {
             let val = match field.as_str() {
                 "kind" => Some(h.kind.clone()),
+                "modality" => Some(
+                    fastsearch_core::Modality::of_kind_str(&h.kind)
+                        .as_str()
+                        .to_string(),
+                ),
                 "doc_id" => Some(h.id.doc_id.clone()),
-                _ => None, // v1 仅支持 kind/doc_id
+                _ => None, // 支持 kind / modality / doc_id
             };
             if let Some(v) = val {
                 *counts.entry(v).or_insert(0) += 1;
@@ -872,6 +877,26 @@ mod tests {
         let h2 = e.search(&r2, None).unwrap();
         assert_eq!(h2.len(), 1);
         assert_eq!(h2[0].id.chunk_id, 3);
+    }
+
+    #[test]
+    fn modality_facet_counts() {
+        let mut e = engine();
+        e.ingest("kb", &chunk("a.pdf", 1, ChunkKind::Image, "data x", 1))
+            .unwrap();
+        e.ingest("kb", &chunk("a.pdf", 2, ChunkKind::Audio, "data y", 2))
+            .unwrap();
+        e.ingest("kb", &chunk("a.pdf", 3, ChunkKind::Paragraph, "data z", 3))
+            .unwrap();
+        e.commit().unwrap();
+        let mut r = req("data");
+        r.facets = vec!["modality".into()];
+        let (_hits, facets) = e.search_with_facets(&r, None).unwrap();
+        let m: std::collections::HashMap<_, _> =
+            facets.get("modality").unwrap().iter().cloned().collect();
+        assert_eq!(m.get("image"), Some(&1));
+        assert_eq!(m.get("audio"), Some(&1));
+        assert_eq!(m.get("text"), Some(&1));
     }
 
     #[test]

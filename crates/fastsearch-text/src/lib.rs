@@ -113,6 +113,7 @@ impl TextIndex {
         doc.add_text(f.text, &chunk.text);
         doc.add_text(f.heading, chunk.heading_path.join(" "));
         doc.add_text(f.kind, kind_str(chunk.kind));
+        doc.add_text(f.modality, chunk.kind.modality().as_str());
         doc.add_u64(f.page, chunk.page as u64);
         doc.add_u64(f.section_id, chunk.section_id);
         doc.add_u64(f.chunk_id, chunk.chunk_id);
@@ -584,6 +585,41 @@ mod tests {
             .search("data", Some(&not_exists), None, 10, false)
             .unwrap();
         assert_eq!(got4.len(), 3);
+    }
+
+    #[test]
+    fn empty_text_and_modality_fast_field() {
+        let mut idx = ram(TokenizerKind::Default);
+        // 图 chunk 无 caption → text=""（媒资无文本表示）
+        idx.upsert("kb", &chunk("a.pdf", 1, ChunkKind::Image, "", 1))
+            .unwrap();
+        // 文本 chunk
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 2, ChunkKind::Paragraph, "data here", 1),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        let img_filter = Filter::Eq(
+            "modality".into(),
+            fastsearch_core::FieldValue::Str("image".into()),
+        );
+        // text="" 不产 term：keyword 查 "data" 命中文本 chunk，不命中空文本图
+        let kw = idx.search("data", None, None, 10, false).unwrap();
+        assert_eq!(kw.len(), 1);
+        assert_eq!(kw[0].id.chunk_id, 2);
+        // 空查询 + modality=image（fast field 真预过滤）→ 命中空文本图
+        let img = idx.search("", Some(&img_filter), None, 10, false).unwrap();
+        assert_eq!(img.len(), 1);
+        assert_eq!(img[0].id.chunk_id, 1);
+        // modality=text → 仅文本 chunk
+        let txt_filter = Filter::Eq(
+            "modality".into(),
+            fastsearch_core::FieldValue::Str("text".into()),
+        );
+        let txt = idx.search("", Some(&txt_filter), None, 10, false).unwrap();
+        assert_eq!(txt.len(), 1);
+        assert_eq!(txt[0].id.chunk_id, 2);
     }
 
     #[test]
