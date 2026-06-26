@@ -17,4 +17,25 @@ for h in c.search("kb", "毛利率为什么下降", top_k=10):
     print(h["citation_id"], "p", h["page"], h["bbox"])
 ```
 
+## LangChain / LlamaIndex
+
+`fastsearch_client.integrations` 提供两个生态的检索适配（依赖可选，未装则回退本地等价对象）：
+
+```python
+from fastsearch_client import FastsearchClient
+from fastsearch_client.integrations import FastsearchRetriever, hits_to_llama_nodes
+
+c = FastsearchClient("http://127.0.0.1:8642", api_key="dev")
+
+# LangChain：鸭子兼容 get_relevant_documents/invoke，可直接进 LCEL 管道
+retriever = FastsearchRetriever(c, "kb", mode="hybrid", top_k=8, highlight=True)
+docs = retriever.invoke("毛利率为什么下降")   # -> list[Document]
+
+# LlamaIndex：命中 -> NodeWithScore
+nodes = hits_to_llama_nodes(c.search("kb", "毛利率", top_k=8, highlight=True))
+```
+
+注：`/v1/search` 不回整段正文（载荷精简），`page_content` 取高亮片段（`highlight=True`），
+完整正文/深链靠 `metadata["citation_id"]` 经答案层 `resolve_citation` 解析。
+
 ACL 由服务端按 API Key 强制，客户端无法越权。许可 Apache-2.0。
