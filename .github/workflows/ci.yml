@@ -10,21 +10,6 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # pgvector 镜像：仅用 pgvector + 逻辑复制，不装任何需 shared_preload_libraries 的扩展
-    # （守住"托管 PG 可移植"硬约束 N1b）。
-    services:
-      postgres:
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: fastsearch_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/fastsearch_test
     steps:
@@ -33,9 +18,34 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+
+      # Postgres 用 docker run（非 services）才能传 `-c wal_level=logical`——CDC 集成测试
+      # 需逻辑复制。仍只用 pgvector + 逻辑复制，不装任何需 shared_preload_libraries 的原生
+      # 扩展（守住"托管 PG 可移植"硬约束 N1b）。
+      - name: start postgres (pgvector + logical replication)
+        run: |
+          docker run -d --name pg \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=fastsearch_test \
+            -p 5432:5432 \
+            pgvector/pgvector:pg17 \
+            -c wal_level=logical \
+            -c max_replication_slots=8 \
+            -c max_wal_senders=8
+      - name: wait for postgres
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec pg pg_isready -U postgres >/dev/null 2>&1; then
+              echo "postgres ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "postgres did not become ready" >&2; docker logs pg; exit 1
+
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy (zero warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: test (incl. PG integration via DATABASE_URL)
+      # 全量测试：含 PG 集成（DATABASE_URL）+ CDC 逻辑复制闭环 + eval 相关性回归门禁。
+      - name: test (incl. PG integration + CDC + relevance gate)
         run: cargo test --workspace
