@@ -120,6 +120,27 @@ impl PgStore {
             .collect()
     }
 
+    /// **写穿**（B6 §2）：把某 chunk 的向量写回 PG `embedding` 列（直查档的向量由此进 PG）。
+    /// 向量以 `$1::text::vector` 文本传（免 pgvector ToSql 依赖）。返回更新行数。
+    pub async fn set_embedding(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        chunk_id: u64,
+        embedding: &[f32],
+    ) -> Result<u64> {
+        let sql = format!(
+            "UPDATE {} SET embedding = $1::text::vector \
+             WHERE collection = $2 AND doc_id = $3 AND chunk_id = $4",
+            self.cfg.table
+        );
+        let v = format_vector(embedding);
+        Ok(self
+            .client
+            .execute(&sql, &[&v, &collection, &doc_id, &(chunk_id as i64)])
+            .await?)
+    }
+
     /// **B6 直查档**：pgvector ANN 检索（ANN 在 PG 跑）。`acl`+可翻译 `filter` 下推 SQL（精确）、
     /// 不可翻译子句走 SUPERSET + **Rust 精确后过滤**（守不变量 #5）；`iterative_scan` 让 HNSW
     /// 在选择性过滤下仍 filter-aware（pgvector ≥0.8）。over-fetch `k×over_fetch` 抵消后过滤损耗。
@@ -131,7 +152,7 @@ impl PgStore {
         over_fetch: usize,
         acl: Option<&fastsearch_core::AclFilter>,
         filter: Option<&fastsearch_core::Filter>,
-    ) -> Result<Vec<fastsearch_core::Scored>> {
+    ) -> Result<Vec<(fastsearch_core::Scored, fastsearch_core::Citation)>> {
         if k == 0 {
             return Ok(vec![]);
         }
@@ -156,8 +177,9 @@ impl PgStore {
             owned.iter().map(|b| &**b as &(dyn ToSql + Sync)).collect();
         let rows = self.client.query(&sql, &params).await?;
 
-        // Rust 精确后过滤（filter + ACL 复核）+ 组装 Scored。
-        let mut scored: Vec<fastsearch_core::Scored> = Vec::with_capacity(rows.len());
+        // Rust 精确后过滤（filter + ACL 复核）+ 组装 Scored + Citation（含 page/bbox，供溯源）。
+        let mut hits: Vec<(fastsearch_core::Scored, fastsearch_core::Citation)> =
+            Vec::with_capacity(rows.len());
         for r in &rows {
             let row = PgVecRow::from_row(r)?;
             if let Some(f) = filter {
@@ -170,19 +192,20 @@ impl PgStore {
                     continue;
                 }
             }
-            scored.push(fastsearch_core::Scored {
+            let scored = fastsearch_core::Scored {
                 id: row.gid(),
                 score: r.try_get::<_, f64>("score")?,
-            });
+            };
+            hits.push((scored, row.citation()));
         }
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+        hits.sort_by(|a, b| {
+            b.0.score
+                .partial_cmp(&a.0.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.0.id.cmp(&b.0.id))
         });
-        scored.truncate(k);
-        Ok(scored)
+        hits.truncate(k);
+        Ok(hits)
     }
 }
 
@@ -212,19 +235,18 @@ struct PgVecRow {
     tenant: Option<String>,
     acl: Vec<String>,
     heading_path: Vec<String>,
-    /// 由 media jsonb 解析出的时间区间（供 time_start_ms/time_end_ms 后过滤）。
-    time: Option<fastsearch_core::TimeSpan>,
+    bbox: fastsearch_core::BBox,
+    /// 解析出的媒资引用（供 Citation.media；time 也由它给）。
+    media: Option<fastsearch_core::MediaRef>,
 }
 
 impl PgVecRow {
     fn from_row(r: &Row) -> Result<Self> {
-        let media: Option<String> = r.try_get("media")?;
-        let time = match media.as_deref() {
-            Some(j) => serde_json::from_str::<fastsearch_core::MediaRef>(j)
-                .ok()
-                .and_then(|m| m.time),
-            None => None,
-        };
+        let media_json: Option<String> = r.try_get("media")?;
+        let media =
+            media_json.and_then(|j| serde_json::from_str::<fastsearch_core::MediaRef>(&j).ok());
+        let bbox_json: String = r.try_get("bbox")?;
+        let bbox = serde_json::from_str(&bbox_json)?;
         Ok(PgVecRow {
             collection: r.try_get("collection")?,
             doc_id: r.try_get("doc_id")?,
@@ -236,8 +258,13 @@ impl PgVecRow {
             tenant: r.try_get("tenant")?,
             acl: r.try_get("acl")?,
             heading_path: r.try_get("heading_path")?,
-            time,
+            bbox,
+            media,
         })
+    }
+
+    fn time(&self) -> Option<fastsearch_core::TimeSpan> {
+        self.media.as_ref().and_then(|m| m.time)
     }
 
     fn gid(&self) -> fastsearch_core::GlobalId {
@@ -245,6 +272,21 @@ impl PgVecRow {
             collection: self.collection.clone(),
             doc_id: self.doc_id.clone(),
             chunk_id: self.chunk_id as u64,
+        }
+    }
+
+    /// 组装溯源引用（page/bbox/heading_path + media/time）。
+    fn citation(&self) -> fastsearch_core::Citation {
+        fastsearch_core::Citation {
+            collection: self.collection.clone(),
+            doc_id: self.doc_id.clone(),
+            chunk_id: self.chunk_id as u64,
+            page: self.page as u32,
+            bbox: self.bbox,
+            heading_path: self.heading_path.clone(),
+            section_id: self.section_id as u64,
+            time: self.time(),
+            media: self.media.clone(),
         }
     }
 }
@@ -260,8 +302,8 @@ impl fastsearch_core::FieldSource for PgVecRow {
             "tenant" => self.tenant.clone().map(FieldValue::Str),
             "page" => Some(FieldValue::Int(self.page as i64)),
             "section_id" => Some(FieldValue::Int(self.section_id)),
-            "time_start_ms" => self.time.map(|t| FieldValue::Int(t.start_ms as i64)),
-            "time_end_ms" => self.time.map(|t| FieldValue::Int(t.end_ms as i64)),
+            "time_start_ms" => self.time().map(|t| FieldValue::Int(t.start_ms as i64)),
+            "time_end_ms" => self.time().map(|t| FieldValue::Int(t.end_ms as i64)),
             _ => None,
         }
     }
@@ -428,9 +470,11 @@ mod tests {
             .await
             .expect("search");
         assert!(!hits.is_empty());
-        assert_eq!(hits[0].id.chunk_id, 1, "最近邻应为 chunk 1");
+        assert_eq!(hits[0].0.id.chunk_id, 1, "最近邻应为 chunk 1");
+        // citation 含真实 page（来自 PG），不是退化的 0。
+        assert_eq!(hits[0].1.page, 1);
         for h in &hits {
-            assert!(h.id.chunk_id <= 2, "越权：team-b（chunk 3/4）不应可见");
+            assert!(h.0.id.chunk_id <= 2, "越权：team-b（chunk 3/4）不应可见");
         }
 
         // filter-aware：查最接近 [0,0,0,1]（=chunk 4，team-b）但过滤 modality=image →
@@ -445,7 +489,7 @@ mod tests {
             .await
             .expect("search2");
         assert_eq!(hits2.len(), 1, "仅 1 个 image");
-        assert_eq!(hits2[0].id.chunk_id, 1);
+        assert_eq!(hits2[0].0.id.chunk_id, 1);
 
         store
             .client

@@ -46,6 +46,9 @@ fn vector_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("vector.bin")
 }
 
+/// pgvector 直查档的过取系数（PG 取 `candidates × 此值` 候选再精确后过滤，抵消损耗）。
+const PG_VECTOR_OVER_FETCH: usize = 4;
+
 /// CDC 检查点：派生索引落盘时一并记录的水位（崩溃后从此续传）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Checkpoint {
@@ -211,6 +214,10 @@ pub struct Engine {
     /// 可选嵌入后端：设置后，**CDC 应用路径**（`IndexSink::apply_upsert`）会自动嵌入
     /// chunk 正文并写向量索引（None=仅全文）。详见 `set_embedder`。
     embedder: Option<Box<dyn Embedder + Send + Sync>>,
+    /// 可选 **pgvector 直查档（B6）**：设置后，向量召回**绕过引擎侧索引、在 PG 跑 ANN**
+    /// （filter/ACL 下推 + iterative scan + 精确后过滤）。仅在 **multi-thread tokio runtime** 下可用
+    /// （`run` 内 `block_in_place` 桥接同步检索↔异步 PG 查询）。详见 `set_pg_vector`。
+    vector_pg: Option<std::sync::Arc<fastsearch_pg::PgStore>>,
 }
 
 impl Engine {
@@ -225,6 +232,7 @@ impl Engine {
             vector: VectorStore::new(backend),
             reranker: Box::new(LexicalOverlapReranker),
             embedder: None,
+            vector_pg: None,
         })
     }
 
@@ -234,6 +242,7 @@ impl Engine {
             vector: VectorStore::new(VectorBackendKind::Brute),
             reranker: Box::new(LexicalOverlapReranker),
             embedder: None,
+            vector_pg: None,
         })
     }
 
@@ -274,6 +283,7 @@ impl Engine {
                 vector,
                 reranker: Box::new(LexicalOverlapReranker),
                 embedder: None,
+                vector_pg: None,
             },
             Lsn(cp.applied_lsn),
         ))
@@ -379,6 +389,13 @@ impl Engine {
     /// 使"PG 写 → 复制 → 解码 → 嵌入 → 派生 BM25+向量"主循环完整成立。None=仅全文。
     pub fn set_embedder(&mut self, embedder: Box<dyn Embedder + Send + Sync>) {
         self.embedder = Some(embedder);
+    }
+
+    /// 开启 **pgvector 直查档（B6）**：向量召回改在 PG 跑 ANN（见字段 `vector_pg`）。
+    /// **要求 multi-thread tokio runtime**（检索在 `block_in_place` 里 `block_on` PG 异步查询）。
+    /// 仅影响向量召回；keyword 仍走引擎 Tantivy。embedding 需已在 PG（外部写入或写穿）。
+    pub fn set_pg_vector(&mut self, store: std::sync::Arc<fastsearch_pg::PgStore>) {
+        self.vector_pg = Some(store);
     }
 
     /// 灌入一个 chunk（仅全文，不提交）。
@@ -543,8 +560,32 @@ impl Engine {
         } else {
             vec![]
         };
-        // semantic 召回（filter-aware，真预过滤）
-        let vec_scored: Vec<Scored> = if want_vec {
+        // semantic 召回（filter-aware，真预过滤）。pgvector 直查档（B6）时绕引擎索引、在 PG 跑 ANN，
+        // 并带回 citation（page/bbox，PG SELECT 出来）；否则走引擎侧向量后端。
+        let mut pg_citations: HashMap<GlobalId, Citation> = HashMap::new();
+        let vec_scored: Vec<Scored> = if !want_vec {
+            vec![]
+        } else if let Some(pg) = &self.vector_pg {
+            let qv = req.vector.as_ref().unwrap();
+            // 同步检索↔异步 PG：block_in_place 桥接（要求 multi-thread runtime）。
+            let pairs = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(pg.vector_search(
+                    qv,
+                    candidates,
+                    PG_VECTOR_OVER_FETCH,
+                    acl,
+                    req.filter.as_ref(),
+                ))
+            })
+            .map_err(|e| EngineError::Vector(e.to_string()))?;
+            pairs
+                .into_iter()
+                .map(|(s, c)| {
+                    pg_citations.insert(s.id.clone(), c);
+                    s
+                })
+                .collect()
+        } else {
             self.vector
                 .search(
                     req.vector.as_ref().unwrap(),
@@ -553,8 +594,6 @@ impl Engine {
                     acl,
                 )
                 .map_err(|e| EngineError::Vector(e.to_string()))?
-        } else {
-            vec![]
         };
 
         // 分面：在（keyword）候选集上按字段计数（kind / doc_id）。
@@ -577,22 +616,27 @@ impl Engine {
         for s in &vec_scored {
             vec_score.insert(s.id.clone(), s.score);
             citation.entry(s.id.clone()).or_insert_with(|| {
-                self.vector.citation(&s.id).unwrap_or_else(|| Citation {
-                    collection: s.id.collection.clone(),
-                    doc_id: s.id.doc_id.clone(),
-                    chunk_id: s.id.chunk_id,
-                    page: 0,
-                    bbox: fastsearch_core::BBox {
-                        x0: 0.0,
-                        y0: 0.0,
-                        x1: 0.0,
-                        y1: 0.0,
-                    },
-                    heading_path: vec![],
-                    section_id: 0,
-                    time: None,
-                    media: None,
-                })
+                // pgvector 直查档：用 PG 带回的真实引用；否则引擎侧向量后端；都无则退化占位。
+                pg_citations
+                    .get(&s.id)
+                    .cloned()
+                    .or_else(|| self.vector.citation(&s.id))
+                    .unwrap_or_else(|| Citation {
+                        collection: s.id.collection.clone(),
+                        doc_id: s.id.doc_id.clone(),
+                        chunk_id: s.id.chunk_id,
+                        page: 0,
+                        bbox: fastsearch_core::BBox {
+                            x0: 0.0,
+                            y0: 0.0,
+                            x1: 0.0,
+                            y1: 0.0,
+                        },
+                        heading_path: vec![],
+                        section_id: 0,
+                        time: None,
+                        media: None,
+                    })
             });
         }
 
@@ -933,6 +977,56 @@ mod tests {
         assert!(!hits.is_empty());
         // 最近 [1,0,0] → chunk 1 居首（HNSW 后端经引擎端到端可用）
         assert_eq!(hits[0].id.chunk_id, 1);
+    }
+
+    /// B6 直查档接入引擎（需 DATABASE_URL + multi-thread runtime）：向量召回在 PG 跑 ANN，
+    /// 引擎拿到带真实 page/bbox 的引用并完成排序。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pgvector_backend_via_engine() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip pgvector_backend_via_engine: DATABASE_URL not set");
+            return;
+        };
+        use fastsearch_pg::{PgConfig, PgStore, VectorType};
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_eng_vec_it".into();
+        cfg.vector_dim = 4;
+        cfg.vector_type = VectorType::Vector;
+        let mut store = PgStore::connect(cfg).await.expect("connect");
+        store.ensure_schema().await.expect("schema");
+        // 3 个 chunk（page 各异），写正交向量。
+        let mk = |id: u64, page: u32| Chunk {
+            page,
+            ..chunk("d.pdf", id, ChunkKind::Paragraph, &format!("c{id}"), 1)
+        };
+        let chunks = vec![mk(1, 11), mk(2, 22), mk(3, 33)];
+        store
+            .upsert_doc("kb", "d.pdf", &chunks)
+            .await
+            .expect("upsert");
+        for id in 1..=3u64 {
+            let mut e = vec![0.0f32; 4];
+            e[(id - 1) as usize] = 1.0;
+            store
+                .set_embedding("kb", "d.pdf", id, &e)
+                .await
+                .expect("emb");
+        }
+
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_pg_vector(std::sync::Arc::new(store));
+        // 查最接近 [0,1,0,0] = chunk 2（page 22）。
+        let r = SearchRequest {
+            query: String::new(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![0.1, 0.9, 0.0, 0.0]),
+            ..Default::default()
+        };
+        let hits = engine.search(&r, None).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].id.chunk_id, 2, "PG ANN 最近邻应为 chunk 2");
+        assert_eq!(hits[0].citation.page, 22, "引用 page 应来自 PG（非退化 0）");
+        assert!(hits[0].vector.is_some(), "应有向量分");
     }
 
     #[test]

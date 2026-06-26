@@ -208,10 +208,10 @@ pub fn pgvector_search_sql(
     if let Some(f) = filter {
         wheres.push(b.build(f));
     }
-    // heading_path/media 一并取回，供 Rust 侧对**不可翻译子句**（HeadingPrefix/时间等）做精确后过滤。
+    // heading_path/media 供不可翻译子句（HeadingPrefix/时间）精确后过滤；bbox/media 供组装 Citation。
     let sql = format!(
         "SELECT collection, doc_id, chunk_id, kind, modality, page, section_id, tenant, acl, \
-         heading_path, media::text, 1 - (embedding <=> $1::text::vector) AS score \
+         heading_path, bbox::text, media::text, 1 - (embedding <=> $1::text::vector) AS score \
          FROM {table} WHERE {} \
          ORDER BY embedding <=> $1::text::vector LIMIT {limit}",
         wheres.join(" AND ")
