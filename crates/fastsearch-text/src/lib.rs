@@ -10,6 +10,7 @@ mod schema;
 mod tokenizer;
 
 pub use error::{Result, TextError};
+pub use query_build::StoredRow;
 pub use schema::{TextIndexConfig, TokenizerKind};
 
 use fastsearch_core::{AclFilter, Chunk, ChunkKind, Citation, Filter, GlobalId};
@@ -200,6 +201,24 @@ impl TextIndex {
                     .get_first(self.fields.text)
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 按 global_id 取已索引行的完整字段视图（acl/tenant/media/引用所需），供
+    /// `resolve_citation` 做 ACL 校验 + 媒资解析。不存在返回 None。
+    pub fn stored_row_by_gid(&self, gid: &GlobalId) -> Result<Option<StoredRow>> {
+        let searcher = self.reader.searcher();
+        let q = TermQuery::new(
+            Term::from_field_text(self.fields.gid, &gid.to_citation_id()),
+            IndexRecordOption::Basic,
+        );
+        let top = searcher.search(&q, &TopDocs::with_limit(1).order_by_score())?;
+        match top.first() {
+            Some((_s, addr)) => {
+                let doc: TantivyDocument = searcher.doc(*addr)?;
+                Ok(Some(query_build::stored_row(&doc, &self.fields)))
             }
             None => Ok(None),
         }

@@ -10,7 +10,8 @@
 //! **分组折叠**（req.collapse 每 doc/section 限 N 条）均已接入。
 
 use fastsearch_core::{
-    fuse, AclFilter, Chunk, ChunkKind, Citation, GlobalId, Scored, SearchMode, SearchRequest,
+    fuse, AclFilter, AssetPointer, BBox, Chunk, ChunkKind, Citation, GlobalId, Scored, SearchMode,
+    SearchRequest, TimeSpan,
 };
 use fastsearch_embed::{EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
@@ -140,6 +141,29 @@ pub struct SearchHit {
     /// auto-merge 时被并入本代表命中的同 section 兄弟 chunk_id（升序）；未归并为空。
     /// 答案层可据此解析整段的全部引用。
     pub merged_chunk_ids: Vec<u64>,
+}
+
+/// `resolve_citation` 的结果：如何**安全地**取到这段媒资（已过 ACL）。
+#[derive(Debug, Clone)]
+pub struct ResolvedAsset {
+    pub fetch: AssetFetch,
+    pub time: Option<TimeSpan>,
+    pub media_type: Option<String>,
+}
+
+/// 取媒资字节的方式。
+#[derive(Debug, Clone)]
+pub enum AssetFetch {
+    /// 内联字节（小裁图，字节在 PG `media_bytes`——MM2 接入；当前引擎索引无字节）。
+    InlineBytes(Vec<u8>),
+    /// 对象存储签名 URL（真签名待对象存储接入；当前回 uri + 过期秒数）。
+    SignedUrl { url: String, expires_s: u64 },
+    /// 无独立字节：跳转到原文位置（page+bbox），答案层据此深链/高亮。
+    DocRender {
+        doc_id: String,
+        page: u32,
+        bbox: BBox,
+    },
 }
 
 /// 端到端检索引擎。
@@ -346,6 +370,49 @@ impl Engine {
         acl: Option<&AclFilter>,
     ) -> Result<(Vec<SearchHit>, Facets)> {
         self.run(req, acl)
+    }
+
+    /// 由 `citation_id` + ACL 解析"如何安全取到这段媒资"。**ACL 在此强制**：解析出的
+    /// chunk 不可见 → 返回 `None`（等同 404，不暴露存在性）。无媒资/Inline 字节不在引擎
+    /// （在 PG `media_bytes`，MM2）→ `None`。详见多模态计划 §6。
+    pub fn resolve_citation(
+        &self,
+        cid: &str,
+        acl: Option<&AclFilter>,
+    ) -> Result<Option<ResolvedAsset>> {
+        let gid = GlobalId::parse(cid)?;
+        let row = match self.text.stored_row_by_gid(&gid)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        // ACL 强制注入（不可绕过）：不可见 → None，等同 404。
+        if let Some(a) = acl {
+            if !a.visible(&row) {
+                return Ok(None);
+            }
+        }
+        let media = match row.media {
+            Some(m) => m,
+            None => return Ok(None), // 该 chunk 无媒资
+        };
+        let fetch = match media.asset {
+            AssetPointer::DocRegion { page, bbox } => AssetFetch::DocRender {
+                doc_id: row.doc_id,
+                page,
+                bbox,
+            },
+            AssetPointer::Object { uri } => AssetFetch::SignedUrl {
+                url: uri,
+                expires_s: 300,
+            },
+            // Inline 字节在 PG media_bytes（MM2 接入）；引擎索引不持字节。
+            AssetPointer::Inline => return Ok(None),
+        };
+        Ok(Some(ResolvedAsset {
+            fetch,
+            time: media.time,
+            media_type: media.media_type,
+        }))
     }
 
     /// more_like_this：以种子 chunk 的正文反查相似命中（keyword 模式），排除种子自身。
@@ -878,6 +945,51 @@ mod tests {
         let h2 = e.search(&r2, None).unwrap();
         assert_eq!(h2.len(), 1);
         assert_eq!(h2[0].id.chunk_id, 3);
+    }
+
+    #[test]
+    fn resolve_citation_enforces_acl() {
+        use fastsearch_core::{AssetPointer, MediaRef};
+        let mut e = engine();
+        let mut c = chunk("a.pdf", 1, ChunkKind::Image, "figure caption", 7);
+        c.tenant = Some("acme".into());
+        c.acl = vec!["team-a".into()];
+        c.media = Some(MediaRef {
+            asset: AssetPointer::DocRegion {
+                page: 7,
+                bbox: c.bbox,
+            },
+            media_type: Some("image/png".into()),
+            time: None,
+            region: Some(c.bbox),
+            caption_source: None,
+            thumbnail: None,
+        });
+        e.ingest("kb", &c).unwrap();
+        e.commit().unwrap();
+        let cid = "kb:a.pdf:1";
+        let authorized = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        let unauthorized = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-b".into()],
+        };
+        // 授权 → DocRender（跳原文页/区域）
+        let r = e.resolve_citation(cid, Some(&authorized)).unwrap().unwrap();
+        assert_eq!(r.media_type.as_deref(), Some("image/png"));
+        assert!(matches!(r.fetch, AssetFetch::DocRender { page: 7, .. }));
+        // 越权 → None（等同 404，不暴露存在性）
+        assert!(e
+            .resolve_citation(cid, Some(&unauthorized))
+            .unwrap()
+            .is_none());
+        // 不存在 → None
+        assert!(e
+            .resolve_citation("kb:a.pdf:999", Some(&authorized))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

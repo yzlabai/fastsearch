@@ -6,13 +6,15 @@
 //! 安全核心（需求 F44）：ACL 只来自认证身份，客户端无法在请求体里传 ACL 或越权。
 
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Path, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
 use fastsearch_core::{AclFilter, Chunk, GlobalId, SearchMode, SearchRequest};
 use fastsearch_embed::{EmbedKind, Embedder};
+use fastsearch_engine::AssetFetch;
 use fastsearch_engine::Engine;
 use fastsearch_sync::replication::ReplicationConfig;
 use serde::Deserialize;
@@ -265,6 +267,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/v1/search", post(search))
         .route("/v1/similar", post(similar))
+        .route("/v1/asset/{cid}", get(asset))
         .route("/v1/index", post(index))
         .with_state(state)
 }
@@ -368,6 +371,17 @@ fn openapi_spec() -> Value {
                             "citation_id": {"type": "string"}, "top_k": {"type": "integer", "default": 10}}}}}},
                     "responses": {"200": {"description": "命中列表"}, "400": {"description": "非法 citation_id"},
                         "401": {"description": "认证失败"}}
+                }
+            },
+            "/v1/asset/{citation_id}": {
+                "get": {
+                    "summary": "媒资 ACL 网关（resolve_citation；不可见/不存在均 404）",
+                    "responses": {
+                        "200": {"description": "InlineBytes 字节 / DocRender JSON（跳原文 page+bbox）"},
+                        "302": {"description": "SignedUrl 重定向到短时签名 URL"},
+                        "401": {"description": "认证失败"},
+                        "404": {"description": "不可见或不存在"}
+                    }
                 }
             },
             "/healthz": {"get": {"summary": "存活探针", "security": [], "responses": {"200": {"description": "ok"}}}},
@@ -595,6 +609,67 @@ async fn similar(
         status: 200,
     });
     Ok(Json(json!({ "hits": hits_json(&hits) })))
+}
+
+/// 媒资 ACL 网关：`GET /v1/asset/{citation_id}` —— `principal→acl_for→resolve_citation`，
+/// ACL 不可绕过（不可见/不存在均 404，不暴露存在性）。InlineBytes 直吐字节、SignedUrl 302、
+/// DocRender 返回跳原文 JSON。Range（音视频 seek）待字节服务（MM2/对象存储）接入。
+async fn asset(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(cid): Path<String>,
+) -> Response {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if !s.allow(&rate_key(&headers)) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    let Some(principal) = principal_from_headers(&headers, &s.keys) else {
+        s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
+        return (StatusCode::UNAUTHORIZED, "missing or invalid API key").into_response();
+    };
+    let acl = acl_for(&principal);
+    let engine = s.engine.lock().await;
+    let resolved = match engine.resolve_citation(&cid, Some(&acl)) {
+        Ok(r) => r,
+        Err(e) => {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+    drop(engine);
+    let status = if resolved.is_some() { 200 } else { 404 };
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/asset",
+        tenant: principal.tenant.clone(),
+        tags: principal.tags.clone(),
+        query: Some(cid.clone()),
+        collection: None,
+        doc_id: None,
+        hits: None,
+        status,
+    });
+    let Some(a) = resolved else {
+        // 不可见或不存在——均 404，不暴露存在性。
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    match a.fetch {
+        AssetFetch::DocRender { doc_id, page, bbox } => Json(json!({
+            "type": "doc_render",
+            "doc_id": doc_id,
+            "page": page,
+            "bbox": bbox,
+            "time": a.time,
+            "media_type": a.media_type,
+        }))
+        .into_response(),
+        AssetFetch::SignedUrl { url, .. } => Redirect::temporary(&url).into_response(),
+        AssetFetch::InlineBytes(bytes) => {
+            let ct = a
+                .media_type
+                .unwrap_or_else(|| "application/octet-stream".into());
+            ([(header::CONTENT_TYPE, ct)], bytes).into_response()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1097,6 +1172,60 @@ mod tests {
             hits[0]["vector"].as_f64().is_some(),
             "vector score should be present"
         );
+    }
+
+    #[tokio::test]
+    async fn asset_acl_not_bypassable() {
+        // 灌入带 media(DocRegion) 的图 chunk，acl=team-a。
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let body = r#"{"collection":"kb","doc_id":"rep.pdf","chunks":[
+            {"doc_id":"rep.pdf","chunk_id":1,"kind":"image","text":"figure caption","page":7,
+             "bbox":{"x0":1.0,"y0":2.0,"x1":3.0,"y1":4.0},"char_len":14,"acl":["team-a"],"tenant":"acme",
+             "media":{"asset":{"kind":"doc_region","page":7,"bbox":{"x0":1.0,"y0":2.0,"x1":3.0,"y1":4.0}},
+                      "media_type":"image/png"}}]}"#;
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let asset_req = |key: &str| {
+            Request::builder()
+                .uri("/v1/asset/kb:rep.pdf:1")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        // 授权 team-a → 200 doc_render
+        let ok = app.clone().oneshot(asset_req("k-team-a")).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let v = body_json(ok).await;
+        assert_eq!(v["type"], "doc_render");
+        assert_eq!(v["page"], 7);
+        // 越权 team-b → 404（不暴露存在性，不可绕过）
+        let denied = app.clone().oneshot(asset_req("k-team-b")).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        // 无 key → 401
+        let noauth = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/asset/kb:rep.pdf:1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(noauth.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
