@@ -1,7 +1,7 @@
 //! 纯 SQL 生成 + Chunk↔行映射（无 PG 依赖，可单测）。
 
 use crate::error::{PgError, Result};
-use fastsearch_core::{BBox, Chunk, ChunkKind};
+use fastsearch_core::{AclFilter, BBox, Chunk, ChunkKind, FieldValue, Filter};
 
 /// 向量列类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +60,170 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              END $$;"
         ),
     ]
+}
+
+// ============================ B6: pgvector 直查档 SQL 生成（纯函数，可单测） ============================
+//
+// 把 `AclFilter`+`Filter` 翻译成**精确 SQL WHERE**（可翻译子句）或 `TRUE`（不可翻译→SUPERSET，
+// 由调用方 Rust 侧 `Filter::eval`/`AclFilter::visible` 精确后过滤），守不变量 #5。详见
+// [B6 设计](../../docs/plans/2026-06-26-B6-pgvector直查档设计.md)。
+
+/// 绑定到 SQL 的参数（按出现顺序；调用方据类型 bind 进 tokio-postgres）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlParam {
+    Text(String),
+    Int(i64),
+    /// `text[]`（ACL 标签集）。
+    TextArray(Vec<String>),
+}
+
+/// 可翻译列 → (列名, 是否 text 类型)。其余字段不可翻译（→ TRUE 超集）。
+/// 注意 time_start_ms/time_end_ms 当前**不是列**（MM2c 才加）→ 不可翻译。
+fn col_kind(field: &str) -> Option<(&'static str, bool)> {
+    match field {
+        "collection" => Some(("collection", true)),
+        "doc_id" => Some(("doc_id", true)),
+        "kind" => Some(("kind", true)),
+        "modality" => Some(("modality", true)),
+        "tenant" => Some(("tenant", true)),
+        "page" => Some(("page", false)),
+        "section_id" => Some(("section_id", false)),
+        _ => None,
+    }
+}
+
+/// 值与列类型匹配则返回对应 `SqlParam`，否则 None（→ 该叶子不可翻译，TRUE 超集）。
+fn match_param(is_text_col: bool, v: &FieldValue) -> Option<SqlParam> {
+    match (is_text_col, v) {
+        (true, FieldValue::Str(s)) => Some(SqlParam::Text(s.clone())),
+        (false, FieldValue::Int(i)) => Some(SqlParam::Int(*i)),
+        _ => None, // 类型不匹配（如对 int 列传字符串）→ 不翻译
+    }
+}
+
+struct WhereBuilder {
+    params: Vec<SqlParam>,
+    base: usize, // 首个参数占位符编号（$1 留给查询向量 → base=2）
+}
+
+impl WhereBuilder {
+    fn ph(&mut self, p: SqlParam) -> String {
+        self.params.push(p);
+        format!("${}", self.base + self.params.len() - 1)
+    }
+
+    /// 叶子比较 `col OP $n`；不可翻译（列未知/类型不符/文本比较/否定）→ "TRUE"（超集）。
+    fn cmp(&mut self, field: &str, op: &str, v: &FieldValue) -> String {
+        let Some((col, is_text)) = col_kind(field) else {
+            return "TRUE".into();
+        };
+        // 大小比较仅对数值列（文本字典序受 collation 影响，交给 Rust 后过滤）。
+        if matches!(op, "<" | "<=" | ">" | ">=") && is_text {
+            return "TRUE".into();
+        }
+        match match_param(is_text, v) {
+            Some(p) => {
+                let ph = self.ph(p);
+                format!("{col} {op} {ph}")
+            }
+            None => "TRUE".into(),
+        }
+    }
+
+    fn build(&mut self, f: &Filter) -> String {
+        match f {
+            Filter::And(fs) => self.join(fs, "AND", "TRUE"),
+            Filter::Or(fs) => self.join(fs, "OR", "FALSE"),
+            // 否定的精确 SQL 在可空列上有 NULL 补集坑 → 一律 TRUE 超集，Rust 后过滤兜精确。
+            Filter::Not(_) | Filter::Ne(_, _) => "TRUE".into(),
+            Filter::Eq(k, v) => self.cmp(k, "=", v),
+            Filter::Gt(k, v) => self.cmp(k, ">", v),
+            Filter::Gte(k, v) => self.cmp(k, ">=", v),
+            Filter::Lt(k, v) => self.cmp(k, "<", v),
+            Filter::Lte(k, v) => self.cmp(k, "<=", v),
+            Filter::In(k, vs) => self.in_clause(k, vs),
+            Filter::Exists(k) => match col_kind(k) {
+                Some(("tenant", _)) => "tenant IS NOT NULL".into(),
+                Some(_) => "TRUE".into(), // 其余列 NOT NULL → 恒存在
+                None => "TRUE".into(),
+            },
+            // heading_path 前缀：数组前缀匹配不便精确下推 → TRUE 超集，Rust 后过滤兜。
+            Filter::HeadingPrefix(_) => "TRUE".into(),
+        }
+    }
+
+    fn join(&mut self, fs: &[Filter], op: &str, empty: &str) -> String {
+        if fs.is_empty() {
+            return empty.into();
+        }
+        let parts: Vec<String> = fs.iter().map(|f| self.build(f)).collect();
+        format!("({})", parts.join(&format!(" {op} ")))
+    }
+
+    fn in_clause(&mut self, field: &str, vs: &[FieldValue]) -> String {
+        let Some((col, is_text)) = col_kind(field) else {
+            return "TRUE".into();
+        };
+        // 全部值类型匹配才翻译；否则 TRUE 超集。
+        let params: Option<Vec<SqlParam>> = vs.iter().map(|v| match_param(is_text, v)).collect();
+        match params {
+            Some(ps) if !ps.is_empty() => {
+                let phs: Vec<String> = ps.into_iter().map(|p| self.ph(p)).collect();
+                format!("{col} IN ({})", phs.join(", "))
+            }
+            _ => "TRUE".into(), // 空 In 或类型不符
+        }
+    }
+}
+
+/// ACL → 精确 SQL（tenant 严格隔离 + public/标签相交）。无 tenant 限制（管理员）→ 仅标签维度。
+fn acl_clause(acl: &AclFilter, b: &mut WhereBuilder) -> String {
+    let mut clauses = Vec::new();
+    if let Some(t) = &acl.tenant {
+        let ph = b.ph(SqlParam::Text(t.clone()));
+        clauses.push(format!("tenant = {ph}")); // 行 tenant 必须等于调用者（NULL→排除，严格）
+    }
+    // public 公开 或 acl 与授权标签相交。
+    let tags = b.ph(SqlParam::TextArray(acl.allowed_tags.clone()));
+    clauses.push(format!("('public' = ANY(acl) OR acl && {tags}::text[])"));
+    format!("({})", clauses.join(" AND "))
+}
+
+/// 构造 pgvector 直查 SELECT：`$1` 为查询向量（调用方 bind），filter/acl 参数从 `$2` 起。
+/// 返回 (SQL, params)。SUPERSET WHERE + 调用方 over-fetch + Rust 精确后过滤（守 #5）。
+pub fn pgvector_search_sql(
+    table: &str,
+    limit: usize,
+    acl: Option<&AclFilter>,
+    filter: Option<&Filter>,
+) -> (String, Vec<SqlParam>) {
+    let mut b = WhereBuilder {
+        params: Vec::new(),
+        base: 2,
+    };
+    let mut wheres = vec!["embedding IS NOT NULL".to_string()];
+    if let Some(a) = acl {
+        wheres.push(acl_clause(a, &mut b));
+    }
+    if let Some(f) = filter {
+        wheres.push(b.build(f));
+    }
+    let sql = format!(
+        "SELECT collection, doc_id, chunk_id, kind, modality, page, section_id, tenant, acl, \
+         1 - (embedding <=> $1::vector) AS score \
+         FROM {table} WHERE {} \
+         ORDER BY embedding <=> $1::vector LIMIT {limit}",
+        wheres.join(" AND ")
+    );
+    (sql, b.params)
+}
+
+/// embedding 上的 HNSW ANN 索引（cosine）——直查档需要；幂等。
+pub fn ann_index_sql(table: &str) -> String {
+    format!(
+        "CREATE INDEX IF NOT EXISTS {table}_emb_hnsw ON {table} \
+         USING hnsw (embedding vector_cosine_ops)"
+    )
 }
 
 /// 列顺序（写入 + 读取共用）。
@@ -308,6 +472,71 @@ mod tests {
         assert_eq!(row.modality, "image");
         assert!(row.media.as_ref().unwrap().contains("doc_region"));
         assert_eq!(row.to_chunk().unwrap(), c);
+    }
+
+    #[test]
+    fn pgvector_sql_acl_and_filter_pushdown() {
+        let acl = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        let filter = Filter::And(vec![
+            Filter::Eq("modality".into(), FieldValue::Str("image".into())),
+            Filter::Gte("page".into(), FieldValue::Int(5)),
+        ]);
+        let (sql, params) = pgvector_search_sql("t", 80, Some(&acl), Some(&filter));
+        // 查询向量是 $1；ACL 先入参（$2 tenant, $3 tags），filter 后（$4 modality, $5 page）。
+        assert!(sql.contains("embedding <=> $1::vector"));
+        assert!(sql.contains("tenant = $2"));
+        assert!(sql.contains("'public' = ANY(acl) OR acl && $3::text[]"));
+        assert!(sql.contains("modality = $4"));
+        assert!(sql.contains("page >= $5"));
+        assert!(sql.contains("LIMIT 80"));
+        assert_eq!(
+            params,
+            vec![
+                SqlParam::Text("acme".into()),
+                SqlParam::TextArray(vec!["team-a".into()]),
+                SqlParam::Text("image".into()),
+                SqlParam::Int(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn pgvector_sql_untranslatable_is_superset_true() {
+        // 不可翻译：未知字段 / 否定 / 类型不符 / 文本大小比较 → TRUE（超集，Rust 后过滤兜）。
+        let f = Filter::And(vec![
+            Filter::Eq("weird_field".into(), FieldValue::Str("x".into())), // 未知列
+            Filter::Ne("kind".into(), FieldValue::Str("image".into())),    // 否定
+            Filter::Eq("page".into(), FieldValue::Str("oops".into())),     // 类型不符
+            Filter::Gt("kind".into(), FieldValue::Str("a".into())),        // 文本大小比较
+        ]);
+        let (sql, params) = pgvector_search_sql("t", 10, None, Some(&f));
+        assert!(params.is_empty(), "全不可翻译 → 无参数");
+        // 子句全为 TRUE：AND(TRUE,TRUE,TRUE,TRUE)
+        assert!(sql.contains("(TRUE AND TRUE AND TRUE AND TRUE)"));
+        // 无 ACL/无可翻译过滤仍至少 embedding IS NOT NULL 守门。
+        assert!(sql.contains("embedding IS NOT NULL"));
+    }
+
+    #[test]
+    fn pgvector_sql_in_and_no_filter() {
+        let f = Filter::In(
+            "kind".into(),
+            vec![
+                FieldValue::Str("table".into()),
+                FieldValue::Str("image".into()),
+            ],
+        );
+        let (sql, params) = pgvector_search_sql("t", 5, None, Some(&f));
+        assert!(sql.contains("kind IN ($2, $3)"));
+        assert_eq!(params.len(), 2);
+        // 无过滤 + 无 ACL：仅 embedding 守门。
+        let (sql2, p2) = pgvector_search_sql("t", 5, None, None);
+        assert!(sql2.contains("WHERE embedding IS NOT NULL ORDER BY"));
+        assert!(p2.is_empty());
+        assert!(ann_index_sql("t").contains("USING hnsw (embedding vector_cosine_ops)"));
     }
 
     #[test]

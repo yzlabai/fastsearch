@@ -8,7 +8,9 @@ mod error;
 mod sql;
 
 pub use error::{PgError, Result};
-pub use sql::{ChunkRow, VectorType, COLUMNS, PUBLICATION};
+pub use sql::{
+    ann_index_sql, pgvector_search_sql, ChunkRow, SqlParam, VectorType, COLUMNS, PUBLICATION,
+};
 
 use fastsearch_core::Chunk;
 use tokio_postgres::types::ToSql;
