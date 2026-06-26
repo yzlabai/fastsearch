@@ -9,6 +9,10 @@
 //! - 召回 **近似**：ANN 固有。靠 `over_fetch`（取回 `k×over_fetch` 候选）+ `ef_search` 调高召回；
 //!   强过滤下召回可能下降（候选被过滤殆尽）——见设计 §4，小集合回退暴力为下一迭代。
 //!
+//! **墓碑增长（诚实记账，触不变量 #6）**：删除/更新只把 `entries[id]` 置 None、向量仍留图中，
+//! 故长生命周期进程在高频 upsert/delete 下 `entries` 与图**无界增长**，直到 `save`→`load`
+//! （只持久化活条目、重建图）或 `rebuild_from` 压实。无进程内自动压实（下一迭代）。
+//!
 //! **非确定性（诚实记账，触不变量 #4）**：`hnsw_rs` 用 `StdRng::from_os_rng()` 生成层级、
 //! **未暴露 seed**，故每次建图不同 → 检索结果有近似抖动、`save`→`load`（重建图）结果可能微异。
 //! 这是 ANN 固有性质；默认的暴力 [`MemVectorIndex`](crate::MemVectorIndex) 仍**完全确定**。

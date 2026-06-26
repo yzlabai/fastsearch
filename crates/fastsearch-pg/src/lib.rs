@@ -43,8 +43,10 @@ pub struct PgStore {
 }
 
 impl PgStore {
-    /// 连接（后台驱动连接 future）。
+    /// 连接（后台驱动连接 future）。表名经标识符校验后才用于 SQL 拼接（防御性：表名是运维配置、
+    /// 非客户端输入，但若未来被外部影响，此校验阻断注入面）。
     pub async fn connect(cfg: PgConfig) -> Result<Self> {
+        validate_identifier(&cfg.table)?;
         let (client, connection) = tokio_postgres::connect(&cfg.url, NoTls).await?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -209,6 +211,24 @@ impl PgStore {
     }
 }
 
+/// 校验 SQL 标识符（表名）：`[A-Za-z_][A-Za-z0-9_]*`，长度 ≤63（PG 上限）。
+/// 表名在 `sql.rs` 经 `format!` 拼进 SQL（值用参数化、标识符不能参数化），故在此把关。
+fn validate_identifier(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()));
+    if ok {
+        Ok(())
+    } else {
+        Err(PgError::Config(format!(
+            "invalid table identifier: {name:?}"
+        )))
+    }
+}
+
 /// f32 向量 → pgvector 文本字面 `[v1,v2,...]`（配合 SQL 内 `$1::text::vector`：先 text 再 vector，
 /// 避免 tokio-postgres 把 `$1` 推断成 vector 类型而拒收 String，同 jsonb 写入的处理）。
 fn format_vector(v: &[f32]) -> String {
@@ -361,6 +381,17 @@ mod tests {
             tenant: None,
             acl: vec!["public".into()],
         }
+    }
+
+    #[test]
+    fn rejects_bad_table_identifiers() {
+        assert!(validate_identifier("fastsearch_chunks").is_ok());
+        assert!(validate_identifier("t1").is_ok());
+        assert!(validate_identifier("").is_err());
+        assert!(validate_identifier("1abc").is_err()); // 数字开头
+        assert!(validate_identifier("a;DROP TABLE x").is_err());
+        assert!(validate_identifier("a b").is_err());
+        assert!(validate_identifier("a\"b").is_err());
     }
 
     /// 集成测试：仅当 `DATABASE_URL` 设置时运行；否则跳过（不算失败）。
