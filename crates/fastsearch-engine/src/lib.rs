@@ -788,7 +788,6 @@ mod tests {
             section_id: 7,
             char_len: text.chars().count() as u32,
             media: None,
-            image_meta: None,
             tenant: None,
             acl: vec!["public".into()],
         }

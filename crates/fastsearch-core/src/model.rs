@@ -123,6 +123,25 @@ pub struct ImageMeta {
     pub media_type: Option<String>,
 }
 
+impl ImageMeta {
+    /// 迁移到统一的 [`MediaRef`]（`file`→`Object`，否则 `DocRegion` 跳原文；带 page+bbox）。
+    /// 供消费旧 docparse `image` 字段的入口（如 CLI JSON index）映射到 `media`。
+    pub fn to_media(&self, page: u32, bbox: BBox) -> MediaRef {
+        let asset = match &self.file {
+            Some(f) => AssetPointer::Object { uri: f.clone() },
+            None => AssetPointer::DocRegion { page, bbox },
+        };
+        MediaRef {
+            asset,
+            media_type: self.media_type.clone(),
+            time: None,
+            region: Some(bbox),
+            caption_source: self.caption_source.clone(),
+            thumbnail: None,
+        }
+    }
+}
+
 fn default_acl() -> Vec<String> {
     vec!["public".to_string()]
 }
@@ -142,11 +161,9 @@ pub struct Chunk {
     #[serde(default)]
     pub section_id: u64,
     pub char_len: u32,
-    /// 媒资引用（图/音/视频）。`image_meta` 为遗留字段，迁移到 `media` 见多模态计划 §6/MM2。
+    /// 媒资引用（图/音/视频；统一目标，遗留 `image_meta` 已迁移至此，见 MM2b）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_meta: Option<ImageMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
     #[serde(default = "default_acl")]
@@ -356,7 +373,6 @@ mod tests {
             section_id: 17,
             char_len: 1,
             media: None,
-            image_meta: None,
             tenant: None,
             acl: default_acl(),
         };

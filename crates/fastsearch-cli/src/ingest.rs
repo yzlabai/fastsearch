@@ -113,7 +113,6 @@ pub fn from_docparse_chunk(
             .image
             .as_ref()
             .map(|im| map_image(im, dc.page as u32, bbox)),
-        image_meta: None,
         tenant,
         acl,
     }
@@ -160,7 +159,7 @@ mod tests {
         assert_eq!(c.section_id, 7);
         assert_eq!(c.tenant.as_deref(), Some("acme"));
         assert_eq!(c.acl, vec!["team-a".to_string()]);
-        assert!(c.media.is_none() && c.image_meta.is_none());
+        assert!(c.media.is_none());
         // 模态由 kind 派生
         assert_eq!(c.kind.modality(), fastsearch_core::Modality::Text);
     }

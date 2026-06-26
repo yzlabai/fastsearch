@@ -1,7 +1,7 @@
 //! 纯 SQL 生成 + Chunk↔行映射（无 PG 依赖，可单测）。
 
 use crate::error::{PgError, Result};
-use fastsearch_core::{BBox, Chunk, ChunkKind, ImageMeta};
+use fastsearch_core::{BBox, Chunk, ChunkKind};
 
 /// 向量列类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +39,6 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              heading_path text[] NOT NULL DEFAULT '{{}}',\n\
              section_id bigint NOT NULL DEFAULT 0,\n\
              char_len integer NOT NULL,\n\
-             image_meta jsonb,\n\
              modality text NOT NULL DEFAULT 'text',\n\
              media jsonb,\n\
              tenant text,\n\
@@ -75,7 +74,6 @@ pub const COLUMNS: &[&str] = &[
     "heading_path",
     "section_id",
     "char_len",
-    "image_meta",
     "modality",
     "media",
     "tenant",
@@ -89,8 +87,8 @@ pub const COLUMNS: &[&str] = &[
 pub fn insert_sql(table: &str) -> String {
     format!(
         "INSERT INTO {table} \
-         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, image_meta, modality, media, tenant, acl) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11::text::jsonb, $12, $13::text::jsonb, $14, $15)"
+         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, modality, media, tenant, acl) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11, $12::text::jsonb, $13, $14)"
     )
 }
 
@@ -103,7 +101,7 @@ pub fn delete_doc_sql(table: &str) -> String {
 pub fn fetch_doc_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, image_meta::text, modality, media::text, tenant, acl \
+         section_id, char_len, modality, media::text, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 ORDER BY chunk_id"
     )
 }
@@ -112,7 +110,7 @@ pub fn fetch_doc_sql(table: &str) -> String {
 pub fn fetch_all_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, image_meta::text, modality, media::text, tenant, acl \
+         section_id, char_len, modality, media::text, tenant, acl \
          FROM {table} ORDER BY collection, doc_id, chunk_id"
     )
 }
@@ -131,7 +129,7 @@ fn kind_from_str(s: &str) -> Result<ChunkKind> {
 }
 
 /// 列值的拥有式视图：写入时按列借引用作参数，读取时从此构造 [`Chunk`]。
-/// jsonb 列以文本承载（`bbox`/`image_meta`）。
+/// jsonb 列以文本承载（`bbox`/`media`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChunkRow {
     pub collection: String,
@@ -144,7 +142,6 @@ pub struct ChunkRow {
     pub heading_path: Vec<String>,
     pub section_id: i64,
     pub char_len: i32,
-    pub image_meta: Option<String>,
     /// 模态（由 kind 派生，落列供 SQL 侧过滤）。
     pub modality: String,
     /// 媒资引用 JSON（`MediaRef`，不含 inline 字节）。
@@ -166,11 +163,6 @@ impl ChunkRow {
             heading_path: c.heading_path.clone(),
             section_id: c.section_id as i64,
             char_len: c.char_len as i32,
-            image_meta: c
-                .image_meta
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?,
             modality: c.kind.modality().as_str().to_string(),
             media: c.media.as_ref().map(serde_json::to_string).transpose()?,
             tenant: c.tenant.clone(),
@@ -180,10 +172,6 @@ impl ChunkRow {
 
     pub fn to_chunk(&self) -> Result<Chunk> {
         let bbox: BBox = serde_json::from_str(&self.bbox)?;
-        let image_meta: Option<ImageMeta> = match &self.image_meta {
-            Some(j) => Some(serde_json::from_str(j)?),
-            None => None,
-        };
         let media = match &self.media {
             Some(j) => Some(serde_json::from_str(j)?),
             None => None,
@@ -199,7 +187,6 @@ impl ChunkRow {
             section_id: self.section_id as u64,
             char_len: self.char_len as u32,
             media, // 媒资从 media jsonb 列恢复（modality 在 Chunk 侧由 kind 派生）
-            image_meta,
             tenant: self.tenant.clone(),
             acl: self.acl.clone(),
         })
@@ -228,7 +215,6 @@ mod tests {
             section_id: 17,
             char_len: 8,
             media: None,
-            image_meta: None,
             tenant: Some("acme".into()),
             acl: vec!["team-a".into(), "public".into()],
         }
@@ -251,12 +237,12 @@ mod tests {
     #[test]
     fn insert_and_delete_sql_shape() {
         let ins = insert_sql("t");
-        assert!(ins.contains("$15"));
+        assert!(ins.contains("$14"));
         assert!(ins.contains("$7::text::jsonb")); // bbox（先 ::text 再 ::jsonb，见 insert_sql 注释）
-        assert!(ins.contains("$11::text::jsonb")); // image_meta
-        assert!(ins.contains("$13::text::jsonb")); // media
+        assert!(ins.contains("$12::text::jsonb")); // media
         assert!(ins.contains("modality, media")); // 新列入列名
-        assert!(!ins.contains("$16")); // exactly 15 params
+        assert!(!ins.contains("image_meta")); // 遗留列已移除
+        assert!(!ins.contains("$15")); // exactly 14 params
         let del = delete_doc_sql("t");
         assert_eq!(del, "DELETE FROM t WHERE collection = $1 AND doc_id = $2");
     }
@@ -302,15 +288,25 @@ mod tests {
     }
 
     #[test]
-    fn chunkrow_handles_image_meta_and_empty_heading() {
+    fn chunkrow_handles_media_and_empty_heading() {
+        use fastsearch_core::{AssetPointer, MediaRef};
         let mut c = sample();
         c.heading_path = vec![];
-        c.image_meta = Some(ImageMeta {
-            caption: Some("图1".into()),
-            ..Default::default()
+        c.kind = ChunkKind::Image;
+        c.media = Some(MediaRef {
+            asset: AssetPointer::DocRegion {
+                page: 23,
+                bbox: c.bbox,
+            },
+            media_type: Some("image/png".into()),
+            time: None,
+            region: Some(c.bbox),
+            caption_source: Some("图1".into()),
+            thumbnail: None,
         });
         let row = ChunkRow::from_chunk("kb", &c).unwrap();
-        assert!(row.image_meta.as_ref().unwrap().contains("图1"));
+        assert_eq!(row.modality, "image");
+        assert!(row.media.as_ref().unwrap().contains("doc_region"));
         assert_eq!(row.to_chunk().unwrap(), c);
     }
 

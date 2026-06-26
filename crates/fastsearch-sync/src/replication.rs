@@ -202,7 +202,7 @@ fn get<'a>(m: &HashMap<&'a str, Option<&'a str>>, k: &str) -> Result<&'a str> {
 }
 
 /// fastsearch_chunks 行（pgoutput 文本元组）→ `(collection, Chunk)`，复用
-/// [`ChunkRow::to_chunk`]（bbox/image_meta JSON、kind 解析、类型转换）。
+/// [`ChunkRow::to_chunk`]（bbox/media JSON、kind 解析、类型转换）。
 fn row_to_chunk(rel: &Relation, tuple: &TupleData) -> Result<(String, Chunk)> {
     let m = cols(rel, tuple);
     let row = ChunkRow {
@@ -216,7 +216,6 @@ fn row_to_chunk(rel: &Relation, tuple: &TupleData) -> Result<(String, Chunk)> {
         heading_path: parse_pg_array(get(&m, "heading_path")?),
         section_id: get(&m, "section_id")?.parse().context("section_id")?,
         char_len: get(&m, "char_len")?.parse().context("char_len")?,
-        image_meta: m.get("image_meta").copied().flatten().map(String::from),
         // modality 默认 "text"（NOT NULL DEFAULT），media 可空。
         modality: m
             .get("modality")

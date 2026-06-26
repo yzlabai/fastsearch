@@ -159,7 +159,6 @@ mod tests {
             section_id: 0,
             char_len: 1,
             media: None,
-            image_meta: None,
             tenant: None,
             acl: vec!["public".into()],
         })

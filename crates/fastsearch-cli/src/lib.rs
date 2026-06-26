@@ -43,8 +43,8 @@ fn to_core(dc: DocparseChunk, doc_id: &str) -> Chunk {
         heading_path: dc.heading_path,
         section_id: dc.section_id,
         char_len: dc.char_len,
-        media: None,
-        image_meta: dc.image,
+        // 遗留 docparse `image` 字段迁移到统一 media（file→Object，否则 DocRegion）。
+        media: dc.image.as_ref().map(|im| im.to_media(dc.page, dc.bbox)),
         tenant: None,
         acl: vec!["public".to_string()],
     }
