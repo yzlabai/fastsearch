@@ -65,6 +65,8 @@ fn kind_str(k: ChunkKind) -> &'static str {
         ChunkKind::Code => "code",
         ChunkKind::ListItem => "list_item",
         ChunkKind::Image => "image",
+        ChunkKind::Audio => "audio",
+        ChunkKind::Video => "video",
     }
 }
 
@@ -318,6 +320,8 @@ impl TextIndex {
                 bbox: row.bbox,
                 heading_path: row.heading.clone(),
                 section_id: row.section_id,
+                time: None,
+                media: None,
             };
             hits.push(TextHit {
                 id: GlobalId {
@@ -360,6 +364,7 @@ mod tests {
             heading_path: vec!["第3章".into(), "财务".into()],
             section_id: 7,
             char_len: text.chars().count() as u32,
+            media: None,
             image_meta: None,
             tenant: None,
             acl: vec!["public".into()],

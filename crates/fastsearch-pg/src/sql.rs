@@ -184,6 +184,7 @@ impl ChunkRow {
             heading_path: self.heading_path.clone(),
             section_id: self.section_id as u64,
             char_len: self.char_len as u32,
+            media: None, // 媒资 jsonb 列在 MM2 接入；当前 ChunkRow 不持 media
             image_meta,
             tenant: self.tenant.clone(),
             acl: self.acl.clone(),
@@ -212,6 +213,7 @@ mod tests {
             heading_path: vec!["第3章".into(), "财务".into()],
             section_id: 17,
             char_len: 8,
+            media: None,
             image_meta: None,
             tenant: Some("acme".into()),
             acl: vec!["team-a".into(), "public".into()],

@@ -40,6 +40,7 @@ fn to_core(dc: DocparseChunk, doc_id: &str) -> Chunk {
         heading_path: dc.heading_path,
         section_id: dc.section_id,
         char_len: dc.char_len,
+        media: None,
         image_meta: dc.image,
         tenant: None,
         acl: vec!["public".to_string()],

@@ -13,5 +13,8 @@ mod query;
 pub use error::{CoreError, Result};
 pub use filter::{AclFilter, FieldSource, FieldValue, Filter};
 pub use fusion::{fuse, Fusion, Scored};
-pub use model::{BBox, Chunk, ChunkKind, Citation, GlobalId, ImageMeta};
+pub use model::{
+    AssetPointer, BBox, Chunk, ChunkKind, Citation, GlobalId, ImageMeta, MediaRef, Modality,
+    TimeSpan,
+};
 pub use query::{Collapse, RerankSpec, SearchMode, SearchRequest};

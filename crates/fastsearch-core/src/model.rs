@@ -26,6 +26,77 @@ pub enum ChunkKind {
     Code,
     ListItem,
     Image,
+    Audio,
+    Video,
+}
+
+impl ChunkKind {
+    /// 模态（嵌入路由 + 过滤下推用，见多模态计划 D4）。文本类→Text，图→Image，音→Audio，视频→Video。
+    pub fn modality(self) -> Modality {
+        match self {
+            ChunkKind::Image => Modality::Image,
+            ChunkKind::Audio => Modality::Audio,
+            ChunkKind::Video => Modality::Video,
+            _ => Modality::Text,
+        }
+    }
+}
+
+/// 检索/嵌入模态。serde snake_case，可作 `Filter` 字段值下推（普通元数据，非新搜索参数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Modality {
+    Text,
+    Image,
+    Audio,
+    Video,
+}
+
+impl Modality {
+    /// 落库/过滤用的稳定字符串（与 serde snake_case 一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Modality::Text => "text",
+            Modality::Image => "image",
+            Modality::Audio => "audio",
+            Modality::Video => "video",
+        }
+    }
+}
+
+/// 音视频时间区间（毫秒）。用于深链与时间过滤。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSpan {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// 如何取到媒资字节。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum AssetPointer {
+    /// 字节在 PG `bytea`（小裁图，随逻辑复制走）。
+    Inline,
+    /// 对象存储 key/uri（大媒资）。
+    Object { uri: String },
+    /// 仅坐标无字节：跳转到原文位置（不能直接产出可显示字节）。
+    DocRegion { page: u32, bbox: BBox },
+}
+
+/// 媒资引用（图/音/视频的渲染与取字节所需；替换原 `ImageMeta` 的超集，迁移见多模态计划 §6）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaRef {
+    pub asset: AssetPointer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<TimeSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<BBox>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<AssetPointer>,
 }
 
 /// 图片 chunk 的渲染/审计元数据（非图片 chunk 为 None）。
@@ -51,6 +122,7 @@ pub struct Chunk {
     pub doc_id: String,
     pub chunk_id: u64,
     pub kind: ChunkKind,
+    /// **可检索文本表示**（正文 / caption / 转录）；媒资无文本时为 `""`（空串=不进 BM25）。
     pub text: String,
     pub page: u32,
     pub bbox: BBox,
@@ -59,6 +131,9 @@ pub struct Chunk {
     #[serde(default)]
     pub section_id: u64,
     pub char_len: u32,
+    /// 媒资引用（图/音/视频）。`image_meta` 为遗留字段，迁移到 `media` 见多模态计划 §6/MM2。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_meta: Option<ImageMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,6 +208,12 @@ pub struct Citation {
     pub heading_path: Vec<String>,
     #[serde(default)]
     pub section_id: u64,
+    /// 音视频深链区间（无则 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<TimeSpan>,
+    /// 渲染/取字节所需媒资引用（答案层据此内联展示；无则 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaRef>,
 }
 
 impl Citation {
@@ -144,6 +225,85 @@ impl Citation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modality_derivation_and_serde() {
+        assert_eq!(ChunkKind::Paragraph.modality(), Modality::Text);
+        assert_eq!(ChunkKind::Table.modality(), Modality::Text);
+        assert_eq!(ChunkKind::Image.modality(), Modality::Image);
+        assert_eq!(ChunkKind::Audio.modality(), Modality::Audio);
+        assert_eq!(ChunkKind::Video.modality(), Modality::Video);
+        // serde snake_case，可作 Filter 字段值
+        assert_eq!(
+            serde_json::to_string(&Modality::Image).unwrap(),
+            "\"image\""
+        );
+        assert_eq!(Modality::Audio.as_str(), "audio");
+        // 新增 ChunkKind 变体 serde
+        assert_eq!(
+            serde_json::to_string(&ChunkKind::Video).unwrap(),
+            "\"video\""
+        );
+        let k: ChunkKind = serde_json::from_str("\"audio\"").unwrap();
+        assert_eq!(k, ChunkKind::Audio);
+    }
+
+    #[test]
+    fn media_ref_serde_roundtrip() {
+        // 各 AssetPointer 变体 + 时间区间 + region
+        let m = MediaRef {
+            asset: AssetPointer::Object {
+                uri: "s3://bucket/clip.mp4".into(),
+            },
+            media_type: Some("video/mp4".into()),
+            time: Some(TimeSpan {
+                start_ms: 1000,
+                end_ms: 4500,
+            }),
+            region: None,
+            caption_source: Some("asr".into()),
+            thumbnail: Some(AssetPointer::Inline),
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRef>(&j).unwrap(), m);
+        // tag 形式：AssetPointer 用 internally tagged "kind"
+        let inline: AssetPointer = serde_json::from_str(r#"{"kind":"inline"}"#).unwrap();
+        assert_eq!(inline, AssetPointer::Inline);
+        let region: AssetPointer = serde_json::from_str(
+            r#"{"kind":"doc_region","page":3,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0}}"#,
+        )
+        .unwrap();
+        assert!(matches!(region, AssetPointer::DocRegion { page: 3, .. }));
+    }
+
+    #[test]
+    fn citation_time_media_default_and_roundtrip() {
+        // 旧 Citation JSON（无 time/media）应能解析（serde default）
+        let old = r#"{"collection":"kb","doc_id":"d","chunk_id":1,"page":1,
+            "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0}}"#;
+        let c: Citation = serde_json::from_str(old).unwrap();
+        assert!(c.time.is_none() && c.media.is_none());
+        // 带 time 的回环
+        let c2 = Citation {
+            time: Some(TimeSpan {
+                start_ms: 5,
+                end_ms: 9,
+            }),
+            ..c.clone()
+        };
+        let j = serde_json::to_string(&c2).unwrap();
+        assert_eq!(serde_json::from_str::<Citation>(&j).unwrap(), c2);
+    }
+
+    #[test]
+    fn chunk_media_defaults_none() {
+        // 旧 Chunk JSON（无 media）解析 → media None（additive 向后兼容）
+        let json = r#"{"doc_id":"a","chunk_id":1,"kind":"audio","text":"转录文本",
+            "page":1,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":4}"#;
+        let c: Chunk = serde_json::from_str(json).unwrap();
+        assert_eq!(c.kind, ChunkKind::Audio);
+        assert!(c.media.is_none());
+    }
 
     #[test]
     fn chunk_kind_serde_snake_case() {
@@ -184,6 +344,7 @@ mod tests {
             heading_path: vec![],
             section_id: 17,
             char_len: 1,
+            media: None,
             image_meta: None,
             tenant: None,
             acl: default_acl(),

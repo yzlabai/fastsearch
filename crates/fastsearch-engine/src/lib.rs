@@ -100,6 +100,8 @@ fn kind_str(k: ChunkKind) -> &'static str {
         ChunkKind::Code => "code",
         ChunkKind::ListItem => "list_item",
         ChunkKind::Image => "image",
+        ChunkKind::Audio => "audio",
+        ChunkKind::Video => "video",
     }
 }
 
@@ -443,6 +445,8 @@ impl Engine {
                     },
                     heading_path: vec![],
                     section_id: 0,
+                    time: None,
+                    media: None,
                 })
             });
         }
@@ -708,6 +712,7 @@ mod tests {
             heading_path: vec!["第3章".into()],
             section_id: 7,
             char_len: text.chars().count() as u32,
+            media: None,
             image_meta: None,
             tenant: None,
             acl: vec!["public".into()],

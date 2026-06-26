@@ -38,6 +38,8 @@ impl VecMeta {
             bbox: self.bbox,
             heading_path: self.heading_path.clone(),
             section_id: self.section_id,
+            time: None,
+            media: None,
         }
     }
 }

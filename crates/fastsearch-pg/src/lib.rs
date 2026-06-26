@@ -159,6 +159,7 @@ mod tests {
             heading_path: vec!["章".into()],
             section_id: 1,
             char_len: 5,
+            media: None,
             image_meta: None,
             tenant: None,
             acl: vec!["public".into()],
