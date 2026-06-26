@@ -50,6 +50,17 @@ enum Command {
         /// 输入文件；省略或 `-` 读 stdin。
         input: Option<PathBuf>,
     },
+    /// 喂一个文件夹：递归灌入其中的 .md/.txt（每文件一个 doc，doc_id=相对路径），随后可检索。
+    IndexDir {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, default_value = "default")]
+        collection: String,
+        #[arg(long, value_enum, default_value_t = Tok::Jieba)]
+        tokenizer: Tok,
+        /// 资料文件夹路径。
+        dir: PathBuf,
+    },
     /// 检索（落盘 keyword）。
     Search {
         #[arg(long)]
@@ -155,6 +166,23 @@ fn main() -> Result<()> {
             };
             let n = cmd_index(&opts, &bytes)?;
             eprintln!("indexed {n} chunk(s) for doc '{}'", opts.doc_id);
+        }
+        Command::IndexDir {
+            data,
+            collection,
+            tokenizer,
+            dir,
+        } => {
+            let opts = fastsearch_cli::IndexDirOpts {
+                data,
+                collection,
+                tokenizer: tokenizer.into(),
+            };
+            let (files, chunks) = fastsearch_cli::cmd_index_dir(&opts, &dir)?;
+            eprintln!(
+                "indexed {files} file(s), {chunks} chunk(s) from {}",
+                dir.display()
+            );
         }
         Command::Search {
             data,

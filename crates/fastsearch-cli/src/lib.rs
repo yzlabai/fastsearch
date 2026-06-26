@@ -77,6 +77,110 @@ pub fn parse_chunks(bytes: &[u8], doc_id: &str) -> Result<Vec<Chunk>> {
     }
 }
 
+/// 解析 markdown 标题行 → `(层级, 标题)`；非标题返回 None。
+fn parse_md_heading(line: &str) -> Option<(usize, String)> {
+    let t = line.trim_start();
+    let level = t.chars().take_while(|&c| c == '#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let title = t[level..].trim();
+    // 需 `#` 后有空白（避免把 `#tag` 误判为标题）。
+    if title.is_empty() || !t[level..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some((level, title.to_string()))
+}
+
+fn heading_titles(path: &[(usize, String)]) -> Vec<String> {
+    path.iter().map(|(_, t)| t.clone()).collect()
+}
+
+fn mk_text_chunk(
+    doc_id: &str,
+    id: &mut u64,
+    kind: ChunkKind,
+    text: String,
+    hp: Vec<String>,
+) -> Chunk {
+    let c = Chunk {
+        doc_id: doc_id.to_string(),
+        chunk_id: *id,
+        kind,
+        char_len: text.chars().count() as u32,
+        text,
+        page: 1, // 纯文本/markdown 无页码概念
+        bbox: BBox {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 0.0,
+            y1: 0.0,
+        },
+        heading_path: hp,
+        section_id: 0,
+        media: None,
+        tenant: None,
+        acl: vec!["public".to_string()],
+    };
+    *id += 1;
+    c
+}
+
+/// flush 待定正文段为一个 Paragraph chunk（非空才推）。
+fn flush_para(
+    buf: &mut Vec<&str>,
+    chunks: &mut Vec<Chunk>,
+    next: &mut u64,
+    doc_id: &str,
+    path: &[(usize, String)],
+) {
+    if buf.is_empty() {
+        return;
+    }
+    let text = buf.join(" ").trim().to_string();
+    buf.clear();
+    if !text.is_empty() {
+        chunks.push(mk_text_chunk(
+            doc_id,
+            next,
+            ChunkKind::Paragraph,
+            text,
+            heading_titles(path),
+        ));
+    }
+}
+
+/// 把纯文本 / markdown 内容切成 chunk：**空行分段**；markdown 标题（`# …`）更新 `heading_path`
+/// 并自成一个 `Heading` chunk，正文段为 `Paragraph`。供"喂一个文件夹"的端到端检索（无需 PDF/docparse）。
+pub fn chunk_text(content: &str, doc_id: &str) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    let mut path: Vec<(usize, String)> = Vec::new();
+    let mut buf: Vec<&str> = Vec::new();
+    let mut next = 0u64;
+    for line in content.lines() {
+        if let Some((level, title)) = parse_md_heading(line) {
+            flush_para(&mut buf, &mut chunks, &mut next, doc_id, &path);
+            while path.last().map(|(l, _)| *l >= level).unwrap_or(false) {
+                path.pop();
+            }
+            path.push((level, title.clone()));
+            chunks.push(mk_text_chunk(
+                doc_id,
+                &mut next,
+                ChunkKind::Heading,
+                title,
+                heading_titles(&path),
+            ));
+        } else if line.trim().is_empty() {
+            flush_para(&mut buf, &mut chunks, &mut next, doc_id, &path);
+        } else {
+            buf.push(line);
+        }
+    }
+    flush_para(&mut buf, &mut chunks, &mut next, doc_id, &path);
+    chunks
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Meta {
     tokenizer: String,
@@ -137,6 +241,64 @@ pub fn cmd_index(opts: &IndexOpts, input: &[u8]) -> Result<usize> {
     }
     engine.commit()?;
     Ok(chunks.len())
+}
+
+/// index-dir 选项（喂整个文件夹）。
+pub struct IndexDirOpts {
+    pub data: PathBuf,
+    pub collection: String,
+    pub tokenizer: TokenizerKind,
+}
+
+/// 文本类文件后缀（其余忽略——PDF 等需 `parse` feature 的 `ingest`）。
+fn is_text_file(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some("md") | Some("markdown") | Some("txt") | Some("text")
+    )
+}
+
+/// 递归收集文件夹下的文本类文件（确定性：调用方排序）。
+fn collect_text_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
+        let p = entry?.path();
+        if p.is_dir() {
+            collect_text_files(&p, out)?;
+        } else if is_text_file(&p) {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+/// **喂一个文件夹**：递归遍历 `root` 下的 .md/.txt（确定性排序），对每个文件 `chunk_text` 切块、
+/// 按**文件**做 doc 级灌入（`doc_id` = 相对路径，再灌即替换）。返回 `(文件数, chunk 数)`。
+/// 之后即可 `cmd_search` 对这批内容检索——一个不依赖 PDF/docparse 的端到端检索闭环。
+pub fn cmd_index_dir(opts: &IndexDirOpts, root: &Path) -> Result<(usize, usize)> {
+    std::fs::create_dir_all(&opts.data)?;
+    let tokenizer = load_or_init_meta(&opts.data, opts.tokenizer)?;
+    let mut engine = open_engine(&opts.data, tokenizer)?;
+    let mut files = Vec::new();
+    collect_text_files(root, &mut files)?;
+    files.sort(); // 确定性：稳定的 chunk_id/doc 顺序
+    let mut total = 0usize;
+    for path in &files {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let chunks = chunk_text(&content, &rel);
+        engine.remove_doc(&opts.collection, &rel)?; // 替换语义
+        for c in &chunks {
+            engine.ingest(&opts.collection, c)?;
+        }
+        total += chunks.len();
+    }
+    engine.commit()?;
+    Ok((files.len(), total))
 }
 
 /// search 选项。
@@ -299,6 +461,83 @@ mod tests {
         assert_eq!(hits[0].id.chunk_id, 1);
         assert_eq!(hits[0].citation.page, 23);
         assert_eq!(hits[0].citation.heading_path, vec!["第3章", "财务"]);
+    }
+
+    #[test]
+    fn chunk_text_markdown_headings_and_paras() {
+        let md = "# 财报\n\n毛利率 提升 至 42%。\n\n## 风险\n\n汇率 波动 影响 海外 收入。\n\n#notag 不是标题\n";
+        let cs = chunk_text(md, "report.md");
+        // Heading(财报) + Para + Heading(风险) + Para + Para(#notag 行)
+        let kinds: Vec<_> = cs.iter().map(|c| c.kind).collect();
+        assert_eq!(cs[0].kind, ChunkKind::Heading);
+        assert_eq!(cs[0].text, "财报");
+        // "毛利率" 段在 财报 标题下
+        let mao = cs.iter().find(|c| c.text.contains("毛利率")).unwrap();
+        assert_eq!(mao.heading_path, vec!["财报"]);
+        // "汇率" 段在 财报>风险 下
+        let fx = cs.iter().find(|c| c.text.contains("汇率")).unwrap();
+        assert_eq!(fx.heading_path, vec!["财报", "风险"]);
+        // chunk_id 连续从 0
+        assert_eq!(cs[0].chunk_id, 0);
+        assert!(cs.windows(2).all(|w| w[1].chunk_id == w[0].chunk_id + 1));
+        // `#notag` 无空白 → 不是标题，作正文
+        assert!(cs.iter().any(|c| c.text.contains("#notag")));
+        assert!(kinds.contains(&ChunkKind::Paragraph));
+    }
+
+    #[test]
+    fn index_dir_then_search() {
+        let src = tempfile::tempdir().unwrap();
+        // 模拟"一个资料文件夹"：两篇 markdown + 一个子目录 + 一个被忽略的非文本文件。
+        std::fs::write(
+            src.path().join("finance.md"),
+            "# 财务\n\n公司 毛利率 提升 至 42%。\n\n营业 收入 同比 增长。\n",
+        )
+        .unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(
+            src.path().join("sub").join("product.txt"),
+            "新一代 旗舰 手机 搭载 自研 芯片。",
+        )
+        .unwrap();
+        std::fs::write(src.path().join("ignore.bin"), b"\x00\x01binary").unwrap();
+
+        let data = tempfile::tempdir().unwrap();
+        let iopts = IndexDirOpts {
+            data: data.path().to_path_buf(),
+            collection: "kb".into(),
+            tokenizer: TokenizerKind::Jieba,
+        };
+        let (files, chunks) = cmd_index_dir(&iopts, src.path()).unwrap();
+        assert_eq!(files, 2, "只灌 .md/.txt（忽略 .bin）");
+        assert!(chunks >= 3);
+
+        let search = |q: &str| {
+            cmd_search(&SearchOpts {
+                data: data.path().to_path_buf(),
+                collection: "kb".into(),
+                query: q.into(),
+                top_k: 10,
+                kind: None,
+                page_min: None,
+                page_max: None,
+            })
+            .unwrap()
+        };
+        // 跨文件检索：命中来自不同文件，doc_id = 相对路径。
+        let mao = search("毛利率");
+        assert!(!mao.is_empty());
+        assert_eq!(mao[0].id.doc_id, "finance.md");
+        assert_eq!(mao[0].citation.heading_path, vec!["财务"]);
+
+        let chip = search("自研 芯片");
+        assert!(!chip.is_empty());
+        assert_eq!(chip[0].id.doc_id, "sub/product.txt");
+
+        // 子目录文件确实被收录、检索得到。
+        assert!(search("旗舰 手机")
+            .iter()
+            .any(|h| h.id.doc_id == "sub/product.txt"));
     }
 
     #[test]

@@ -16,10 +16,16 @@
 ## 2. 命令
 
 ```
-fastsearch index  --data <dir> --collection <c> --doc-id <id> [--tokenizer default|jieba] [INPUT|-]
-fastsearch search --data <dir> --collection <c> --query <q> [--top-k N] [--kind K]
-                  [--page-min N] [--page-max N] [--json]
+fastsearch index     --data <dir> --collection <c> --doc-id <id> [--tokenizer default|jieba] [INPUT|-]
+fastsearch index-dir --data <dir> --collection <c> [--tokenizer default|jieba] <DIR>
+fastsearch search    --data <dir> --collection <c> --query <q> [--top-k N] [--kind K]
+                     [--page-min N] [--page-max N] [--json]
+fastsearch ingest    <PDF> --data <dir> --collection <c> --doc-id <id>   # 需 --features parse
+fastsearch eval      --golden <g.json> [--baseline <b.json>] [--tol] [--k]
 ```
+- **`index-dir <DIR>`**：递归遍历文件夹下 `.md/.txt/.markdown/.text`，按文件做 doc 级灌入
+  （`doc_id`=相对路径），markdown 标题切 `Heading` chunk + 维护 `heading_path`、空行分段。
+  一个**不依赖 PDF/docparse 的"喂文件夹→检索"端到端闭环**。其余后缀忽略（PDF 走 `ingest`）。
 - INPUT 为 docparse chunks 文件或 `-`/省略读 stdin。
 - 输入格式：JSON 数组 或 NDJSON（每行一个 chunk）。docparse chunk 字段 `id`→`chunk_id`，`doc_id` 由 `--doc-id` 注入；`acl` 默认 `[public]`。
 
