@@ -208,11 +208,12 @@ pub fn pgvector_search_sql(
     if let Some(f) = filter {
         wheres.push(b.build(f));
     }
+    // heading_path/media 一并取回，供 Rust 侧对**不可翻译子句**（HeadingPrefix/时间等）做精确后过滤。
     let sql = format!(
         "SELECT collection, doc_id, chunk_id, kind, modality, page, section_id, tenant, acl, \
-         1 - (embedding <=> $1::vector) AS score \
+         heading_path, media::text, 1 - (embedding <=> $1::text::vector) AS score \
          FROM {table} WHERE {} \
-         ORDER BY embedding <=> $1::vector LIMIT {limit}",
+         ORDER BY embedding <=> $1::text::vector LIMIT {limit}",
         wheres.join(" AND ")
     );
     (sql, b.params)
@@ -486,7 +487,7 @@ mod tests {
         ]);
         let (sql, params) = pgvector_search_sql("t", 80, Some(&acl), Some(&filter));
         // 查询向量是 $1；ACL 先入参（$2 tenant, $3 tags），filter 后（$4 modality, $5 page）。
-        assert!(sql.contains("embedding <=> $1::vector"));
+        assert!(sql.contains("embedding <=> $1::text::vector"));
         assert!(sql.contains("tenant = $2"));
         assert!(sql.contains("'public' = ANY(acl) OR acl && $3::text[]"));
         assert!(sql.contains("modality = $4"));

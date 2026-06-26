@@ -119,6 +119,158 @@ impl PgStore {
             .map(|r| Ok((r.try_get::<_, String>("collection")?, row_to_chunk(r)?)))
             .collect()
     }
+
+    /// **B6 直查档**：pgvector ANN 检索（ANN 在 PG 跑）。`acl`+可翻译 `filter` 下推 SQL（精确）、
+    /// 不可翻译子句走 SUPERSET + **Rust 精确后过滤**（守不变量 #5）；`iterative_scan` 让 HNSW
+    /// 在选择性过滤下仍 filter-aware（pgvector ≥0.8）。over-fetch `k×over_fetch` 抵消后过滤损耗。
+    /// 返回按余弦相似降序、同分按 GlobalId 升序（确定 tie-break）的 top-k `(citation_id, score)`。
+    pub async fn vector_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        over_fetch: usize,
+        acl: Option<&fastsearch_core::AclFilter>,
+        filter: Option<&fastsearch_core::Filter>,
+    ) -> Result<Vec<fastsearch_core::Scored>> {
+        if k == 0 {
+            return Ok(vec![]);
+        }
+        let limit = k.saturating_mul(over_fetch.max(1)).max(k);
+        let (sql, sparams) = pgvector_search_sql(&self.cfg.table, limit, acl, filter);
+        // filter-aware：iterative scan + 提高 ef_search（会话级，对本直查连接生效）。
+        self.client
+            .batch_execute("SET hnsw.iterative_scan = relaxed_order; SET hnsw.ef_search = 100;")
+            .await
+            .ok(); // 旧版 pgvector 无此 GUC 时忽略（退化为普通后过滤）。
+                   // $1 = 查询向量（以文本字面 '[..]' 传，SQL 内 ::vector 转换，免 pgvector ToSql 依赖）。
+        let qvec = format_vector(query);
+        let mut owned: Vec<Box<dyn ToSql + Sync>> = vec![Box::new(qvec)];
+        for p in &sparams {
+            owned.push(match p {
+                SqlParam::Text(s) => Box::new(s.clone()),
+                SqlParam::Int(i) => Box::new(*i),
+                SqlParam::TextArray(a) => Box::new(a.clone()),
+            });
+        }
+        let params: Vec<&(dyn ToSql + Sync)> =
+            owned.iter().map(|b| &**b as &(dyn ToSql + Sync)).collect();
+        let rows = self.client.query(&sql, &params).await?;
+
+        // Rust 精确后过滤（filter + ACL 复核）+ 组装 Scored。
+        let mut scored: Vec<fastsearch_core::Scored> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let row = PgVecRow::from_row(r)?;
+            if let Some(f) = filter {
+                if !f.eval(&row) {
+                    continue;
+                }
+            }
+            if let Some(a) = acl {
+                if !a.visible(&row) {
+                    continue;
+                }
+            }
+            scored.push(fastsearch_core::Scored {
+                id: row.gid(),
+                score: r.try_get::<_, f64>("score")?,
+            });
+        }
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        scored.truncate(k);
+        Ok(scored)
+    }
+}
+
+/// f32 向量 → pgvector 文本字面 `[v1,v2,...]`（配合 SQL 内 `$1::text::vector`：先 text 再 vector，
+/// 避免 tokio-postgres 把 `$1` 推断成 vector 类型而拒收 String，同 jsonb 写入的处理）。
+fn format_vector(v: &[f32]) -> String {
+    let mut s = String::from("[");
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&x.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// 直查返回行的字段视图，供 `Filter::eval`/`AclFilter::visible` 精确后过滤（实现 `FieldSource`）。
+struct PgVecRow {
+    collection: String,
+    doc_id: String,
+    chunk_id: i64,
+    kind: String,
+    modality: String,
+    page: i32,
+    section_id: i64,
+    tenant: Option<String>,
+    acl: Vec<String>,
+    heading_path: Vec<String>,
+    /// 由 media jsonb 解析出的时间区间（供 time_start_ms/time_end_ms 后过滤）。
+    time: Option<fastsearch_core::TimeSpan>,
+}
+
+impl PgVecRow {
+    fn from_row(r: &Row) -> Result<Self> {
+        let media: Option<String> = r.try_get("media")?;
+        let time = match media.as_deref() {
+            Some(j) => serde_json::from_str::<fastsearch_core::MediaRef>(j)
+                .ok()
+                .and_then(|m| m.time),
+            None => None,
+        };
+        Ok(PgVecRow {
+            collection: r.try_get("collection")?,
+            doc_id: r.try_get("doc_id")?,
+            chunk_id: r.try_get("chunk_id")?,
+            kind: r.try_get("kind")?,
+            modality: r.try_get("modality")?,
+            page: r.try_get("page")?,
+            section_id: r.try_get("section_id")?,
+            tenant: r.try_get("tenant")?,
+            acl: r.try_get("acl")?,
+            heading_path: r.try_get("heading_path")?,
+            time,
+        })
+    }
+
+    fn gid(&self) -> fastsearch_core::GlobalId {
+        fastsearch_core::GlobalId {
+            collection: self.collection.clone(),
+            doc_id: self.doc_id.clone(),
+            chunk_id: self.chunk_id as u64,
+        }
+    }
+}
+
+impl fastsearch_core::FieldSource for PgVecRow {
+    fn get(&self, field: &str) -> Option<fastsearch_core::FieldValue> {
+        use fastsearch_core::FieldValue;
+        match field {
+            "kind" => Some(FieldValue::Str(self.kind.clone())),
+            "modality" => Some(FieldValue::Str(self.modality.clone())),
+            "doc_id" => Some(FieldValue::Str(self.doc_id.clone())),
+            "collection" => Some(FieldValue::Str(self.collection.clone())),
+            "tenant" => self.tenant.clone().map(FieldValue::Str),
+            "page" => Some(FieldValue::Int(self.page as i64)),
+            "section_id" => Some(FieldValue::Int(self.section_id)),
+            "time_start_ms" => self.time.map(|t| FieldValue::Int(t.start_ms as i64)),
+            "time_end_ms" => self.time.map(|t| FieldValue::Int(t.end_ms as i64)),
+            _ => None,
+        }
+    }
+    fn heading_path(&self) -> &[String] {
+        &self.heading_path
+    }
+    fn acl(&self) -> &[String] {
+        &self.acl
+    }
 }
 
 /// tokio_postgres::Row → Chunk（经 ChunkRow）。
@@ -207,5 +359,98 @@ mod tests {
             store.fetch_doc("kb", "a.pdf").await.expect("fetch3").len(),
             0
         );
+    }
+
+    /// B6 直查集成：pgvector ANN + ACL 下推 + filter-aware（需 DATABASE_URL）。
+    #[tokio::test]
+    async fn integration_pgvector_search() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip integration_pgvector_search: DATABASE_URL not set");
+            return;
+        };
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_vec_it".into();
+        cfg.vector_dim = 4;
+        cfg.vector_type = VectorType::Vector; // 精确 vector(4)，便于断言
+        let mut store = PgStore::connect(cfg).await.expect("connect");
+        // 干净重建表（schema 可能变）。
+        store
+            .client
+            .batch_execute("DROP TABLE IF EXISTS fastsearch_vec_it")
+            .await
+            .ok();
+        store.ensure_schema().await.expect("schema");
+        store
+            .client
+            .batch_execute(&sql::ann_index_sql("fastsearch_vec_it"))
+            .await
+            .ok();
+
+        // 4 个 chunk：1=image/team-a, 2=paragraph/team-a, 3=paragraph/team-b, 4=paragraph/team-b。
+        let mut chunks = vec![
+            sample("d.pdf", 1),
+            sample("d.pdf", 2),
+            sample("d.pdf", 3),
+            sample("d.pdf", 4),
+        ];
+        chunks[0].kind = ChunkKind::Image;
+        for (i, c) in chunks.iter_mut().enumerate() {
+            c.tenant = Some("acme".into());
+            c.acl = vec![if i < 2 { "team-a" } else { "team-b" }.into()];
+        }
+        store
+            .upsert_doc("kb", "d.pdf", &chunks)
+            .await
+            .expect("upsert");
+
+        // 写 embedding（正交单位向量）：1=[1,0,0,0] ... 4=[0,0,0,1]。
+        for id in 1..=4u64 {
+            let mut e = vec![0.0f32; 4];
+            e[(id - 1) as usize] = 1.0;
+            store
+                .client
+                .execute(
+                    "UPDATE fastsearch_vec_it SET embedding = $1::text::vector WHERE chunk_id = $2",
+                    &[&format_vector(&e), &(id as i64)],
+                )
+                .await
+                .expect("set embedding");
+        }
+
+        let acl_a = fastsearch_core::AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        // 查最接近 [1,0,0,0]（=chunk 1）+ team-a ACL → 命中 team-a（chunk 1/2），不见 team-b。
+        let q = vec![0.9f32, 0.1, 0.0, 0.0];
+        let hits = store
+            .vector_search(&q, 5, 4, Some(&acl_a), None)
+            .await
+            .expect("search");
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].id.chunk_id, 1, "最近邻应为 chunk 1");
+        for h in &hits {
+            assert!(h.id.chunk_id <= 2, "越权：team-b（chunk 3/4）不应可见");
+        }
+
+        // filter-aware：查最接近 [0,0,0,1]（=chunk 4，team-b）但过滤 modality=image →
+        // 只有 chunk 1 是 image。iterative scan + 下推 WHERE 仍能召回到它（不因后过滤崩）。
+        let only_image = fastsearch_core::Filter::Eq(
+            "modality".into(),
+            fastsearch_core::FieldValue::Str("image".into()),
+        );
+        let q2 = vec![0.0f32, 0.0, 0.0, 1.0];
+        let hits2 = store
+            .vector_search(&q2, 3, 8, None, Some(&only_image))
+            .await
+            .expect("search2");
+        assert_eq!(hits2.len(), 1, "仅 1 个 image");
+        assert_eq!(hits2[0].id.chunk_id, 1);
+
+        store
+            .client
+            .batch_execute("DROP TABLE IF EXISTS fastsearch_vec_it")
+            .await
+            .ok();
     }
 }
