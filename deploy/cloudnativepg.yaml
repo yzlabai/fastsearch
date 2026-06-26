@@ -1,0 +1,77 @@
+# CloudNativePG 部署样例：托管 PG（pgvector + 逻辑复制）+ fastsearch-server。
+# 守"托管 PG 可移植"硬约束：只用 pgvector 扩展 + 逻辑复制，无任何 shared_preload_libraries 原生扩展。
+# 前置：集群已装 CloudNativePG operator（https://cloudnative-pg.io）。
+#   kubectl apply -f deploy/cloudnativepg.yaml
+# 状态：制品已编写，K8s 实跑为 `待运行验证`（本环境无集群）。
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: fastsearch-pg
+spec:
+  instances: 3                      # 1 主 + 2 副本（HA）
+  imageName: ghcr.io/cloudnative-pg/postgresql:17   # 需含 pgvector，或用 pgvector 镜像
+  postgresql:
+    parameters:
+      # 逻辑复制（CDC 必需）。不设任何 shared_preload_libraries 原生扩展。
+      wal_level: "logical"
+      max_replication_slots: "8"
+      max_wal_senders: "8"
+  bootstrap:
+    initdb:
+      database: fastsearch
+      owner: fastsearch
+      postInitSQL:
+        - CREATE EXTENSION IF NOT EXISTS vector;   # 唯一扩展：pgvector
+  storage:
+    size: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastsearch-server
+spec:
+  replicas: 2                       # 引擎无状态、可多副本（派生索引各自从复制流/快照重建）
+  selector:
+    matchLabels: { app: fastsearch-server }
+  template:
+    metadata:
+      labels: { app: fastsearch-server }
+    spec:
+      containers:
+        - name: server
+          image: fastsearch-server:latest   # 替换为你的镜像仓地址
+          ports:
+            - containerPort: 8642
+          env:
+            - name: FASTSEARCH_CDC
+              value: "1"
+            - name: DATABASE_URL          # CloudNativePG 生成的连接 secret
+              valueFrom:
+                secretKeyRef: { name: fastsearch-pg-app, key: uri }
+            - name: FASTSEARCH_KEYS
+              valueFrom:
+                secretKeyRef: { name: fastsearch-keys, key: keys }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          # 探针走 HTTP /healthz（镜像无 curl，用 httpGet 不需要）。
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8642 }
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8642 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: data
+          emptyDir: {}                # 派生索引可重建；生产可换 PVC 加速重启
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastsearch-server
+spec:
+  selector: { app: fastsearch-server }
+  ports:
+    - { port: 80, targetPort: 8642 }

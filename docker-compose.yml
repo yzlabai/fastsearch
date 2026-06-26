@@ -1,0 +1,52 @@
+# 一键起 fastsearch 全栈：pgvector（真源，逻辑复制）+ fastsearch-server（CDC 同步）。
+#   docker compose up --build
+#   curl -s localhost:8642/healthz
+# PG 侧只用 pgvector + 逻辑复制，不装任何需 shared_preload_libraries 的原生扩展（守可移植 N1b）。
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    # -c wal_level=logical 开逻辑复制（CDC 必需）。
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+    environment:
+      POSTGRES_USER: fastsearch
+      POSTGRES_PASSWORD: fastsearch
+      POSTGRES_DB: fastsearch
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastsearch"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      FASTSEARCH_KEYS: "dev=:public"
+      DATABASE_URL: "postgres://fastsearch:fastsearch@postgres:5432/fastsearch"
+      # 开启后台 CDC 同步（PG 真源 → 引擎派生索引）。需先在 PG 建 chunks 表 + publication
+      # （引擎首次 ensure_slot/bootstrap 会处理；schema 见 fastsearch-pg/sql.rs DDL）。
+      FASTSEARCH_CDC: "1"
+      # 真语义嵌入可选：把下面换成 ollama/openai（+ FASTSEARCH_EMBED_*），默认不嵌入=keyword。
+      # FASTSEARCH_EMBEDDER: "ollama"
+    ports:
+      - "8642:8642"
+    volumes:
+      - fsdata:/data
+
+volumes:
+  pgdata:
+  fsdata:
