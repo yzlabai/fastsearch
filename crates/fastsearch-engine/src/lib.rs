@@ -18,7 +18,8 @@ use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
 use fastsearch_sync::replication::{advance_slot, peek_with_lsn, ReplicationConfig};
 use fastsearch_sync::{Applier, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
-use fastsearch_vector::{VecMeta, VectorBackend, VectorBackendKind, VectorStore};
+pub use fastsearch_vector::{HnswParams, VectorBackendKind};
+use fastsearch_vector::{VecMeta, VectorBackend, VectorStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -236,20 +237,28 @@ impl Engine {
         })
     }
 
-    /// 打开**数据目录**下的完整派生索引（落盘恢复）：`<data>/text`（Tantivy mmap）+
-    /// `<data>/vector.bin`（向量快照）+ `<data>/checkpoint.json`（CDC 水位）。返回引擎与
-    /// 已持久化的 `applied_lsn`（无检查点则 0），供 `Applier::new` 续传。
+    /// 打开**数据目录**下的完整派生索引（落盘恢复），向量后端默认 `Brute`。
     pub fn open(data_dir: &Path, cfg: TextIndexConfig) -> Result<(Self, Lsn)> {
+        Self::open_with(data_dir, cfg, VectorBackendKind::Brute)
+    }
+
+    /// 同 [`open`](Self::open)，但**首启（无检查点）时用 `default_backend`**；已有检查点则沿用
+    /// 其记录的后端（不被 default 覆盖）。`<data>/text` + `vector.bin` + `checkpoint.json`。
+    pub fn open_with(
+        data_dir: &Path,
+        cfg: TextIndexConfig,
+        default_backend: VectorBackendKind,
+    ) -> Result<(Self, Lsn)> {
         let text_dir = data_dir.join("text");
         std::fs::create_dir_all(&text_dir)
             .map_err(|e| EngineError::Persist(format!("create data dir: {e}")))?;
         let text = TextIndex::open_or_create(&text_dir, cfg)?;
         let cp = Checkpoint::load(data_dir)?;
-        // 据检查点选向量后端 loader（hnsw 的 params 取自快照本身，此处仅定变体）。
-        let kind = if cp.vector_backend == "hnsw" {
-            VectorBackendKind::Hnsw(fastsearch_vector::HnswParams::default())
-        } else {
-            VectorBackendKind::Brute
+        // 已有检查点 → 沿用其后端（hnsw params 取自快照本身）；无检查点（首启）→ 用传入默认。
+        let kind = match cp.vector_backend.as_str() {
+            "hnsw" => VectorBackendKind::Hnsw(fastsearch_vector::HnswParams::default()),
+            "brute" => VectorBackendKind::Brute,
+            _ => default_backend,
         };
         let vector = VectorStore::load(kind, &vector_path(data_dir))
             .map_err(|e| EngineError::Vector(e.to_string()))?;

@@ -8,6 +8,8 @@
 //! - `FASTSEARCH_RATE_LIMIT`：`capacity,refill_per_sec`（每 key 令牌桶）；未设=不限流。
 //! - `FASTSEARCH_AUDIT`：设为 `1`/`stderr` 则每个成功请求向 stderr 输出一行审计 JSON。
 //! - `FASTSEARCH_EMBEDDER` = `hash`|`ollama`|`openai`（+ `FASTSEARCH_EMBED_*`）：真语义嵌入后端。
+//! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`hnsw`：向量后端。hnsw=近似 ANN（大规模、
+//!   近似召回+非确定）；仅首启生效，已建索引沿用其记录后端。
 //! - `FASTSEARCH_CDC=1`（+ `DATABASE_URL`，可选 `FASTSEARCH_CDC_SLOT`/`_PUBLICATION`/`_INTERVAL_MS`）：
 //!   起后台 CDC 同步循环（崩溃安全、落盘续传），从 PG 真源把变更同步到派生索引。
 
@@ -76,8 +78,16 @@ async fn main() -> anyhow::Result<()> {
         tokenizer,
         ..Default::default()
     };
+    // 向量后端：FASTSEARCH_VECTOR_BACKEND=hnsw 用 HNSW 近似（大规模，近似+非确定）；
+    // 默认 brute 暴力精确（确定）。仅首启（无检查点）生效；已建索引沿用其记录的后端。
+    let backend = match std::env::var("FASTSEARCH_VECTOR_BACKEND").as_deref() {
+        Ok("hnsw") => {
+            fastsearch_engine::VectorBackendKind::Hnsw(fastsearch_engine::HnswParams::default())
+        }
+        _ => fastsearch_engine::VectorBackendKind::Brute,
+    };
     // 打开数据目录下的派生索引（落盘恢复）：text + vector.bin + checkpoint.json。
-    let (mut engine, start_lsn) = Engine::open(&data, cfg)?;
+    let (mut engine, start_lsn) = Engine::open_with(&data, cfg, backend)?;
 
     // 嵌入后端配置（FASTSEARCH_EMBEDDER=ollama|openai；默认 hash→不嵌入）。
     let ecfg = fastsearch_embed::EmbedderConfig::from_env();
