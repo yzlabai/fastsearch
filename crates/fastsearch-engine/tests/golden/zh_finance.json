@@ -17,6 +17,16 @@
       "page": 2, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 29
     },
     {
+      "doc_id": "fin2024", "chunk_id": 3, "kind": "paragraph",
+      "text": "公司宣布每股派息 0.5 元，全年现金分红总额为 6 亿元。",
+      "page": 3, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 25
+    },
+    {
+      "doc_id": "fin2024", "chunk_id": 4, "kind": "paragraph",
+      "text": "净利润同比增长 25%，达到 18 亿元，盈利能力进一步增强。",
+      "page": 3, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 27
+    },
+    {
       "doc_id": "prod", "chunk_id": 0, "kind": "paragraph",
       "text": "新一代旗舰手机搭载自研芯片，图形与 AI 性能大幅提升。",
       "page": 1, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 26
@@ -27,6 +37,16 @@
       "page": 2, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 24
     },
     {
+      "doc_id": "prod", "chunk_id": 2, "kind": "paragraph",
+      "text": "新机型将于第三季度上市，预计带动手机出货量稳步增长。",
+      "page": 3, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 25
+    },
+    {
+      "doc_id": "risk", "chunk_id": 0, "kind": "paragraph",
+      "text": "报告期内汇率波动对海外业务收入造成一定影响，公司已采取套期保值。",
+      "page": 1, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 31
+    },
+    {
       "doc_id": "misc", "chunk_id": 0, "kind": "paragraph",
       "text": "公司在年度员工大会上表彰了优秀团队，并公布了新的休假政策。",
       "page": 1, "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0}, "char_len": 28
@@ -35,6 +55,13 @@
   "queries": [
     {"query": "毛利率", "relevant": {"kb:fin2024:0": 3, "kb:prod:1": 2}},
     {"query": "营业收入", "relevant": {"kb:fin2024:1": 3, "kb:fin2024:2": 1}},
-    {"query": "芯片研发", "relevant": {"kb:prod:0": 3, "kb:fin2024:2": 2}}
+    {"query": "芯片研发", "relevant": {"kb:prod:0": 3, "kb:fin2024:2": 2}},
+    {"query": "现金分红", "relevant": {"kb:fin2024:3": 3}},
+    {"query": "净利润", "relevant": {"kb:fin2024:4": 3}},
+    {"query": "手机出货量", "relevant": {"kb:prod:2": 3, "kb:prod:0": 1}},
+    {"query": "汇率波动", "relevant": {"kb:risk:0": 3}},
+    {"query": "旗舰手机", "relevant": {"kb:prod:0": 3, "kb:prod:1": 1}},
+    {"query": "自研芯片", "relevant": {"kb:prod:0": 3, "kb:fin2024:2": 1}},
+    {"query": "员工大会", "relevant": {"kb:misc:0": 3}}
   ]
 }

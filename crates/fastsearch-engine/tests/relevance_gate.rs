@@ -10,12 +10,22 @@ const GOLDEN: &str = include_str!("golden/zh_finance.json");
 const BASELINE: &str = include_str!("golden/zh_finance.baseline.json");
 const MM_GOLDEN: &str = include_str!("golden/multimodal.json");
 const MM_BASELINE: &str = include_str!("golden/multimodal.baseline.json");
+const EN_GOLDEN: &str = include_str!("golden/en_tech.json");
+const EN_BASELINE: &str = include_str!("golden/en_tech.baseline.json");
 const K: usize = 5;
 const TOL: f64 = 0.02;
 
 fn zh_cfg() -> TextIndexConfig {
     TextIndexConfig {
         tokenizer: TokenizerKind::Jieba,
+        ..Default::default()
+    }
+}
+
+/// 英文集用默认分词器（空白/标点切分）。
+fn en_cfg() -> TextIndexConfig {
+    TextIndexConfig {
+        tokenizer: TokenizerKind::Default,
         ..Default::default()
     }
 }
@@ -33,6 +43,20 @@ fn probe_print_metrics() {
     let mm = GoldenSet::from_json(MM_GOLDEN).unwrap();
     let mmm = golden::run(&mm, zh_cfg(), SearchMode::Keyword, K).unwrap();
     println!("PROBE_MM_METRICS {}", serde_json::to_string(&mmm).unwrap());
+    // 英文集（默认分词器）
+    let en = GoldenSet::from_json(EN_GOLDEN).unwrap();
+    let enm = golden::run(&en, en_cfg(), SearchMode::Keyword, K).unwrap();
+    println!("PROBE_EN_METRICS {}", serde_json::to_string(&enm).unwrap());
+}
+
+/// 英文相关性门禁：默认分词器下技术语料 keyword 召回不掉点（中英双集覆盖，A15）。
+#[test]
+fn en_no_regression() {
+    let set = GoldenSet::from_json(EN_GOLDEN).unwrap();
+    let current = golden::run(&set, en_cfg(), SearchMode::Keyword, K).unwrap();
+    let baseline: Metrics = serde_json::from_str(EN_BASELINE).unwrap();
+    assert_no_regression(&baseline, &current, TOL)
+        .unwrap_or_else(|e| panic!("en relevance regression: {e}\ncurrent={current:?}"));
 }
 
 /// 多模态相关性门禁：图 caption / 音视频转录经 keyword（M0 派生文本路线）可召回，nDCG/recall
