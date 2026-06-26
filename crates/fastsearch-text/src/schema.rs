@@ -59,6 +59,8 @@ pub struct Fields {
     pub acl: Field,
     pub heading_path: Field,
     pub bbox: Field,
+    /// 媒资引用 JSON（STORED，仅供命中组装 Citation.media/time，不索引/不过滤）。
+    pub media: Field,
 }
 
 /// 构建 schema + 字段句柄。text/heading 用给定分词器。
@@ -96,6 +98,7 @@ pub fn build_schema(tokenizer: TokenizerKind) -> (Schema, Fields) {
         acl: sb.add_text_field("acl", str_fast_stored()), // 多值：add_text 多次
         heading_path: sb.add_text_field("heading_path", STORED),
         bbox: sb.add_text_field("bbox", STORED),
+        media: sb.add_text_field("media", STORED),
     };
 
     (sb.build(), fields)

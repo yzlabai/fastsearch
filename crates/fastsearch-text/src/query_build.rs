@@ -6,7 +6,7 @@
 //! - **后过滤**：对取回的文档用 core `Filter::eval` + `AclFilter::visible` 做
 //!   **精确**判定（保证不越权、不误纳）。over-fetch 抵消后过滤的截断。
 
-use fastsearch_core::{AclFilter, BBox, FieldSource, FieldValue, Filter};
+use fastsearch_core::{AclFilter, BBox, FieldSource, FieldValue, Filter, MediaRef};
 use std::ops::Bound;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::{IndexRecordOption, Value};
@@ -220,6 +220,8 @@ pub struct StoredRow {
     pub bbox: BBox,
     pub heading: Vec<String>,
     pub acl: Vec<String>,
+    /// 媒资引用（STORED，供组装 Citation.media/time；无则 None）。
+    pub media: Option<MediaRef>,
 }
 
 impl FieldSource for StoredRow {
@@ -275,6 +277,8 @@ pub fn stored_row(doc: &TantivyDocument, f: &Fields) -> StoredRow {
             x1: 0.0,
             y1: 0.0,
         });
+    let media: Option<MediaRef> =
+        first_str(doc, f.media).and_then(|j| serde_json::from_str(&j).ok());
     StoredRow {
         kind: first_str(doc, f.kind).unwrap_or_default(),
         doc_id: first_str(doc, f.doc_id).unwrap_or_default(),
@@ -286,5 +290,6 @@ pub fn stored_row(doc: &TantivyDocument, f: &Fields) -> StoredRow {
         bbox,
         heading,
         acl,
+        media,
     }
 }

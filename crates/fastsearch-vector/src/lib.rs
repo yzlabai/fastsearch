@@ -7,7 +7,8 @@
 //! 量化 + pgvector 直查档为下一迭代。详见 [spec](../../docs/specs/15-vector.md)。
 
 use fastsearch_core::{
-    AclFilter, BBox, Citation, FieldSource, FieldValue, Filter, GlobalId, Scored, TimeSpan,
+    AclFilter, BBox, Citation, FieldSource, FieldValue, Filter, GlobalId, MediaRef, Scored,
+    TimeSpan,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,6 +33,9 @@ pub struct VecMeta {
     /// 音视频时间区间（无则 None）。
     #[serde(default)]
     pub time: Option<TimeSpan>,
+    /// 媒资引用（供命中组装 Citation.media；无则 None）。
+    #[serde(default)]
+    pub media: Option<MediaRef>,
 }
 
 impl VecMeta {
@@ -44,8 +48,10 @@ impl VecMeta {
             bbox: self.bbox,
             heading_path: self.heading_path.clone(),
             section_id: self.section_id,
-            time: self.time,
-            media: None,
+            time: self
+                .time
+                .or_else(|| self.media.as_ref().and_then(|m| m.time)),
+            media: self.media.clone(),
         }
     }
 }
@@ -312,6 +318,7 @@ mod tests {
                 y1: 1.0,
             },
             time: None,
+            media: None,
         }
     }
 

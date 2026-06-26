@@ -468,6 +468,8 @@ fn hits_json(hits: &[fastsearch_engine::SearchHit]) -> Vec<Value> {
                 "section_id": h.citation.section_id,
                 "highlight": h.highlight,
                 "merged_chunk_ids": h.merged_chunk_ids,
+                "time": h.citation.time,
+                "media": h.citation.media,
             })
         })
         .collect()

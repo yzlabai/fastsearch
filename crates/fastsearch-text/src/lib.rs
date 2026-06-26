@@ -125,6 +125,9 @@ impl TextIndex {
         }
         doc.add_text(f.heading_path, serde_json::to_string(&chunk.heading_path)?);
         doc.add_text(f.bbox, serde_json::to_string(&chunk.bbox)?);
+        if let Some(m) = &chunk.media {
+            doc.add_text(f.media, serde_json::to_string(m)?);
+        }
         self.writer.add_document(doc)?;
         Ok(())
     }
@@ -321,8 +324,9 @@ impl TextIndex {
                 bbox: row.bbox,
                 heading_path: row.heading.clone(),
                 section_id: row.section_id,
-                time: None,
-                media: None,
+                // 时间区间从媒资引用透出（音视频深链）；媒资引用供答案层渲染/取字节。
+                time: row.media.as_ref().and_then(|m| m.time),
+                media: row.media.clone(),
             };
             hits.push(TextHit {
                 id: GlobalId {

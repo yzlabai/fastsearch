@@ -119,6 +119,7 @@ fn vec_meta(collection: &str, c: &Chunk) -> VecMeta {
         acl: c.acl.clone(),
         bbox: c.bbox,
         time: c.media.as_ref().and_then(|m| m.time),
+        media: c.media.clone(),
     }
 }
 
@@ -877,6 +878,37 @@ mod tests {
         let h2 = e.search(&r2, None).unwrap();
         assert_eq!(h2.len(), 1);
         assert_eq!(h2[0].id.chunk_id, 3);
+    }
+
+    #[test]
+    fn media_time_surface_on_citation() {
+        use fastsearch_core::{AssetPointer, MediaRef, TimeSpan};
+        let mut e = engine();
+        // 音频 chunk：转录入 text，media 带时间区间 + 对象指针
+        let mut c = chunk("a.pdf", 1, ChunkKind::Audio, "meeting transcript notes", 1);
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Object {
+                uri: "s3://b/clip.mp3".into(),
+            },
+            media_type: Some("audio/mpeg".into()),
+            time: Some(TimeSpan {
+                start_ms: 3000,
+                end_ms: 8000,
+            }),
+            region: None,
+            caption_source: Some("asr".into()),
+            thumbnail: None,
+        });
+        e.ingest("kb", &c).unwrap();
+        e.commit().unwrap();
+        // keyword 路（转录命中）→ Citation 透出 time/media
+        let hits = e.search(&req("transcript"), None).unwrap();
+        assert_eq!(hits.len(), 1);
+        let cit = &hits[0].citation;
+        assert_eq!(cit.time.unwrap().start_ms, 3000);
+        let media = cit.media.as_ref().unwrap();
+        assert_eq!(media.media_type.as_deref(), Some("audio/mpeg"));
+        assert!(matches!(&media.asset, AssetPointer::Object { uri } if uri == "s3://b/clip.mp3"));
     }
 
     #[test]
