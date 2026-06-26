@@ -21,6 +21,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 解析 PDF（in-process docparse）→ 适配 → 索引（需 `--features parse`）。
+    #[cfg(feature = "parse")]
+    Ingest {
+        /// 待解析的 PDF 路径。
+        pdf: PathBuf,
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, default_value = "default")]
+        collection: String,
+        #[arg(long)]
+        doc_id: String,
+        #[arg(long, value_enum, default_value_t = Tok::Jieba)]
+        tokenizer: Tok,
+        #[arg(long)]
+        tenant: Option<String>,
+    },
     /// 灌入 docparse chunks（JSON 数组或 NDJSON；省略 INPUT 读 stdin）。
     Index {
         #[arg(long)]
@@ -102,6 +118,27 @@ fn read_input(input: &Option<PathBuf>) -> Result<Vec<u8>> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(feature = "parse")]
+        Command::Ingest {
+            pdf,
+            data,
+            collection,
+            doc_id,
+            tokenizer,
+            tenant,
+        } => {
+            let opts = fastsearch_cli::ingest::IngestOpts {
+                pdf,
+                data,
+                collection,
+                doc_id,
+                tokenizer: tokenizer.into(),
+                tenant,
+                acl: vec!["public".to_string()],
+            };
+            let n = fastsearch_cli::ingest::cmd_ingest(&opts)?;
+            eprintln!("ingested {n} chunk(s) from pdf for doc '{}'", opts.doc_id);
+        }
         Command::Index {
             data,
             collection,

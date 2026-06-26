@@ -27,10 +27,11 @@ anyhow.workspace = true
 # 解析（docparse-rs 融合 Option B：摄取热路径，feature 门控，搜索热路径零依赖）。
 # C 预演阶段用本地兄弟仓路径依赖；subtree 收编后改 workspace 内 path（见 docparse 融合方案 §4）。
 docparse-core = { path = "../../../docparse-rs/crates/docparse-core", optional = true }
+docparse-pdf = { path = "../../../docparse-rs/crates/docparse-pdf", optional = true }
 
 [features]
-# 开启 docparse 解析（无 ONNX/渲染）；默认不开，保持 CLI 精简。
-parse = ["dep:docparse-core"]
+# 开启 docparse 解析（core + pdf，无 ONNX/渲染）；默认不开，保持 CLI 精简。
+parse = ["dep:docparse-core", "dep:docparse-pdf"]
 
 [dev-dependencies]
 tempfile.workspace = true

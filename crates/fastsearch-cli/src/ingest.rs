@@ -6,7 +6,47 @@
 //!
 //! 搜索热路径（core/server/engine/...）不依赖任何 docparse crate；解析能力仅在本 feature 编译。
 
+use anyhow::{Context, Result};
 use fastsearch_core::{AssetPointer, BBox, Chunk, ChunkKind, MediaRef};
+use fastsearch_text::TokenizerKind;
+use std::path::PathBuf;
+
+/// `fastsearch ingest <pdf>` 选项。
+pub struct IngestOpts {
+    pub pdf: PathBuf,
+    pub data: PathBuf,
+    pub collection: String,
+    pub doc_id: String,
+    pub tokenizer: TokenizerKind,
+    pub tenant: Option<String>,
+    pub acl: Vec<String>,
+}
+
+/// **in-process 解析 → 适配 → 索引**（doc 级替换）：读 PDF → docparse 解析+分块 →
+/// `from_docparse_chunk` 适配 → 灌入现有落盘索引。返回灌入条数。
+/// 这是融合 Option C 预演的"打通 解析→适配→索引"端到端路径（无需 shell 出 docparse JSON）。
+pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
+    let bytes =
+        std::fs::read(&opts.pdf).with_context(|| format!("reading pdf {}", opts.pdf.display()))?;
+    let doc = docparse_pdf::PdfParser::default()
+        .parse_bytes(&bytes)
+        .context("docparse pdf parse")?;
+    let dchunks = docparse_core::chunk::chunk_document(&doc);
+    let chunks: Vec<Chunk> = dchunks
+        .iter()
+        .map(|d| from_docparse_chunk(d, &opts.doc_id, opts.tenant.clone(), opts.acl.clone()))
+        .collect();
+
+    std::fs::create_dir_all(&opts.data)?;
+    let tokenizer = crate::load_or_init_meta(&opts.data, opts.tokenizer)?;
+    let mut engine = crate::open_engine(&opts.data, tokenizer)?;
+    engine.remove_doc(&opts.collection, &opts.doc_id)?; // 替换语义
+    for c in &chunks {
+        engine.ingest(&opts.collection, c)?;
+    }
+    engine.commit()?;
+    Ok(chunks.len())
+}
 
 /// docparse ChunkKind → fastsearch ChunkKind（前 6 类同构；Audio/Video 来自媒资预处理，非 PDF）。
 fn map_kind(k: docparse_core::chunk::ChunkKind) -> ChunkKind {
