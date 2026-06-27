@@ -218,6 +218,10 @@ pub struct Engine {
     /// （filter/ACL 下推 + iterative scan + 精确后过滤）。仅在 **multi-thread tokio runtime** 下可用
     /// （`run` 内 `block_in_place` 桥接同步检索↔异步 PG 查询）。详见 `set_pg_vector`。
     vector_pg: Option<std::sync::Arc<fastsearch_pg::PgStore>>,
+    /// 可选 **真源 PG 句柄**（MM6-inline）：媒资网关 `resolve_citation` 的 `Inline` 路径用它
+    /// 按需直查 PG `media_bytes` 字节（字节是真源、引擎派生层不持）。与 `vector_pg` 解耦（语义不同，
+    /// 可指向同一 `PgStore`）。仅在 **multi-thread tokio runtime** 下可用（`block_in_place` 桥接）。
+    source_pg: Option<std::sync::Arc<fastsearch_pg::PgStore>>,
 }
 
 impl Engine {
@@ -233,6 +237,7 @@ impl Engine {
             reranker: Box::new(LexicalOverlapReranker),
             embedder: None,
             vector_pg: None,
+            source_pg: None,
         })
     }
 
@@ -243,6 +248,7 @@ impl Engine {
             reranker: Box::new(LexicalOverlapReranker),
             embedder: None,
             vector_pg: None,
+            source_pg: None,
         })
     }
 
@@ -284,6 +290,7 @@ impl Engine {
                 reranker: Box::new(LexicalOverlapReranker),
                 embedder: None,
                 vector_pg: None,
+                source_pg: None,
             },
             Lsn(cp.applied_lsn),
         ))
@@ -398,6 +405,13 @@ impl Engine {
         self.vector_pg = Some(store);
     }
 
+    /// 开启 **媒资真源直查（MM6-inline）**：`resolve_citation` 的 `Inline` 路径据此从 PG
+    /// `media_bytes` 按需取字节（字节是真源、引擎派生层不持）。可与 `set_pg_vector` 共用同一
+    /// `PgStore`。**要求 multi-thread tokio runtime**（`resolve_citation` 内 `block_in_place` 桥接）。
+    pub fn set_source_store(&mut self, store: std::sync::Arc<fastsearch_pg::PgStore>) {
+        self.source_pg = Some(store);
+    }
+
     /// 灌入一个 chunk（仅全文，不提交）。
     pub fn ingest(&mut self, collection: &str, chunk: &Chunk) -> Result<()> {
         self.text.upsert(collection, chunk)?;
@@ -497,8 +511,26 @@ impl Engine {
                 url: uri,
                 expires_s: 300,
             },
-            // Inline 字节在 PG media_bytes（MM2 接入）；引擎索引不持字节。
-            AssetPointer::Inline => return Ok(None),
+            // Inline 字节在 PG media_bytes 真源（MM6-inline）：有真源句柄则按需直查取字节；
+            // 无句柄 / 无字节 → None（等同 404）。block_in_place 桥接同步 resolve↔异步 PG
+            // （要求 multi-thread runtime，同 B6）。ACL 已在上方强制，此处仅取已授权 chunk 的字节。
+            AssetPointer::Inline => match &self.source_pg {
+                Some(pg) => {
+                    let bytes = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(pg.fetch_media_bytes(
+                            &gid.collection,
+                            &gid.doc_id,
+                            gid.chunk_id,
+                        ))
+                    })
+                    .map_err(|e| EngineError::Vector(format!("fetch media_bytes: {e}")))?;
+                    match bytes {
+                        Some(b) => AssetFetch::InlineBytes(b),
+                        None => return Ok(None),
+                    }
+                }
+                None => return Ok(None),
+            },
         };
         Ok(Some(ResolvedAsset {
             fetch,
@@ -1038,6 +1070,70 @@ mod tests {
         assert_eq!(hits[0].id.chunk_id, 2, "PG ANN 最近邻应为 chunk 2");
         assert_eq!(hits[0].citation.page, 22, "引用 page 应来自 PG（非退化 0）");
         assert!(hits[0].vector.is_some(), "应有向量分");
+    }
+
+    /// MM6-inline 集成（需 DATABASE_URL + multi-thread runtime）：媒资网关 `resolve_citation`
+    /// 的 `Inline` 路径从 PG `media_bytes` 真源按需取字节；ACL 强制不可绕过。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mm6_inline_serves_bytes_from_source_pg() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip mm6_inline_serves_bytes_from_source_pg: DATABASE_URL not set");
+            return;
+        };
+        use fastsearch_core::{AssetPointer, MediaRef};
+        use fastsearch_pg::{PgConfig, PgStore};
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_eng_mb_it".into();
+        let mut store = PgStore::connect(cfg).await.expect("connect");
+        store.ensure_schema().await.expect("schema");
+
+        // 带 inline 字节的图 chunk（无 caption，text=""），限 team-a 可见。
+        let mut c = chunk("d.pdf", 1, ChunkKind::Image, "", 1);
+        c.tenant = Some("acme".into());
+        c.acl = vec!["team-a".into()];
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Inline,
+            media_type: Some("image/png".into()),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        let bytes = vec![0x89u8, 0x50, 0x4E, 0x47];
+        c.media_bytes = Some(bytes.clone());
+        store
+            .upsert_doc("kb", "d.pdf", &[c.clone()])
+            .await
+            .expect("upsert");
+
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.ingest("kb", &c).unwrap(); // 进引擎 text 索引（resolve 取 MediaRef）
+        engine.commit().unwrap();
+        engine.set_source_store(std::sync::Arc::new(store));
+
+        let acl_ok = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        let acl_no = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-b".into()],
+        };
+        // 授权 → InlineBytes（真源字节）+ Content-Type。
+        let r = engine
+            .resolve_citation("kb:d.pdf:1", Some(&acl_ok))
+            .unwrap()
+            .expect("authorized → Some");
+        match r.fetch {
+            AssetFetch::InlineBytes(b) => assert_eq!(b, bytes, "应吐 PG 真源字节"),
+            other => panic!("expected InlineBytes, got {other:?}"),
+        }
+        assert_eq!(r.media_type.as_deref(), Some("image/png"));
+        // 越权 → None（ACL 不可绕过，不暴露存在性/字节）。
+        assert!(engine
+            .resolve_citation("kb:d.pdf:1", Some(&acl_no))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

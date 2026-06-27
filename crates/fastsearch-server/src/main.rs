@@ -106,6 +106,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 媒资真源（MM6-inline）：媒资网关 `/v1/asset` 的 Inline 路径从 PG `media_bytes` 按需取字节。
+    // 与向量后端无关——只要有 PG 真源（DATABASE_URL）即开启（字节是真源、引擎派生层不持）。
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        match fastsearch_pg::PgStore::connect(fastsearch_pg::PgConfig::new(url)).await {
+            Ok(pg) => {
+                engine.set_source_store(std::sync::Arc::new(pg));
+                eprintln!("media source: PG media_bytes（/v1/asset inline 字节）");
+            }
+            Err(e) => eprintln!("media source store 连接失败: {e}（inline 字节不可用）"),
+        }
+    }
+
     // 嵌入后端配置（FASTSEARCH_EMBEDDER=ollama|openai；默认 hash→不嵌入）。
     let ecfg = fastsearch_embed::EmbedderConfig::from_env();
     let embed_on = matches!(ecfg.kind, fastsearch_embed::EmbedderKind::Http(_));
