@@ -15,7 +15,7 @@
 三个后端档（同 `VectorBackend` trait）：`MemVectorIndex`（暴力，默认确定）、`HnswVectorIndex`
 （HNSW+u8 量化，A9，大规模近似）、**pgvector 直查**（ANN 在 PG 跑，B6，经 `fastsearch-pg::PgStore::vector_search`）。
 
-**不做**：嵌入计算（embed 模块）；RaBitQ 量化 / filtered-traversal（下一迭代）；CDC 自动写穿 PG embedding（下一迭代）；**多向量 MaxSim（ColPali，M2/MM11）`gated`**——只在引擎派生层、不入 PG 真源（不变量 #1），待多模态模型与规模信封。当前后端全是**单向量**（文本嵌入产出；视觉/跨模态向量属 M1 gated，本 crate 不感知模态、只存 `VecMeta.modality` 供过滤下推）。
+**不做**：嵌入计算（embed 模块）；RaBitQ 量化 / filtered-traversal（下一迭代）；CDC 自动写穿 PG embedding（**已落地**，见 §6 已知限制 + [pg spec](12-pg.md)）；**多向量 MaxSim（ColPali，M2/MM11）`gated`**——只在引擎派生层、不入 PG 真源（不变量 #1），待多模态模型与规模信封。当前后端全是**单向量**（文本嵌入产出；视觉/跨模态向量属 M1 gated，本 crate 不感知模态、只存 `VecMeta.modality` 供过滤下推）。
 
 ## 2. 公开接口
 
@@ -72,5 +72,5 @@ pub struct VecMeta { pub kind, doc_id, collection, tenant, page, section_id, hea
 
 **已知限制 / 下一迭代：**
 - RaBitQ 量化 / filtered-traversal（更优压缩/召回）；HNSW 大 N 的 p95 与暴力交叉点实测（见 [容量/SLO](../governance/2026-06-26-容量与SLO.md)）。
-- pgvector 直查的 **CDC 自动写穿**（嵌入→PG embedding 列）下一迭代；当前需 embedding 已在 PG。
+- ✅ pgvector 直查的 **CDC 自动写穿已落地**（2026-06-27，B6 续作）：engine `apply_upsert` 在配了 `set_pg_vector` 时把嵌入写回 PG `embedding` 列（`PgStore::set_embedding`，block_in_place 桥），而非引擎派生索引——直查读 PG、写也归 PG，闭环。**CDC 反馈环**经"列清单 publication 排除派生列（`embedding`/`embed_model`/`updated_at`）+ `set_embedding` 幂等守卫（0 行不复制）"双防线断开。Docker pgvector 验证（见 [pg spec §7](12-pg.md)、devlog）。
 - 向量经 CDC 落地路径自动嵌入（`engine.set_embedder` + `apply_upsert`）或 `ingest_vector` 灌入。

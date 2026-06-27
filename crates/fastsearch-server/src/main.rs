@@ -141,6 +141,8 @@ async fn main() -> anyhow::Result<()> {
     let embed_on = matches!(ecfg.kind, fastsearch_embed::EmbedderKind::Http(_));
     if embed_on {
         // CDC 落地路径用引擎自身的 embedder 嵌入 passage。
+        // 写穿标记 = "模型@维度"（落 PG embed_model，溯源 + 幂等守卫；换模型/换维度即变标记）。
+        engine.set_embed_model(format!("{}@{}", ecfg.model, ecfg.dim));
         engine.set_embedder(fastsearch_embed::build_embedder(&ecfg));
     }
 

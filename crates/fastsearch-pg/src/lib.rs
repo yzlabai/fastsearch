@@ -144,24 +144,54 @@ impl PgStore {
             .collect()
     }
 
-    /// **写穿**（B6 §2）：把某 chunk 的向量写回 PG `embedding` 列（直查档的向量由此进 PG）。
-    /// 向量以 `$1::text::vector` 文本传（免 pgvector ToSql 依赖）。返回更新行数。
+    /// **写穿**（B6 §2）：把某 chunk 的向量写回 PG `embedding` 列（直查档的向量由此进 PG），
+    /// 同时记 `embed_model`（来源/版本）+ 刷 `updated_at`。向量以 `$1::text::vector` 文本传
+    /// （免 pgvector ToSql 依赖）。返回更新行数。
+    ///
+    /// **幂等守卫**：`AND (embedding IS DISTINCT FROM $1 OR embed_model IS DISTINCT FROM $5)`
+    /// ——值未变 → 0 行更新 → **不产生复制事件**，即便某部署的 publication 未排除派生列也能阻尼
+    /// CDC 写穿反馈环（与列清单 publication 互为防线）。`embedding`/`embed_model`/`updated_at`
+    /// 三列已不在 publication 列清单 → 正常情况下这条 UPDATE 本就不复制。
     pub async fn set_embedding(
         &self,
         collection: &str,
         doc_id: &str,
         chunk_id: u64,
         embedding: &[f32],
+        model: &str,
     ) -> Result<u64> {
         let sql = format!(
-            "UPDATE {} SET embedding = $1::text::vector \
-             WHERE collection = $2 AND doc_id = $3 AND chunk_id = $4",
+            "UPDATE {} SET embedding = $1::text::vector, embed_model = $5, updated_at = now() \
+             WHERE collection = $2 AND doc_id = $3 AND chunk_id = $4 \
+             AND (embedding IS DISTINCT FROM $1::text::vector OR embed_model IS DISTINCT FROM $5)",
             self.cfg.table
         );
         let v = format_vector(embedding);
         Ok(self
             .client
-            .execute(&sql, &[&v, &collection, &doc_id, &(chunk_id as i64)])
+            .execute(
+                &sql,
+                &[&v, &collection, &doc_id, &(chunk_id as i64), &model],
+            )
+            .await?)
+    }
+
+    /// 清除某 chunk 的 `embedding`（设 NULL）+ 清 `embed_model`：B6 写穿路径下，chunk 文本变空
+    /// （如媒资丢 caption）时删其向量，避免直查命中残留。仅在 `embedding` 非空时更新（幂等、不空转复制）。
+    pub async fn clear_embedding(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        chunk_id: u64,
+    ) -> Result<u64> {
+        let sql = format!(
+            "UPDATE {} SET embedding = NULL, embed_model = NULL, updated_at = now() \
+             WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 AND embedding IS NOT NULL",
+            self.cfg.table
+        );
+        Ok(self
+            .client
+            .execute(&sql, &[&collection, &doc_id, &(chunk_id as i64)])
             .await?)
     }
 
@@ -573,7 +603,7 @@ mod tests {
         c.acl = vec!["public".into()];
         store.upsert_doc("kb", "a.mp3", &[c]).await.expect("upsert");
         store
-            .set_embedding("kb", "a.mp3", 1, &[1.0, 0.0])
+            .set_embedding("kb", "a.mp3", 1, &[1.0, 0.0], "test")
             .await
             .expect("emb");
         // 模拟"遗留行"：把反规范化列清成 NULL（media.time 仍在 jsonb）。
@@ -609,6 +639,59 @@ mod tests {
         store
             .client
             .batch_execute("DROP TABLE fastsearch_time_null_it")
+            .await
+            .ok();
+    }
+
+    /// B6 写穿——`set_embedding` 幂等守卫（断 CDC 反馈环的行为基元；需 DATABASE_URL）。
+    /// 相同向量+模型重写 → 0 行更新 → PG **不产生复制事件**，即便部署缺列清单 publication 也阻尼反馈环
+    /// （列清单 publication 排除派生列的结构性证明见纯函数单测 `ddl_has_extension_table_publication`）。
+    #[tokio::test]
+    async fn b6_set_embedding_idempotent_guard() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip b6_set_embedding_idempotent_guard: DATABASE_URL not set");
+            return;
+        };
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_b6_guard_it".into();
+        cfg.vector_dim = 4;
+        cfg.vector_type = VectorType::Vector;
+        let mut store = PgStore::connect(cfg).await.expect("connect");
+        store.ensure_schema().await.expect("schema");
+        // 再跑一次确认 DDL 幂等（publication 已存在 → 不抢占分支）。
+        store.ensure_schema().await.expect("schema idempotent");
+
+        let c = sample("d.pdf", 1);
+        store.upsert_doc("kb", "d.pdf", &[c]).await.expect("upsert");
+        let v = [0.0f32, 1.0, 0.0, 0.0];
+        let n1 = store
+            .set_embedding("kb", "d.pdf", 1, &v, "m@4")
+            .await
+            .expect("set1");
+        assert_eq!(n1, 1, "首次写穿应更新 1 行");
+        let n2 = store
+            .set_embedding("kb", "d.pdf", 1, &v, "m@4")
+            .await
+            .expect("set2");
+        assert_eq!(
+            n2, 0,
+            "相同向量+模型重写应 0 行（幂等，不空转复制 → 断 CDC 反馈环）"
+        );
+        // 换模型标记 → 应更新（即便向量同，溯源变）。
+        let n3 = store
+            .set_embedding("kb", "d.pdf", 1, &v, "m2@4")
+            .await
+            .expect("set3");
+        assert_eq!(n3, 1, "换 embed_model 应更新 1 行");
+        // clear_embedding 幂等：清一次更新、再清 0 行。
+        let c1 = store.clear_embedding("kb", "d.pdf", 1).await.expect("clr1");
+        assert_eq!(c1, 1, "清向量应更新 1 行");
+        let c2 = store.clear_embedding("kb", "d.pdf", 1).await.expect("clr2");
+        assert_eq!(c2, 0, "已 NULL 再清应 0 行（幂等）");
+
+        store
+            .client
+            .batch_execute("DROP TABLE fastsearch_b6_guard_it CASCADE")
             .await
             .ok();
     }

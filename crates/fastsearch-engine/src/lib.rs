@@ -113,6 +113,12 @@ fn kind_str(k: ChunkKind) -> &'static str {
     }
 }
 
+/// 同步↔异步桥：在 CDC 落地（同步 `IndexSink`）里调 PG 异步写穿。**要求 multi-thread tokio
+/// runtime**（与 `set_pg_vector`/B6 检索同约束）；仅在配了 `vector_pg` 时触达，故约束一致。
+fn block_on_pg<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+}
+
 fn vec_meta(collection: &str, c: &Chunk) -> VecMeta {
     VecMeta {
         collection: collection.to_string(),
@@ -232,6 +238,8 @@ pub struct Engine {
     /// 可选 **对象存储签名器**（MM6-secure）：`resolve_citation` 的 `Object` 路径用它签短时 URL；
     /// **未配置 → `Object` 返回 None（404），绝不回退到裸 key**（不变量 #3）。
     object_signer: Option<Box<dyn ObjectSigner>>,
+    /// 嵌入来源/版本标记（B6 写穿时写入 PG `embed_model`，供溯源与幂等守卫）。None→`"unknown"`。
+    embed_model: Option<String>,
 }
 
 impl Engine {
@@ -249,6 +257,7 @@ impl Engine {
             vector_pg: None,
             source_pg: None,
             object_signer: None,
+            embed_model: None,
         })
     }
 
@@ -261,6 +270,7 @@ impl Engine {
             vector_pg: None,
             source_pg: None,
             object_signer: None,
+            embed_model: None,
         })
     }
 
@@ -304,6 +314,7 @@ impl Engine {
                 vector_pg: None,
                 source_pg: None,
                 object_signer: None,
+                embed_model: None,
             },
             Lsn(cp.applied_lsn),
         ))
@@ -413,9 +424,18 @@ impl Engine {
 
     /// 开启 **pgvector 直查档（B6）**：向量召回改在 PG 跑 ANN（见字段 `vector_pg`）。
     /// **要求 multi-thread tokio runtime**（检索在 `block_in_place` 里 `block_on` PG 异步查询）。
-    /// 仅影响向量召回；keyword 仍走引擎 Tantivy。embedding 需已在 PG（外部写入或写穿）。
+    /// 仅影响向量召回；keyword 仍走引擎 Tantivy。
+    ///
+    /// **写穿（B6 续作）**：设此句柄后，CDC 落地路径 `apply_upsert` 会把嵌入**写回 PG `embedding`
+    /// 列**（`set_embedding`）而非引擎侧派生索引——直查档读 PG，故写也归 PG，闭环。复制流已排除
+    /// `embedding`/`embed_model`/`updated_at`（DDL 列清单 publication）→ 写穿不触发 CDC 反馈环。
     pub fn set_pg_vector(&mut self, store: std::sync::Arc<fastsearch_pg::PgStore>) {
         self.vector_pg = Some(store);
+    }
+
+    /// 设置嵌入来源标记（写穿时落 PG `embed_model`，溯源 + 幂等守卫）。server 传嵌入模型名。
+    pub fn set_embed_model(&mut self, model: impl Into<String>) {
+        self.embed_model = Some(model.into());
     }
 
     /// 开启 **媒资真源直查（MM6-inline）**：`resolve_citation` 的 `Inline` 路径据此从 PG
@@ -887,9 +907,27 @@ impl fastsearch_sync::IndexSink for Engine {
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
-                self.vector
-                    .upsert(chunk.global_id(collection), v, vec_meta(collection, chunk))
-                    .map_err(|e| anyhow::anyhow!("vector upsert: {e}"))?;
+                if let Some(pg) = &self.vector_pg {
+                    // B6 写穿：pgvector 直查档——嵌入写回 PG `embedding` 列（直查读 PG，故写归 PG）；
+                    // 不写引擎侧派生索引（直查模式读路径不用它）。复制流已排除派生列 → 不触发反馈环。
+                    let model = self.embed_model.as_deref().unwrap_or("unknown");
+                    block_on_pg(pg.set_embedding(
+                        collection,
+                        &chunk.doc_id,
+                        chunk.chunk_id,
+                        &v,
+                        model,
+                    ))
+                    .map_err(|e| anyhow::anyhow!("pg set_embedding: {e}"))?;
+                } else {
+                    self.vector
+                        .upsert(chunk.global_id(collection), v, vec_meta(collection, chunk))
+                        .map_err(|e| anyhow::anyhow!("vector upsert: {e}"))?;
+                }
+            } else if let Some(pg) = &self.vector_pg {
+                // 幂等：文本空了 → 清 PG `embedding`（设 NULL），避免直查命中残留向量。
+                block_on_pg(pg.clear_embedding(collection, &chunk.doc_id, chunk.chunk_id))
+                    .map_err(|e| anyhow::anyhow!("pg clear_embedding: {e}"))?;
             } else {
                 // 幂等：覆盖更新时若旧版本有向量、新版本文本空了，删除旧向量避免残留。
                 self.vector.delete(&chunk.global_id(collection))?;
@@ -1075,7 +1113,7 @@ mod tests {
             let mut e = vec![0.0f32; 4];
             e[(id - 1) as usize] = 1.0;
             store
-                .set_embedding("kb", "d.pdf", id, &e)
+                .set_embedding("kb", "d.pdf", id, &e, "test")
                 .await
                 .expect("emb");
         }
@@ -1094,6 +1132,71 @@ mod tests {
         assert_eq!(hits[0].id.chunk_id, 2, "PG ANN 最近邻应为 chunk 2");
         assert_eq!(hits[0].citation.page, 22, "引用 page 应来自 PG（非退化 0）");
         assert!(hits[0].vector.is_some(), "应有向量分");
+    }
+
+    /// B6 写穿（需 DATABASE_URL + multi-thread runtime）：CDC 落地 `apply_upsert` 在 pgvector 直查
+    /// 模式下把嵌入**写回 PG `embedding` 列**（而非引擎派生索引）；写穿后直查即命中。空文本则清向量。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b6_cdc_write_through_to_pg_embedding() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip b6_cdc_write_through_to_pg_embedding: DATABASE_URL not set");
+            return;
+        };
+        use fastsearch_embed::{EmbedKind, Embedder, HashEmbedder};
+        use fastsearch_pg::{PgConfig, PgStore, VectorType};
+        use fastsearch_sync::IndexSink;
+
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_b6_wt_it".into();
+        cfg.vector_dim = 16;
+        cfg.vector_type = VectorType::Vector;
+        let mut store = PgStore::connect(cfg).await.expect("connect");
+        store.ensure_schema().await.expect("schema");
+
+        // 源行（embedding 留 NULL，模拟上游/CDC 投递）。doc 级替换 → 重复跑亦干净。
+        let c = chunk("d.pdf", 1, ChunkKind::Paragraph, "毛利率 下降 显著", 7);
+        store
+            .upsert_doc("kb", "d.pdf", std::slice::from_ref(&c))
+            .await
+            .expect("upsert");
+
+        let store = std::sync::Arc::new(store);
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_embedder(Box::new(HashEmbedder::new(16)));
+        engine.set_embed_model("hash@16");
+        engine.set_pg_vector(store.clone());
+
+        // CDC 落地一条 upsert → 应写穿到 PG embedding（不写引擎派生索引）。
+        engine.apply_upsert("kb", &c).unwrap();
+
+        // 写穿后：PG 直查（用同 embedder 嵌 query）命中 chunk 1，引用 page 来自 PG。
+        let qv = HashEmbedder::new(16)
+            .embed(&["毛利率 下降".into()], EmbedKind::Query)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let r = SearchRequest {
+            query: String::new(),
+            mode: SearchMode::Vector,
+            vector: Some(qv),
+            ..Default::default()
+        };
+        let hits = engine.search(&r, None).unwrap();
+        assert_eq!(
+            hits.first().map(|h| h.id.chunk_id),
+            Some(1),
+            "写穿后 PG 直查应命中 chunk 1"
+        );
+        assert_eq!(hits[0].citation.page, 7, "引用 page 应来自 PG 真源");
+
+        // 文本变空（媒资丢 caption）→ 写穿路径清 PG 向量 → 直查不再命中。
+        let empty = chunk("d.pdf", 1, ChunkKind::Image, "", 7);
+        engine.apply_upsert("kb", &empty).unwrap();
+        let hits2 = engine.search(&r, None).unwrap();
+        assert!(
+            hits2.iter().all(|h| h.id.chunk_id != 1),
+            "清向量后 chunk 1 不应再被直查命中"
+        );
     }
 
     /// MM6-inline 集成（需 DATABASE_URL + multi-thread runtime）：媒资网关 `resolve_citation`

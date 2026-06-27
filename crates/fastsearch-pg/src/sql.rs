@@ -55,12 +55,33 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
             dim = vector_dim
         ),
         format!("CREATE INDEX IF NOT EXISTS {table}_doc ON {table} (collection, doc_id);"),
+        // Publication 只发布**源真源列**（`COLUMNS`），刻意**排除引擎派生/记账列**
+        // `embedding`/`embed_model`/`updated_at`——这样 B6 写穿（`set_embedding` UPDATE 这三列）
+        // **不产生逻辑复制事件**，从根上断开"写穿→复制→再嵌入→再写穿"的 CDC 反馈环。
+        // 列清单发布需 **PG 15+**（核心特性、非扩展，不破"托管 PG 可移植"不变量 #1）。
+        //
+        // 幂等 + **自愈但不抢占**：① 无 publication → CREATE（带列清单）；② 本表已在该 publication
+        // 但**无列清单**（legacy 全列发布，`prattrs IS NULL`）→ ALTER 收敛到列清单（仅旧部署一次）。
+        // 本表已是列清单、或 publication 属于别的表 → **不动**（避免并发/多表互抢同名 publication）。
+        // `CREATE` 包 `EXCEPTION` 防并发首建 TOCTOU（两连接同时见"无"→ 都建）：并发竞态在 PG 表现为
+        // `unique_violation`(23505, pg_publication 唯一索引) 或 `duplicate_object`(42710)，两者都忽略。
         format!(
             "DO $$ BEGIN\n\
              IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = '{PUBLICATION}') THEN\n\
-             CREATE PUBLICATION {PUBLICATION} FOR TABLE {table};\n\
+             BEGIN\n\
+             CREATE PUBLICATION {PUBLICATION} FOR TABLE {table} ({collist});\n\
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;\n\
+             END;\n\
+             ELSIF EXISTS (\n\
+             SELECT 1 FROM pg_publication_rel pr\n\
+             JOIN pg_publication p ON p.oid = pr.prpubid\n\
+             JOIN pg_class c ON c.oid = pr.prrelid\n\
+             WHERE p.pubname = '{PUBLICATION}' AND c.relname = '{table}' AND pr.prattrs IS NULL\n\
+             ) THEN\n\
+             ALTER PUBLICATION {PUBLICATION} SET TABLE {table} ({collist});\n\
              END IF;\n\
-             END $$;"
+             END $$;",
+            collist = COLUMNS.join(", ")
         ),
     ]
 }
@@ -455,7 +476,21 @@ mod tests {
         assert!(joined.contains("media_bytes bytea"));
         assert!(joined.contains("time_start_ms bigint"));
         assert!(joined.contains("time_end_ms bigint"));
-        assert!(joined.contains("CREATE PUBLICATION fastsearch_pub FOR TABLE fastsearch_chunks"));
+        // Publication 用列清单（PG15+）、发布源列、**排除派生列**（断 CDC 写穿反馈环）。
+        assert!(joined.contains(
+            "CREATE PUBLICATION fastsearch_pub FOR TABLE fastsearch_chunks (collection, doc_id,"
+        ));
+        assert!(joined.contains("ALTER PUBLICATION fastsearch_pub SET TABLE fastsearch_chunks ("));
+        // 派生/记账列不得出现在 publication 列清单里。
+        let pub_line = joined
+            .lines()
+            .find(|l| l.contains("CREATE PUBLICATION"))
+            .unwrap();
+        assert!(!pub_line.contains("embedding"), "embedding 不应被发布");
+        assert!(!pub_line.contains("embed_model"), "embed_model 不应被发布");
+        assert!(!pub_line.contains("updated_at"), "updated_at 不应被发布");
+        // 但源列要在。
+        assert!(pub_line.contains("text") && pub_line.contains("acl"));
     }
 
     #[test]
