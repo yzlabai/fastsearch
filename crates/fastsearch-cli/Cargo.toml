@@ -29,10 +29,30 @@ anyhow.workspace = true
 # 自有 workspace、被本仓根 `exclude` 隔离，不进 fastsearch 精简构建（见 docparse 融合方案 §4）。
 docparse-core = { path = "../../vendor/docparse/crates/docparse-core", optional = true }
 docparse-pdf = { path = "../../vendor/docparse/crates/docparse-pdf", optional = true }
+docparse-docx = { path = "../../vendor/docparse/crates/docparse-docx", optional = true }
+docparse-html = { path = "../../vendor/docparse/crates/docparse-html", optional = true }
+docparse-md = { path = "../../vendor/docparse/crates/docparse-md", optional = true }
+docparse-csv = { path = "../../vendor/docparse/crates/docparse-csv", optional = true }
+docparse-xlsx = { path = "../../vendor/docparse/crates/docparse-xlsx", optional = true }
+docparse-pptx = { path = "../../vendor/docparse/crates/docparse-pptx", optional = true }
+docparse-srt = { path = "../../vendor/docparse/crates/docparse-srt", optional = true }
+docparse-eml = { path = "../../vendor/docparse/crates/docparse-eml", optional = true }
 
 [features]
-# 开启 docparse 解析（core + pdf，无 ONNX/渲染）；默认不开，保持 CLI 精简。
-parse = ["dep:docparse-core", "dep:docparse-pdf"]
+# 开启 docparse 多格式解析（core + 轻量格式解析器，**无 ONNX/渲染**）；默认不开，保持 CLI 精简。
+# 重增强器（OCR/VLM/raster，需运行时 ONNX 模型）走 parse-ocr/parse-vlm（下一迭代，模型 gated）。
+parse = [
+    "dep:docparse-core",
+    "dep:docparse-pdf",
+    "dep:docparse-docx",
+    "dep:docparse-html",
+    "dep:docparse-md",
+    "dep:docparse-csv",
+    "dep:docparse-xlsx",
+    "dep:docparse-pptx",
+    "dep:docparse-srt",
+    "dep:docparse-eml",
+]
 
 [dev-dependencies]
 tempfile.workspace = true

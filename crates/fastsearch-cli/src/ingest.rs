@@ -11,9 +11,10 @@ use fastsearch_core::{AssetPointer, BBox, Chunk, ChunkKind, MediaRef};
 use fastsearch_text::TokenizerKind;
 use std::path::PathBuf;
 
-/// `fastsearch ingest <pdf>` 选项。
+/// `fastsearch ingest <file>` 选项。
 pub struct IngestOpts {
-    pub pdf: PathBuf,
+    /// 待解析文件（按扩展名分发到对应 docparse 解析器；多格式）。
+    pub file: PathBuf,
     pub data: PathBuf,
     pub collection: String,
     pub doc_id: String,
@@ -22,15 +23,40 @@ pub struct IngestOpts {
     pub acl: Vec<String>,
 }
 
-/// **in-process 解析 → 适配 → 索引**（doc 级替换）：读 PDF → docparse 解析+分块 →
+/// docparse 多格式解析器注册表（轻量、无 ONNX）：按 `DocumentParser::supports`（扩展名/magic）
+/// 派发。OCR/VLM/raster 增强器需运行时模型，属 `parse-ocr`/`parse-vlm`（下一迭代）。
+fn parsers() -> Vec<Box<dyn docparse_core::parser::DocumentParser>> {
+    vec![
+        Box::new(docparse_pdf::PdfParser::default()),
+        Box::new(docparse_docx::DocxParser),
+        Box::new(docparse_html::HtmlParser),
+        Box::new(docparse_md::MarkdownParser),
+        Box::new(docparse_csv::CsvParser),
+        Box::new(docparse_xlsx::XlsxParser),
+        Box::new(docparse_pptx::PptxParser),
+        Box::new(docparse_srt::SrtParser),
+        Box::new(docparse_eml::EmlParser),
+    ]
+}
+
+/// **in-process 解析 → 适配 → 索引**（doc 级替换）：按扩展名选 docparse 解析器 → 解析+分块 →
 /// `from_docparse_chunk` 适配 → 灌入现有落盘索引。返回灌入条数。
-/// 这是融合 Option C 预演的"打通 解析→适配→索引"端到端路径（无需 shell 出 docparse JSON）。
+/// 融合 Option B 摄取热路径：进程内多格式解析（PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML），
+/// 无需 shell 出 docparse JSON。
 pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
-    let bytes =
-        std::fs::read(&opts.pdf).with_context(|| format!("reading pdf {}", opts.pdf.display()))?;
-    let doc = docparse_pdf::PdfParser::default()
-        .parse_bytes(&bytes)
-        .context("docparse pdf parse")?;
+    let registry = parsers();
+    let parser = registry
+        .iter()
+        .find(|p| p.supports(&opts.file))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no docparse parser supports {}（支持：pdf/docx/html/md/csv/xlsx/pptx/srt/eml）",
+                opts.file.display()
+            )
+        })?;
+    let doc = parser
+        .parse(&opts.file)
+        .with_context(|| format!("docparse {} parse {}", parser.name(), opts.file.display()))?;
     let dchunks = docparse_core::chunk::chunk_document(&doc);
     let chunks: Vec<Chunk> = dchunks
         .iter()
@@ -210,5 +236,42 @@ mod tests {
             c3.media.as_ref().unwrap().asset,
             AssetPointer::DocRegion { page: 3, .. }
         ));
+    }
+
+    /// 多格式分发：md/html/csv 各写一个临时文件 → 注册表按扩展名选解析器 → 解析+分块 → 适配出
+    /// 非空 fastsearch chunk。证明 `parse` feature 的多格式摄取端到端（轻量、无 ONNX、无网络）。
+    #[test]
+    fn multiformat_dispatch_parses_and_adapts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("doc.md", "# 标题\n\n正文段落，含**毛利率**。\n"),
+            (
+                "page.html",
+                "<html><body><h1>纪要</h1><p>净利润上升。</p></body></html>",
+            ),
+            ("data.csv", "name,val\n甲,1\n乙,2\n"),
+        ];
+        let registry = parsers();
+        for (fname, content) in cases {
+            let path = dir.path().join(fname);
+            std::fs::write(&path, content).unwrap();
+            let parser = registry
+                .iter()
+                .find(|p| p.supports(&path))
+                .unwrap_or_else(|| panic!("no parser supports {fname}"));
+            let doc = parser
+                .parse(&path)
+                .unwrap_or_else(|e| panic!("parse {fname}: {e}"));
+            let dchunks = docparse_core::chunk::chunk_document(&doc);
+            assert!(!dchunks.is_empty(), "{fname} 应产出 chunk");
+            let chunks: Vec<_> = dchunks
+                .iter()
+                .map(|d| from_docparse_chunk(d, fname, None, vec!["public".into()]))
+                .collect();
+            assert!(
+                chunks.iter().any(|c| !c.text.is_empty()),
+                "{fname} 适配后应有非空文本 chunk"
+            );
+        }
     }
 }

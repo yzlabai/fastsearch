@@ -21,11 +21,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 解析 PDF（in-process docparse）→ 适配 → 索引（需 `--features parse`）。
+    /// 解析文件（in-process docparse 多格式：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML）
+    /// → 适配 → 索引（需 `--features parse`）。
     #[cfg(feature = "parse")]
     Ingest {
-        /// 待解析的 PDF 路径。
-        pdf: PathBuf,
+        /// 待解析文件路径（按扩展名自动选解析器）。
+        file: PathBuf,
         #[arg(long)]
         data: PathBuf,
         #[arg(long, default_value = "default")]
@@ -131,7 +132,7 @@ fn main() -> Result<()> {
     match cli.command {
         #[cfg(feature = "parse")]
         Command::Ingest {
-            pdf,
+            file,
             data,
             collection,
             doc_id,
@@ -139,7 +140,7 @@ fn main() -> Result<()> {
             tenant,
         } => {
             let opts = fastsearch_cli::ingest::IngestOpts {
-                pdf,
+                file,
                 data,
                 collection,
                 doc_id,
@@ -148,7 +149,7 @@ fn main() -> Result<()> {
                 acl: vec!["public".to_string()],
             };
             let n = fastsearch_cli::ingest::cmd_ingest(&opts)?;
-            eprintln!("ingested {n} chunk(s) from pdf for doc '{}'", opts.doc_id);
+            eprintln!("ingested {n} chunk(s) for doc '{}'", opts.doc_id);
         }
         Command::Index {
             data,
