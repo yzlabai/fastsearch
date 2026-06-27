@@ -13,7 +13,7 @@ use fastsearch_core::{
     fuse, AclFilter, AssetPointer, BBox, Chunk, ChunkKind, Citation, GlobalId, Scored, SearchMode,
     SearchRequest, TimeSpan,
 };
-use fastsearch_embed::{EmbedKind, Embedder};
+use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
 use fastsearch_sync::replication::{advance_slot, peek_with_lsn, ReplicationConfig};
 use fastsearch_sync::{Applier, Lsn};
@@ -438,6 +438,27 @@ impl Engine {
         self.embed_model = Some(model.into());
     }
 
+    /// 以图搜图查询嵌入（MM9）：`req.query_image` 存在且配了**支持图像**的后端 → 嵌成查询向量；
+    /// 无 `query_image`/无 embedder → `None`（不报错，退化为纯文本/无向量）。后端不支持图像 → 报错
+    /// （避免静默拿文本后端嵌图）。真跨模态（文→图）还需 `caps.cross_modal`，与本路径正交。
+    fn embed_query_image(&self, req: &SearchRequest) -> Result<Option<Vec<f32>>> {
+        let (Some(bytes), Some(emb)) = (req.query_image.as_ref(), &self.embedder) else {
+            return Ok(None);
+        };
+        if !emb.caps().image {
+            return Err(EngineError::Vector(
+                "query_image 需要支持图像的嵌入后端（caps.image=false）".into(),
+            ));
+        }
+        let v = emb
+            .embed_multi(&[EmbedInput::Image(bytes.clone())], EmbedKind::Query)
+            .map_err(|e| EngineError::Vector(e.to_string()))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| EngineError::Vector("image embedder returned no vector".into()))?;
+        Ok(Some(v))
+    }
+
     /// 开启 **媒资真源直查（MM6-inline）**：`resolve_citation` 的 `Inline` 路径据此从 PG
     /// `media_bytes` 按需取字节（字节是真源、引擎派生层不持）。可与 `set_pg_vector` 共用同一
     /// `PgStore`。**要求 multi-thread tokio runtime**（`resolve_citation` 内 `block_in_place` 桥接）。
@@ -621,8 +642,15 @@ impl Engine {
         let candidates = req.candidates.max(req.top_k);
 
         let want_kw = matches!(req.mode, SearchMode::Keyword | SearchMode::Hybrid);
+        // 查询向量：显式 `req.vector` 优先；否则若带 `query_image` 且后端支持图像 → 嵌图
+        // （**以图搜图**，MM9）。真跨模态（以文搜图/以图搜文）还需后端 `caps.cross_modal`——
+        // 当前 HashEmbedder 基线 cross_modal=false，仅图→图有意义；文→图待真跨模态模型。
+        let query_vec: Option<Vec<f32>> = match &req.vector {
+            Some(v) => Some(v.clone()),
+            None => self.embed_query_image(req)?,
+        };
         let want_vec =
-            matches!(req.mode, SearchMode::Vector | SearchMode::Hybrid) && req.vector.is_some();
+            matches!(req.mode, SearchMode::Vector | SearchMode::Hybrid) && query_vec.is_some();
 
         // keyword 召回
         let kw_hits: Vec<TextHit> = if want_kw {
@@ -642,7 +670,7 @@ impl Engine {
         let vec_scored: Vec<Scored> = if !want_vec {
             vec![]
         } else if let Some(pg) = &self.vector_pg {
-            let qv = req.vector.as_ref().unwrap();
+            let qv = query_vec.as_ref().unwrap();
             // 同步检索↔异步 PG：block_in_place 桥接（要求 multi-thread runtime）。
             let pairs = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(pg.vector_search(
@@ -664,7 +692,7 @@ impl Engine {
         } else {
             self.vector
                 .search(
-                    req.vector.as_ref().unwrap(),
+                    query_vec.as_ref().unwrap(),
                     candidates,
                     req.filter.as_ref(),
                     acl,
@@ -895,42 +923,54 @@ impl fastsearch_sync::IndexSink for Engine {
     fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()> {
         self.text.upsert(collection, chunk)?;
         // 配了嵌入后端则同步写向量索引（CDC 主循环：复制→解码→嵌入→派生向量）。
-        // **MM5 modality 路由（M0）**：当前只有文本嵌入器，按"可检索文本表示"(`chunk.text`，
-        // 含 caption/转录) 嵌入。**无文本的媒资 chunk（如无 caption 的图，`text=""`）跳过向量**——
-        // 否则空串嵌成退化向量（HashEmbedder 仅前缀 token → 所有无文本媒资塌成同一向量；真嵌入器
-        // 给"空文档"向量），污染 ANN。这些 chunk 仍在 BM25 + modality fast field（可按模态召回），
-        // 视觉向量待 M1 图像嵌入路由接入。
+        // **模态路由（MM5/MM10）**：① 有可检索文本（正文/caption/转录）→ 文本嵌入；② 否则无文本但
+        // 后端**支持图像**（`caps.image`）且有 inline 字节 → **图像嵌入**（M1/MM10，视觉向量进检索）；
+        // ③ 都不满足（无文本图、纯文本后端）→ **不嵌**（避免空串退化向量污染 ANN；仍在 BM25 +
+        // modality fast field 可按模态召回）。真跨模态文↔图还需 `caps.cross_modal`（HashEmbedder 基线
+        // 为 false，仅图→图有意义；文→图待真跨模态模型）。
         if let Some(emb) = &self.embedder {
-            if !chunk.text.trim().is_empty() {
-                let v = emb
-                    .embed(std::slice::from_ref(&chunk.text), EmbedKind::Passage)?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
-                if let Some(pg) = &self.vector_pg {
-                    // B6 写穿：pgvector 直查档——嵌入写回 PG `embedding` 列（直查读 PG，故写归 PG）；
-                    // 不写引擎侧派生索引（直查模式读路径不用它）。复制流已排除派生列 → 不触发反馈环。
-                    let model = self.embed_model.as_deref().unwrap_or("unknown");
-                    block_on_pg(pg.set_embedding(
-                        collection,
-                        &chunk.doc_id,
-                        chunk.chunk_id,
-                        &v,
-                        model,
-                    ))
-                    .map_err(|e| anyhow::anyhow!("pg set_embedding: {e}"))?;
-                } else {
-                    self.vector
-                        .upsert(chunk.global_id(collection), v, vec_meta(collection, chunk))
-                        .map_err(|e| anyhow::anyhow!("vector upsert: {e}"))?;
-                }
-            } else if let Some(pg) = &self.vector_pg {
-                // 幂等：文本空了 → 清 PG `embedding`（设 NULL），避免直查命中残留向量。
-                block_on_pg(pg.clear_embedding(collection, &chunk.doc_id, chunk.chunk_id))
-                    .map_err(|e| anyhow::anyhow!("pg clear_embedding: {e}"))?;
+            let input: Option<EmbedInput> = if !chunk.text.trim().is_empty() {
+                Some(EmbedInput::Text(chunk.text.clone()))
+            } else if emb.caps().image {
+                chunk.media_bytes.clone().map(EmbedInput::Image)
             } else {
-                // 幂等：覆盖更新时若旧版本有向量、新版本文本空了，删除旧向量避免残留。
-                self.vector.delete(&chunk.global_id(collection))?;
+                None
+            };
+            match input {
+                Some(inp) => {
+                    let v = emb
+                        .embed_multi(std::slice::from_ref(&inp), EmbedKind::Passage)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+                    if let Some(pg) = &self.vector_pg {
+                        // B6 写穿：pgvector 直查档——嵌入写回 PG `embedding` 列（直查读 PG，故写归 PG）；
+                        // 不写引擎侧派生索引（直查模式读路径不用它）。复制流已排除派生列 → 不触发反馈环。
+                        let model = self.embed_model.as_deref().unwrap_or("unknown");
+                        block_on_pg(pg.set_embedding(
+                            collection,
+                            &chunk.doc_id,
+                            chunk.chunk_id,
+                            &v,
+                            model,
+                        ))
+                        .map_err(|e| anyhow::anyhow!("pg set_embedding: {e}"))?;
+                    } else {
+                        self.vector
+                            .upsert(chunk.global_id(collection), v, vec_meta(collection, chunk))
+                            .map_err(|e| anyhow::anyhow!("vector upsert: {e}"))?;
+                    }
+                }
+                None if self.vector_pg.is_some() => {
+                    // 幂等：无可嵌入内容 → 清 PG `embedding`（设 NULL），避免直查命中残留向量。
+                    let pg = self.vector_pg.as_ref().unwrap();
+                    block_on_pg(pg.clear_embedding(collection, &chunk.doc_id, chunk.chunk_id))
+                        .map_err(|e| anyhow::anyhow!("pg clear_embedding: {e}"))?;
+                }
+                None => {
+                    // 幂等：覆盖更新时若旧版本有向量、新版本无可嵌入内容，删除旧向量避免残留。
+                    self.vector.delete(&chunk.global_id(collection))?;
+                }
             }
         }
         Ok(())
@@ -1043,6 +1083,82 @@ mod tests {
             section_id,
             ..chunk(doc, id, ChunkKind::Paragraph, text, 1)
         }
+    }
+
+    // MM10（apply_upsert 图像路由）+ MM9（query_image 以图搜图）端到端基线（HashEmbedder，确定）。
+    #[test]
+    fn mm10_image_routing_and_mm9_query_image() {
+        use fastsearch_embed::HashEmbedder;
+        use fastsearch_sync::IndexSink;
+        let mut e = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        e.set_embedder(Box::new(HashEmbedder::new(32))); // caps.image=true
+
+        let img = |id: u64, bytes: Vec<u8>| {
+            let mut c = chunk("d.pdf", id, ChunkKind::Image, "", id as u32); // text="" 无 caption
+            c.media_bytes = Some(bytes);
+            c
+        };
+        let a_bytes = vec![0x89, 0x50, 0x4E, 0x47, 10, 20, 30, 40, 50];
+        let a = img(1, a_bytes.clone());
+        let b = img(2, vec![0xFF, 0xD8, 0xFF, 0xE0, 99, 98, 97, 96, 95]);
+        let c = img(3, vec![0x47, 0x49, 0x46, 0x38, 1, 1, 2, 3, 5, 8]);
+        // 无字节的无文本图：应被跳过（不进向量）。
+        let no_bytes = img2_no_bytes();
+        for ch in [&a, &b, &c, &no_bytes] {
+            e.apply_upsert("kb", ch).unwrap();
+        }
+        e.commit().unwrap();
+
+        // MM9：以图搜图——用 a 的字节做 query_image → 嵌成查询向量 → 最近邻应是图 a 自身（cos=1）。
+        let req = SearchRequest {
+            mode: SearchMode::Vector,
+            query_image: Some(a_bytes),
+            ..Default::default()
+        };
+        let hits = e.search(&req, None).unwrap();
+        assert!(!hits.is_empty(), "以图搜图应有结果");
+        assert_eq!(
+            hits[0].id.chunk_id, 1,
+            "query_image=a 字节 → 最近邻是图 a 自身"
+        );
+        // 无字节无文本图（chunk_id=9）从未写向量 → 不会出现在向量结果。
+        assert!(
+            hits.iter().all(|h| h.id.chunk_id != 9),
+            "无字节无文本图不应进向量召回"
+        );
+    }
+
+    fn img2_no_bytes() -> Chunk {
+        chunk("d.pdf", 9, ChunkKind::Image, "", 9) // text="" 且 media_bytes=None
+    }
+
+    // 纯文本后端 + query_image → 报错（不静默拿文本后端嵌图）。
+    #[test]
+    fn mm9_query_image_requires_image_backend() {
+        let mut e = engine();
+        e.set_embedder(Box::new(fastsearch_embed::HashEmbedder::new(16))); // 支持图像 → 不报错路径
+                                                                           // 用一个纯文本后端验证报错：构造默认 trait 行为的后端。
+        struct TextOnly;
+        impl fastsearch_embed::Embedder for TextOnly {
+            fn dim(&self) -> usize {
+                16
+            }
+            fn embed(
+                &self,
+                texts: &[String],
+                _: fastsearch_embed::EmbedKind,
+            ) -> anyhow::Result<Vec<Vec<f32>>> {
+                Ok(texts.iter().map(|_| vec![0.0; 16]).collect())
+            }
+        }
+        e.set_embedder(Box::new(TextOnly));
+        let req = SearchRequest {
+            mode: SearchMode::Vector,
+            query_image: Some(vec![1, 2, 3, 4]),
+            ..Default::default()
+        };
+        let err = e.search(&req, None).unwrap_err().to_string();
+        assert!(err.contains("caps.image=false"), "got: {err}");
     }
 
     #[test]

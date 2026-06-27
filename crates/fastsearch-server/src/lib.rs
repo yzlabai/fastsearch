@@ -513,9 +513,11 @@ async fn search(
     let acl = acl_for(&principal);
 
     // 真混合：mode 需要向量、客户端未传 vector、且配了嵌入后端 → 锁外嵌入 query。
+    // **带 `query_image`（以图搜图，MM9）时不预嵌文本**——否则会用空文本向量遮蔽图像查询；
+    // 留 `vector=None` 交引擎 `embed_query_image` 嵌图。
     let mut req = req;
     let needs_vec = matches!(req.mode, SearchMode::Hybrid | SearchMode::Vector);
-    if needs_vec && req.vector.is_none() && s.embedder.is_some() {
+    if needs_vec && req.vector.is_none() && req.query_image.is_none() && s.embedder.is_some() {
         match s.embed(vec![req.query.clone()], EmbedKind::Query).await {
             Ok(mut v) if !v.is_empty() => req.vector = Some(v.remove(0)),
             Ok(_) => {}

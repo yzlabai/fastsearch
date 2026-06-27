@@ -53,6 +53,10 @@ pub struct SearchRequest {
     /// 外部提供的查询向量；None 则需 embedder 现算。
     #[serde(default)]
     pub vector: Option<Vec<f32>>,
+    /// 以图搜图查询图字节（MM9）：`vector` 为 None 时，引擎用**支持图像**的后端嵌成查询向量，
+    /// 走现有向量召回。真跨模态（文→图）另需后端 `caps.cross_modal`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_image: Option<Vec<u8>>,
     #[serde(default)]
     pub embedder: Option<String>,
     #[serde(default = "default_candidates")]
@@ -94,6 +98,7 @@ impl Default for SearchRequest {
             fusion: Fusion::default(),
             filter: None,
             vector: None,
+            query_image: None,
             embedder: None,
             candidates: default_candidates(),
             top_k: default_top_k(),
