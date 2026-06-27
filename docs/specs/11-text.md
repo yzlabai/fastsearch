@@ -54,6 +54,7 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 | `text` | TEXT | indexed(positions)，用配置分词器，参与 BM25 |
 | `heading` | TEXT | indexed，分词器同上，检索期 boost |
 | `kind` | STRING | FAST（过滤/分面） |
+| `modality` | STRING | FAST + STORED（多模态过滤/分面；由 `kind` 派生后落字段，MM3/MM4） |
 | `page` | U64 | FAST（范围过滤） |
 | `section_id` | U64 | FAST |
 | `chunk_id` | U64 | STORED（组装 citation） |
@@ -70,6 +71,7 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
   - Eq/Ne/In → Term/Boolean。
   - Gt/Gte/Lt/Lte（page/section_id 数值）→ RangeQuery。
   - HeadingPrefix → 暂用 stored heading_path 后过滤（或对 heading 文本 phrase-prefix；先后过滤，标注迭代）。
+  - `modality` → Term over `modality` fast field（MM4）；后过滤侧 `FieldSource::get("modality")` 由 `kind` 派生（`Modality::of_kind_str`），与 vector 侧取值一致 → 两端过滤同构、SUPERSET+精确后过滤不变量 #5 自然成立。
   - ACL：`AclFilter` → `(tenant=...) AND (acl IN allowed ∪ {public})`，作为强制子查询 AND 入主查询。
 
 ## 5. 行为规约
@@ -106,6 +108,7 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 - 预过滤目前对 page/section_id/kind/doc_id/tenant/ACL 是真索引侧过滤；**`Ne`/`Not` 已升级为索引侧精确补集**（2026-06-25）：内层能精确翻译时取 `MustNot(精确查询)`（= 精确补集，仍是合法 SUPERSET，post-filter 兜底；见 `query_build::exact_translate`）；`Exists`/`HeadingPrefix` 及不可精确翻译的内层仍退化 AllQuery + 后过滤。
 
 **迭代记录：**
+- 2026-06-27 回写多模态（MM3/MM4，代码已实现）：schema 加 `modality` fast field（STRING, FAST+STORED；由 `kind` 派生落字段）；`modality` 作 `Filter` 字段两端下推（§4）；`text=""`（媒资无文本）路径审计——空串不产 term、仍可经 `modality` fast field 真预过滤召回（测试 `empty_text_and_modality_fast_field`）；caption/转录复用 `text` 字段，高亮对转录命中句适用。设计见 [多模态功能设计与开发计划](../plans/2026-06-25-多模态功能设计与开发计划.md)。
 - 2026-06-24 v1（完成）：schema + BM25 + jieba + 过滤 + ACL 强制 + upsert/delete + 确定性。10 测试绿。
 - 2026-06-25：`Ne`/`Not` 索引侧精确补集翻译（`exact_translate`/`complement`），+1 端到端测试（Ne/Not/Not(And)/Not(Exists 退化）。
 - 2026-06-25：**查询能力补全**——短语 `"a b"` 与邻近 `"a b"~N` 经 Tantivy parser 已支持（加回归测试确认）；新增**末词前缀** `term*`（search-as-you-type）：`build_text_query` 识别末词 `*`、用 `RegexQuery` 在 text 字段前缀匹配（前词照常 parse、Should 合并），含引号时不启用。+1 测试（短语/slop/前缀/多词前缀/无匹配）。

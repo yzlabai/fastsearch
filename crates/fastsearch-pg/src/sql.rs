@@ -41,6 +41,8 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              char_len integer NOT NULL,\n\
              modality text NOT NULL DEFAULT 'text',\n\
              media jsonb,\n\
+             time_start_ms bigint,\n\
+             time_end_ms bigint,\n\
              tenant text,\n\
              acl text[] NOT NULL DEFAULT '{{public}}',\n\
              embedding {vectype}({dim}),\n\
@@ -78,7 +80,8 @@ pub enum SqlParam {
 }
 
 /// 可翻译列 → (列名, 是否 text 类型)。其余字段不可翻译（→ TRUE 超集）。
-/// 注意 time_start_ms/time_end_ms 当前**不是列**（MM2c 才加）→ 不可翻译。
+/// `time_start_ms`/`time_end_ms` 为 bigint 列（MM2c）：从 `media.time` 派生落列，
+/// 与 `PgVecRow` 后过滤同源（后过滤亦取自 `media.time`）→ 时间区间可精确 SUPERSET 下推、守不变量 #5。
 fn col_kind(field: &str) -> Option<(&'static str, bool)> {
     match field {
         "collection" => Some(("collection", true)),
@@ -88,6 +91,8 @@ fn col_kind(field: &str) -> Option<(&'static str, bool)> {
         "tenant" => Some(("tenant", true)),
         "page" => Some(("page", false)),
         "section_id" => Some(("section_id", false)),
+        "time_start_ms" => Some(("time_start_ms", false)),
+        "time_end_ms" => Some(("time_end_ms", false)),
         _ => None,
     }
 }
@@ -241,6 +246,8 @@ pub const COLUMNS: &[&str] = &[
     "char_len",
     "modality",
     "media",
+    "time_start_ms",
+    "time_end_ms",
     "tenant",
     "acl",
 ];
@@ -252,8 +259,8 @@ pub const COLUMNS: &[&str] = &[
 pub fn insert_sql(table: &str) -> String {
     format!(
         "INSERT INTO {table} \
-         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, modality, media, tenant, acl) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11, $12::text::jsonb, $13, $14)"
+         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, modality, media, time_start_ms, time_end_ms, tenant, acl) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11, $12::text::jsonb, $13, $14, $15, $16)"
     )
 }
 
@@ -266,7 +273,7 @@ pub fn delete_doc_sql(table: &str) -> String {
 pub fn fetch_doc_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, modality, media::text, tenant, acl \
+         section_id, char_len, modality, media::text, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 ORDER BY chunk_id"
     )
 }
@@ -275,7 +282,7 @@ pub fn fetch_doc_sql(table: &str) -> String {
 pub fn fetch_all_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, modality, media::text, tenant, acl \
+         section_id, char_len, modality, media::text, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} ORDER BY collection, doc_id, chunk_id"
     )
 }
@@ -311,6 +318,10 @@ pub struct ChunkRow {
     pub modality: String,
     /// 媒资引用 JSON（`MediaRef`，不含 inline 字节）。
     pub media: Option<String>,
+    /// 时间区间（毫秒）：从 `media.time` 派生落列（MM2c），供 SQL 侧 SUPERSET 下推/排序。
+    /// 读路径 `to_chunk` 的 `time` 仍由 `media` 恢复（这两列是写侧反规范化，非权威源）。
+    pub time_start_ms: Option<i64>,
+    pub time_end_ms: Option<i64>,
     pub tenant: Option<String>,
     pub acl: Vec<String>,
 }
@@ -330,6 +341,17 @@ impl ChunkRow {
             char_len: c.char_len as i32,
             modality: c.kind.modality().as_str().to_string(),
             media: c.media.as_ref().map(serde_json::to_string).transpose()?,
+            // 时间区间从 media.time 派生落列（与后过滤同源 → 下推/后过滤一致）。
+            time_start_ms: c
+                .media
+                .as_ref()
+                .and_then(|m| m.time)
+                .map(|t| t.start_ms as i64),
+            time_end_ms: c
+                .media
+                .as_ref()
+                .and_then(|m| m.time)
+                .map(|t| t.end_ms as i64),
             tenant: c.tenant.clone(),
             acl: c.acl.clone(),
         })
@@ -396,18 +418,20 @@ mod tests {
         assert!(joined.contains("acl text[]"));
         assert!(joined.contains("modality text NOT NULL DEFAULT 'text'"));
         assert!(joined.contains("media jsonb"));
+        assert!(joined.contains("time_start_ms bigint"));
+        assert!(joined.contains("time_end_ms bigint"));
         assert!(joined.contains("CREATE PUBLICATION fastsearch_pub FOR TABLE fastsearch_chunks"));
     }
 
     #[test]
     fn insert_and_delete_sql_shape() {
         let ins = insert_sql("t");
-        assert!(ins.contains("$14"));
+        assert!(ins.contains("$16"));
         assert!(ins.contains("$7::text::jsonb")); // bbox（先 ::text 再 ::jsonb，见 insert_sql 注释）
         assert!(ins.contains("$12::text::jsonb")); // media
-        assert!(ins.contains("modality, media")); // 新列入列名
+        assert!(ins.contains("modality, media, time_start_ms, time_end_ms")); // 新列入列名（MM2c）
         assert!(!ins.contains("image_meta")); // 遗留列已移除
-        assert!(!ins.contains("$15")); // exactly 14 params
+        assert!(!ins.contains("$17")); // exactly 16 params
         let del = delete_doc_sql("t");
         assert_eq!(del, "DELETE FROM t WHERE collection = $1 AND doc_id = $2");
     }
@@ -448,8 +472,11 @@ mod tests {
         let row = ChunkRow::from_chunk("kb", &c).unwrap();
         assert_eq!(row.modality, "audio"); // 由 kind 派生
         assert!(row.media.is_some());
+        // 时间区间从 media.time 派生落列（MM2c），供 SQL 侧下推。
+        assert_eq!(row.time_start_ms, Some(1000));
+        assert_eq!(row.time_end_ms, Some(5000));
         let back = row.to_chunk().unwrap();
-        assert_eq!(back, c); // media 往返一致
+        assert_eq!(back, c); // media 往返一致（time 由 media 恢复，与列同源）
     }
 
     #[test]
@@ -538,6 +565,23 @@ mod tests {
         assert!(sql2.contains("WHERE embedding IS NOT NULL ORDER BY"));
         assert!(p2.is_empty());
         assert!(ann_index_sql("t").contains("USING hnsw (embedding vector_cosine_ops)"));
+    }
+
+    #[test]
+    fn pgvector_sql_time_range_pushdown() {
+        // 时间区间过滤（音视频）→ 精确 SUPERSET 下推到 SQL（MM2c）：与 modality/page 同构。
+        let f = Filter::And(vec![
+            Filter::Gte("time_start_ms".into(), FieldValue::Int(1000)),
+            Filter::Lte("time_end_ms".into(), FieldValue::Int(9000)),
+        ]);
+        let (sql, params) = pgvector_search_sql("t", 20, None, Some(&f));
+        assert!(sql.contains("time_start_ms >= $2"));
+        assert!(sql.contains("time_end_ms <= $3"));
+        assert_eq!(
+            params,
+            vec![SqlParam::Int(1000), SqlParam::Int(9000)],
+            "时间为 bigint 列 → Int 参数下推"
+        );
     }
 
     #[test]

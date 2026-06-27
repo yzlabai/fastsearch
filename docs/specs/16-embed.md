@@ -55,3 +55,4 @@ impl HashEmbedder { pub fn new(dim: usize) -> Self; }
 **已知限制 / 下一迭代：**
 - HashEmbedder **非语义**，仅离线/CI/fallback；真语义经 HTTP 后端（Ollama/OpenAI 兼容）接入——**这是默认且唯一推荐路径**（绕开重依赖与模型下载）。**进程内模型推理（Candle/ort）已决定不做**（2026-06-25）。
 - **未接入管线**：ingest 自动嵌入 chunk、query 自动嵌入（CLI/server 在调 engine 前 embed）是下一步；当前向量仍由 `ingest_vector`/`req.vector` 外部传入。换嵌入模型维度变化时需同步 PG `vector_dim` 并重建派生索引。
+- **多模态嵌入（MM8，gated，未实现）**：`Embedder` trait 当前仍只吃 `&[String]`（文本）。跨模态单向量（`EmbedInput::{Text,Image}` + `HttpEmbedder` 图像 base64 路由 + `caps()` 文图同空间断言，接 SigLIP-2/JinaCLIP-v2/jina-v4/Voyage/Cohere）属 [多模态计划 M1](../plans/2026-06-25-多模态功能设计与开发计划.md)，**待多模态 HTTP 模型服务**，状态 `gated`——M0 阶段图/音/视频经 docparse 的 caption/转录走**文本**嵌入,本 crate 无需改动。

@@ -25,20 +25,51 @@
 pub struct Chunk {
     pub doc_id: String,
     pub chunk_id: u64,
-    pub kind: ChunkKind,          // Paragraph|Table|Image|Heading|ListItem|Code
-    pub text: String,
+    pub kind: ChunkKind,          // Heading|Paragraph|Table|Code|ListItem|Image|Audio|Video
+    pub text: String,            // 可检索文本表示（正文/caption/转录）；媒资无文本时为 ""（语义已放宽，MM1）
     pub page: u32,
     pub bbox: BBox,               // {x0,y0,x1,y1} f32
     pub heading_path: Vec<String>,
     pub section_id: u64,
     pub char_len: u32,
-    pub image_meta: Option<ImageMeta>,
+    pub media: Option<MediaRef>, // 媒资引用（替换原 image_meta，统一目标，MM2b）
     pub tenant: Option<String>,
     pub acl: Vec<String>,         // 默认 ["public"]
 }
 ```
 - `GlobalId`：`(collection, doc_id, chunk_id)` 的稳定标识；`fn global_id(&self, collection) -> GlobalId`。
-- `ChunkKind`：serde 用 snake_case（与 docparse 一致：paragraph/table/image/heading/list_item/code）。
+- `ChunkKind`：serde 用 snake_case（与 docparse 一致：heading/paragraph/table/code/list_item/image/**audio/video**）。`Audio`/`Video` 为多模态新增（MM1）。
+
+### 2.1b 多模态：模态 + 媒资引用（MM1）
+
+```rust
+pub enum Modality { Text, Image, Audio, Video }   // serde snake_case；作 Filter 字段值下推（普通元数据，非新搜索参数）
+
+impl ChunkKind { pub fn modality(self) -> Modality; }   // Image→Image, Audio→Audio, Video→Video, 其余→Text
+impl Modality {
+    pub fn as_str(self) -> &'static str;               // text|image|audio|video（落库/过滤稳定串）
+    pub fn of_kind_str(kind: &str) -> Modality;        // 供只持 kind 字符串的后端做后过滤；未知→Text
+}
+
+pub struct TimeSpan { pub start_ms: u64, pub end_ms: u64 }   // 音视频区间，用于深链/时间过滤
+
+pub enum AssetPointer {                                       // 如何取到媒资字节（serde tag="kind"）
+    Inline,                                                   // 字节在 PG bytea（小裁图，随逻辑复制走）
+    Object { uri: String },                                  // 对象存储 key/uri（大媒资）
+    DocRegion { page: u32, bbox: BBox },                     // 仅坐标无字节：跳转原文位置
+}
+
+pub struct MediaRef {
+    pub asset: AssetPointer,
+    pub media_type: Option<String>,    // MIME
+    pub time: Option<TimeSpan>,
+    pub region: Option<BBox>,          // 图/关键帧内区域
+    pub caption_source: Option<String>,
+    pub thumbnail: Option<AssetPointer>,
+}
+```
+- **`modality` 不是新字段**：由 `kind` 派生，作普通 `Filter` 值两端下推（不变量 #5），零新搜索参数。
+- `ImageMeta`（旧 docparse `image` 元数据）仍保留，但**已不在 `Chunk` 上**；提供 `ImageMeta::to_media(page, bbox) -> MediaRef`（`file`→`Object`，否则 `DocRegion`），供消费旧 docparse `image` 字段的入口（CLI JSON index）迁移到 `media`（MM2b）。
 
 ### 2.2 查询 AST
 
@@ -99,9 +130,11 @@ pub struct Scored { pub id: GlobalId, pub score: f64 }
 
 ```rust
 pub struct Citation { pub collection, doc_id: String, pub chunk_id: u64,
-                      pub page: u32, pub bbox: BBox, pub heading_path: Vec<String>, pub section_id: u64 }
+                      pub page: u32, pub bbox: BBox, pub heading_path: Vec<String>, pub section_id: u64,
+                      pub time: Option<TimeSpan>,    // 音视频深链区间（MM1）
+                      pub media: Option<MediaRef> }  // 渲染/取字节所需，answer 层据此内联展示（MM1）
 ```
-- `citation_id`：`"{collection}:{doc_id}:{chunk_id}"`；`fn parse(&str) -> Result<(collection,doc_id,chunk_id)>`（doc_id 可含 `:`？→ 用反向解析：首段=collection、末段=chunk_id、中间=doc_id）。
+- `citation_id`：`"{collection}:{doc_id}:{chunk_id}"`；`fn parse(&str) -> Result<(collection,doc_id,chunk_id)>`（doc_id 可含 `:`？→ 用反向解析：首段=collection、末段=chunk_id、中间=doc_id）。**格式不变**：`time`/`media` 走结构字段，不进 id 编码。`resolve_citation`（citation→安全媒资获取）是 engine/server 侧**新增能力**（见 [多模态计划 §6](../plans/2026-06-25-多模态功能设计与开发计划.md)），非改本模块函数。
 
 ### 2.6 后端 trait（只定义）
 
@@ -157,3 +190,4 @@ pub enum CoreError { InvalidRequest(String), InvalidCitation(String), InvalidFil
 ## 8. 迭代记录
 
 - 2026-06-24 v1：首版，数据模型 + 查询/过滤 AST + 融合 + 引用 + 错误，单测覆盖 §5。
+- 2026-06-27 回写多模态（MM1，代码已实现）：`ChunkKind` 加 `Audio`/`Video` + `ChunkKind::modality()`；新增 `Modality`/`TimeSpan`/`AssetPointer`/`MediaRef`（§2.1b）；`Chunk.image_meta`→`media`（MM2b，`ImageMeta` 降级为迁移用 `to_media`）；`text` 语义放宽为"可空串的可检索文本表示"；`Citation` 加 `time`/`media`（§2.5）。设计见 [多模态功能设计与开发计划](../plans/2026-06-25-多模态功能设计与开发计划.md)；单测覆盖 modality 派生/serde/citation 回环。

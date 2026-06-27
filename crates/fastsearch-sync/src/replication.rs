@@ -224,6 +224,17 @@ fn row_to_chunk(rel: &Relation, tuple: &TupleData) -> Result<(String, Chunk)> {
             .unwrap_or("text")
             .to_string(),
         media: m.get("media").copied().flatten().map(String::from),
+        // 时间区间为可空 bigint 列（MM2c）；to_chunk 的 time 由 media 恢复，这两列仅写侧下推用。
+        time_start_ms: m
+            .get("time_start_ms")
+            .copied()
+            .flatten()
+            .and_then(|s| s.parse().ok()),
+        time_end_ms: m
+            .get("time_end_ms")
+            .copied()
+            .flatten()
+            .and_then(|s| s.parse().ok()),
         tenant: m.get("tenant").copied().flatten().map(String::from),
         acl: parse_pg_array(get(&m, "acl")?),
     };
