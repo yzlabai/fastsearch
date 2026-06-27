@@ -70,8 +70,12 @@ pub fn build_filter(kind, page_min, page_max) -> Option<Filter>;
 - [x] **多格式摄取（2026-06-27，docparse 融合后）**：`fastsearch ingest <file>`（`--features parse`）经 docparse `DocumentParser` 注册表按扩展名分发，支持 **PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML + 图片**（无 ONNX）。`from_docparse_chunk` 适配 → 落盘索引 → 检索。+1 测试 `multiformat_dispatch`（md/html/csv）+ 实跑命中。
 - [x] **OCR 摄取（2026-06-27，`--features parse-ocr`，真模型端到端验证）**：扫描件/图片无文本层 → docparse-img 解析（页标 `ScannedNoText`）→ `apply_ocr`（env `FASTSEARCH_OCR_MODELS` 指 PP-OCR ONNX 模型目录 → `PpOcrEnhancer` + `enhance::apply`）抽文本 → 索引可检索。重 tract/ONNX 仅此 feature（搜索热路径零依赖）。**真机验证**（ppocr-v5 det+rec+dict，omnidocbench 数据表页）：1/1 页增强→9 chunk（vs 不开仅 1 图 chunk）、OCR 文本 `Impedance/Reference/BLM18AG121SN1D` 索引后命中（2/8/6）。+1 env-gated 测试 `ocr_end_to_end_gated`（真模型 80s 绿）；模型不进仓（待运行验证策略）。
 
+- [x] **表格结构识别（2026-06-28，`--features parse-tables`，非 VLM 确定性 ONNX）**：解析检测出的表格区域（`Element::Table`）→ docparse-raster（**纯 Rust hayro，无 pdfium**）从源 PDF 栅格化裁剪 → `UniRec`（ONNX，对应 docparse-cli `--unirec`，**非** `--vlm-tables`）重识别为结构化 HTML 表格 → 替换。env `FASTSEARCH_UNIREC_MODELS`。+1 env-gated 测试 `tables_refine_gated`（真模型路径端到端：lorem.pdf 0 表快速验证 load+refine 链路）。**注**：UniRec 是 2000-token 自回归解码，**CPU 上单复杂表耗时数分钟**，大批量建议 GPU。
+
 **已知限制 / 下一迭代：**
-- OCR 模型需运行时下载（`docparse-rs/scripts/fetch-models.sh`，CI 无模型则 OCR 测试 skip）。VLM（图描述，OpenAI 兼容 HTTP）= `parse-vlm` 下一迭代。layout/table/formula 等其余 docparse 增强器同 `parse-ocr` 模式可后续接。
+- OCR/UniRec 模型需运行时下载（`docparse-rs/scripts/fetch-models.sh`，CI 无模型则相关测试 skip）。UniRec 表格解码 CPU 慢（自回归）。
+- **VLM**（自然图/图表**语义描述**，OpenAI 兼容 HTTP）= `parse-vlm` 下一迭代——需 VLM 服务（如 Ollama llava），非 `Enhancer` trait，需对 image chunk 自定义编排。**区别**：表格/公式/版面**结构**已有本地 ONNX 确定性路（无需 VLM）；VLM 仅补"自然图语义描述"。
+- 公式（UniRec→LaTeX）/ layout 版面增强同 ONNX 路可后续接。
 - 跨调用为 keyword（向量索引未落盘）；hybrid 待向量持久化迭代。
 - 过滤仅 `--kind/--page-min/--page-max` 简单标志；完整 filter DSL 走 REST/库 API。
 - 真源应是 Postgres（CLI 当前直接落盘 text 索引演示；与 PG/CDC 串联待 server/sync 线缆层）。

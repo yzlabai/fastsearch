@@ -25,6 +25,9 @@ cargo run -p fastsearch-cli --features parse --bin fastsearch -- ingest --data .
 # 扫描件/图片 OCR 抽文本（--features parse-ocr，需 PP-OCR ONNX 模型目录）
 FASTSEARCH_OCR_MODELS=/path/to/docparse-rs/models/ppocr-v5 \
   cargo run -p fastsearch-cli --features parse-ocr --bin fastsearch -- ingest --data ./data --collection kb --doc-id scan.png scan.png
+# 表格结构识别（非 VLM 的确定性 ONNX：UniRec；--features parse-tables，需 UniRec 模型目录）
+FASTSEARCH_UNIREC_MODELS=/path/to/docparse-rs/models/unirec \
+  cargo run -p fastsearch-cli --features parse-tables --bin fastsearch -- ingest --data ./data --collection kb --doc-id r.pdf r.pdf
 
 # Postgres 集成测试（默认跳过；设 DATABASE_URL 才跑，CI 用 pgvector/pgvector 镜像）
 DATABASE_URL=postgres://user@localhost/db cargo test -p fastsearch-pg
@@ -32,7 +35,7 @@ DATABASE_URL=postgres://user@localhost/db cargo test -p fastsearch-pg
 FASTSEARCH_OCR_MODELS=…/models/ppocr-v5 FASTSEARCH_OCR_TEST_IMAGE=…/page.png cargo test -p fastsearch-cli --features parse-ocr ocr_end_to_end
 ```
 
-> **构建分档**：默认 `cargo build`（搜索热路径，**零 docparse/ONNX 依赖**）；`--features parse`（多格式解析，轻量、无 ONNX）；`--features parse-ocr`（+OCR，拉 vendored tract/ONNX，仅此档重）。`vendor/docparse` 有自有 workspace、被根 `exclude`，不进默认收口。
+> **构建分档**：默认 `cargo build`（搜索热路径，**零 docparse/ONNX 依赖**）；`--features parse`（多格式解析，轻量、无 ONNX）；`--features parse-ocr`（+PP-OCR 扫描件抽文本）；`--features parse-tables`（+UniRec **非 VLM** 表格结构识别，拉 raster/tract ONNX）。重 ONNX 档运行时需指模型目录（env），仅摄取侧；`vendor/docparse` 有自有 workspace、被根 `exclude`，不进默认收口。
 
 **收口（push 前必跑，等价于"完整类型检查"）**：`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` 三者全过，详见 AI_AGENT_DEV_SPEC §收口。
 
