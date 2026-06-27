@@ -20,7 +20,7 @@ fastsearch index     --data <dir> --collection <c> --doc-id <id> [--tokenizer de
 fastsearch index-dir --data <dir> --collection <c> [--tokenizer default|jieba] <DIR>
 fastsearch search    --data <dir> --collection <c> --query <q> [--top-k N] [--kind K]
                      [--page-min N] [--page-max N] [--json]
-fastsearch ingest    <PDF> --data <dir> --collection <c> --doc-id <id>   # 需 --features parse
+fastsearch ingest    <FILE> --data <dir> --collection <c> --doc-id <id>  # 需 --features parse；多格式：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML（按扩展名分发）
 fastsearch eval      --golden <g.json> [--baseline <b.json>] [--tol] [--k]
 ```
 - **`index-dir <DIR>`**：递归遍历文件夹下 `.md/.txt/.markdown/.text`，按文件做 doc 级灌入
@@ -67,7 +67,10 @@ pub fn build_filter(kind, page_min, page_max) -> Option<Filter>;
 - [x] v1 完成：index/search 子命令 + docparse 解析（数组/NDJSON）+ 落盘 keyword 检索 + doc 级替换 + kind/page 过滤 + JSON/表格输出。5 单测绿 + **真二进制端到端验证**（index→search→引用→过滤全部正确）。clippy 净、fmt 净。
 - [x] v1.1：`eval` 子命令（`cmd_eval`/`EvalOpts`）—— 对 golden 集跑真实检索算 nDCG/recall/MRR/precision，给 `--baseline` 则做回归门禁（掉点超 `--tol` 时非零退出，CI 可用）。复用 `eval::GoldenSet` + `engine::golden::run`（mode=Keyword，确定性）。+1 单测；**真二进制验证**：`fastsearch eval --golden …zh_finance.json --baseline …baseline.json` 输出指标且 `gate: OK`、exit 0。
 
+- [x] **多格式摄取（2026-06-27，docparse 融合后）**：`fastsearch ingest <file>`（`--features parse`）经 docparse `DocumentParser` 注册表按扩展名分发，支持 **PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML** 9 种轻量格式（无 ONNX）。`from_docparse_chunk` 适配 → 落盘索引 → 检索。+1 测试 `multiformat_dispatch`（md/html/csv 解析+适配）+ 实跑（md/csv 摄取后搜索命中）。**重增强器 OCR/VLM/raster**（需运行时 ONNX 模型）= `parse-ocr`/`parse-vlm` 下一迭代（模型 gated）。
+
 **已知限制 / 下一迭代：**
+- **OCR/VLM 增强**（图扫描件/无文本层 PDF）：docparse `PpOcrEnhancer` 等需运行时下载 ONNX 模型（fetch-models.sh）+ 编排（参 docparse-cli `parse_and_enhance`）；feature 编译可验、真跑模型 gated。
 - 跨调用为 keyword（向量索引未落盘）；hybrid 待向量持久化迭代。
 - 过滤仅 `--kind/--page-min/--page-max` 简单标志；完整 filter DSL 走 REST/库 API。
 - 真源应是 Postgres（CLI 当前直接落盘 text 索引演示；与 PG/CDC 串联待 server/sync 线缆层）。
