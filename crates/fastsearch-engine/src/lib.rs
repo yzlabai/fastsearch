@@ -18,7 +18,7 @@ use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
 use fastsearch_sync::replication::{advance_slot, peek_with_lsn, ReplicationConfig};
 use fastsearch_sync::{Applier, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
-pub use fastsearch_vector::{HnswParams, VectorBackendKind};
+pub use fastsearch_vector::{HnswParams, VectorBackendKind, DEFAULT_BINARY_OVERSAMPLE};
 use fastsearch_vector::{VecMeta, VectorBackend, VectorStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -295,6 +295,9 @@ impl Engine {
         let kind = match cp.vector_backend.as_str() {
             "hnsw" => VectorBackendKind::Hnsw(fastsearch_vector::HnswParams::default()),
             "brute" => VectorBackendKind::Brute,
+            "brute_binary" => {
+                VectorBackendKind::BruteBinary(fastsearch_vector::DEFAULT_BINARY_OVERSAMPLE)
+            }
             _ => default_backend,
         };
         let vector = VectorStore::load(kind, &vector_path(data_dir))
@@ -2105,6 +2108,46 @@ mod tests {
         // 文本也在（keyword 路）
         let kw = e2.search(&req("beta"), None).unwrap();
         assert_eq!(kw[0].id.chunk_id, 2);
+    }
+
+    /// 二值粗筛后端化：首启用 `BruteBinary` → 检查点记 `brute_binary` → 重开（即便默认 `Brute`）
+    /// 仍恢复粗筛档（oversample 取默认，同 HNSW 参数策略）；检索可用。
+    #[test]
+    fn persist_reopen_restores_brute_binary_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut e, _) = Engine::open_with(
+            dir.path(),
+            TextIndexConfig::default(),
+            VectorBackendKind::BruteBinary(8),
+        )
+        .unwrap();
+        assert_eq!(e.vector.kind_str(), "brute_binary");
+        e.ingest_vector(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha", 1),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        e.persist(dir.path(), Lsn(7)).unwrap();
+        drop(e);
+
+        // 重开**用默认 Brute**：检查点记的 brute_binary 覆盖默认 → 仍粗筛档。
+        let (e2, lsn) = Engine::open_with(
+            dir.path(),
+            TextIndexConfig::default(),
+            VectorBackendKind::Brute,
+        )
+        .unwrap();
+        assert_eq!(lsn, Lsn(7));
+        assert_eq!(
+            e2.vector.kind_str(),
+            "brute_binary",
+            "检查点应恢复粗筛档（覆盖默认 brute）"
+        );
+        let mut r = req("");
+        r.mode = SearchMode::Vector;
+        r.vector = Some(vec![1.0, 0.0]);
+        assert_eq!(e2.search(&r, None).unwrap()[0].id.chunk_id, 1);
     }
 
     #[test]

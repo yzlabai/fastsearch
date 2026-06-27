@@ -18,11 +18,18 @@ mod binary;
 mod hnsw;
 pub use hnsw::{HnswParams, HnswVectorIndex};
 
+/// 二值量化粗筛档的默认 oversample（重开检查点时用；与 HNSW 参数同策略——格式入检查点、
+/// 调参取默认）。粗筛候选数 = `k·oversample`。
+pub const DEFAULT_BINARY_OVERSAMPLE: usize = 8;
+
 /// 后端选择（engine 据此建库）。默认 `Brute`（暴力精确、确定）。
 #[derive(Debug, Clone, Copy)]
 pub enum VectorBackendKind {
     /// 暴力精确（默认，小/中规模、CI、需确定性）。
     Brute,
+    /// 暴力 + **二值量化两阶段粗筛**（大集合更快、仍确定；on-disk 格式同 `Brute` 的 f32，
+    /// 仅检索策略不同）。`usize` = oversample。
+    BruteBinary(usize),
     /// HNSW 近似（大规模 opt-in；近似召回 + 非确定，见 [`HnswVectorIndex`]）。
     Hnsw(HnswParams),
 }
@@ -38,13 +45,18 @@ impl VectorStore {
     pub fn new(kind: VectorBackendKind) -> Self {
         match kind {
             VectorBackendKind::Brute => VectorStore::Brute(MemVectorIndex::new()),
+            VectorBackendKind::BruteBinary(m) => {
+                VectorStore::Brute(MemVectorIndex::with_binary_prefilter(m))
+            }
             VectorBackendKind::Hnsw(p) => VectorStore::Hnsw(Box::new(HnswVectorIndex::new(p))),
         }
     }
 
-    /// 后端名（落检查点，open 时据此选 loader）。
+    /// 后端名（落检查点，open 时据此选 loader）。二值粗筛档与暴力共享 on-disk f32 格式，但记
+    /// `"brute_binary"` 以便重开时恢复粗筛档（oversample 取默认，同 HNSW 参数策略）。
     pub fn kind_str(&self) -> &'static str {
         match self {
+            VectorStore::Brute(m) if m.binary_oversample().is_some() => "brute_binary",
             VectorStore::Brute(_) => "brute",
             VectorStore::Hnsw(_) => "hnsw",
         }
@@ -90,9 +102,15 @@ impl VectorStore {
     }
 
     /// 按后端名加载（`kind` 取自检查点；默认 brute）。文件缺失 → 空库。
+    /// 二值粗筛档与暴力共享 f32 快照格式：load 同样的 f32 条目，再翻到粗筛档。
     pub fn load(kind: VectorBackendKind, path: &Path) -> anyhow::Result<Self> {
         Ok(match kind {
             VectorBackendKind::Brute => VectorStore::Brute(MemVectorIndex::load(path)?),
+            VectorBackendKind::BruteBinary(m) => {
+                let mut idx = MemVectorIndex::load(path)?;
+                idx.set_binary_prefilter(Some(m));
+                VectorStore::Brute(idx)
+            }
             VectorBackendKind::Hnsw(_) => VectorStore::Hnsw(Box::new(HnswVectorIndex::load(path)?)),
         })
     }
@@ -242,6 +260,16 @@ impl MemVectorIndex {
             binary_oversample: Some(oversample.max(1)),
             ..Self::default()
         }
+    }
+
+    /// 设置/关闭二值粗筛（`None`=精确暴力）。供 load 后翻档（检查点存格式、调档运行期定）。
+    pub fn set_binary_prefilter(&mut self, oversample: Option<usize>) {
+        self.binary_oversample = oversample.map(|m| m.max(1));
+    }
+
+    /// 当前二值粗筛 oversample（`None`=精确暴力档）。
+    pub fn binary_oversample(&self) -> Option<usize> {
+        self.binary_oversample
     }
 
     /// 取某 gid 的引用（命中组装用）。
@@ -770,6 +798,42 @@ mod tests {
             recall >= 0.85,
             "二值粗筛 recall@{k}={recall:.3} 应 ≥0.85（oversample=8）"
         );
+    }
+
+    /// 后端化：`VectorStore` 的 `BruteBinary` 档——`kind_str="brute_binary"`、落盘按粗筛档重载、
+    /// 重载后仍粗筛 + 结果一致（检查点存格式、oversample 取默认，同 HNSW 策略）。
+    #[test]
+    fn vectorstore_brute_binary_roundtrip() {
+        let mut s = VectorStore::new(VectorBackendKind::BruteBinary(8));
+        assert_eq!(s.kind_str(), "brute_binary");
+        for i in 0..40u64 {
+            s.upsert(
+                gid("d", i),
+                pseudo_vec(i, 48),
+                meta("d", i, "paragraph", i as u32, vec!["public"]),
+            )
+            .unwrap();
+        }
+        let q = pseudo_vec(777, 48);
+        let before: Vec<u64> = s
+            .search(&q, 6, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vector.bin");
+        s.save(&path).unwrap();
+        let reloaded = VectorStore::load(VectorBackendKind::BruteBinary(8), &path).unwrap();
+        assert_eq!(reloaded.kind_str(), "brute_binary", "重载应保持粗筛档");
+        let after: Vec<u64> = reloaded
+            .search(&q, 6, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+        assert_eq!(before, after, "落盘往返结果应一致");
     }
 
     /// 二值档仍 filter-aware：预过滤在粗筛**之前**施加，过滤外的项不进候选（守不变量 #5）。

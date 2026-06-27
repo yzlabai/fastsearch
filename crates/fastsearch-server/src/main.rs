@@ -98,10 +98,19 @@ async fn main() -> anyhow::Result<()> {
         ..default_cfg
     };
     // 向量后端：FASTSEARCH_VECTOR_BACKEND=hnsw 用 HNSW 近似（大规模，近似+非确定）；
-    // 默认 brute 暴力精确（确定）。仅首启（无检查点）生效；已建索引沿用其记录的后端。
+    // `brute_binary` 暴力 + 二值量化粗筛（大集合更快、仍确定，oversample 由
+    // FASTSEARCH_BINARY_OVERSAMPLE 调，默认 8）；默认 brute 暴力精确。仅首启（无检查点）生效；
+    // 已建索引沿用其记录的后端。
     let backend = match std::env::var("FASTSEARCH_VECTOR_BACKEND").as_deref() {
         Ok("hnsw") => {
             fastsearch_engine::VectorBackendKind::Hnsw(fastsearch_engine::HnswParams::default())
+        }
+        Ok("brute_binary") => {
+            let m = std::env::var("FASTSEARCH_BINARY_OVERSAMPLE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(fastsearch_engine::DEFAULT_BINARY_OVERSAMPLE);
+            fastsearch_engine::VectorBackendKind::BruteBinary(m)
         }
         _ => fastsearch_engine::VectorBackendKind::Brute,
     };
