@@ -1301,6 +1301,93 @@ mod tests {
         assert_eq!(noauth.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// MM6-inline 服务端 E2E（需 DATABASE_URL + multi-thread）：`GET /v1/asset/{cid}` 经
+    /// auth→handler→engine→source_pg 吐 PG `media_bytes` 真源字节；越权 404、无 key 401。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn asset_inline_bytes_e2e() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip asset_inline_bytes_e2e: DATABASE_URL not set");
+            return;
+        };
+        use fastsearch_core::{AssetPointer, BBox, Chunk, ChunkKind, MediaRef};
+        use fastsearch_pg::{PgConfig, PgStore};
+
+        // 带 inline 字节的图 chunk（无 caption），限 team-a 可见。
+        let bytes = vec![0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A];
+        let mut c = Chunk {
+            doc_id: "img.pdf".into(),
+            chunk_id: 1,
+            kind: ChunkKind::Image,
+            text: String::new(),
+            page: 1,
+            bbox: BBox {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 1.0,
+            },
+            heading_path: vec![],
+            section_id: 0,
+            char_len: 0,
+            media: Some(MediaRef {
+                asset: AssetPointer::Inline,
+                media_type: Some("image/png".into()),
+                time: None,
+                region: None,
+                caption_source: None,
+                thumbnail: None,
+            }),
+            media_bytes: None,
+            tenant: Some("acme".into()),
+            acl: vec!["team-a".into()],
+        };
+
+        // 引擎索引：放 chunk（resolve 取 MediaRef）。PG 真源：放字节。
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.ingest("kb", &c).unwrap();
+        engine.commit().unwrap();
+
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_srv_mb_it".into();
+        let mut store = PgStore::connect(cfg).await.expect("connect");
+        store.ensure_schema().await.expect("schema");
+        c.media_bytes = Some(bytes.clone());
+        store
+            .upsert_doc("kb", "img.pdf", &[c])
+            .await
+            .expect("upsert");
+        engine.set_source_store(std::sync::Arc::new(store));
+
+        let app = router(ServerState::new(engine, keys()));
+        let asset_req = |key: &str| {
+            Request::builder()
+                .uri("/v1/asset/kb:img.pdf:1")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        // 授权 → 200 + image/png + 真源字节。
+        let ok = app.clone().oneshot(asset_req("k-team-a")).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers().get("content-type").unwrap(), "image/png");
+        let got = axum::body::to_bytes(ok.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(got.as_ref(), bytes.as_slice(), "应吐 PG 真源字节");
+        // 越权 → 404（不暴露存在性/字节）。
+        let denied = app.clone().oneshot(asset_req("k-team-b")).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        // 无 key → 401。
+        let noauth = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/asset/kb:img.pdf:1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(noauth.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn pure_auth_and_acl() {
         let ks = keys();
