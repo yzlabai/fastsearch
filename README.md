@@ -1,71 +1,73 @@
 # fastsearch
 
-**外部单二进制混合检索引擎，以托管 Postgres(pgvector) 为真源。** 为可溯源文档 chunk（docparse-rs 解析或纯文本/markdown）做全文 / 向量 / 混合检索，把 **page+bbox 引用端到端**带到答案层——专为 **AI Agent / RAG 的检索与 grounding** 而生。
+> 🌏 中文版: [README.zh-CN.md](README.zh-CN.md)
 
-> 👉 **用于 Agent 开发？先读 [在 Agent 中使用 fastsearch](docs/在Agent中使用fastsearch.md)**（四张脸接入 · RAG recipe · MCP · 多租户 ACL · 同类对比）。
+**A single-binary, external hybrid-search engine that treats managed Postgres (pgvector) as the source of truth.** It runs full-text / vector / hybrid retrieval over traceable document chunks (parsed by docparse-rs, or plain text / markdown) and carries **page+bbox citations end-to-end** to the answer layer — purpose-built for **retrieval and grounding in AI Agents / RAG**.
 
-> 超越 ParadeDB 的关键：**能跑在任意托管 Postgres（RDS/Supabase/Neon）上**——只需 pgvector + 逻辑复制，**不要求任何 `shared_preload_libraries` 原生扩展**。
+> 👉 **Building an Agent? Start with [Using fastsearch in an Agent](docs/在Agent中使用fastsearch.md)** (the four faces · RAG recipe · MCP · multi-tenant ACL · comparison with alternatives). *(currently in Chinese)*
 
-## 架构
+> The key edge over ParadeDB: **it runs on any managed Postgres (RDS / Supabase / Neon)** — it only needs pgvector + logical replication, and **requires no `shared_preload_libraries` native extension**.
+
+## Architecture
 
 ```
-docparse chunks / 文本文件 → Postgres(真源: chunk+元数据+ACL+pgvector)
-                       │ 逻辑复制 CDC（pgoutput, 幂等, LSN 续传）
+docparse chunks / text files → Postgres (source of truth: chunk + metadata + ACL + pgvector)
+                       │ logical-replication CDC (pgoutput, idempotent, LSN resumable)
                        ▼
-   fastsearch 引擎（单二进制, 无状态多副本, 派生索引可重建）
-     · BM25 倒排(Tantivy/mmap)   · 向量(暴力/HNSW+u8量化/pgvector直查, filter-aware)
-     · 融合(RRF/归一化/加权)      · 逐文档 ACL 强制注入(不可绕过)
-     · 引用溯源(page+bbox+section) + resolve_citation 深链 · 多模态
-   四张脸：CLI · 库 · REST · MCP
+   fastsearch engine (single binary, stateless multi-replica, derived index rebuildable)
+     · BM25 inverted index (Tantivy/mmap)   · vector (brute-force / HNSW+u8 quant / pgvector direct, filter-aware)
+     · fusion (RRF / normalized / weighted) · per-document ACL enforced server-side (cannot be bypassed)
+     · citation traceability (page+bbox+section) + resolve_citation deep links · multimodal
+   Four faces: CLI · library · REST · MCP
 ```
 
-## 五分钟上手（本机零依赖）
+## Five-minute quickstart (zero deps, runs locally)
 
 ```bash
 cargo build -p fastsearch-cli --bin fastsearch
-# 喂一个资料文件夹（递归 .md/.txt，markdown 标题成面包屑），随后检索
-./target/debug/fastsearch index-dir --data ./idx --collection kb  ./我的资料
-./target/debug/fastsearch search    --data ./idx --collection kb --query "毛利率" --json
+# Feed it a folder (recurses .md/.txt; markdown headings become breadcrumbs), then search
+./target/debug/fastsearch index-dir --data ./idx --collection kb  ./my-docs
+./target/debug/fastsearch search    --data ./idx --collection kb --query "gross margin" --json
 ```
 
-接 docparse / PDF / REST / MCP / Python 的用法见 [Agent 使用指南](docs/在Agent中使用fastsearch.md)。
+For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs/在Agent中使用fastsearch.md).
 
-## 模块（workspace crates）
+## Modules (workspace crates)
 
-| crate | 职责 |
+| crate | Responsibility |
 |---|---|
-| `fastsearch-core` | 文档模型、查询/过滤 AST、融合(RRF/归一化/加权)、引用、**ACL** |
-| `fastsearch-text` | Tantivy BM25 + CJK(jieba) + 过滤 + 高亮/分面 + ACL |
-| `fastsearch-vector` | 向量后端三档：暴力(默认确定) / HNSW+u8量化(近似) / pgvector直查；filter-aware |
-| `fastsearch-embed` | 嵌入后端 trait + 可配置 HTTP 后端（Ollama / OpenAI 兼容） |
-| `fastsearch-pg` | Postgres 真源：DDL、Chunk↔行映射、doc 级替换写、pgvector 直查 |
-| `fastsearch-sync` | CDC apply：pgoutput 解码 + 幂等 + LSN 检查点 + 替换语义 |
-| `fastsearch-engine` | 整合：ingest→CDC→索引→**全文/向量/混合**检索→引用 + 深分页 + 重建 + 媒资解析 |
-| `fastsearch-eval` | 相关性评测：golden 集 + nDCG/recall/MRR + CI 回归门禁 |
-| `fastsearch-server` | REST(axum) + API-Key 认证 + **ACL 不可绕过** + 指标/限流/审计 + 媒资网关 + CDC 生命周期 |
-| `fastsearch-mcp` | 第四张脸：MCP(stdio+JSON-RPC) 暴露 `search`/`resolve_citation` 工具 |
-| `fastsearch-cli` | `fastsearch` 二进制：index / index-dir / search / ingest(PDF) / eval |
-| `clients/{python,ts}` | 零依赖 SDK + LangChain/LlamaIndex 适配 |
+| `fastsearch-core` | Document model, query/filter AST, fusion (RRF / normalized / weighted), citations, **ACL** |
+| `fastsearch-text` | Tantivy BM25 + CJK (jieba) + filtering + highlighting/facets + ACL |
+| `fastsearch-vector` | Three vector backends: brute-force (deterministic default) / HNSW+u8 quant (approximate) / pgvector direct; filter-aware |
+| `fastsearch-embed` | Embedder trait + configurable HTTP backend (Ollama / OpenAI-compatible) |
+| `fastsearch-pg` | Postgres source of truth: DDL, Chunk↔row mapping, doc-level replace write path, pgvector direct query |
+| `fastsearch-sync` | CDC apply: pgoutput decode + idempotency + LSN checkpoint + replace semantics |
+| `fastsearch-engine` | Orchestration: ingest→CDC→index→**full-text / vector / hybrid** search→citations + deep pagination + rebuild + media resolution |
+| `fastsearch-eval` | Relevance evaluation: golden set + nDCG/recall/MRR + CI regression gate |
+| `fastsearch-server` | REST (axum) + API-key auth + **ACL cannot be bypassed** + metrics/rate-limit/audit + media gateway + CDC lifecycle |
+| `fastsearch-mcp` | The fourth face: MCP (stdio + JSON-RPC) exposing the `search` / `resolve_citation` tools |
+| `fastsearch-cli` | `fastsearch` binary: index / index-dir / search / ingest (PDF) / eval |
+| `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters |
 
-**端到端可用**：ingest/CDC → 索引 → 三模式检索（keyword/vector/hybrid）→ 带引用命中，ACL 强制不可绕过。四张脸齐全。
+**End-to-end usable**: ingest/CDC → index → three search modes (keyword / vector / hybrid) → hits with citations, ACL enforced and unbypassable. All four faces in place.
 
-## 构建与测试
+## Build & test
 
 ```bash
-cargo test --workspace                                    # 全绿（PG 集成在有 DATABASE_URL 时运行）
-cargo clippy --workspace --all-targets -- -D warnings     # 零 warning
+cargo test --workspace                                    # all green (PG integration runs when DATABASE_URL is set)
+cargo clippy --workspace --all-targets -- -D warnings     # zero warnings
 cargo fmt --all --check
-DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG 集成（CI 用 pgvector/pgvector 镜像 + wal_level=logical）
+DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG integration (CI uses the pgvector/pgvector image + wal_level=logical)
 ```
 
-## 文档
+## Documentation
 
-- **[在 Agent 中使用 fastsearch](docs/在Agent中使用fastsearch.md)**（开发者使用指南）
-- [架构速查 / 命令 / 不变量（CLAUDE.md）](CLAUDE.md)
-- [模块拆分与 spec 索引](docs/specs/00-模块拆分.md)
-- [需求分析](docs/plans/2026-06-24-需求分析报告.md) · [产品设计](docs/plans/2026-06-24-产品设计文档.md)
-- [部署](deploy/) · [容量与 SLO](docs/governance/2026-06-26-容量与SLO.md)
+- **[Using fastsearch in an Agent](docs/在Agent中使用fastsearch.md)** (developer usage guide)
+- [Architecture cheat-sheet / commands / invariants (CLAUDE.md)](CLAUDE.md)
+- [Module breakdown & spec index](docs/specs/00-模块拆分.md)
+- [Requirements analysis](docs/plans/2026-06-24-需求分析报告.md) · [Product design](docs/plans/2026-06-24-产品设计文档.md)
+- [Deployment](deploy/) · [Capacity & SLO](docs/governance/2026-06-26-容量与SLO.md)
 
-## 许可
+## License
 
-Apache-2.0。分词词典用 jieba-rs（**MIT**，含内嵌 dict）——无 CC-BY-SA 等 share-alike 义务，分发附 MIT 归属即可（见 [许可审](docs/governance/2026-06-26-词典与第三方许可审.md)）。
+Apache-2.0. Tokenization dictionaries come from jieba-rs (**MIT**, with embedded dict) — no share-alike obligation (e.g. CC-BY-SA); shipping the MIT attribution is sufficient (see the [license review](docs/governance/2026-06-26-词典与第三方许可审.md)).
