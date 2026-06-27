@@ -37,10 +37,12 @@ docparse-xlsx = { path = "../../vendor/docparse/crates/docparse-xlsx", optional 
 docparse-pptx = { path = "../../vendor/docparse/crates/docparse-pptx", optional = true }
 docparse-srt = { path = "../../vendor/docparse/crates/docparse-srt", optional = true }
 docparse-eml = { path = "../../vendor/docparse/crates/docparse-eml", optional = true }
+docparse-img = { path = "../../vendor/docparse/crates/docparse-img", optional = true }
+# OCR 增强器（PP-OCR，运行时加载 ONNX 模型；重 tract 依赖，仅 parse-ocr feature）。
+docparse-ocr = { path = "../../vendor/docparse/crates/docparse-ocr", optional = true }
 
 [features]
-# 开启 docparse 多格式解析（core + 轻量格式解析器，**无 ONNX/渲染**）；默认不开，保持 CLI 精简。
-# 重增强器（OCR/VLM/raster，需运行时 ONNX 模型）走 parse-ocr/parse-vlm（下一迭代，模型 gated）。
+# 开启 docparse 多格式解析（core + 轻量格式解析器 + 图片，**无 ONNX/渲染**）；默认不开，保持 CLI 精简。
 parse = [
     "dep:docparse-core",
     "dep:docparse-pdf",
@@ -52,7 +54,11 @@ parse = [
     "dep:docparse-pptx",
     "dep:docparse-srt",
     "dep:docparse-eml",
+    "dep:docparse-img",
 ]
+# OCR 增强（扫描件/图片无文本层 → PP-OCR 抽文本）：拉入 docparse-ocr（**重 ONNX/tract**）。
+# 运行时需指 ONNX 模型目录（env `FASTSEARCH_OCR_MODELS`，如 docparse-rs/models/ppocr-v5）。
+parse-ocr = ["parse", "dep:docparse-ocr"]
 
 [dev-dependencies]
 tempfile.workspace = true

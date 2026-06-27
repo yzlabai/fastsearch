@@ -36,7 +36,30 @@ fn parsers() -> Vec<Box<dyn docparse_core::parser::DocumentParser>> {
         Box::new(docparse_pptx::PptxParser),
         Box::new(docparse_srt::SrtParser),
         Box::new(docparse_eml::EmlParser),
+        Box::new(docparse_img::ImageParser), // 图片：扫描件/无文本层 → OCR 路由（parse-ocr）
     ]
+}
+
+/// OCR 增强（`parse-ocr` feature）：扫描件/图片无文本层的页经 PP-OCR 抽文本。仅当 env
+/// `FASTSEARCH_OCR_MODELS` 指向 ONNX 模型目录（如 `docparse-rs/models/ppocr-v5`）时启用；
+/// 未设则原样返回（解析层已给出的文本/图 chunk 不变）。重 ONNX 推理在此发生（非搜索热路径）。
+#[cfg(feature = "parse-ocr")]
+fn apply_ocr(doc: docparse_core::ir::Document) -> Result<docparse_core::ir::Document> {
+    let Some(dir) = std::env::var_os("FASTSEARCH_OCR_MODELS") else {
+        return Ok(doc);
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let ocr = docparse_ocr::PpOcrEnhancer::new(&dir)
+        .with_context(|| format!("load PP-OCR models from {}", dir.display()))?;
+    let (enhanced, routes) = docparse_core::enhance::apply(&doc, &[&ocr]);
+    let applied = routes.iter().filter(|r| r.applied).count();
+    eprintln!("OCR: {applied}/{} 页经增强（PP-OCR）", routes.len());
+    Ok(enhanced)
+}
+
+#[cfg(not(feature = "parse-ocr"))]
+fn apply_ocr(doc: docparse_core::ir::Document) -> Result<docparse_core::ir::Document> {
+    Ok(doc)
 }
 
 /// **in-process 解析 → 适配 → 索引**（doc 级替换）：按扩展名选 docparse 解析器 → 解析+分块 →
@@ -57,11 +80,18 @@ pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
     let doc = parser
         .parse(&opts.file)
         .with_context(|| format!("docparse {} parse {}", parser.name(), opts.file.display()))?;
+    let doc = apply_ocr(doc)?; // parse-ocr feature + 模型目录时跑 OCR；否则原样
     let dchunks = docparse_core::chunk::chunk_document(&doc);
     let chunks: Vec<Chunk> = dchunks
         .iter()
         .map(|d| from_docparse_chunk(d, &opts.doc_id, opts.tenant.clone(), opts.acl.clone()))
         .collect();
+    if std::env::var_os("FASTSEARCH_INGEST_DEBUG").is_some() {
+        for (i, c) in chunks.iter().enumerate() {
+            let t: String = c.text.chars().take(60).collect();
+            eprintln!("  chunk[{i}] kind={:?} text={t:?}", c.kind);
+        }
+    }
 
     std::fs::create_dir_all(&opts.data)?;
     let tokenizer = crate::load_or_init_meta(&opts.data, opts.tokenizer)?;
@@ -273,5 +303,43 @@ mod tests {
                 "{fname} 适配后应有非空文本 chunk"
             );
         }
+    }
+
+    /// OCR 端到端（env-gated，需运行时 ONNX 模型——同 PG 集成测试策略）：设
+    /// `FASTSEARCH_OCR_MODELS`（PP-OCR 模型目录，如 `docparse-rs/models/ppocr-v5`）+
+    /// `FASTSEARCH_OCR_TEST_IMAGE`（一张含文字的图片）才跑。验证：图片经 OCR 增强后产出**非空文本**
+    /// chunk（vs 不开 OCR 仅 1 个图 chunk）。**真机验证 2026-06-27**：omnidocbench 数据表页 →
+    /// "Impedance/Reference/BLM18AG121SN1D" 等 OCR 文本可检索。
+    #[cfg(feature = "parse-ocr")]
+    #[test]
+    fn ocr_end_to_end_gated() {
+        let (Some(models), Some(img)) = (
+            std::env::var_os("FASTSEARCH_OCR_MODELS"),
+            std::env::var_os("FASTSEARCH_OCR_TEST_IMAGE"),
+        ) else {
+            eprintln!("skip ocr_end_to_end_gated: FASTSEARCH_OCR_MODELS / _TEST_IMAGE not set");
+            return;
+        };
+        use docparse_core::parser::DocumentParser;
+        let path = std::path::PathBuf::from(&img);
+        let doc = docparse_img::ImageParser.parse(&path).expect("parse image");
+        // 不开 OCR：无文本（仅图）。
+        let base: usize = docparse_core::chunk::chunk_document(&doc)
+            .iter()
+            .filter(|c| !c.text.trim().is_empty())
+            .count();
+        // 开 OCR：抽出文本 chunk。
+        let ocr = docparse_ocr::PpOcrEnhancer::new(std::path::Path::new(&models))
+            .expect("load PP-OCR models");
+        let (enhanced, routes) = docparse_core::enhance::apply(&doc, &[&ocr]);
+        assert!(routes.iter().any(|r| r.applied), "OCR 应至少增强一页");
+        let with_text: usize = docparse_core::chunk::chunk_document(&enhanced)
+            .iter()
+            .filter(|c| !c.text.trim().is_empty())
+            .count();
+        assert!(
+            with_text > base,
+            "OCR 后应多出非空文本 chunk（base={base} ocr={with_text}）"
+        );
     }
 }
