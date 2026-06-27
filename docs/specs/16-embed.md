@@ -1,7 +1,7 @@
 # spec · fastsearch-embed
 
 > 模块 #6，依赖：fastsearch-core。阶段 P2。上游：[产品设计 §3.3](../plans/2026-06-24-产品设计文档.md)、需求 F12。
-> 状态：**开发中**。
+> 状态：**v1.1 已落地**（trait + HashEmbedder + HttpEmbedder；server 端 query/passage 自动嵌入已接入）。多模态 `EmbedInput`（M1/MM8）`gated`。
 
 ## 1. 目的与范围
 
@@ -54,5 +54,5 @@ impl HashEmbedder { pub fn new(dim: usize) -> Self; }
 
 **已知限制 / 下一迭代：**
 - HashEmbedder **非语义**，仅离线/CI/fallback；真语义经 HTTP 后端（Ollama/OpenAI 兼容）接入——**这是默认且唯一推荐路径**（绕开重依赖与模型下载）。**进程内模型推理（Candle/ort）已决定不做**（2026-06-25）。
-- **未接入管线**：ingest 自动嵌入 chunk、query 自动嵌入（CLI/server 在调 engine 前 embed）是下一步；当前向量仍由 `ingest_vector`/`req.vector` 外部传入。换嵌入模型维度变化时需同步 PG `vector_dim` 并重建派生索引。
+- **管线已接入（2026-06-27 核对）**：**server** 路径自动嵌入——query 走 `EmbedKind::Query`、passage/CDC 写入走 `EmbedKind::Passage`（`engine.set_embedder` + `apply_upsert` 在 CDC 落地主循环自动嵌 chunk → 写派生向量索引）。**CLI 仍纯文本路径**（未装 embedder，BM25-only 或需 `ingest_vector`/`req.vector` 外部传向量）。换嵌入模型维度变化时需同步 PG `vector_dim` 并重建派生索引。
 - **多模态嵌入（MM8，gated，未实现）**：`Embedder` trait 当前仍只吃 `&[String]`（文本）。跨模态单向量（`EmbedInput::{Text,Image}` + `HttpEmbedder` 图像 base64 路由 + `caps()` 文图同空间断言，接 SigLIP-2/JinaCLIP-v2/jina-v4/Voyage/Cohere）属 [多模态计划 M1](../plans/2026-06-25-多模态功能设计与开发计划.md)，**待多模态 HTTP 模型服务**，状态 `gated`——M0 阶段图/音/视频经 docparse 的 caption/转录走**文本**嵌入,本 crate 无需改动。

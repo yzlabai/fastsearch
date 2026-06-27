@@ -15,7 +15,7 @@
 三个后端档（同 `VectorBackend` trait）：`MemVectorIndex`（暴力，默认确定）、`HnswVectorIndex`
 （HNSW+u8 量化，A9，大规模近似）、**pgvector 直查**（ANN 在 PG 跑，B6，经 `fastsearch-pg::PgStore::vector_search`）。
 
-**不做**：嵌入计算（embed 模块）；RaBitQ 量化 / filtered-traversal（下一迭代）；CDC 自动写穿 PG embedding（下一迭代）。
+**不做**：嵌入计算（embed 模块）；RaBitQ 量化 / filtered-traversal（下一迭代）；CDC 自动写穿 PG embedding（下一迭代）；**多向量 MaxSim（ColPali，M2/MM11）`gated`**——只在引擎派生层、不入 PG 真源（不变量 #1），待多模态模型与规模信封。当前后端全是**单向量**（文本嵌入产出；视觉/跨模态向量属 M1 gated，本 crate 不感知模态、只存 `VecMeta.modality` 供过滤下推）。
 
 ## 2. 公开接口
 

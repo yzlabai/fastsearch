@@ -42,6 +42,8 @@
 | **PG 真源写入 + CDC + 模态过滤检索** | **fastsearch** | ✅ 主体 | PG 真源写入 + 逻辑复制 CDC（幂等/LSN 续传）+ **模态过滤（两端 SUPERSET）+ 时间区间精确下推** ✅（MM2c-time/MM4/MM5） |
 
 > **现状以代码为真源**，状态截至 2026-06-27（见 [多模态完善 devlog](../devlog/2026-06-27-多模态完善.md) 完成情况表）。fastsearch 侧的 M0 多模态（schema/过滤/媒资网关/inline 字节）已落地并 Docker 验证；剩余 gated 项（对象存储、跨模态/ColPali 模型）已诚实标注。
+>
+> **图像检索现状速览（caption-as-text，无 CLIP）**：图能被检到靠的是 docparse 上游给的 **caption/描述文本**（4 级绑定）落进 chunk 的 `text`，走 **BM25 倒排 + 文本向量 ANN** 召回；图字节本身只用于展示（inline `media_bytes` / `/v1/asset` 网关），**不参与打分**。引擎侧 `Embedder` trait 仍只吃 `&[String]`（`EmbedKind=Query|Passage`），**无视觉/跨模态嵌入、未集成 CLIP/SigLIP/ColPali**。真正的视觉向量（以图搜图、page-image 多向量）= **M1（跨模态单向量，MM8/9/10）/ M2（ColPali MaxSim，MM11+）**，均 `gated` 待多模态 HTTP 模型服务（接入落点见 [功能设计 §4.1/§5.3](2026-06-25-多模态功能设计与开发计划.md)）。
 
 ---
 
