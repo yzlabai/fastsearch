@@ -789,6 +789,7 @@ mod tests {
             section_id: 0,
             char_len: text.len() as u32,
             media: None,
+            media_bytes: None,
             tenant: Some("acme".into()),
             acl: acl.into_iter().map(String::from).collect(),
         }

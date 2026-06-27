@@ -113,6 +113,7 @@ pub fn from_docparse_chunk(
             .image
             .as_ref()
             .map(|im| map_image(im, dc.page as u32, bbox)),
+        media_bytes: None, // docparse base64 → 字节携带待 base64 依赖（MM2c-bytes follow-up）
         tenant,
         acl,
     }

@@ -45,6 +45,7 @@ fn to_core(dc: DocparseChunk, doc_id: &str) -> Chunk {
         char_len: dc.char_len,
         // 遗留 docparse `image` 字段迁移到统一 media（file→Object，否则 DocRegion）。
         media: dc.image.as_ref().map(|im| im.to_media(dc.page, dc.bbox)),
+        media_bytes: None, // inline 字节经 docparse base64 携带待 base64 依赖（MM2c-bytes follow-up）
         tenant: None,
         acl: vec!["public".to_string()],
     }
@@ -119,6 +120,7 @@ fn mk_text_chunk(
         heading_path: hp,
         section_id: 0,
         media: None,
+        media_bytes: None,
         tenant: None,
         acl: vec!["public".to_string()],
     };

@@ -78,7 +78,7 @@ impl PgStore {
         let mut n = 0u64;
         for c in chunks {
             let row = ChunkRow::from_chunk(collection, c)?;
-            let params: [&(dyn ToSql + Sync); 16] = [
+            let params: [&(dyn ToSql + Sync); 17] = [
                 &row.collection,
                 &row.doc_id,
                 &row.chunk_id,
@@ -91,6 +91,7 @@ impl PgStore {
                 &row.char_len,
                 &row.modality,
                 &row.media,
+                &row.media_bytes,
                 &row.time_start_ms,
                 &row.time_end_ms,
                 &row.tenant,
@@ -113,6 +114,25 @@ impl PgStore {
         let q = sql::fetch_doc_sql(&self.cfg.table);
         let rows = self.client.query(&q, &[&collection, &doc_id]).await?;
         rows.iter().map(row_to_chunk).collect()
+    }
+
+    /// 按主键取 inline 媒资字节（媒资网关 `/v1/asset` Inline 路径，MM6-inline 用）。
+    /// 无该行 / `media_bytes` 为 NULL → `Ok(None)`。字节是 PG 真源、引擎派生层不持 → 按需直查。
+    pub async fn fetch_media_bytes(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        chunk_id: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let q = sql::fetch_media_bytes_sql(&self.cfg.table);
+        let rows = self
+            .client
+            .query(&q, &[&collection, &doc_id, &(chunk_id as i64)])
+            .await?;
+        match rows.first() {
+            Some(r) => Ok(r.try_get::<_, Option<Vec<u8>>>("media_bytes")?),
+            None => Ok(None),
+        }
     }
 
     /// 全表读取 `(collection, Chunk)`（初始快照 bootstrap 用）。v1 全量；超大表分页为后续。
@@ -352,6 +372,7 @@ fn row_to_chunk(r: &Row) -> Result<Chunk> {
         char_len: r.try_get("char_len")?,
         modality: r.try_get("modality")?,
         media: r.try_get("media")?,
+        media_bytes: r.try_get("media_bytes")?,
         time_start_ms: r.try_get("time_start_ms")?,
         time_end_ms: r.try_get("time_end_ms")?,
         tenant: r.try_get("tenant")?,
@@ -382,6 +403,7 @@ mod tests {
             section_id: 1,
             char_len: 5,
             media: None,
+            media_bytes: None,
             tenant: None,
             acl: vec!["public".into()],
         }
@@ -436,6 +458,74 @@ mod tests {
             store.fetch_doc("kb", "a.pdf").await.expect("fetch3").len(),
             0
         );
+    }
+
+    /// MM2c-bytes 集成：inline 字节经 PG `media_bytes` bytea 真源往返（需 DATABASE_URL）。
+    #[tokio::test]
+    async fn integration_media_bytes_roundtrip() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip integration_media_bytes_roundtrip: DATABASE_URL not set");
+            return;
+        };
+        use fastsearch_core::{AssetPointer, MediaRef};
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_mbytes_it".into();
+        let mut store = PgStore::connect(cfg).await.expect("connect");
+        store
+            .client
+            .batch_execute("DROP TABLE IF EXISTS fastsearch_mbytes_it")
+            .await
+            .ok();
+        store.ensure_schema().await.expect("schema");
+
+        // 一张带 inline 字节的小图 + 一个无字节的文本段。
+        let mut img = sample("d.pdf", 1);
+        img.kind = ChunkKind::Image;
+        img.text = String::new();
+        img.media = Some(MediaRef {
+            asset: AssetPointer::Inline,
+            media_type: Some("image/png".into()),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        let bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]; // PNG 头样例
+        img.media_bytes = Some(bytes.clone());
+        let txt = sample("d.pdf", 2); // media_bytes None
+
+        store
+            .upsert_doc("kb", "d.pdf", &[img, txt])
+            .await
+            .expect("upsert");
+
+        // 网关按需直查字节：图有字节、文本段无字节、不存在返回 None。
+        let got = store
+            .fetch_media_bytes("kb", "d.pdf", 1)
+            .await
+            .expect("fetch bytes");
+        assert_eq!(got, Some(bytes));
+        let none = store
+            .fetch_media_bytes("kb", "d.pdf", 2)
+            .await
+            .expect("fetch none");
+        assert_eq!(none, None);
+        let missing = store
+            .fetch_media_bytes("kb", "d.pdf", 999)
+            .await
+            .expect("fetch missing");
+        assert_eq!(missing, None);
+
+        // fetch_doc 往返也带回字节（写侧 Chunk.media_bytes 一致）。
+        let back = store.fetch_doc("kb", "d.pdf").await.expect("fetch_doc");
+        assert!(back
+            .iter()
+            .find(|c| c.chunk_id == 1)
+            .unwrap()
+            .media_bytes
+            .is_some());
+
+        store.delete_doc("kb", "d.pdf").await.ok();
     }
 
     /// B6 直查集成：pgvector ANN + ACL 下推 + filter-aware（需 DATABASE_URL）。

@@ -63,6 +63,7 @@ fn chunk(id: u64, text: String) -> Chunk {
         section_id: 0,
         char_len: 60,
         media: None,
+        media_bytes: None,
         tenant: None,
         acl: vec!["public".into()],
     }

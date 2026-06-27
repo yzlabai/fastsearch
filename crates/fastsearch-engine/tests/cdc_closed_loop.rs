@@ -40,6 +40,7 @@ fn chunk(doc: &str, id: u64, text: &str) -> Chunk {
         section_id: 7,
         char_len: text.len() as u32,
         media: None,
+        media_bytes: None,
         tenant: None,
         acl: vec!["public".into()],
     }

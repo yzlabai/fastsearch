@@ -164,6 +164,10 @@ pub struct Chunk {
     /// 媒资引用（图/音/视频；统一目标，遗留 `image_meta` 已迁移至此，见 MM2b）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaRef>,
+    /// inline 媒资字节（小裁图，`AssetPointer::Inline` 时有值；落 PG `media_bytes` 真源，MM2c-bytes）。
+    /// 写侧通道：不进 JSON 线缆/不上 Citation（字节是真源内容，由媒资网关按需从 PG 取）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_bytes: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
     #[serde(default = "default_acl")]
@@ -373,6 +377,7 @@ mod tests {
             section_id: 17,
             char_len: 1,
             media: None,
+            media_bytes: None,
             tenant: None,
             acl: default_acl(),
         };

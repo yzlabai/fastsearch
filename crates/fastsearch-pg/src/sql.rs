@@ -41,6 +41,7 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              char_len integer NOT NULL,\n\
              modality text NOT NULL DEFAULT 'text',\n\
              media jsonb,\n\
+             media_bytes bytea,\n\
              time_start_ms bigint,\n\
              time_end_ms bigint,\n\
              tenant text,\n\
@@ -246,6 +247,7 @@ pub const COLUMNS: &[&str] = &[
     "char_len",
     "modality",
     "media",
+    "media_bytes",
     "time_start_ms",
     "time_end_ms",
     "tenant",
@@ -259,8 +261,17 @@ pub const COLUMNS: &[&str] = &[
 pub fn insert_sql(table: &str) -> String {
     format!(
         "INSERT INTO {table} \
-         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, modality, media, time_start_ms, time_end_ms, tenant, acl) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11, $12::text::jsonb, $13, $14, $15, $16)"
+         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, modality, media, media_bytes, time_start_ms, time_end_ms, tenant, acl) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11, $12::text::jsonb, $13, $14, $15, $16, $17)"
+    )
+}
+
+/// 按主键取 inline 媒资字节（媒资网关 `/v1/asset` 的 Inline 路径，MM6-inline 用）。
+/// 返回单列 `media_bytes`（可空 bytea）。字节是 PG 真源、引擎派生层不持有 → 按需直查。
+pub fn fetch_media_bytes_sql(table: &str) -> String {
+    format!(
+        "SELECT media_bytes FROM {table} \
+         WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3"
     )
 }
 
@@ -273,7 +284,7 @@ pub fn delete_doc_sql(table: &str) -> String {
 pub fn fetch_doc_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, modality, media::text, time_start_ms, time_end_ms, tenant, acl \
+         section_id, char_len, modality, media::text, media_bytes, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 ORDER BY chunk_id"
     )
 }
@@ -282,7 +293,7 @@ pub fn fetch_doc_sql(table: &str) -> String {
 pub fn fetch_all_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, modality, media::text, time_start_ms, time_end_ms, tenant, acl \
+         section_id, char_len, modality, media::text, media_bytes, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} ORDER BY collection, doc_id, chunk_id"
     )
 }
@@ -318,6 +329,8 @@ pub struct ChunkRow {
     pub modality: String,
     /// 媒资引用 JSON（`MediaRef`，不含 inline 字节）。
     pub media: Option<String>,
+    /// inline 媒资字节（`bytea`，`AssetPointer::Inline` 时有值；PG 真源，MM2c-bytes）。
+    pub media_bytes: Option<Vec<u8>>,
     /// 时间区间（毫秒）：从 `media.time` 派生落列（MM2c），供 SQL 侧 SUPERSET 下推/排序。
     /// 读路径 `to_chunk` 的 `time` 仍由 `media` 恢复（这两列是写侧反规范化，非权威源）。
     pub time_start_ms: Option<i64>,
@@ -341,6 +354,7 @@ impl ChunkRow {
             char_len: c.char_len as i32,
             modality: c.kind.modality().as_str().to_string(),
             media: c.media.as_ref().map(serde_json::to_string).transpose()?,
+            media_bytes: c.media_bytes.clone(),
             // 时间区间从 media.time 派生落列（与后过滤同源 → 下推/后过滤一致）。
             time_start_ms: c
                 .media
@@ -374,6 +388,7 @@ impl ChunkRow {
             section_id: self.section_id as u64,
             char_len: self.char_len as u32,
             media, // 媒资从 media jsonb 列恢复（modality 在 Chunk 侧由 kind 派生）
+            media_bytes: self.media_bytes.clone(),
             tenant: self.tenant.clone(),
             acl: self.acl.clone(),
         })
@@ -402,6 +417,7 @@ mod tests {
             section_id: 17,
             char_len: 8,
             media: None,
+            media_bytes: None,
             tenant: Some("acme".into()),
             acl: vec!["team-a".into(), "public".into()],
         }
@@ -418,6 +434,7 @@ mod tests {
         assert!(joined.contains("acl text[]"));
         assert!(joined.contains("modality text NOT NULL DEFAULT 'text'"));
         assert!(joined.contains("media jsonb"));
+        assert!(joined.contains("media_bytes bytea"));
         assert!(joined.contains("time_start_ms bigint"));
         assert!(joined.contains("time_end_ms bigint"));
         assert!(joined.contains("CREATE PUBLICATION fastsearch_pub FOR TABLE fastsearch_chunks"));
@@ -426,12 +443,12 @@ mod tests {
     #[test]
     fn insert_and_delete_sql_shape() {
         let ins = insert_sql("t");
-        assert!(ins.contains("$16"));
+        assert!(ins.contains("$17"));
         assert!(ins.contains("$7::text::jsonb")); // bbox（先 ::text 再 ::jsonb，见 insert_sql 注释）
         assert!(ins.contains("$12::text::jsonb")); // media
-        assert!(ins.contains("modality, media, time_start_ms, time_end_ms")); // 新列入列名（MM2c）
+        assert!(ins.contains("modality, media, media_bytes, time_start_ms, time_end_ms")); // 新列（MM2c）
         assert!(!ins.contains("image_meta")); // 遗留列已移除
-        assert!(!ins.contains("$17")); // exactly 16 params
+        assert!(!ins.contains("$18")); // exactly 17 params
         let del = delete_doc_sql("t");
         assert_eq!(del, "DELETE FROM t WHERE collection = $1 AND doc_id = $2");
     }
@@ -456,6 +473,7 @@ mod tests {
         use fastsearch_core::{AssetPointer, MediaRef, TimeSpan};
         let mut c = sample();
         c.kind = ChunkKind::Audio;
+        c.media_bytes = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]); // inline 字节往返
         c.media = Some(MediaRef {
             asset: AssetPointer::Object {
                 uri: "s3://b/clip.mp3".into(),
@@ -475,6 +493,7 @@ mod tests {
         // 时间区间从 media.time 派生落列（MM2c），供 SQL 侧下推。
         assert_eq!(row.time_start_ms, Some(1000));
         assert_eq!(row.time_end_ms, Some(5000));
+        assert_eq!(row.media_bytes, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
         let back = row.to_chunk().unwrap();
         assert_eq!(back, c); // media 往返一致（time 由 media 恢复，与列同源）
     }
