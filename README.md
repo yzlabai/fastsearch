@@ -4,7 +4,7 @@
 
 **A single-binary, external hybrid-search engine that treats managed Postgres (pgvector) as the source of truth.** It runs full-text / vector / hybrid retrieval over traceable document chunks (parsed by docparse-rs, or plain text / markdown) and carries **page+bbox citations end-to-end** to the answer layer — purpose-built for **retrieval and grounding in AI Agents / RAG**.
 
-> 👉 **Building an Agent? Start with [Using fastsearch in an Agent](docs/在Agent中使用fastsearch.md)** (the four faces · RAG recipe · MCP · multi-tenant ACL · comparison with alternatives). *(currently in Chinese)*
+> 👉 **Building an Agent? Start with [Using fastsearch in an Agent](docs/using-fastsearch-in-an-agent.md)** (the four faces · RAG recipe · MCP · multi-tenant ACL · comparison with alternatives).
 
 > The key edge over ParadeDB: **it runs on any managed Postgres (RDS / Supabase / Neon)** — it only needs pgvector + logical replication, and **requires no `shared_preload_libraries` native extension**.
 
@@ -62,7 +62,7 @@ DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG integration (CI u
 
 ## Documentation
 
-- **[Using fastsearch in an Agent](docs/在Agent中使用fastsearch.md)** (developer usage guide)
+- **[Using fastsearch in an Agent](docs/using-fastsearch-in-an-agent.md)** (developer usage guide)
 - [Architecture cheat-sheet / commands / invariants (CLAUDE.md)](CLAUDE.md)
 - [Module breakdown & spec index](docs/specs/00-模块拆分.md)
 - [Requirements analysis](docs/plans/2026-06-24-需求分析报告.md) · [Product design](docs/plans/2026-06-24-产品设计文档.md)

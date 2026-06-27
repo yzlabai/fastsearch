@@ -1,5 +1,7 @@
 # 在 Agent 开发中使用 fastsearch
 
+> 🌐 English version: [using-fastsearch-in-an-agent.md](using-fastsearch-in-an-agent.md)
+
 > 面向开发者的使用指南：把 fastsearch 作为 **AI Agent / RAG 的检索与 grounding 层**。
 > 参考了 Meilisearch、Qdrant、pgvector、Exa/Tavily 等同类产品在 agentic-RAG 场景的做法
 > （见文末「同类对比」），落到 fastsearch 的**真实 API**（本文示例均可直接跑）。
