@@ -278,7 +278,7 @@ struct PgVecRow {
     acl: Vec<String>,
     heading_path: Vec<String>,
     bbox: fastsearch_core::BBox,
-    /// 解析出的媒资引用（供 Citation.media；time 也由它给）。
+    /// 解析出的媒资引用（供 Citation.media / Citation.time；time 后过滤的权威源）。
     media: Option<fastsearch_core::MediaRef>,
 }
 
@@ -344,6 +344,9 @@ impl fastsearch_core::FieldSource for PgVecRow {
             "tenant" => self.tenant.clone().map(FieldValue::Str),
             "page" => Some(FieldValue::Int(self.page as i64)),
             "section_id" => Some(FieldValue::Int(self.section_id)),
+            // 后过滤读**权威源** media.time（与 brute/HNSW 侧一致）。下推侧对 time 列用
+            // `OR col IS NULL` 保证超集（见 sql.rs WhereBuilder）→ 即便列 NULL 而 media.time 有值，
+            // 该行仍被下推保留、由此处精确判定，不漏召回（守不变量 #5）。
             "time_start_ms" => self.time().map(|t| FieldValue::Int(t.start_ms as i64)),
             "time_end_ms" => self.time().map(|t| FieldValue::Int(t.end_ms as i64)),
             _ => None,
@@ -526,6 +529,88 @@ mod tests {
             .is_some());
 
         store.delete_doc("kb", "d.pdf").await.ok();
+    }
+
+    /// 不变量 #5 回归（需 DATABASE_URL）：行有 `media.time` 但反规范化列 `time_start_ms` 为
+    /// NULL（模拟遗留/外部写入）时，时间区间过滤**仍正确**——下推 `OR IS NULL` 保超集、后过滤读
+    /// 权威 `media.time`：匹配的不漏召回、不匹配的精确排除。
+    #[tokio::test]
+    async fn integration_time_filter_null_column_superset() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip integration_time_filter_null_column_superset: DATABASE_URL not set");
+            return;
+        };
+        use fastsearch_core::{AssetPointer, FieldValue, Filter, MediaRef, TimeSpan};
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_time_null_it".into();
+        cfg.vector_dim = 2;
+        cfg.vector_type = VectorType::Vector;
+        let mut store = PgStore::connect(cfg).await.expect("connect");
+        store
+            .client
+            .batch_execute("DROP TABLE IF EXISTS fastsearch_time_null_it")
+            .await
+            .ok();
+        store.ensure_schema().await.expect("schema");
+
+        // 音频段：media.time=[2000,4000]，正常写入会同时填 time_start_ms 列。
+        let mut c = sample("a.mp3", 1);
+        c.kind = ChunkKind::Audio;
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Object {
+                uri: "s3://b/a.mp3".into(),
+            },
+            media_type: Some("audio/mpeg".into()),
+            time: Some(TimeSpan {
+                start_ms: 2000,
+                end_ms: 4000,
+            }),
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        c.tenant = None;
+        c.acl = vec!["public".into()];
+        store.upsert_doc("kb", "a.mp3", &[c]).await.expect("upsert");
+        store
+            .set_embedding("kb", "a.mp3", 1, &[1.0, 0.0])
+            .await
+            .expect("emb");
+        // 模拟"遗留行"：把反规范化列清成 NULL（media.time 仍在 jsonb）。
+        store
+            .client
+            .execute(
+                "UPDATE fastsearch_time_null_it SET time_start_ms = NULL, time_end_ms = NULL",
+                &[],
+            )
+            .await
+            .expect("null out cols");
+
+        let q = vec![1.0f32, 0.0];
+        // 匹配查询（media.time.start=2000 >= 1000）：列 NULL 但**不漏召回**（OR IS NULL + 后过滤）。
+        let f_hit = Filter::Gte("time_start_ms".into(), FieldValue::Int(1000));
+        let hits = store
+            .vector_search(&q, 5, 4, None, Some(&f_hit))
+            .await
+            .expect("search hit");
+        assert_eq!(
+            hits.len(),
+            1,
+            "媒资 time 匹配 → 不漏召回（列 NULL 不致排除）"
+        );
+        // 不匹配查询（start=2000 < 3000）：后过滤读权威 media.time **精确排除**。
+        let f_miss = Filter::Gte("time_start_ms".into(), FieldValue::Int(3000));
+        let none = store
+            .vector_search(&q, 5, 4, None, Some(&f_miss))
+            .await
+            .expect("search miss");
+        assert!(none.is_empty(), "media.time 不匹配 → 后过滤精确排除");
+
+        store
+            .client
+            .batch_execute("DROP TABLE fastsearch_time_null_it")
+            .await
+            .ok();
     }
 
     /// B6 直查集成：pgvector ANN + ACL 下推 + filter-aware（需 DATABASE_URL）。

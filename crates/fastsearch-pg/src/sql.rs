@@ -98,6 +98,14 @@ fn col_kind(field: &str) -> Option<(&'static str, bool)> {
     }
 }
 
+/// 该列是否是"**权威源在别处**的可空反规范化列"——其值由写路径从权威字段派生落列，
+/// 但权威源（如 `media.time`）才是后过滤读的真相。这类列下推须加 `OR col IS NULL` 保超集：
+/// 否则列 NULL（遗留/外部写入行）而权威源有值时，下推会排除掉后过滤会保留的行（违反 #5）。
+/// 目前仅 `time_start_ms`/`time_end_ms`（派生自 `media.time`，MM2c-time）。
+fn nullable_denorm(col: &str) -> bool {
+    matches!(col, "time_start_ms" | "time_end_ms")
+}
+
 /// 值与列类型匹配则返回对应 `SqlParam`，否则 None（→ 该叶子不可翻译，TRUE 超集）。
 fn match_param(is_text_col: bool, v: &FieldValue) -> Option<SqlParam> {
     match (is_text_col, v) {
@@ -130,7 +138,12 @@ impl WhereBuilder {
         match match_param(is_text, v) {
             Some(p) => {
                 let ph = self.ph(p);
-                format!("{col} {op} {ph}")
+                if nullable_denorm(col) {
+                    // 超集：列 NULL 行也放行，交后过滤（读权威 media.time）精确判定，守 #5。
+                    format!("({col} {op} {ph} OR {col} IS NULL)")
+                } else {
+                    format!("{col} {op} {ph}")
+                }
             }
             None => "TRUE".into(),
         }
@@ -175,7 +188,12 @@ impl WhereBuilder {
         match params {
             Some(ps) if !ps.is_empty() => {
                 let phs: Vec<String> = ps.into_iter().map(|p| self.ph(p)).collect();
-                format!("{col} IN ({})", phs.join(", "))
+                let inner = format!("{col} IN ({})", phs.join(", "));
+                if nullable_denorm(col) {
+                    format!("({inner} OR {col} IS NULL)")
+                } else {
+                    inner
+                }
             }
             _ => "TRUE".into(), // 空 In 或类型不符
         }
@@ -214,7 +232,7 @@ pub fn pgvector_search_sql(
     if let Some(f) = filter {
         wheres.push(b.build(f));
     }
-    // heading_path/media 供不可翻译子句（HeadingPrefix/时间）精确后过滤；bbox/media 供组装 Citation。
+    // heading_path/media 供不可翻译子句（HeadingPrefix）+ 时间后过滤（media.time 权威）；bbox/media 供组装 Citation。
     let sql = format!(
         "SELECT collection, doc_id, chunk_id, kind, modality, page, section_id, tenant, acl, \
          heading_path, bbox::text, media::text, 1 - (embedding <=> $1::text::vector) AS score \
@@ -594,8 +612,10 @@ mod tests {
             Filter::Lte("time_end_ms".into(), FieldValue::Int(9000)),
         ]);
         let (sql, params) = pgvector_search_sql("t", 20, None, Some(&f));
-        assert!(sql.contains("time_start_ms >= $2"));
-        assert!(sql.contains("time_end_ms <= $3"));
+        // 超集守 #5：时间列下推须 `OR col IS NULL`（列 NULL 而 media.time 有值的遗留行不被排除，
+        // 交后过滤读权威 media.time 精确判定）。
+        assert!(sql.contains("(time_start_ms >= $2 OR time_start_ms IS NULL)"));
+        assert!(sql.contains("(time_end_ms <= $3 OR time_end_ms IS NULL)"));
         assert_eq!(
             params,
             vec![SqlParam::Int(1000), SqlParam::Int(9000)],
