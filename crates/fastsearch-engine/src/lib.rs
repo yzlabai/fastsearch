@@ -196,7 +196,7 @@ pub struct ResolvedAsset {
 pub enum AssetFetch {
     /// 内联字节（小裁图，字节在 PG `media_bytes`——MM2 接入；当前引擎索引无字节）。
     InlineBytes(Vec<u8>),
-    /// 对象存储签名 URL（真签名待对象存储接入；当前回 uri + 过期秒数）。
+    /// 对象存储**短时签名 URL**（由 [`ObjectSigner`] 签发；绝不含裸 key，不变量 #3）。
     SignedUrl { url: String, expires_s: u64 },
     /// 无独立字节：跳转到原文位置（page+bbox），答案层据此深链/高亮。
     DocRender {
@@ -204,6 +204,13 @@ pub enum AssetFetch {
         page: u32,
         bbox: BBox,
     },
+}
+
+/// 对象存储签名器（MM6-secure）：把 `AssetPointer::Object` 的存储 key/uri 签成**短时 URL**，
+/// 使客户端能取大媒资字节而**不暴露裸 key**（不变量 #3）。返回 `(签名 URL, 过期秒数)`；
+/// `None` = 不可签（如 key 非法）→ 网关 404。真实现（S3 presign 类）属对象存储接入，gated。
+pub trait ObjectSigner: Send + Sync {
+    fn sign(&self, uri: &str) -> Option<(String, u64)>;
 }
 
 /// 端到端检索引擎。
@@ -222,6 +229,9 @@ pub struct Engine {
     /// 按需直查 PG `media_bytes` 字节（字节是真源、引擎派生层不持）。与 `vector_pg` 解耦（语义不同，
     /// 可指向同一 `PgStore`）。仅在 **multi-thread tokio runtime** 下可用（`block_in_place` 桥接）。
     source_pg: Option<std::sync::Arc<fastsearch_pg::PgStore>>,
+    /// 可选 **对象存储签名器**（MM6-secure）：`resolve_citation` 的 `Object` 路径用它签短时 URL；
+    /// **未配置 → `Object` 返回 None（404），绝不回退到裸 key**（不变量 #3）。
+    object_signer: Option<Box<dyn ObjectSigner>>,
 }
 
 impl Engine {
@@ -238,6 +248,7 @@ impl Engine {
             embedder: None,
             vector_pg: None,
             source_pg: None,
+            object_signer: None,
         })
     }
 
@@ -249,6 +260,7 @@ impl Engine {
             embedder: None,
             vector_pg: None,
             source_pg: None,
+            object_signer: None,
         })
     }
 
@@ -291,6 +303,7 @@ impl Engine {
                 embedder: None,
                 vector_pg: None,
                 source_pg: None,
+                object_signer: None,
             },
             Lsn(cp.applied_lsn),
         ))
@@ -412,6 +425,12 @@ impl Engine {
         self.source_pg = Some(store);
     }
 
+    /// 配置 **对象存储签名器（MM6-secure）**：`resolve_citation` 的 `Object` 路径据此签短时 URL。
+    /// **不配置则 `Object` 一律 404（不暴露裸 key，不变量 #3）**。真实现（S3 presign 类）gated 对象存储。
+    pub fn set_object_signer(&mut self, signer: Box<dyn ObjectSigner>) {
+        self.object_signer = Some(signer);
+    }
+
     /// 灌入一个 chunk（仅全文，不提交）。
     pub fn ingest(&mut self, collection: &str, chunk: &Chunk) -> Result<()> {
         self.text.upsert(collection, chunk)?;
@@ -507,9 +526,14 @@ impl Engine {
                 page,
                 bbox,
             },
-            AssetPointer::Object { uri } => AssetFetch::SignedUrl {
-                url: uri,
-                expires_s: 300,
+            // Object 大媒资在对象存储：必须经签名器签短时 URL（绝不暴露裸 key，不变量 #3）。
+            // 无签名器 → None（404），**不回退到裸 uri**。真签名器（S3 presign 类）gated 对象存储。
+            AssetPointer::Object { uri } => match &self.object_signer {
+                Some(signer) => match signer.sign(&uri) {
+                    Some((url, expires_s)) => AssetFetch::SignedUrl { url, expires_s },
+                    None => return Ok(None),
+                },
+                None => return Ok(None),
             },
             // Inline 字节在 PG media_bytes 真源（MM6-inline）：有真源句柄则按需直查取字节；
             // 无句柄 / 无字节 → None（等同 404）。block_in_place 桥接同步 resolve↔异步 PG
@@ -1464,6 +1488,67 @@ mod tests {
             .resolve_citation("kb:a.pdf:999", Some(&authorized))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn mm6_secure_object_no_signer_is_404() {
+        use fastsearch_core::{AssetPointer, MediaRef};
+        let mut e = engine();
+        let mut c = chunk("a.pdf", 1, ChunkKind::Audio, "transcript", 1);
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Object {
+                uri: "s3://bucket/secret-key.mp3".into(),
+            },
+            media_type: Some("audio/mpeg".into()),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        e.ingest("kb", &c).unwrap();
+        e.commit().unwrap();
+        // 无签名器 → None（404），绝不回退到裸 key（不变量 #3）。
+        assert!(
+            e.resolve_citation("kb:a.pdf:1", None).unwrap().is_none(),
+            "无签名器时 Object 必 404，不暴露裸 key"
+        );
+    }
+
+    #[test]
+    fn mm6_secure_object_with_signer_signs() {
+        use fastsearch_core::{AssetPointer, MediaRef};
+        struct TestSigner;
+        impl ObjectSigner for TestSigner {
+            fn sign(&self, uri: &str) -> Option<(String, u64)> {
+                // 真实现会 S3 presign；测试桩只证明：签出的 URL 不含裸 key。
+                let name = uri.rsplit('/').next().unwrap_or("asset");
+                Some((format!("https://signed.example/{name}?token=abc"), 300))
+            }
+        }
+        let mut e = engine();
+        e.set_object_signer(Box::new(TestSigner));
+        let mut c = chunk("a.pdf", 1, ChunkKind::Audio, "transcript", 1);
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Object {
+                uri: "s3://bucket/secret-key.mp3".into(),
+            },
+            media_type: Some("audio/mpeg".into()),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        e.ingest("kb", &c).unwrap();
+        e.commit().unwrap();
+        let r = e.resolve_citation("kb:a.pdf:1", None).unwrap().unwrap();
+        match r.fetch {
+            AssetFetch::SignedUrl { url, expires_s } => {
+                assert!(url.starts_with("https://signed.example/"));
+                assert!(!url.contains("s3://"), "签名 URL 绝不含裸 key");
+                assert_eq!(expires_s, 300);
+            }
+            other => panic!("expected SignedUrl, got {other:?}"),
+        }
     }
 
     #[test]

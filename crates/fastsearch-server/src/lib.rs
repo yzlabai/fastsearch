@@ -616,8 +616,9 @@ async fn similar(
 }
 
 /// 媒资 ACL 网关：`GET /v1/asset/{citation_id}` —— `principal→acl_for→resolve_citation`，
-/// ACL 不可绕过（不可见/不存在均 404，不暴露存在性）。InlineBytes 直吐字节、SignedUrl 302、
-/// DocRender 返回跳原文 JSON。Range（音视频 seek）待字节服务（MM2/对象存储）接入。
+/// ACL 不可绕过（不可见/不存在均 404，不暴露存在性）。InlineBytes 直吐字节（PG 真源，MM6-inline）、
+/// SignedUrl 302（由 `ObjectSigner` 签短时 URL；**未配签名器时 Object→404，绝不暴露裸 key**，MM6-secure）、
+/// DocRender 返回跳原文 JSON。Range（音视频 seek）待对象存储接入。
 async fn asset(
     State(s): State<ServerState>,
     headers: HeaderMap,

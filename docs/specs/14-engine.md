@@ -73,7 +73,11 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 - [x] v2.5（MM6-inline，2026-06-27，**Docker 真机验证**）：`source_pg` 真源句柄 + `set_source_store`；
   `resolve_citation` 的 `Inline` 路径从 PG `media_bytes` 真源 `block_in_place` 按需取字节 → `InlineBytes`
   （字节是真源、引擎派生层不持；要求 multi-thread runtime，同 B6）。集成 `mm6_inline_serves_bytes_from_source_pg`
-  （授权吐真源字节、越权 None）。⚠ **`Object`→`SignedUrl` 仍直传裸 uri**（MM6-secure 待拍板：改 404/真签名）。
+  （授权吐真源字节、越权 None）。
+- [x] v2.6（MM6-secure，2026-06-27）：`ObjectSigner` trait + `set_object_signer`；`resolve_citation` 的 `Object`
+  路径**必须经签名器签短时 URL，未配签名器 → None（404），绝不回退裸 key**（堵不变量 #3 漏洞）。单测
+  `mm6_secure_object_no_signer_is_404` / `mm6_secure_object_with_signer_signs`（签名 URL 不含 `s3://`）。
+  真签名器（S3 presign 类）gated 对象存储。
 - [x] 多模态（MM1-7）：`vec_meta` 透出 modality/time/media；分面支持 modality；kind Audio/Video。
 - [x] v2.4（MM5，M0 路由，2026-06-27）：CDC `apply_upsert` 嵌入按"可检索文本表示"（`chunk.text`，含 caption/转录）；
   **无文本媒资（`text==""`）跳过向量嵌入/写入**（否则空串塌成退化向量污染 ANN），幂等覆盖时删旧向量。
