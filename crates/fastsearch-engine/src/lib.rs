@@ -819,15 +819,25 @@ impl fastsearch_sync::IndexSink for Engine {
     fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()> {
         self.text.upsert(collection, chunk)?;
         // 配了嵌入后端则同步写向量索引（CDC 主循环：复制→解码→嵌入→派生向量）。
+        // **MM5 modality 路由（M0）**：当前只有文本嵌入器，按"可检索文本表示"(`chunk.text`，
+        // 含 caption/转录) 嵌入。**无文本的媒资 chunk（如无 caption 的图，`text=""`）跳过向量**——
+        // 否则空串嵌成退化向量（HashEmbedder 仅前缀 token → 所有无文本媒资塌成同一向量；真嵌入器
+        // 给"空文档"向量），污染 ANN。这些 chunk 仍在 BM25 + modality fast field（可按模态召回），
+        // 视觉向量待 M1 图像嵌入路由接入。
         if let Some(emb) = &self.embedder {
-            let v = emb
-                .embed(std::slice::from_ref(&chunk.text), EmbedKind::Passage)?
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
-            self.vector
-                .upsert(chunk.global_id(collection), v, vec_meta(collection, chunk))
-                .map_err(|e| anyhow::anyhow!("vector upsert: {e}"))?;
+            if !chunk.text.trim().is_empty() {
+                let v = emb
+                    .embed(std::slice::from_ref(&chunk.text), EmbedKind::Passage)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
+                self.vector
+                    .upsert(chunk.global_id(collection), v, vec_meta(collection, chunk))
+                    .map_err(|e| anyhow::anyhow!("vector upsert: {e}"))?;
+            } else {
+                // 幂等：覆盖更新时若旧版本有向量、新版本文本空了，删除旧向量避免残留。
+                self.vector.delete(&chunk.global_id(collection))?;
+            }
         }
         Ok(())
     }
@@ -1268,6 +1278,50 @@ mod tests {
         let h2 = e.search(&r2, None).unwrap();
         assert_eq!(h2.len(), 1);
         assert_eq!(h2[0].id.chunk_id, 3);
+    }
+
+    #[test]
+    fn mm5_textless_media_skips_vector() {
+        use fastsearch_embed::{EmbedKind, Embedder, HashEmbedder};
+        // MM5（M0 路由）：有文本（caption/转录/正文）→ 嵌入写向量；无文本媒资（text=""）→ 不嵌、
+        // 不写向量（否则空串塌成退化向量污染 ANN）。无文本图仍在 BM25 + modality fast field
+        // （按模态召回由 fastsearch-text `empty_text_and_modality_fast_field` 覆盖）。
+        let emb = HashEmbedder::new(16);
+        let mut e = engine();
+        e.set_embedder(Box::new(HashEmbedder::new(16)));
+        let text_c = chunk(
+            "a.pdf",
+            1,
+            ChunkKind::Paragraph,
+            "quarterly gross margin",
+            1,
+        );
+        let img_c = chunk("a.pdf", 2, ChunkKind::Image, "", 2); // 无 caption 的图
+                                                                // 经 CDC 落地路径（apply_upsert + 嵌入）灌入。
+        e.rebuild_from(&[("kb".to_string(), text_c), ("kb".to_string(), img_c)])
+            .unwrap();
+        // 向量检索：无文本图没有向量 → 永不出现；修复前它会以"前缀塌缩向量"混入。
+        let qv = emb
+            .embed(&["quarterly gross margin".into()], EmbedKind::Query)
+            .unwrap()
+            .remove(0);
+        let r = SearchRequest {
+            query: String::new(),
+            mode: SearchMode::Vector,
+            vector: Some(qv),
+            candidates: 10,
+            top_k: 10,
+            ..Default::default()
+        };
+        let hits = e.search(&r, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id.chunk_id == 1),
+            "有文本 chunk 应被嵌入并向量召回"
+        );
+        assert!(
+            hits.iter().all(|h| h.id.chunk_id != 2),
+            "无文本媒资不应进入向量索引（避免退化向量污染 ANN）"
+        );
     }
 
     #[test]

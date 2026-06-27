@@ -71,6 +71,9 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 - [x] v2.3（MM6）：**媒资解析** `resolve_citation(cid, acl) -> Option<ResolvedAsset{fetch,time,media_type}}`
   （`AssetFetch::DocRender/SignedUrl/InlineBytes`），ACL 强制（不可见/不存在均 None=404）。
 - [x] 多模态（MM1-7）：`vec_meta` 透出 modality/time/media；分面支持 modality；kind Audio/Video。
+- [x] v2.4（MM5，M0 路由，2026-06-27）：CDC `apply_upsert` 嵌入按"可检索文本表示"（`chunk.text`，含 caption/转录）；
+  **无文本媒资（`text==""`）跳过向量嵌入/写入**（否则空串塌成退化向量污染 ANN），幂等覆盖时删旧向量。
+  无文本媒资仍在 BM25 + modality fast field。单测 `mm5_textless_media_skips_vector`。真 CDC 端到端音视频召回需 PG（`待运行验证`）；M1 图像向量路由 `gated`。
 
 **已知限制 / 下一迭代：**
 - ✅ auto-merging（v1.3）、rerank 钩子、CDC 自动 embedding（v1.6）、search_after（v2.1）、单集合重建（v2.2）均已实现。
