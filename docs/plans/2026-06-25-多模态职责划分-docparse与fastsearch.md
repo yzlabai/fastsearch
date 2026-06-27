@@ -2,6 +2,7 @@
 
 > 状态：架构分析 v1.1（**fastsearch 侧 M0 已落地**，2026-06-27 回写现状）｜日期：2026-06-25｜上游：[多模态需求分析](2026-06-25-多模态数据支持-需求分析.md)、[多模态功能设计与开发计划](2026-06-25-多模态功能设计与开发计划.md)、[多模态完善 devlog](../devlog/2026-06-27-多模态完善.md)。
 > **现状**：fastsearch 侧的 schema 扩展 / 模态·时间过滤 / 媒资网关 / inline 字节均已落地并 Docker 验证（§1、§3）；剩余跨仓阻塞 = **docparse 侧补 `time` 字段 + `Audio/Video` kind**。
+> **⭐ 更新（2026-06-27）：docparse 已 subtree 并入本仓 `vendor/docparse`（融合 Option B）**——"跨仓手工锁步"痛点**已结构性消解**：两仓同处一个 git 仓，schema 对齐由摄取适配器 [`from_docparse_chunk`](../../crates/fastsearch-cli/src/ingest.rs)（编译即报错的焊点）保证；`fastsearch ingest` 进程内解析 9 格式 + 扫描件 OCR。详见 [融合 devlog](../devlog/2026-06-27-docparse融合与多格式OCR摄取.md)。§3 的"跨仓评审"现退化为"单仓内改 `chunk.rs` + 适配器编译验证"。
 >
 > **本文目标**：从 localkb 整体架构出发，回答"多模态预处理的哪些功能应该放到 **docparse-rs**（解析上游），哪些留在 **fastsearch**（检索下游）"，并指出两者必须**锁步协调**的契约。
 >

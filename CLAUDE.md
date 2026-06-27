@@ -20,9 +20,19 @@ cargo run -p fastsearch-cli --bin fastsearch -- index --data ./data --collection
 cargo run -p fastsearch-cli --bin fastsearch -- search --data ./data --collection kb --query "毛利率" --json
 FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" cargo run -p fastsearch-server --bin fastsearch-server  # REST :8642
 
+# 多格式解析摄取（docparse 融合，--features parse）：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML + 图片
+cargo run -p fastsearch-cli --features parse --bin fastsearch -- ingest --data ./data --collection kb --doc-id r.docx r.docx
+# 扫描件/图片 OCR 抽文本（--features parse-ocr，需 PP-OCR ONNX 模型目录）
+FASTSEARCH_OCR_MODELS=/path/to/docparse-rs/models/ppocr-v5 \
+  cargo run -p fastsearch-cli --features parse-ocr --bin fastsearch -- ingest --data ./data --collection kb --doc-id scan.png scan.png
+
 # Postgres 集成测试（默认跳过；设 DATABASE_URL 才跑，CI 用 pgvector/pgvector 镜像）
 DATABASE_URL=postgres://user@localhost/db cargo test -p fastsearch-pg
+# OCR 端到端测试（默认跳过；设模型目录 + 测试图才跑）
+FASTSEARCH_OCR_MODELS=…/models/ppocr-v5 FASTSEARCH_OCR_TEST_IMAGE=…/page.png cargo test -p fastsearch-cli --features parse-ocr ocr_end_to_end
 ```
+
+> **构建分档**：默认 `cargo build`（搜索热路径，**零 docparse/ONNX 依赖**）；`--features parse`（多格式解析，轻量、无 ONNX）；`--features parse-ocr`（+OCR，拉 vendored tract/ONNX，仅此档重）。`vendor/docparse` 有自有 workspace、被根 `exclude`，不进默认收口。
 
 **收口（push 前必跑，等价于"完整类型检查"）**：`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` 三者全过，详见 AI_AGENT_DEV_SPEC §收口。
 
@@ -56,7 +66,7 @@ docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(
 | `engine` | 整合 text+vector+rerank+sync sink → 端到端排序管线 | `run()` 是管线主体；`search`/`search_with_facets`；实现 `sync::IndexSink`（适配器，避免 text 反依赖 sync） |
 | `eval` | 相关性评测：nDCG/recall/MRR + `assert_no_regression`(CI 门禁) | 纯函数 |
 | `server` | REST(axum) + API-Key 认证 + **ACL 服务端注入不可绕过** + /metrics | `principal_from_headers`→`acl_for`→`engine.search(req, Some(acl))`；客户端无法传/绕过 ACL |
-| `cli` | `fastsearch` 二进制：吃 docparse chunks → 落盘 text 索引 → 检索 | 逻辑在 lib，main 是壳 |
+| `cli` | `fastsearch` 二进制：`index`(吃 chunks.json) / `search` / `eval` / **`ingest`(多格式进程内解析)** → 落盘索引 → 检索 | 逻辑在 lib，main 是壳；`ingest` 走 `--features parse`（docparse `DocumentParser` 注册表按扩展名分发 9 格式+图片）/ `--features parse-ocr`（扫描件 PP-OCR，env 指模型目录）。解析能力 feature 门控，搜索热路径零 docparse |
 | `mcp` | 第四张脸：MCP（stdio+JSON-RPC）暴露 `search`/`resolve_citation` 工具 | 逻辑在 lib（`McpServer::handle` 纯函数可单测），main 是 stdio 壳；**ACL 服务端注入不可绕过** |
 | `clients/{python,ts}` | 零依赖 SDK（封装 REST）+ LangChain/LlamaIndex 适配 | — |
 
