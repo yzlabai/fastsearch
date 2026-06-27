@@ -1,101 +1,99 @@
-# 知识库 Agent 例子（Hono · Drizzle/SQLite · AI SDK · Vite/React/shadcn）
+# Knowledge-Base Agent Example (Hono · Drizzle/SQLite · AI SDK · Vite/React/shadcn)
 
-一个端到端的"知识库 Agent"小应用，检索后端用本仓库的 **fastsearch** REST 引擎。
+English | [简体中文](./README.zh-CN.md)
+
+An end-to-end "knowledge-base agent" mini-app whose retrieval backend is this repo's **fastsearch** REST engine.
 
 ```
-浏览器 (Vite/React/shadcn 聊天 UI)
-   │  /api  →  Hono 服务 (:8787)
-   │            ├─ /api/chat       Vercel AI SDK · streamText + 工具循环 (DeepSeek)
-   │            │      └─ 工具 searchKnowledgeBase ──→ fastsearch /v1/search
-   │            └─ /api/documents  切块 ──→ fastsearch /v1/index   + 登记到 SQLite(Drizzle)
+Browser (Vite/React/shadcn chat UI)
+   │  /api  →  Hono server (:8787)
+   │            ├─ /api/chat       Vercel AI SDK · streamText + tool loop (DeepSeek)
+   │            │      └─ tool searchKnowledgeBase ──→ fastsearch /v1/search
+   │            └─ /api/documents  chunk ──→ fastsearch /v1/index  + register in SQLite (Drizzle)
    ▼
-fastsearch-server (:8642)  ← 混合检索引擎（本仓库 Rust crate）
+fastsearch-server (:8642)  ← hybrid search engine (Rust crate in this repo)
 ```
 
-- **Hono**：后端 HTTP（聊天流式接口 + 文档喂入接口）。
-- **SQLite + Drizzle**：本地存"文档清单"和"聊天历史"（可检索内容的真源在 fastsearch/PG，这里只是清单）。
-- **Vercel AI SDK**：Agent 主体——`streamText` 跑工具循环，默认 **DeepSeek（deepseek-chat / V3）**；`searchKnowledgeBase` 工具调 fastsearch 取证。
-- **Vite + React + shadcn/ui**：聊天界面 + 文档喂入面板，回答带可回溯的 `citation_id`。
+- **Hono**: backend HTTP (streaming chat endpoint + document ingest endpoint).
+- **SQLite + Drizzle**: local store for the "document list" and "chat history" (the source of truth for searchable content lives in fastsearch/PG; this is just a registry).
+- **Vercel AI SDK**: the agent itself — `streamText` runs a tool loop, default model **DeepSeek (`deepseek-v4-flash`)**; the `searchKnowledgeBase` tool calls fastsearch for evidence.
+- **Vite + React + shadcn/ui**: chat interface + document ingest panel, answers carry traceable `citation_id`s.
 
-> 这是给 fastsearch 配套的 *示例*，目的是展示"怎么在 fastsearch 上搭一个 RAG Agent"。
+> This is an *example* shipped alongside fastsearch — it shows "how to build a RAG agent on top of fastsearch."
 
-## 前置
+## Prerequisites
 
-- Node ≥ 20.12（用到 `process.loadEnvFile`）
-- 一把 DeepSeek API key（[platform.deepseek.com](https://platform.deepseek.com)）
-- 仓库根目录能 `cargo run`（起 fastsearch-server）
+- Node ≥ 20.12 (uses `process.loadEnvFile`)
+- A DeepSeek API key ([platform.deepseek.com](https://platform.deepseek.com))
+- Be able to `cargo run` from the repo root (to start fastsearch-server)
 
-## 跑起来（3 个终端）
+## Run it (3 terminals)
 
-**① 起 fastsearch 检索引擎**（在仓库根目录，不是 example/）
+**① Start the fastsearch engine** (at the repo root, not `example/`)
 
 ```bash
 FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" \
   cargo run -p fastsearch-server --bin fastsearch-server
-# 监听 :8642，API Key = dev。没配嵌入后端 → 纯关键词(BM25)模式，足够本例。
+# Listens on :8642, API Key = dev. No embedding backend → pure keyword (BM25) mode, enough for this example.
 ```
 
-**② 装依赖 + 配 .env**（在 example/）
+**② Install deps + configure .env** (in `example/`)
 
 ```bash
 cd example
 npm install
 cp .env.example .env
-# 编辑 .env，至少填 DEEPSEEK_API_KEY
+# Edit .env — at minimum set DEEPSEEK_API_KEY
 ```
 
-**③ 起前后端**
+**③ Start frontend + backend**
 
 ```bash
 npm run dev
-# Hono 后端 http://127.0.0.1:8787
-# 前端       http://127.0.0.1:5173   ← 打开它
+# Hono backend  http://127.0.0.1:8787
+# Frontend      http://127.0.0.1:5173   ← open this
 ```
 
-打开 5173：左边粘一篇文档「喂入知识库」，右边就能提问，Agent 会先检索再带 `[kb:doc:chunk]` 引用作答。
+Open 5173: paste a document on the left and "ingest" it, then ask questions on the right. The agent searches first, then answers with `[kb:doc:chunk]` citations.
 
-## 端到端冒烟测试
+## End-to-end smoke test
 
-栈起好后（①+③ 都在跑、`.env` 有 `DEEPSEEK_API_KEY`），新开一个终端：
+With the stack up (① + ③ both running, `.env` has `DEEPSEEK_API_KEY`), open another terminal:
 
 ```bash
 npm run test:e2e
 ```
 
-它打活着的服务，验证整条链路：健康检查 → 喂入文档(`/v1/index`+SQLite) → `/api/chat`
-Agent 工具循环（调 `searchKnowledgeBase` → 拿 fastsearch 命中 → 带引用作答 → 正常结束）。
-零依赖（只用 Node 内置 `fetch`），全绿退出码 0。脚本见 `test/smoke.mjs`。
+It hits the live server and validates the whole chain: health check → ingest a doc (`/v1/index` + SQLite) → `/api/chat` agent tool loop (calls `searchKnowledgeBase` → gets fastsearch hits → answers with citations → finishes cleanly). Zero dependencies (just Node's built-in `fetch`); exits 0 when all green. Script: `test/smoke.mjs`.
 
-## 想要语义检索（向量）？
+## Want semantic search (vectors)?
 
-给 fastsearch 配个嵌入后端（Ollama / OpenAI 兼容）即可，无需改本例代码——
-`/api/chat` 的工具默认用 `mode: "hybrid"`，引擎侧配了嵌入就自动召回向量。
-具体见仓库根 `CLAUDE.md` 与 `crates/fastsearch-embed`。
+Just configure an embedding backend for fastsearch (Ollama / OpenAI-compatible) — no change needed in this example. The `/api/chat` tool already uses `mode: "hybrid"`, so once the engine has embeddings it recalls vectors automatically. See the repo-root `CLAUDE.md` and `crates/fastsearch-embed`.
 
-## 代码导览
+## Code tour
 
 ```
 src/server/
-  index.ts              Hono 入口（serve :8787）
-  env.ts                最先加载 .env
-  db/schema.ts          Drizzle 表：documents / messages
-  db/index.ts           better-sqlite3 + 启动兜底建表
-  lib/fastsearch.ts     fastsearch REST 客户端（/v1/index, /v1/search）
-  lib/chunk.ts          朴素切块（真实管线用 docparse）
-  lib/agent.ts          模型 + 系统提示 + searchKnowledgeBase 工具
-  routes/chat.ts        AI SDK streamText 工具循环，回合落库
-  routes/documents.ts   喂入：切块→/v1/index→登记 SQLite；列表
+  index.ts              Hono entry (serve :8787)
+  env.ts                loads .env first
+  db/schema.ts          Drizzle tables: documents / chunks / messages
+  db/index.ts           better-sqlite3 + boot-time CREATE TABLE IF NOT EXISTS
+  lib/fastsearch.ts     fastsearch REST client (/v1/index, /v1/search)
+  lib/chunk.ts          naive chunker (real pipelines use docparse)
+  lib/agent.ts          model + system prompt + searchKnowledgeBase tool
+  routes/chat.ts        AI SDK streamText tool loop, persists each turn
+  routes/documents.ts   ingest: chunk → /v1/index → register in SQLite; list
 src/web/
-  App.tsx               双栏布局
-  components/Chat.tsx          useChat 聊天 + 渲染工具来源
-  components/DocumentsPanel.tsx 文档喂入 + 列表
-  components/ui/*       shadcn 原语（button/card/input/textarea/badge）
+  App.tsx               two-pane layout
+  components/Chat.tsx          useChat chat + renders tool sources
+  components/DocumentsPanel.tsx document ingest + list
+  components/ui/*       shadcn primitives (button/card/input/textarea/badge)
 test/
-  smoke.mjs             端到端冒烟测试（npm run test:e2e）
+  smoke.mjs             end-to-end smoke test (npm run test:e2e)
 ```
 
-## 不变量（沿用 fastsearch 的约束）
+## Invariants (inherited from fastsearch's constraints)
 
-- **ACL 不可绕过**：检索/写入的权限由 fastsearch 服务端按 API Key 强制，客户端传不了也放宽不了 ACL。
-- **PG 是真源、引擎索引是派生**：本例 SQLite 只存本地清单，不当权威数据。
-- **诚实记账**：没配嵌入后端就是纯关键词模式——别把它当语义检索。
+- **ACL is not bypassable**: read/write permissions are enforced server-side by fastsearch per API key — clients can't pass or loosen ACL.
+- **PG is the source of truth, the engine index is derived**: the SQLite here only holds a local registry/cache, never authoritative data.
+- **Honest accounting**: with no embedding backend it's pure keyword mode — don't mistake it for semantic search.

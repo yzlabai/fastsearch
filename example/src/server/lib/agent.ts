@@ -5,9 +5,9 @@ import { z } from "zod";
 import { db, schema } from "../db/index.ts";
 import { search } from "./fastsearch.ts";
 
-// DeepSeek（OpenAI 兼容）。deepseek-chat = V3，支持工具调用；读 DEEPSEEK_API_KEY。
-// 想要推理模型可换 deepseek-reasoner（注意其工具调用支持较弱）。
-export const MODEL = process.env.KB_MODEL ?? "deepseek-chat";
+// DeepSeek（OpenAI 兼容）。默认 deepseek-v4-flash，支持工具调用；读 DEEPSEEK_API_KEY。
+// 可用 KB_MODEL 覆盖（如 deepseek-chat / deepseek-reasoner）。
+export const MODEL = process.env.KB_MODEL ?? "deepseek-v4-flash";
 export const model = deepseek(MODEL);
 
 export const SYSTEM_PROMPT = `你是一个知识库问答 Agent。回答用户问题前，先用 searchKnowledgeBase 工具检索知识库取证。
