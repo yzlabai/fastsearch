@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+mod binary;
 mod hnsw;
 pub use hnsw::{HnswParams, HnswVectorIndex};
 
@@ -212,19 +213,35 @@ pub trait VectorBackend {
 
 struct Entry {
     vector: Vec<f32>, // 归一化后存储（内积即余弦）
+    code: Vec<u64>,   // 符号位 bit code（二值粗筛用，由 vector 派生）
     meta: VecMeta,
 }
 
 /// 内存暴力余弦索引（精确基线）。
+///
+/// 默认**精确暴力**（`binary_oversample=None`，确定）。可选 [`Self::with_binary_prefilter`] 开
+/// **二值量化两阶段**：Hamming 粗筛 top-`k·oversample` → f32 精确重排（大集合更快；最终 top-k 在
+/// 候选集内精确，vs 全局精确的 recall 由 oversample 决定）。重排 + GlobalId tie-break 保持确定。
 #[derive(Default)]
 pub struct MemVectorIndex {
     dim: Option<usize>,
     entries: HashMap<GlobalId, Entry>,
+    /// None=精确暴力；Some(m)=二值粗筛取 `k·m` 候选再 f32 重排。
+    binary_oversample: Option<usize>,
 }
 
 impl MemVectorIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 开启二值量化两阶段粗筛（`oversample`≥1：粗筛候选数 = `k·oversample`）。
+    /// `oversample` 越大召回越接近全局精确、越慢；`0` 视作 `1`。
+    pub fn with_binary_prefilter(oversample: usize) -> Self {
+        MemVectorIndex {
+            binary_oversample: Some(oversample.max(1)),
+            ..Self::default()
+        }
     }
 
     /// 取某 gid 的引用（命中组装用）。
@@ -288,10 +305,12 @@ impl MemVectorIndex {
         let snap: Snapshot = serde_json::from_slice(&bytes)?;
         let mut entries = HashMap::with_capacity(snap.entries.len());
         for e in snap.entries {
+            let code = binary::pack_signs(&e.vector); // 由存储的归一化向量重建（不落盘）
             entries.insert(
                 e.gid,
                 Entry {
                     vector: e.vector,
+                    code,
                     meta: e.meta,
                 },
             );
@@ -299,6 +318,7 @@ impl MemVectorIndex {
         Ok(MemVectorIndex {
             dim: snap.dim,
             entries,
+            binary_oversample: None, // 落盘不持搜索策略；如需开二值由调用方 with_binary_prefilter
         })
     }
 }
@@ -346,10 +366,12 @@ impl VectorBackend for MemVectorIndex {
             _ => {}
         }
         let normalized = normalize(&vector);
+        let code = binary::pack_signs(&normalized);
         self.entries.insert(
             gid,
             Entry {
                 vector: normalized,
+                code,
                 meta,
             },
         );
@@ -383,15 +405,33 @@ impl VectorBackend for MemVectorIndex {
         }
         let q = normalize(query);
 
-        let mut scored: Vec<Scored> = self
+        // 真预过滤：先 filter + ACL 筛掉候选（两档共用），守不变量 #5。
+        let candidates = self
             .entries
             .iter()
-            // 真预过滤：先 filter + ACL 筛掉，再进入打分集合。
             .filter(|(_, e)| filter.is_none_or(|f| f.eval(&e.meta)))
-            .filter(|(_, e)| acl.is_none_or(|a| a.visible(&e.meta)))
+            .filter(|(_, e)| acl.is_none_or(|a| a.visible(&e.meta)));
+
+        // 二值粗筛档：Hamming 取 top-(k·oversample) → 仅对候选做 f32 精确重排。
+        let rerank_set: Vec<(&GlobalId, &Entry)> = if let Some(m) = self.binary_oversample {
+            let qcode = binary::pack_signs(&q);
+            let want = k.saturating_mul(m).max(k);
+            // 粗排键：(Hamming 升, gid 升)——确定的候选集（边界同 Hamming 不抖）。
+            let mut coarse: Vec<(u32, &GlobalId, &Entry)> = candidates
+                .map(|(gid, e)| (binary::hamming(&qcode, &e.code), gid, e))
+                .collect();
+            coarse.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+            coarse.truncate(want);
+            coarse.into_iter().map(|(_, gid, e)| (gid, e)).collect()
+        } else {
+            candidates.collect()
+        };
+
+        let mut scored: Vec<Scored> = rerank_set
+            .into_iter()
             .map(|(gid, e)| Scored {
                 id: gid.clone(),
-                score: dot(&q, &e.vector) as f64,
+                score: dot(&q, &e.vector) as f64, // f32 精确重排（两档一致）
             })
             .collect();
 
@@ -655,5 +695,102 @@ mod tests {
         let r = v.search(&[0.0, 0.0], 5, None, None).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].score, 0.0);
+    }
+
+    // ===================== 二值量化两阶段粗筛（RaBitQ/BQ 核心） =====================
+
+    /// 确定性合成向量（xorshift，∈[-1,1)），无 RNG 依赖、可复现。
+    fn pseudo_vec(seed: u64, dim: usize) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..dim)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn build(n: usize, dim: usize, oversample: Option<usize>) -> MemVectorIndex {
+        let mut idx = match oversample {
+            Some(m) => MemVectorIndex::with_binary_prefilter(m),
+            None => MemVectorIndex::new(),
+        };
+        for i in 0..n as u64 {
+            idx.upsert(
+                gid("d", i),
+                pseudo_vec(i, dim),
+                meta("d", i, "paragraph", i as u32, vec!["public"]),
+            )
+            .unwrap();
+        }
+        idx
+    }
+
+    /// 强保证：oversample 大到覆盖全集 → 候选=全部 → 结果与精确暴力**逐条相同**（确定，无统计抖动）。
+    #[test]
+    fn binary_full_oversample_equals_exact() {
+        let (n, dim, k) = (150usize, 64usize, 10usize);
+        let exact = build(n, dim, None);
+        let bin = build(n, dim, Some(n)); // k·n ≥ n → 覆盖全集
+        let q = pseudo_vec(99_999, dim);
+        let re = exact.search(&q, k, None, None).unwrap();
+        let rb = bin.search(&q, k, None, None).unwrap();
+        let ids_e: Vec<_> = re.iter().map(|s| s.id.chunk_id).collect();
+        let ids_b: Vec<_> = rb.iter().map(|s| s.id.chunk_id).collect();
+        assert_eq!(ids_e, ids_b, "全覆盖 oversample 下二值两阶段应等于精确");
+        for (a, b) in re.iter().zip(&rb) {
+            assert!((a.score - b.score).abs() < 1e-6, "重排分应为精确 f32");
+        }
+    }
+
+    /// recall@k：中等 oversample 下，二值粗筛 + f32 重排召回应接近精确 top-k。
+    #[test]
+    fn binary_recall_high_with_moderate_oversample() {
+        let (n, dim, k) = (300usize, 96usize, 10usize);
+        let exact = build(n, dim, None);
+        let bin = build(n, dim, Some(8)); // 粗筛 80 候选
+        let mut hit = 0usize;
+        let mut total = 0usize;
+        for qseed in [1u64, 2, 3, 4, 5, 12345, 67890] {
+            let q = pseudo_vec(qseed.wrapping_add(500_000), dim);
+            let want: std::collections::HashSet<u64> = exact
+                .search(&q, k, None, None)
+                .unwrap()
+                .iter()
+                .map(|s| s.id.chunk_id)
+                .collect();
+            let got = bin.search(&q, k, None, None).unwrap();
+            hit += got.iter().filter(|s| want.contains(&s.id.chunk_id)).count();
+            total += k;
+        }
+        let recall = hit as f32 / total as f32;
+        assert!(
+            recall >= 0.85,
+            "二值粗筛 recall@{k}={recall:.3} 应 ≥0.85（oversample=8）"
+        );
+    }
+
+    /// 二值档仍 filter-aware：预过滤在粗筛**之前**施加，过滤外的项不进候选（守不变量 #5）。
+    #[test]
+    fn binary_is_filter_aware() {
+        let mut bin = MemVectorIndex::with_binary_prefilter(4);
+        for i in 0..50u64 {
+            let kind = if i % 2 == 0 { "table" } else { "paragraph" };
+            bin.upsert(
+                gid("d", i),
+                pseudo_vec(i, 32),
+                meta("d", i, kind, i as u32, vec!["public"]),
+            )
+            .unwrap();
+        }
+        let f = Filter::Eq("kind".into(), FieldValue::Str("table".into()));
+        let r = bin.search(&pseudo_vec(7, 32), 10, Some(&f), None).unwrap();
+        assert!(!r.is_empty());
+        assert!(
+            r.iter().all(|s| s.id.chunk_id % 2 == 0),
+            "二值档应只返回 kind=table（偶数 id）"
+        );
     }
 }

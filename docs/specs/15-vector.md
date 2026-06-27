@@ -71,6 +71,7 @@ pub struct VecMeta { pub kind, doc_id, collection, tenant, page, section_id, hea
   同步↔异步桥）+ server `FASTSEARCH_VECTOR_BACKEND=pgvector`。Docker 实测。
 
 **已知限制 / 下一迭代：**
-- RaBitQ 量化 / filtered-traversal（更优压缩/召回）；HNSW 大 N 的 p95 与暴力交叉点实测（见 [容量/SLO](../governance/2026-06-26-容量与SLO.md)）。
+- ✅ **二值量化（1-bit）两阶段粗筛已落地**（2026-06-27，RaBitQ/BQ 核心）：`MemVectorIndex::with_binary_prefilter(oversample)` 开启——符号位 bit code（`binary.rs` `pack_signs`）Hamming 粗筛 top-`k·oversample`（`popcount`，~`d/64` 字操作 vs 精确 `d` flops）→ f32 精确重排，filter/ACL 仍在粗筛前（守 #5）、重排 + GlobalId tie-break 仍确定。+5 单测：全覆盖 oversample **逐条等于精确**、recall@10 ≥0.85(oversample=8)、filter-aware、pack/hamming 原语。**默认仍精确暴力**（`None`，零回归）。**下一迭代**：① 完整 RaBitQ（随机旋转 + 无偏内积估计器，比纯符号粗筛召回更高）；② 暴露为可选后端（`VectorBackendKind::BruteBinary` + 检查点持久化 + server env）——本轮是库级 primitive，后端化是 A9 式独立一轮。
+- filtered-traversal（HNSW 选择性过滤下遍历）；HNSW 大 N 的 p95 与暴力交叉点实测（见 [容量/SLO](../governance/2026-06-26-容量与SLO.md)）。
 - ✅ pgvector 直查的 **CDC 自动写穿已落地**（2026-06-27，B6 续作）：engine `apply_upsert` 在配了 `set_pg_vector` 时把嵌入写回 PG `embedding` 列（`PgStore::set_embedding`，block_in_place 桥），而非引擎派生索引——直查读 PG、写也归 PG，闭环。**CDC 反馈环**经"列清单 publication 排除派生列（`embedding`/`embed_model`/`updated_at`）+ `set_embedding` 幂等守卫（0 行不复制）"双防线断开。Docker pgvector 验证（见 [pg spec §7](12-pg.md)、devlog）。
 - 向量经 CDC 落地路径自动嵌入（`engine.set_embedder` + `apply_upsert`）或 `ingest_vector` 灌入。
