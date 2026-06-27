@@ -25,9 +25,10 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 # 解析（docparse-rs 融合 Option B：摄取热路径，feature 门控，搜索热路径零依赖）。
-# C 预演阶段用本地兄弟仓路径依赖；subtree 收编后改 workspace 内 path（见 docparse 融合方案 §4）。
-docparse-core = { path = "../../../docparse-rs/crates/docparse-core", optional = true }
-docparse-pdf = { path = "../../../docparse-rs/crates/docparse-pdf", optional = true }
+# subtree 收编后改本仓内 path（vendor/docparse）；docparse 重依赖（tract/ONNX/OCR/VLM）在其
+# 自有 workspace、被本仓根 `exclude` 隔离，不进 fastsearch 精简构建（见 docparse 融合方案 §4）。
+docparse-core = { path = "../../vendor/docparse/crates/docparse-core", optional = true }
+docparse-pdf = { path = "../../vendor/docparse/crates/docparse-pdf", optional = true }
 
 [features]
 # 开启 docparse 解析（core + pdf，无 ONNX/渲染）；默认不开，保持 CLI 精简。

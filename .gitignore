@@ -2,3 +2,8 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# docparse（vendor/docparse，subtree 融合）构建产物 / 下载的模型 — 不进仓（模型走 fetch-models.sh）
+/vendor/docparse/target
+/vendor/docparse/models
+/vendor/docparse/tmp

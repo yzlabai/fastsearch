@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+# docparse（subtree 并入 vendor/docparse，融合 Option B）保留其自有 workspace（含 vendored
+# tract + OCR/VLM/raster 重 ONNX crate），从本仓 workspace 排除 → 不进 fastsearch 精简构建/收口；
+# fastsearch-cli 经 `parse` feature path-依赖其 `docparse-core`/`-pdf`（轻，无 ONNX）。
+exclude = ["vendor/docparse"]
 members = [
     "crates/fastsearch-core",
     "crates/fastsearch-text",
