@@ -45,6 +45,17 @@ fn parse_keys(spec: &str) -> HashMap<String, Principal> {
     keys
 }
 
+/// 读取浮点环境变量；缺失或不可解析则回退 `default`（带 warn）。
+fn env_f32(key: &str, default: f32) -> f32 {
+    match std::env::var(key) {
+        Ok(s) => s.trim().parse().unwrap_or_else(|_| {
+            eprintln!("warn: {key}={s:?} 非法浮点，回退 {default}");
+            default
+        }),
+        Err(_) => default,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let data: PathBuf = std::env::var("FASTSEARCH_DATA")
@@ -75,9 +86,16 @@ async fn main() -> anyhow::Result<()> {
         Ok("default") => TokenizerKind::Default,
         _ => TokenizerKind::Jieba,
     };
+    // BM25 k1/b（词频饱和 / 长度归一）：偏离 Tantivy 默认(1.2/0.75)即触发引擎自算重排（A11）。
+    // 仅首启建索引时定型（写进派生索引的 schema 语义无关，但换值需重建以重排既有 doc）。
+    let default_cfg = TextIndexConfig::default();
+    let k1 = env_f32("FASTSEARCH_BM25_K1", default_cfg.k1);
+    let b = env_f32("FASTSEARCH_BM25_B", default_cfg.b);
     let cfg = TextIndexConfig {
         tokenizer,
-        ..Default::default()
+        k1,
+        b,
+        ..default_cfg
     };
     // 向量后端：FASTSEARCH_VECTOR_BACKEND=hnsw 用 HNSW 近似（大规模，近似+非确定）；
     // 默认 brute 暴力精确（确定）。仅首启（无检查点）生效；已建索引沿用其记录的后端。

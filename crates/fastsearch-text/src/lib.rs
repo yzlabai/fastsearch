@@ -4,6 +4,7 @@
 //! 带过滤与 ACL 的检索，返回带引用（page+bbox+heading_path）的命中。
 //! 详见 [spec](../../docs/specs/11-text.md)。
 
+mod bm25;
 mod error;
 mod query_build;
 mod schema;
@@ -311,8 +312,40 @@ impl TextIndex {
         }
         let q = BooleanQuery::new(clauses);
 
-        let overfetch = (k * 4).max(k + 16);
-        let top = searcher.search(&q, &TopDocs::with_limit(overfetch).order_by_score())?;
+        // 自定义 k1/b 生效时放宽候选窗口（重排会改变 top-k 归属，减小窗口偏差）。
+        let custom_bm25 = bm25::custom_params_active(self.cfg.k1, self.cfg.b);
+        let overfetch = if custom_bm25 {
+            (k * 8).max(k + 64)
+        } else {
+            (k * 4).max(k + 16)
+        };
+        let mut top = searcher.search(&q, &TopDocs::with_limit(overfetch).order_by_score())?;
+
+        // 自定义 BM25 重排：用配置 k1/b 自算分覆盖 Tantivy 原生分，再按 (分降序, DocAddress 升序)
+        // 确定性重排。无可计分词的候选（纯前缀命中）保留原生分。matching 不变、仅排序变。
+        if custom_bm25 {
+            let addrs: Vec<_> = top.iter().map(|(_, a)| *a).collect();
+            let scores = bm25::score_candidates(
+                &searcher,
+                &q,
+                self.fields.text,
+                self.fields.heading,
+                self.cfg.heading_boost,
+                self.cfg.k1,
+                self.cfg.b,
+                &addrs,
+            )?;
+            for (score, addr) in top.iter_mut() {
+                if let Some(s) = scores.get(addr) {
+                    *score = *s;
+                }
+            }
+            top.sort_by(|(sa, aa), (sb, ab)| {
+                sb.partial_cmp(sa)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| (aa.segment_ord, aa.doc_id).cmp(&(ab.segment_ord, ab.doc_id)))
+            });
+        }
 
         let mut hits = Vec::with_capacity(k);
         for (score, addr) in top {
@@ -481,6 +514,94 @@ mod tests {
         let hits = idx.search("beta", None, None, 10, false).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].id.chunk_id, 2); // 词频高的在前
+    }
+
+    fn ram_kb(k1: f32, b: f32) -> TextIndex {
+        TextIndex::create_in_ram(TextIndexConfig {
+            k1,
+            b,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    // A11：`b`（长度归一）真生效——短文 vs 长文高 tf，b=0/b=1 排序翻转。
+    #[test]
+    fn bm25_b_length_norm_takes_effect() {
+        let short = chunk("a.pdf", 1, ChunkKind::Paragraph, "target", 1);
+        let mut long_text = String::from("target target target");
+        for i in 0..30 {
+            long_text.push_str(&format!(" filler{i}"));
+        }
+        let longd = chunk("b.pdf", 2, ChunkKind::Paragraph, &long_text, 2);
+        let order = |k1: f32, b: f32| {
+            let mut idx = ram_kb(k1, b);
+            idx.upsert("kb", &short).unwrap();
+            idx.upsert("kb", &longd).unwrap();
+            idx.commit().unwrap();
+            idx.search("target", None, None, 10, false)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id.chunk_id)
+                .collect::<Vec<_>>()
+        };
+        // b=0：无长度归一 → 长文高 tf(3) 占优
+        assert_eq!(order(1.2, 0.0)[0], 2, "b=0 应偏向高 tf 长文");
+        // b=1：满长度归一 → 短文(tf=1, dl=1)反超
+        assert_eq!(order(1.2, 1.0)[0], 1, "b=1 应偏向短文");
+    }
+
+    // A11：`k1`（词频饱和）真生效——同一单文档，k1 改变实际 BM25 分。
+    #[test]
+    fn bm25_k1_changes_score() {
+        let doc = chunk("a.pdf", 1, ChunkKind::Paragraph, "term term term", 1);
+        let score = |k1: f32| {
+            let mut idx = ram_kb(k1, 0.75);
+            idx.upsert("kb", &doc).unwrap();
+            idx.commit().unwrap();
+            idx.search("term", None, None, 10, false).unwrap()[0].score
+        };
+        let (lo, hi) = (score(0.5), score(2.5));
+        assert!(
+            (hi - lo).abs() > 1e-3,
+            "k1 应改变打分：k1=0.5→{lo}, k1=2.5→{hi}"
+        );
+    }
+
+    // A11：自算公式与 Tantivy 对齐——≈默认参数(触发自算路径)的排序 == 原生默认路径排序。
+    #[test]
+    fn custom_bm25_near_default_matches_native_order() {
+        let docs = [
+            chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha beta alpha", 1),
+            chunk(
+                "a.pdf",
+                2,
+                ChunkKind::Paragraph,
+                "alpha gamma delta epsilon",
+                2,
+            ),
+            chunk(
+                "a.pdf",
+                3,
+                ChunkKind::Paragraph,
+                "beta alpha alpha alpha",
+                3,
+            ),
+        ];
+        let order = |k1: f32, b: f32| {
+            let mut idx = ram_kb(k1, b);
+            for d in &docs {
+                idx.upsert("kb", d).unwrap();
+            }
+            idx.commit().unwrap();
+            idx.search("alpha", None, None, 10, false)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id.chunk_id)
+                .collect::<Vec<_>>()
+        };
+        // 原生路径(精确默认) vs 自算路径(≈默认，偏移 >EPSILON 触发重排)：排序一致。
+        assert_eq!(order(1.2, 0.75), order(1.2 + 1e-3, 0.75));
     }
 
     #[test]
