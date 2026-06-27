@@ -86,4 +86,5 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 **已知限制 / 下一迭代：**
 - ✅ auto-merging（v1.3）、rerank 钩子、CDC 自动 embedding（v1.6）、search_after（v2.1）、单集合重建（v2.2）均已实现。
 - 引擎并发去串行（Mutex→RwLock/副本）为后续——影响 server CDC 与检索的串行（见 19-server / [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。
-- pgvector 直查的 **CDC 自动写穿**（嵌入→PG embedding 列）下一迭代（见 [B6 设计](../plans/2026-06-26-B6-pgvector直查档设计.md)）。
+- ✅ pgvector 直查的 **CDC 自动写穿已落地**（2026-06-27，B6 续作）：`apply_upsert` 在 `set_pg_vector` 模式把嵌入写回 PG `embedding` 列（`set_embedding`），列清单 publication 排除派生列 + 幂等守卫双防线断 CDC 反馈环。Docker pgvector 真机验证。详见 [12-pg spec §7 v1.5](12-pg.md)、[devlog](../devlog/2026-06-27-B6-CDC写穿与断反馈环.md)。
+- ✅ **M1 图像嵌入路由基线已落地**（2026-06-27，MM10）：`apply_upsert` 对无文本但 `caps.image`+inline 字节的 chunk 走图像嵌入；以图搜图 `query_image`（MM9）。真视觉模型/跨模态 gated。

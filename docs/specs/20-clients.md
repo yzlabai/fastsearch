@@ -9,7 +9,7 @@
 - Python：`clients/python/fastsearch_client`（标准库 urllib，无第三方依赖）。
 - TypeScript：`clients/typescript/src`（全局 fetch，Node 18+/浏览器）。
 
-**不做**：LangChain/LlamaIndex 适配（下一迭代，薄封装 search→Document）；流式；重试退避（调用方可包）。
+**不做**：流式；重试退避（调用方可包）。（**LangChain/LlamaIndex 适配已实现**——见 §5 A10。）
 
 ## 2. 接口（两端一致）
 
@@ -30,4 +30,5 @@
 ## 5. 验收与状态
 
 - [x] v1：Python + TS 客户端 + 包元数据（pyproject/package.json）+ README + smoke。
-- 下一迭代：LangChain/LlamaIndex 适配、发布到 PyPI/npm。
+- [x] **A10（2026-06-26）：LangChain/LlamaIndex 适配已实现**——`clients/python/fastsearch_client/integrations.py`：`FastsearchRetriever`（命中→`Document`）、`hits_to_llama_nodes`（→`NodeWithScore`），依赖可选回退、零硬依赖；`test_integrations.py` 自测绿。
+- 下一迭代：发布到 PyPI/npm；TS 侧 LangChain.js 适配。
