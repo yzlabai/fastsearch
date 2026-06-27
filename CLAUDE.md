@@ -30,8 +30,10 @@ DATABASE_URL=postgres://user@localhost/db cargo test -p fastsearch-pg
 
 **一句话**：外部单二进制混合检索引擎，**以托管 Postgres(pgvector) 为真源**；引擎侧索引是**派生、可重建**的。差异化（超越 ParadeDB）= **只需 pgvector + 逻辑复制、不在 PG 装任何原生扩展**，因此能跑在任意托管 PG（RDS/Supabase/Neon）。
 
+> **docparse 已 subtree 并入本仓 `vendor/docparse/`**（融合 Option B，2026-06-27）：它保留**自有 workspace**（含 vendored tract + OCR/VLM/raster 重 ONNX），经根 `exclude` 与 fastsearch 精简构建隔离；`fastsearch-cli` 的 **`parse` feature** path-依赖其 `docparse-core`/`-pdf`（轻、无 ONNX），`fastsearch ingest <file>` 即可进程内解析→适配→索引。**搜索热路径零 docparse 依赖**（`cargo tree` 校验）。见 [融合方案评估](docs/plans/2026-06-26-docparse融合方案评估.md)。
+
 ```
-docparse chunks → Postgres(真源: chunks 表 + 元数据 + ACL + pgvector 向量列)
+docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(真源: chunks 表 + 元数据 + ACL + pgvector 向量列)
                        │ 逻辑复制 CDC（pgoutput, 幂等, LSN 续传）   ← fastsearch-sync
                        ▼
    fastsearch 引擎（无状态, 可多副本）  ← fastsearch-engine 编排
