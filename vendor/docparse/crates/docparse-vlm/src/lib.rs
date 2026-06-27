@@ -1,0 +1,595 @@
+//! VLM enhancer over OpenAI-compatible services (plan G8b).
+//!
+//! One protocol covers vLLM, LM Studio and cloud endpoints:
+//! `POST {url}/v1/chat/completions` with a base64 PNG data-URL image. The
+//! deterministic pipeline never depends on this — tasks are opt-in per call,
+//! results come back as [`TextChunk`]s with `source: "vlm:<model>"` and
+//! reduced confidence, and any service failure degrades to "no annotation",
+//! never a parse failure.
+//!
+//! First task — picture description: each sizable figure region is cropped
+//! from an on-demand page render (`docparse-raster`, works for embedded
+//! rasters *and* vector-drawn charts alike) and captioned by the model. The
+//! caption is written back onto the figure's [`ImageChunk::caption`] (with
+//! `caption_source: "vlm:<model>"`), so the chunker folds it into that image's
+//! RAG chunk — figure and description stay one unit instead of a free-floating
+//! text block.
+
+use anyhow::{Context, Result};
+use base64::Engine;
+use docparse_core::ir::{BBox, Cell, Document, Element};
+
+/// Minimum share of the page area for a figure to be worth a VLM call.
+const MIN_FIGURE_COVERAGE: f32 = 0.01;
+/// Page render scale for cropping figure regions (pixels per PDF point).
+const RENDER_SCALE: f32 = 2.0;
+/// Network timeout per VLM call.
+const TIMEOUT_SECS: u64 = 120;
+/// Crops are downscaled to this max side before encoding: VLMs don't need
+/// more, and an unscaled full-page figure would base64 to ~8MB.
+const MAX_IMAGE_SIDE: usize = 1024;
+
+const DESCRIBE_PROMPT: &str = "Describe this figure from a document in one or two sentences. \
+     If it is a chart or diagram, state what it shows, including axes and key values. \
+     Reply with the description only.";
+
+#[derive(Debug, Clone)]
+pub struct VlmConfig {
+    /// Service base URL, e.g. a vLLM / LM Studio / cloud host.
+    pub url: String,
+    /// Model name as the service knows it, as the service knows it.
+    pub model: String,
+    pub api_key: Option<String>,
+}
+
+pub struct VlmClient {
+    cfg: VlmConfig,
+    agent: ureq::Agent,
+}
+
+impl VlmClient {
+    pub fn new(cfg: VlmConfig) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .build();
+        Self { cfg, agent }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.cfg.model
+    }
+
+    /// One image + prompt → model text. RGB input is PNG-encoded in process.
+    pub fn ask_about_image(&self, rgb: &[u8], w: u32, h: u32, prompt: &str) -> Result<String> {
+        let (w, h, rgb) = downscale_max(rgb, w as usize, h as usize, MAX_IMAGE_SIDE);
+        let (w, h) = (w as u32, h as u32);
+        let png = encode_png_rgb(&rgb, w, h);
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        );
+        let body = serde_json::json!({
+            "model": self.cfg.model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": prompt },
+                    { "type": "image_url", "image_url": { "url": data_url } }
+                ]
+            }],
+        });
+        let url = format!("{}/v1/chat/completions", self.cfg.url.trim_end_matches('/'));
+        let mut req = self
+            .agent
+            .post(&url)
+            .set("content-type", "application/json");
+        if let Some(key) = &self.cfg.api_key {
+            req = req.set("authorization", &format!("Bearer {key}"));
+        }
+        let resp: serde_json::Value = req
+            .send_string(&body.to_string())
+            .map_err(|e| anyhow::anyhow!("vlm request failed: {e}"))?
+            .into_json()
+            .context("vlm response is not JSON")?;
+        let text = resp["choices"][0]["message"]["content"]
+            .as_str()
+            .context("vlm response missing choices[0].message.content")?
+            .trim()
+            .to_string();
+        anyhow::ensure!(!text.is_empty(), "vlm returned an empty description");
+        Ok(text)
+    }
+}
+
+/// Caption sizable figures, writing each description back onto its
+/// [`ImageChunk::caption`] (`caption_source: "vlm:<model>"`). The chunker then
+/// folds it into that image's RAG chunk. Returns the number of captions added.
+/// Per-figure failures are reported on stderr and skipped — the deterministic
+/// result always stands.
+pub fn annotate_pictures(
+    doc: &mut Document,
+    pdf_bytes: Vec<u8>,
+    client: &VlmClient,
+) -> Result<usize> {
+    let raster = docparse_raster::Rasterizer::new(pdf_bytes)?;
+    let mut annotated = 0usize;
+    for page in &mut doc.pages {
+        let page_area = (page.width * page.height).max(1.0);
+        // Indices of gated figures — kept (not bboxes) so we can write the
+        // caption back onto the very element after the network round-trip.
+        let figure_idxs: Vec<usize> = page
+            .elements
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Element::Image(im) => {
+                    let a = im.bbox.width() * im.bbox.height();
+                    (a / page_area >= MIN_FIGURE_COVERAGE).then_some(i)
+                }
+                _ => None,
+            })
+            .collect();
+        if figure_idxs.is_empty() {
+            continue;
+        }
+        let (w, h, rgb) = match raster.render_rgb(page.number.saturating_sub(1), RENDER_SCALE) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("vlm: render failed on page {}: {e:#}", page.number);
+                continue;
+            }
+        };
+        let (page_h, page_no) = (page.height, page.number);
+        for i in figure_idxs {
+            let Element::Image(im) = &page.elements[i] else {
+                continue;
+            };
+            let bbox = im.bbox;
+            let Some((cw, ch, crop)) =
+                crop_region(&rgb, w as usize, h as usize, &bbox, RENDER_SCALE, page_h)
+            else {
+                continue;
+            };
+            match client.ask_about_image(&crop, cw as u32, ch as u32, DESCRIBE_PROMPT) {
+                Ok(text) => {
+                    if let Element::Image(im) = &mut page.elements[i] {
+                        im.caption = Some(text);
+                        im.caption_source = Some(format!("vlm:{}", client.model()));
+                    }
+                    annotated += 1;
+                }
+                Err(e) => eprintln!("vlm: describe failed on page {page_no}: {e:#}"),
+            }
+        }
+    }
+    Ok(annotated)
+}
+
+const TABLE_PROMPT: &str = "Extract the table in this image as tab-separated values: \
+one line per row, cells separated by TAB characters. For merged cells repeat the \
+value in every spanned position. Output ONLY the rows, no commentary, no markdown.";
+
+/// Re-extract the structure of detected tables with a VLM (`--vlm-tables`):
+/// render each table's region, ask for TSV, and REPLACE the deterministic
+/// grid when the answer parses into a sane (≥2×2) grid — the model sees the
+/// drawn table, so it can resolve merged cells and multi-row headers the
+/// geometric detectors cannot. On any failure the deterministic grid stands.
+/// Replaced tables carry `source: "vlm:<model>"`; cell bboxes become an even
+/// synthetic grid over the (real) table bbox — the VLM returns no geometry.
+/// Returns the number of tables replaced.
+pub fn refine_tables(doc: &mut Document, pdf_bytes: Vec<u8>, client: &VlmClient) -> Result<usize> {
+    let raster = docparse_raster::Rasterizer::new(pdf_bytes)?;
+    let mut refined = 0usize;
+    for page in &mut doc.pages {
+        let has_tables = page.elements.iter().any(|e| matches!(e, Element::Table(_)));
+        if !has_tables {
+            continue;
+        }
+        let (w, h, rgb) = match raster.render_rgb(page.number.saturating_sub(1), RENDER_SCALE) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("vlm: render failed on page {}: {e:#}", page.number);
+                continue;
+            }
+        };
+        for el in &mut page.elements {
+            let Element::Table(table) = el else { continue };
+            let Some((cw, ch, crop)) = crop_region(
+                &rgb,
+                w as usize,
+                h as usize,
+                &table.bbox,
+                RENDER_SCALE,
+                page.height,
+            ) else {
+                continue;
+            };
+            match client.ask_about_image(&crop, cw as u32, ch as u32, TABLE_PROMPT) {
+                Ok(text) => {
+                    let Some(grid) = parse_tsv_grid(&text) else {
+                        eprintln!(
+                            "vlm: table answer on page {} not a usable grid; keeping deterministic rows",
+                            page.number
+                        );
+                        continue;
+                    };
+                    table.rows = grid_cells(&grid, &table.bbox);
+                    table.source = Some(format!("vlm:{}", client.model()));
+                    refined += 1;
+                }
+                Err(e) => eprintln!("vlm: table extract failed on page {}: {e:#}", page.number),
+            }
+        }
+    }
+    Ok(refined)
+}
+
+/// Parse a TSV answer into a rectangular text grid. Tolerates markdown code
+/// fences (models add them despite instructions) and ragged rows (padded to
+/// the widest). `None` unless the result is a real 2-D grid (≥2×2) with some
+/// content — a refusal or prose answer must not replace a detected table.
+fn parse_tsv_grid(text: &str) -> Option<Vec<Vec<String>>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("```") {
+            continue;
+        }
+        rows.push(line.split('\t').map(|c| c.trim().to_string()).collect());
+    }
+    let ncols = rows.iter().map(Vec::len).max()?;
+    if rows.len() < 2 || ncols < 2 {
+        return None;
+    }
+    // Mostly-1-column output is prose, not a table the model actually read.
+    let multi = rows.iter().filter(|r| r.len() >= 2).count();
+    if multi * 2 < rows.len() {
+        return None;
+    }
+    for r in &mut rows {
+        r.resize(ncols, String::new());
+    }
+    Some(rows)
+}
+
+/// Even synthetic cell bboxes over the table region (honest approximation:
+/// the table bbox is real, per-cell geometry from a VLM is not available).
+fn grid_cells(grid: &[Vec<String>], bbox: &BBox) -> Vec<Vec<Cell>> {
+    let nr = grid.len() as f32;
+    let nc = grid.first().map(Vec::len).unwrap_or(0) as f32;
+    let (tw, th) = (bbox.x1 - bbox.x0, bbox.y1 - bbox.y0);
+    grid.iter()
+        .enumerate()
+        .map(|(ri, row)| {
+            row.iter()
+                .enumerate()
+                .map(|(ci, text)| Cell {
+                    text: text.clone(),
+                    bbox: BBox {
+                        x0: bbox.x0 + tw * ci as f32 / nc,
+                        y0: bbox.y1 - th * (ri as f32 + 1.0) / nr,
+                        x1: bbox.x0 + tw * (ci as f32 + 1.0) / nc,
+                        y1: bbox.y1 - th * ri as f32 / nr,
+                    },
+                    row_span: 1,
+                    col_span: 1,
+                    merged: false,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Crop a PDF-space bbox out of a page render (y flips between spaces).
+fn crop_region(
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    bbox: &BBox,
+    scale: f32,
+    page_h: f32,
+) -> Option<(usize, usize, Vec<u8>)> {
+    let x0 = ((bbox.x0 * scale) as usize).min(w);
+    let x1 = ((bbox.x1 * scale) as usize).min(w);
+    let y0 = (((page_h - bbox.y1) * scale) as usize).min(h);
+    let y1 = (((page_h - bbox.y0) * scale) as usize).min(h);
+    let (cw, ch) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    if cw < 16 || ch < 16 {
+        return None;
+    }
+    let mut out = vec![0u8; cw * ch * 3];
+    for y in 0..ch {
+        let src = ((y0 + y) * w + x0) * 3;
+        out[y * cw * 3..(y + 1) * cw * 3].copy_from_slice(&rgb[src..src + cw * 3]);
+    }
+    Some((cw, ch, out))
+}
+
+/// Downscale (nearest-neighbour) so the longer side is at most `max_side`.
+fn downscale_max(rgb: &[u8], w: usize, h: usize, max_side: usize) -> (usize, usize, Vec<u8>) {
+    if w.max(h) <= max_side {
+        return (w, h, rgb.to_vec());
+    }
+    let r = max_side as f32 / w.max(h) as f32;
+    let (dw, dh) = (
+        ((w as f32 * r) as usize).max(1),
+        ((h as f32 * r) as usize).max(1),
+    );
+    let mut out = vec![0u8; dw * dh * 3];
+    for y in 0..dh {
+        let sy = (y * h / dh).min(h - 1);
+        for x in 0..dw {
+            let sx = (x * w / dw).min(w - 1);
+            let (s, d) = ((sy * w + sx) * 3, (y * dw + x) * 3);
+            out[d..d + 3].copy_from_slice(&rgb[s..s + 3]);
+        }
+    }
+    (dw, dh, out)
+}
+
+// ---------------------------------------------------------------------------
+// Minimal PNG encoder (RGB8, stored/uncompressed deflate) — keeps the crate
+// free of image/compression dependencies; VLM payloads don't need small files.
+// Public: the CLI image-export path reuses it for raw-bitmap XObjects.
+// ---------------------------------------------------------------------------
+
+pub fn encode_png_rgb(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+    // Raw scanlines, each prefixed with filter byte 0 (None).
+    let stride = (w as usize) * 3;
+    let mut raw = Vec::with_capacity((stride + 1) * h as usize);
+    for y in 0..h as usize {
+        raw.push(0);
+        raw.extend_from_slice(&rgb[y * stride..(y + 1) * stride]);
+    }
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, RGB
+    push_chunk(&mut png, b"IHDR", &ihdr);
+    push_chunk(&mut png, b"IDAT", &zlib_stored(&raw));
+    push_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(tag);
+    out.extend_from_slice(data);
+    let mut crc = Crc32::new();
+    crc.update(tag);
+    crc.update(data);
+    out.extend_from_slice(&crc.finish().to_be_bytes());
+}
+
+/// zlib stream using stored (uncompressed) deflate blocks + adler32.
+fn zlib_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    let mut chunks = data.chunks(0xFFFF).peekable();
+    while let Some(c) = chunks.next() {
+        out.push(if chunks.peek().is_none() { 1 } else { 0 }); // BFINAL
+        out.extend_from_slice(&(c.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(c.len() as u16)).to_le_bytes());
+        out.extend_from_slice(c);
+    }
+    // adler32
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    out
+}
+
+struct Crc32(u32);
+impl Crc32 {
+    fn new() -> Self {
+        Self(0xFFFF_FFFF)
+    }
+    fn update(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.0 ^= byte as u32;
+            for _ in 0..8 {
+                let mask = (self.0 & 1).wrapping_neg();
+                self.0 = (self.0 >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+    }
+    fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn png_is_well_formed_and_decodable() {
+        let mut rgb = vec![200u8; 4 * 4 * 3];
+        rgb[0] = 7; // distinct first pixel survives the roundtrip
+        let png = encode_png_rgb(&rgb, 4, 4);
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
+        // Decode the stored-deflate IDAT back and verify scanlines + adler32.
+        let idat_at = png.windows(4).position(|w| w == b"IDAT").unwrap();
+        let len = u32::from_be_bytes(png[idat_at - 4..idat_at].try_into().unwrap()) as usize;
+        let z = &png[idat_at + 4..idat_at + 4 + len];
+        let mut raw = Vec::new();
+        let mut i = 2; // skip zlib header
+        loop {
+            let bfinal = z[i] & 1;
+            let blen = u16::from_le_bytes([z[i + 1], z[i + 2]]) as usize;
+            assert_eq!(
+                !u16::from_le_bytes([z[i + 1], z[i + 2]]),
+                u16::from_le_bytes([z[i + 3], z[i + 4]]),
+                "NLEN check"
+            );
+            raw.extend_from_slice(&z[i + 5..i + 5 + blen]);
+            i += 5 + blen;
+            if bfinal == 1 {
+                break;
+            }
+        }
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in &raw {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        let adler = u32::from_be_bytes(z[i..i + 4].try_into().unwrap());
+        assert_eq!(adler, (b << 16) | a, "adler32 must match");
+        // scanlines: filter byte 0 + 12 bytes per row, 4 rows
+        assert_eq!(raw.len(), (1 + 12) * 4);
+        assert_eq!(raw[0], 0);
+        assert_eq!(raw[1], 7, "pixel data survives");
+    }
+
+    #[test]
+    fn downscale_caps_long_side() {
+        let rgb = vec![10u8; 2048 * 100 * 3];
+        let (w, h, out) = downscale_max(&rgb, 2048, 100, 1024);
+        assert_eq!(w, 1024);
+        assert!((49..=50).contains(&h));
+        assert_eq!(out.len(), w * h * 3);
+        assert!(out.iter().all(|&v| v == 10));
+        // No-op below the cap.
+        let (w2, h2, _) = downscale_max(&rgb[..30 * 30 * 3], 30, 30, 1024);
+        assert_eq!((w2, h2), (30, 30));
+    }
+
+    #[test]
+    fn crop_flips_y_and_bounds() {
+        // 10x10 page rendered at scale 1; bbox occupies the TOP-left quarter
+        // in PDF coords (y0=5..y1=10) = top rows of the image.
+        let mut rgb = vec![0u8; 10 * 10 * 3];
+        for y in 0..5 {
+            for x in 0..5 {
+                rgb[(y * 10 + x) * 3] = 255;
+            }
+        }
+        let bbox = BBox {
+            x0: 0.0,
+            y0: 5.0,
+            x1: 5.0,
+            y1: 10.0,
+        };
+        // 16px minimum prevents this small crop; use a bigger synthetic page.
+        assert!(crop_region(&rgb, 10, 10, &bbox, 1.0, 10.0).is_none());
+        let mut big = vec![9u8; 100 * 100 * 3];
+        // Mark the image-space top-left pixel (= PDF top-left of the page).
+        big[0] = 255;
+        let bbox = BBox {
+            x0: 0.0,
+            y0: 50.0,
+            x1: 50.0,
+            y1: 100.0,
+        };
+        let (cw, ch, crop) = crop_region(&big, 100, 100, &bbox, 1.0, 100.0).unwrap();
+        assert_eq!((cw, ch), (50, 50));
+        // PDF bbox covering the TOP half maps to image rows 0..50 — the marked
+        // pixel must be inside the crop at (0,0).
+        assert_eq!(crop[0], 255, "y-flip must select the top of the image");
+    }
+
+    #[test]
+    fn tsv_grid_parses_and_pads() {
+        let g = parse_tsv_grid("```\nName\tValue\na\t1\nb\t2\textra\n```").unwrap();
+        assert_eq!(g.len(), 3);
+        assert_eq!(g[0], vec!["Name", "Value", ""]); // padded to widest
+        assert_eq!(g[2], vec!["b", "2", "extra"]);
+    }
+
+    #[test]
+    fn tsv_grid_rejects_prose_and_1d() {
+        // A refusal / prose answer must never replace a detected table.
+        assert!(parse_tsv_grid("I cannot see a table in this image.").is_none());
+        assert!(parse_tsv_grid("only\tone row").is_none());
+        assert!(parse_tsv_grid("a\nb\nc\n").is_none()); // one column
+    }
+
+    #[test]
+    fn vlm_grid_cells_tile_the_table_bbox() {
+        let grid = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["c".to_string(), "d".to_string()],
+        ];
+        let bbox = BBox {
+            x0: 100.0,
+            y0: 200.0,
+            x1: 300.0,
+            y1: 300.0,
+        };
+        let cells = grid_cells(&grid, &bbox);
+        assert_eq!(cells[0][0].text, "a");
+        // Row 0 is the TOP row in PDF space (y1 side).
+        assert_eq!(cells[0][0].bbox.y1, 300.0);
+        assert_eq!(cells[1][1].bbox.x1, 300.0);
+        assert_eq!(cells[1][1].bbox.y0, 200.0);
+    }
+
+    /// Spin a one-shot HTTP server on a thread, assert the request shape, and
+    /// return a canned OpenAI-style response — protocol pinned without any
+    /// external service.
+    #[test]
+    fn client_speaks_openai_protocol() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let mut total = 0usize;
+            // Read until headers + body (Content-Length) are in.
+            loop {
+                let n = s.read(&mut buf[total..]).unwrap();
+                total += n;
+                let text = String::from_utf8_lossy(&buf[..total]).into_owned();
+                if let Some(hdr_end) = text.find("\r\n\r\n") {
+                    let cl: usize = text
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|l| l.split(':').nth(1))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if total >= hdr_end + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&buf[..total]).into_owned();
+            assert!(text.starts_with("POST /v1/chat/completions"));
+            assert!(text
+                .to_ascii_lowercase()
+                .contains("authorization: bearer k123"));
+            let body_start = text.find("\r\n\r\n").unwrap() + 4;
+            let body: serde_json::Value = serde_json::from_str(&text[body_start..]).unwrap();
+            assert_eq!(body["model"], "test-vlm");
+            assert!(body["messages"][0]["content"][1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"));
+            let resp_body =
+                r#"{"choices":[{"message":{"role":"assistant","content":"A bar chart."}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        });
+
+        let client = VlmClient::new(VlmConfig {
+            url: format!("http://127.0.0.1:{port}"),
+            model: "test-vlm".into(),
+            api_key: Some("k123".into()),
+        });
+        let rgb = vec![128u8; 32 * 32 * 3];
+        let out = client.ask_about_image(&rgb, 32, 32, "describe").unwrap();
+        assert_eq!(out, "A bar chart.");
+        handle.join().unwrap();
+    }
+}

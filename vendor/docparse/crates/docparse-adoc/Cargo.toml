@@ -1,0 +1,11 @@
+[package]
+name = "docparse-adoc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "AsciiDoc backend (common subset) for docparse-rs"
+
+[dependencies]
+docparse-core = { path = "../docparse-core" }
+anyhow.workspace = true

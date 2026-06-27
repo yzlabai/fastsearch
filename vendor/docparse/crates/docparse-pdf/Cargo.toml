@@ -1,0 +1,15 @@
+[package]
+name = "docparse-pdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust PDF backend for docparse-rs (lopdf + a custom content-stream interpreter)"
+
+[dependencies]
+docparse-core = { path = "../docparse-core" }
+lopdf.workspace = true
+rayon.workspace = true
+anyhow.workspace = true
+hayro-ccitt.workspace = true
+hayro-jbig2.workspace = true
+hayro-jpeg2000.workspace = true

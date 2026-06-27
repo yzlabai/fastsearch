@@ -1,0 +1,94 @@
+{
+  "$defs": {
+    "QualityFlag": {
+      "description": "A reason the deterministic parse may be insufficient.",
+      "oneOf": [
+        {
+          "const": "scanned_no_text",
+          "description": "Pages exist but no text was extracted — almost certainly a scan needing OCR.",
+          "type": "string"
+        },
+        {
+          "const": "partial_text_coverage",
+          "description": "Some pages have no text while others do — a mixed/hybrid document.",
+          "type": "string"
+        },
+        {
+          "const": "high_garble",
+          "description": "A high fraction of decoded characters look garbled (control/replacement).",
+          "type": "string"
+        },
+        {
+          "const": "hidden_text_present",
+          "description": "Human-invisible text was found and excluded from rendered outputs\n(prompt-injection vector; N5a). Count in `hidden_chunks`; the flagged\nchunks remain in the IR JSON for audit.",
+          "type": "string"
+        },
+        {
+          "const": "mixed_text_and_scan",
+          "description": "The page has a real text layer AND a large raster with pixel payload\n(e.g. an inserted scan/stamp) — region-level OCR can recover the\nraster's text without touching the digital text (G4).",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A computed quality read on a [`Document`]. Serializable for CLI/observability.",
+  "properties": {
+    "coverage": {
+      "description": "`text_pages / pages` in [0,1].",
+      "format": "float",
+      "type": "number"
+    },
+    "flags": {
+      "items": {
+        "$ref": "#/$defs/QualityFlag"
+      },
+      "type": "array"
+    },
+    "garbled_chars": {
+      "description": "Control (non-whitespace) or U+FFFD characters.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "garbled_ratio": {
+      "description": "`garbled_chars / total_chars` in [0,1].",
+      "format": "float",
+      "type": "number"
+    },
+    "hidden_chunks": {
+      "default": 0,
+      "description": "Text chunks classified hidden (invisible render mode / off-page / tiny\nfont) and excluded from rendered outputs.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "pages": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "text_pages": {
+      "description": "Pages with at least one text chunk.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "total_chars": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "pages",
+    "text_pages",
+    "coverage",
+    "total_chars",
+    "garbled_chars",
+    "garbled_ratio",
+    "flags"
+  ],
+  "title": "QualityReport",
+  "type": "object"
+}

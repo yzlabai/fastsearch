@@ -1,0 +1,85 @@
+{
+  "$defs": {
+    "PageKind": {
+      "description": "What a page fundamentally is — the complexity-profile signal (module 9,\nN5c) that routing and operators consume. Derived purely from the IR.",
+      "oneOf": [
+        {
+          "const": "digital",
+          "description": "Text layer present, no page-covering raster — the fast path.",
+          "type": "string"
+        },
+        {
+          "const": "scanned",
+          "description": "No text layer, a page-covering raster — OCR territory.",
+          "type": "string"
+        },
+        {
+          "const": "mixed",
+          "description": "Both a text layer and a page-covering raster (stamped/hybrid pages).",
+          "type": "string"
+        },
+        {
+          "const": "empty",
+          "description": "Neither text nor images (blank or wholly unsupported content).",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Per-page complexity profile. Cheap to compute, explainable, serializable —\nfeeds routing decisions and the agent-facing quality envelope.",
+  "properties": {
+    "enhanced_chunks": {
+      "description": "Text chunks produced by an enhancer (`source` set) — 0 on a pure\ndeterministic parse.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "image_count": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "image_coverage": {
+      "description": "Largest image's share of the page area, in [0,1].",
+      "format": "float",
+      "type": "number"
+    },
+    "kind": {
+      "$ref": "#/$defs/PageKind"
+    },
+    "page": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "reading_order_anomaly": {
+      "default": 0.0,
+      "description": "Reading-order anomaly: fraction of reading-order-adjacent visible text\nblocks where the next block starts ABOVE the current (a top-down-flow\nviolation that survives XY-cut), normalized by block count. Cheap,\npurely geometric, in [0,1]. NOTE (H3, 2026-06-11): evaluated as an\nauto-`--layout` routing criterion and found NOT separable (clean\ntwo-column pages score 0.0 just like clean single-column; a sub-word\nfragmented page scores highest despite needing no layout model) — it is\nkept as an observable diagnostic / feature for an external page-type\njudge, NOT wired to any automatic decision. See devlog.",
+      "format": "float",
+      "type": "number"
+    },
+    "tables": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "text_chars": {
+      "description": "Visible (non-hidden) text characters.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "page",
+    "kind",
+    "text_chars",
+    "image_count",
+    "image_coverage",
+    "tables",
+    "enhanced_chunks"
+  ],
+  "title": "PageProfile",
+  "type": "object"
+}

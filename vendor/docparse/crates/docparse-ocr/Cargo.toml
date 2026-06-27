@@ -1,0 +1,18 @@
+[package]
+name = "docparse-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ONNX-embedded OCR enhancer (PP-OCR via tract) for docparse-rs"
+
+[dependencies]
+docparse-core = { path = "../docparse-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+tract-onnx.workspace = true
+tract-linalg.workspace = true
+zune-jpeg.workspace = true
+ureq.workspace = true
+rayon.workspace = true
+docparse-raster = { path = "../docparse-raster" }

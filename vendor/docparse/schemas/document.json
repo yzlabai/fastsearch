@@ -1,0 +1,406 @@
+{
+  "$defs": {
+    "BBox": {
+      "description": "Axis-aligned bounding box in PDF user space (origin bottom-left).",
+      "properties": {
+        "x0": {
+          "format": "float",
+          "type": "number"
+        },
+        "x1": {
+          "format": "float",
+          "type": "number"
+        },
+        "y0": {
+          "format": "float",
+          "type": "number"
+        },
+        "y1": {
+          "format": "float",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x0",
+        "y0",
+        "x1",
+        "y1"
+      ],
+      "type": "object"
+    },
+    "Cell": {
+      "description": "One cell of a [`Table`].",
+      "properties": {
+        "bbox": {
+          "$ref": "#/$defs/BBox"
+        },
+        "col_span": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "merged": {
+          "description": "True for a grid position covered by an earlier anchor's span (its\ntext is the replicated anchor text).",
+          "type": "boolean"
+        },
+        "row_span": {
+          "description": "Span semantics (G3-R follow-up): the ANCHOR cell (top-left) of a\nmerged region carries its spans; covered positions stay materialized\nin the grid (flat row-major indexing remains valid — the eval/ODL\nconvention) and are marked [`Cell::merged`]. Deterministic detectors\nemit plain 1×1 cells; only the table model produces real spans.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "bbox"
+      ],
+      "type": "object"
+    },
+    "Element": {
+      "description": "One element on a page. `Table` is the first semantic block; lists/headings\nbuild on these primitives later.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TextChunk",
+          "properties": {
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ImageChunk",
+          "properties": {
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Table",
+          "properties": {
+            "type": {
+              "const": "table",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ImageChunk": {
+      "description": "A raster image region. `data` carries the pixel payload only for\npage-covering images (scan candidates, the OCR-enhancer input) so memory\nstays bounded on image-heavy digital documents — unless the backend was\nasked to decode everything (image export). It is never serialized; the\nJSON keeps bbox/dims for audit, plus `file` once exported to disk.",
+      "properties": {
+        "bbox": {
+          "$ref": "#/$defs/BBox"
+        },
+        "caption": {
+          "description": "Figure caption / description — the text that makes this image findable\nin RAG retrieval. Filled deterministically from an adjacent caption line\nat chunking time, or by the VLM enhancer (`--vlm`) which writes a neural\ndescription here. `None` when no caption was found. See `caption_source`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "caption_source": {
+          "description": "Provenance of `caption`: `\"caption-line\"` (an adjacent in-document\ncaption), `\"vlm:<model>\"` (neural description). Per the project's \"近似\n必须标注\" rule, every non-deterministic/derived value names its source.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data_base64": {
+          "description": "Base64 payload when embedded output was requested (`--image-embed` /\n`images=embedded`); [`ImageChunk::data_media_type`] names the format.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data_media_type": {
+          "description": "MIME type of `data_base64` (`image/jpeg` passthrough or `image/png`\nfor re-encoded raw bitmaps).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "description": "Path the image was exported to (`--image-dir`), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "height_px": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/ImageKind",
+          "default": "none"
+        },
+        "page": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turns": {
+          "description": "Quarter-turns (90° clockwise) the pixel buffer must be rotated to\nmatch the on-page (viewing) orientation of `bbox` — non-zero when the\npage carries /Rotate or the image is placed with a rotated CTM (H2a).",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "width_px": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bbox",
+        "page"
+      ],
+      "type": "object"
+    },
+    "ImageKind": {
+      "description": "Pixel format of an extracted raster image payload.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Recorded position-only (unsupported encoding or below the size gate).",
+          "type": "string"
+        },
+        {
+          "const": "gray8",
+          "description": "Raw 8-bit grayscale, `width_px * height_px` bytes.",
+          "type": "string"
+        },
+        {
+          "const": "rgb8",
+          "description": "Raw 8-bit RGB, `width_px * height_px * 3` bytes.",
+          "type": "string"
+        },
+        {
+          "const": "jpeg",
+          "description": "Undecoded JPEG file bytes (DCTDecode passthrough).",
+          "type": "string"
+        },
+        {
+          "const": "encoded",
+          "description": "Already-encoded image file bytes in some other format (PNG/GIF/… — the\nshape DOCX/PPTX/HTML media arrive in). [`ImageChunk::data_media_type`]\nnames the format; export/embed pass `data` through verbatim.",
+          "type": "string"
+        }
+      ]
+    },
+    "Page": {
+      "properties": {
+        "elements": {
+          "items": {
+            "$ref": "#/$defs/Element"
+          },
+          "type": "array"
+        },
+        "height": {
+          "format": "float",
+          "type": "number"
+        },
+        "number": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "width": {
+          "format": "float",
+          "type": "number"
+        }
+      },
+      "required": [
+        "number",
+        "width",
+        "height",
+        "elements"
+      ],
+      "type": "object"
+    },
+    "Provenance": {
+      "description": "Where a [`Document`] came from: which parser/version produced it, under\nwhich schema. The agent-facing trust/repro anchor (one per document; an\nelement's *source location* is its own `bbox`+`page`).",
+      "properties": {
+        "parser": {
+          "description": "Producing parser, e.g. \"pdf\".",
+          "type": "string"
+        },
+        "parser_version": {
+          "description": "Producing parser/crate version.",
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "parser",
+        "parser_version"
+      ],
+      "type": "object"
+    },
+    "Table": {
+      "description": "A detected table: a grid of cells bounded by ruling lines. Built by the\nsemantic layer ([`crate::table`]) from text chunks + vector segments.",
+      "properties": {
+        "bbox": {
+          "$ref": "#/$defs/BBox"
+        },
+        "page": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "description": "Row-major: `rows[r][c]`. All rows have the same length (column count).",
+          "items": {
+            "items": {
+              "$ref": "#/$defs/Cell"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "source": {
+          "description": "`None` = deterministic detection; `\"vlm:<model>\"` = grid re-extracted\nby a model (`--vlm-tables`) — same audit convention as `TextChunk`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "bbox",
+        "page",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "TextChunk": {
+      "description": "A run of text with a position. The atomic unit emitted by parsers.",
+      "properties": {
+        "bbox": {
+          "$ref": "#/$defs/BBox"
+        },
+        "bold": {
+          "default": false,
+          "description": "Whether the glyphs are bold (from the font weight). Helps heading\ndetection when headings are body-size but bold.",
+          "type": "boolean"
+        },
+        "confidence": {
+          "default": 1.0,
+          "description": "Extraction confidence in [0,1]. 1.0 for deterministic parsing; lower\nwhen a pluggable model (OCR/VLM) produced or corrected this chunk (M7).",
+          "format": "float",
+          "type": "number"
+        },
+        "font": {
+          "description": "Font resource name (e.g. \"F1\"), if known. TODO: resolve to PostScript name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "font_size": {
+          "description": "Effective font size in device space (already scaled by the text/CTM matrices).",
+          "format": "float",
+          "type": "number"
+        },
+        "group": {
+          "description": "Reading group (G2 layout enhancer / G9a tagged PDFs): when set, layout\nreconstruction orders groups by this id before running XY-cut *within*\neach group — a layout model or the author's structure tree dictates\nmacro reading order while deterministic geometry rules inside groups.\n`None` = no grouping (sorts after all groups if mixed).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "hidden": {
+          "default": false,
+          "description": "True when the text is invisible to a human reader (render mode Tr 3/7,\noff-page bbox, or sub-readable font size) — a prompt-injection vector\nfor agents. Hidden chunks stay in the IR (flagged, auditable) but are\nexcluded from rendered outputs via [`Page::text_chunks`] (N5a).",
+          "type": "boolean"
+        },
+        "page": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source": {
+          "description": "Which producer emitted this text: `None` = the deterministic parser;\n`Some(\"ocr:...\")` etc. = an enhancer (N3). Element-level provenance so\ndownstream can audit exactly which text came from a model.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tag": {
+          "description": "Structure role from a tagged PDF's structure tree (\"H1\"..\"H6\", \"P\",\n\"LI\", \"TD\", …) — author-declared semantics (G9a). `None` on untagged\ncontent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "bbox",
+        "font_size",
+        "page"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "pages": {
+      "items": {
+        "$ref": "#/$defs/Page"
+      },
+      "type": "array"
+    },
+    "provenance": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Provenance"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Producing parser/version + schema version. `default` keeps older JSON\n(pre-provenance) loadable."
+    },
+    "source": {
+      "description": "Source path or identifier the document was parsed from.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "source",
+    "pages"
+  ],
+  "title": "Document",
+  "type": "object"
+}

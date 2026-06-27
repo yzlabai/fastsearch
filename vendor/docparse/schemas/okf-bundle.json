@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Open Knowledge Format (OKF v0.1) bundle: Markdown + YAML-frontmatter concept files mirroring the structure tree.",
+  "properties": {
+    "files": {
+      "items": {
+        "properties": {
+          "content": {
+            "description": "Markdown body with YAML frontmatter (type/resource/level/title).",
+            "type": "string"
+          },
+          "path": {
+            "description": "Bundle-relative path, e.g. \"index.md\" or \"03-methods/04-model.md\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "okf_version": {
+      "const": "0.1",
+      "type": "string"
+    }
+  },
+  "required": [
+    "okf_version",
+    "files"
+  ],
+  "title": "OkfBundle",
+  "type": "object"
+}

@@ -1,0 +1,117 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+    "crates/docparse-core",
+    "crates/docparse-pdf",
+    "crates/docparse-docx",
+    "crates/docparse-html",
+    "crates/docparse-ocr",
+    "crates/docparse-raster",
+    "crates/docparse-vlm",
+    "crates/docparse-xlsx",
+    "crates/docparse-pptx",
+    "crates/docparse-md",
+    "crates/docparse-csv",
+    "crates/docparse-srt",
+    "crates/docparse-tex",
+    "crates/docparse-eml",
+    "crates/docparse-img",
+    "crates/docparse-adoc",
+    "crates/docparse-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["docparse-rs contributors"]
+repository = "https://github.com/yzlabai/docparse-rs"
+homepage = "https://github.com/yzlabai/docparse-rs"
+
+# Centralized dependency versions — crates inherit via `dep.workspace = true`.
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Machine-readable contract (2026-06-20): derive JSON Schema (draft 2020-12) from
+# the same serde types, so the output contract has one source of truth (the code)
+# and external agents can codegen/validate. Optional `schema` feature on core —
+# pure-library embedders that don't export schemas never compile it.
+schemars = "1"
+rayon = "1"
+lopdf = "0.41"
+clap = { version = "4", features = ["derive"] }
+docx-rs = "0.4"
+scraper = "0.21"
+# REST face (N2b, user-approved 2026-06-10): axum/tokio kept to the features
+# the server actually uses — no full-feature pull-in.
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+# OCR enhancer (N3, P4 route): pure-Rust ONNX inference + JPEG decode.
+tract-onnx = "0.23"
+tract-linalg = { version = "0.23", features = ["multithread-mm"] }
+zune-jpeg = "0.4"
+zune-png = "0.4"
+mail-parser = "0.9"
+encoding_rs = "0.8"
+chardetng = "0.1"
+# On-demand page rasterization for neural enhancers (user-approved 2026-06-10):
+# the main pipeline never renders; routed hard pages may, pure Rust, opt-in.
+hayro = "0.7"
+# H1 (2026-06-11): 1-bit scan decode (CCITT G3/G4, JBIG2) for the OCR path.
+# Both were already transitive deps via hayro — zero new supply-chain surface.
+hayro-ccitt = "0.3"
+hayro-jbig2 = "0.3"
+# S2 (2026-06-19): JPX (JPEG 2000) scan decode for the OCR path. Also already a
+# transitive dep via hayro — zero new supply-chain surface (same precedent).
+hayro-jpeg2000 = "0.3"
+# VLM enhancer over OpenAI-compatible services (G8b, user-approved 2026-06-10).
+ureq = { version = "2", features = ["json"] }
+base64 = "0.22"
+# Format breadth (G1a, user-approved 2026-06-10): XLSX/PPTX/Markdown backends.
+# `dates`: render date cells as ISO dates, not raw Excel serials (chrono already
+# in the tree; handles the Excel 1900 leap-year quirk correctly).
+calamine = { version = "0.26", features = ["dates"] }
+quick-xml = "0.37"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+pulldown-cmark = { version = "0.12", default-features = false }
+# CLI progress & speed visualization (stderr-only, TTY-gated). Mature, widely
+# used, draws to stderr so stdout data output stays clean; thread-safe bar so the
+# page-parallel OCR loop can increment it from rayon workers.
+indicatif = "0.17"
+# `--stats`: peak RSS + CPU time via getrusage. Already in the tree transitively
+# (tract/tokio/…), so a direct dep adds zero new supply-chain surface.
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[patch.crates-io]
+tract-hir = { path = "vendor/tract-hir" }
+tract-core = { path = "vendor/tract-core" }
+
+# Prebuilt-binary release pipeline (`dist` / cargo-dist). `dist generate`
+# turns this into .github/workflows/release.yml: tagging `v*` builds the
+# `docparse` binary for each target on GitHub-hosted runners and publishes a
+# GitHub Release with a `curl … | sh` (and PowerShell) installer + checksums.
+# CI builds from source, so the vendored tract patch above applies normally.
+# Bump `cargo-dist-version` and re-run `dist generate` to update the workflow.
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+installers = ["shell", "powershell"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+install-path = "CARGO_HOME"
+install-updater = false
+pr-run-mode = "plan"
+# Bundle the English README + Apache NOTICE in every archive. Without this,
+# auto-includes picked up README.zh.md (Chinese) and dropped README.md.
+include = ["README.md", "NOTICE"]

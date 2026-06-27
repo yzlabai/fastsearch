@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+tmp/
+# Python
+__pycache__/
+*.pyc
+/models/
+# JVM crash logs (from running the ODL reference under a broken JDK)
+hs_err_pid*.log
+replay_pid*.log
+.claude/
+# Cross-project scratch dropped here by other tooling — not part of docparse-rs
+video/
+skills/remotion-best-practices/

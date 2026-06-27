@@ -1,0 +1,14 @@
+[package]
+name = "docparse-docx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+docparse-core = { path = "../docparse-core" }
+anyhow.workspace = true
+docx-rs.workspace = true
+# Read cell gridSpan/vMerge via docx-rs's public Serialize contract (the fields
+# have no getters). The JSON shape is pinned by docx-rs's own tests.
+serde_json.workspace = true

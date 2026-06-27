@@ -1,0 +1,168 @@
+{
+  "$defs": {
+    "BBox": {
+      "description": "Axis-aligned bounding box in PDF user space (origin bottom-left).",
+      "properties": {
+        "x0": {
+          "format": "float",
+          "type": "number"
+        },
+        "x1": {
+          "format": "float",
+          "type": "number"
+        },
+        "y0": {
+          "format": "float",
+          "type": "number"
+        },
+        "y1": {
+          "format": "float",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x0",
+        "y0",
+        "x1",
+        "y1"
+      ],
+      "type": "object"
+    },
+    "ChunkKind": {
+      "description": "What kind of content a chunk holds.",
+      "oneOf": [
+        {
+          "enum": [
+            "heading",
+            "paragraph",
+            "table"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "code",
+          "description": "A monospace code block (line breaks + indentation preserved).",
+          "type": "string"
+        },
+        {
+          "const": "list_item",
+          "description": "A list item (bullet/ordinal marker or LI tag).",
+          "type": "string"
+        },
+        {
+          "const": "image",
+          "description": "A figure/picture. Its `text` carries the caption + surrounding context\nfor retrieval; render/audit data lives in [`Chunk::image`].",
+          "type": "string"
+        }
+      ]
+    },
+    "ImageMeta": {
+      "description": "Render/audit payload for an [`ChunkKind::Image`] chunk. Kept separate from\nthe flat retrieval fields so non-image chunks serialize without it\n(`skip_serializing_if`). The chunk's `text` already holds the searchable\ncaption+context; these fields let a consumer display and cite the image.",
+      "properties": {
+        "caption": {
+          "description": "Figure caption alone (also folded into the chunk's `text`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "caption_source": {
+          "description": "Where the caption came from (`\"caption-line\"`, `\"vlm:<model>\"`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data_base64": {
+          "description": "Base64 payload when embedded output was requested (`--image-embed`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "description": "Path the image was exported to (`--image-dir`), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "media_type": {
+          "description": "MIME type of `data_base64`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A retrieval chunk with a precise source anchor.",
+  "properties": {
+    "bbox": {
+      "$ref": "#/$defs/BBox",
+      "description": "Union bounding box of the source content on `page` (PDF user space)."
+    },
+    "char_len": {
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "heading_path": {
+      "description": "Enclosing heading breadcrumb, outermost first (section context).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "id": {
+      "description": "Stable sequential id within the document.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "image": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ImageMeta"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Present only on [`ChunkKind::Image`] chunks: how to render and cite the\nfigure. `None` for text/table chunks."
+    },
+    "kind": {
+      "$ref": "#/$defs/ChunkKind"
+    },
+    "page": {
+      "description": "Source page (1-based, as in the IR).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "section_id": {
+      "default": 0,
+      "description": "Id of the enclosing [`crate::outline::Section`] (0 = before any heading /\ndocument root). Lets a consumer map a chunk back into the structure tree\nfor parent-document / auto-merging retrieval.",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "text": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "kind",
+    "text",
+    "page",
+    "bbox",
+    "heading_path",
+    "char_len"
+  ],
+  "title": "Chunk",
+  "type": "object"
+}

@@ -1,0 +1,77 @@
+docparse-rs
+Copyright 2026 docparse-rs contributors
+
+This product includes software developed by the docparse-rs contributors.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+Third-party components and attributions
+================================================================================
+
+This source tree contains, references, or interoperates with the following
+third-party works. Each is used in a manner compatible with this project's
+Apache-2.0 license.
+
+--------------------------------------------------------------------------------
+1. Vendored tract patches  (vendor/)
+--------------------------------------------------------------------------------
+The directories vendor/tract-core and vendor/tract-hir are a vendored copy of
+the `tract` neural-network inference toolkit by Sonos, Inc.
+
+    tract — https://github.com/sonos/tract
+    Copyright Sonos, Inc.
+    Dual-licensed under MIT OR Apache-2.0 (original LICENSE files retained
+    inside each vendored crate).
+
+These copies carry two minimal local modifications needed to run the
+PP-DocLayoutV2 ONNX model on tract (a GatherNd shape-inference fix and a TopK
+TDim fix). The modified files carry change notices per Apache-2.0 §4(b). The
+rationale, the exact diffs, and the maintenance plan (how to re-apply when
+bumping tract) are documented in vendor/README.md and vendor/PATCHES.md.
+
+--------------------------------------------------------------------------------
+2. veraPDF — algorithmic reference only (no code copied)
+--------------------------------------------------------------------------------
+Parts of the PDF font/CMap and structure logic were independently implemented
+using veraPDF as an *algorithmic* reference. No veraPDF source code is included
+or derived in this project.
+
+    veraPDF — https://github.com/veraPDF
+    Licensed under GPLv3+ / MPLv2.
+
+veraPDF's GPL/MPL terms do NOT apply to this project because no veraPDF code is
+present. Where an algorithm was studied from veraPDF, the corresponding
+veraPDF class/file is cited in the Rust source comments for traceability.
+
+--------------------------------------------------------------------------------
+3. Optional neural models (NOT distributed with this project)
+--------------------------------------------------------------------------------
+The models that power the optional --ocr / --layout / --table-model /
+--formula-model / --transcribe-model features are NOT included in this
+repository or its binaries. They are fetched on demand from their original
+repositories by scripts/fetch-models.sh. All are Apache-2.0:
+
+  * PP-OCRv4 (det/rec/cls) and ppocr_keys_v1.txt
+      via SWHL/RapidOCR — derived from PaddlePaddle/PaddleOCR (Apache-2.0).
+
+  * DocLayout-YOLO (DocStructBench)
+      via wybxc/DocLayout-YOLO-DocStructBench-onnx — derived from
+      opendatalab/DocLayout-YOLO (Apache-2.0).
+
+  * PP-DocLayoutV2
+      via topdu/PP_DoclayoutV2_onnx — part of OpenOCR / OpenDoc-0.1B
+      (https://github.com/Topdu/OpenOCR), Apache-2.0.
+
+  * UniRec-0.1B (encoder/decoder/tokenizer)
+      via topdu/unirec_0_1b_onnx — part of OpenOCR / OpenDoc-0.1B
+      (https://github.com/Topdu/OpenOCR), Apache-2.0.
+
+Users who download these models are bound by the respective upstream licenses.
+
+--------------------------------------------------------------------------------
+4. Rust dependencies
+--------------------------------------------------------------------------------
+This project depends on numerous open-source Rust crates declared in Cargo.toml,
+each under its own permissive license (predominantly MIT and/or Apache-2.0).
+See Cargo.toml and the resolved Cargo.lock for the full dependency set and run
+`cargo license` (or equivalent) for a complete per-crate license listing.

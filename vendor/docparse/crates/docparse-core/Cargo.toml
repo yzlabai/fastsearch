@@ -1,0 +1,21 @@
+[package]
+name = "docparse-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core IR, parser trait, reading-order and output for docparse-rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
+rayon.workspace = true
+libc.workspace = true
+schemars = { workspace = true, optional = true }
+
+[features]
+# Compile the JSON Schema derives + `schema::all()` exporter. Off by default so
+# pure-library/embedding consumers don't pull schemars; the CLI enables it.
+schema = ["dep:schemars"]

@@ -1,0 +1,79 @@
+{
+  "$defs": {
+    "BBox": {
+      "description": "Axis-aligned bounding box in PDF user space (origin bottom-left).",
+      "properties": {
+        "x0": {
+          "format": "float",
+          "type": "number"
+        },
+        "x1": {
+          "format": "float",
+          "type": "number"
+        },
+        "y0": {
+          "format": "float",
+          "type": "number"
+        },
+        "y1": {
+          "format": "float",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x0",
+        "y0",
+        "x1",
+        "y1"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A node in the document structure tree. The root is a synthetic document\nnode (`id` 0, `level` 0, empty `title`) whose `children` are the top-level\nsections; every other node is a heading and the content beneath it.",
+  "properties": {
+    "bbox": {
+      "$ref": "#/$defs/BBox",
+      "description": "Heading bounding box (PDF user space) — citation anchor. Zero for root."
+    },
+    "children": {
+      "description": "Child sections, in reading order.",
+      "items": {
+        "$ref": "#"
+      },
+      "type": "array"
+    },
+    "id": {
+      "description": "Stable id = heading appearance order in reading order (root = 0). Chunks\nreference this via [`crate::chunk::Chunk::section_id`].",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "level": {
+      "description": "Nesting level (1 = top-level section; 0 only for the root).",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "page": {
+      "description": "Page the heading sits on (1-based; 0 for the root).",
+      "format": "uint",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "title": {
+      "description": "Heading text (empty for the synthetic root).",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "level",
+    "page",
+    "bbox"
+  ],
+  "title": "Section",
+  "type": "object"
+}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docparse-client"
+version = "0.1.0"
+description = "Thin Python client for the docparse pure-Rust document parser (subprocess CLI or REST), with LangChain / LlamaIndex adapters"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+# Deliberately ZERO runtime dependencies: the subprocess client wraps the
+# docparse binary, the HTTP client uses urllib. Framework adapters import
+# their hosts lazily.
+dependencies = []
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.2"]
+llamaindex = ["llama-index-core>=0.10"]
+
+[tool.setuptools.packages.find]
+include = ["docparse_client*"]

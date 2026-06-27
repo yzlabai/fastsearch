@@ -1,0 +1,38 @@
+[package]
+name = "docparse-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "CLI for docparse-rs — a fast, pure-Rust, single-binary document parser for agents & RAG"
+
+[[bin]]
+name = "docparse"
+path = "src/main.rs"
+
+[dependencies]
+docparse-core = { path = "../docparse-core", features = ["schema"] }
+docparse-pdf = { path = "../docparse-pdf" }
+docparse-docx = { path = "../docparse-docx" }
+docparse-html = { path = "../docparse-html" }
+docparse-ocr = { path = "../docparse-ocr" }
+docparse-vlm = { path = "../docparse-vlm" }
+base64.workspace = true
+docparse-xlsx = { path = "../docparse-xlsx" }
+docparse-pptx = { path = "../docparse-pptx" }
+docparse-md = { path = "../docparse-md" }
+docparse-csv = { path = "../docparse-csv" }
+docparse-srt = { path = "../docparse-srt" }
+docparse-tex = { path = "../docparse-tex" }
+docparse-eml = { path = "../docparse-eml" }
+docparse-img = { path = "../docparse-img" }
+docparse-adoc = { path = "../docparse-adoc" }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+indicatif.workspace = true
+libc.workspace = true
+rayon.workspace = true

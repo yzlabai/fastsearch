@@ -1,0 +1,13 @@
+[package]
+name = "docparse-img"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Images-as-documents backend (PNG/JPEG) for docparse-rs"
+
+[dependencies]
+docparse-core = { path = "../docparse-core" }
+anyhow.workspace = true
+zune-jpeg.workspace = true
+zune-png.workspace = true
