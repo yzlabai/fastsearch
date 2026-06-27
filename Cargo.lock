@@ -1241,6 +1241,7 @@ dependencies = [
  "docparse-ocr",
  "docparse-pdf",
  "docparse-pptx",
+ "docparse-raster",
  "docparse-srt",
  "docparse-xlsx",
  "fastsearch-core",

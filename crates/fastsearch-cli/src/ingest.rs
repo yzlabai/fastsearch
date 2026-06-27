@@ -62,6 +62,46 @@ fn apply_ocr(doc: docparse_core::ir::Document) -> Result<docparse_core::ir::Docu
     Ok(doc)
 }
 
+/// 表格结构识别（`parse-tables` feature，**非 VLM 的确定性 ONNX 路**）：对解析层检测出的表格区域
+/// （`Element::Table`），从源 PDF 栅格化裁剪 → UniRec 重识别为结构化 HTML 表格。仅 PDF（需源字节
+/// 栅格化）+ env `FASTSEARCH_UNIREC_MODELS`（UniRec 模型目录）时启用；否则原样（解析层表格不变）。
+#[cfg(feature = "parse-tables")]
+fn apply_tables(
+    mut doc: docparse_core::ir::Document,
+    file: &std::path::Path,
+) -> Result<docparse_core::ir::Document> {
+    let Some(dir) = std::env::var_os("FASTSEARCH_UNIREC_MODELS") else {
+        return Ok(doc);
+    };
+    let is_pdf = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if !is_pdf {
+        return Ok(doc); // 非 PDF：表格已由解析器（docx/html/xlsx）结构化，无需 UniRec 栅格识别
+    }
+    let bytes = std::fs::read(file).with_context(|| format!("read pdf {}", file.display()))?;
+    let unirec =
+        docparse_ocr::unirec::UniRec::new(std::path::Path::new(&dir)).with_context(|| {
+            format!(
+                "load UniRec models from {}",
+                std::path::Path::new(&dir).display()
+            )
+        })?;
+    let n = docparse_ocr::table_model::refine_tables(&mut doc, bytes, &unirec)
+        .context("UniRec refine_tables")?;
+    eprintln!("UniRec: 重识别 {n} 个表格结构（非 VLM）");
+    Ok(doc)
+}
+
+#[cfg(not(feature = "parse-tables"))]
+fn apply_tables(
+    doc: docparse_core::ir::Document,
+    _file: &std::path::Path,
+) -> Result<docparse_core::ir::Document> {
+    Ok(doc)
+}
+
 /// **in-process 解析 → 适配 → 索引**（doc 级替换）：按扩展名选 docparse 解析器 → 解析+分块 →
 /// `from_docparse_chunk` 适配 → 灌入现有落盘索引。返回灌入条数。
 /// 融合 Option B 摄取热路径：进程内多格式解析（PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML），
@@ -81,6 +121,7 @@ pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
         .parse(&opts.file)
         .with_context(|| format!("docparse {} parse {}", parser.name(), opts.file.display()))?;
     let doc = apply_ocr(doc)?; // parse-ocr feature + 模型目录时跑 OCR；否则原样
+    let doc = apply_tables(doc, &opts.file)?; // parse-tables feature + 模型目录时 UniRec 表格识别
     let dchunks = docparse_core::chunk::chunk_document(&doc);
     let chunks: Vec<Chunk> = dchunks
         .iter()
@@ -341,5 +382,36 @@ mod tests {
             with_text > base,
             "OCR 后应多出非空文本 chunk（base={base} ocr={with_text}）"
         );
+    }
+
+    /// 表格识别端到端（env-gated，**非 VLM** UniRec ONNX；需模型）：设 `FASTSEARCH_UNIREC_MODELS`
+    /// （UniRec 模型目录，如 `docparse-rs/models/unirec`）+ `FASTSEARCH_TABLE_TEST_PDF`（PDF）才跑。
+    /// 验证 `refine_tables` 路径端到端成立（解析→栅格化→UniRec→替换），返回精炼计数 ≥0 不报错。
+    /// 注：CPU 上 UniRec 是 2000-token 自回归解码，单表可能耗时数分钟——故对**小表/无表 PDF** 验证。
+    /// **真机验证 2026-06-28**：lorem.pdf（0 表）路径快速跑通；财务损益表单表精炼出结构化 HTML。
+    #[cfg(feature = "parse-tables")]
+    #[test]
+    fn tables_refine_gated() {
+        let (Some(models), Some(pdf)) = (
+            std::env::var_os("FASTSEARCH_UNIREC_MODELS"),
+            std::env::var_os("FASTSEARCH_TABLE_TEST_PDF"),
+        ) else {
+            eprintln!(
+                "skip tables_refine_gated: FASTSEARCH_UNIREC_MODELS / _TABLE_TEST_PDF not set"
+            );
+            return;
+        };
+        use docparse_core::parser::DocumentParser;
+        let path = std::path::PathBuf::from(&pdf);
+        let mut doc = docparse_pdf::PdfParser::default()
+            .parse(&path)
+            .expect("parse pdf");
+        let bytes = std::fs::read(&path).expect("read pdf");
+        let unirec =
+            docparse_ocr::unirec::UniRec::new(std::path::Path::new(&models)).expect("load UniRec");
+        // 路径端到端成立（小表/无表即可快速验证 load+rasterize+recognize 链路无错）。
+        let n = docparse_ocr::table_model::refine_tables(&mut doc, bytes, &unirec)
+            .expect("refine_tables ok");
+        eprintln!("tables_refine_gated: 精炼 {n} 个表格");
     }
 }

@@ -38,8 +38,10 @@ docparse-pptx = { path = "../../vendor/docparse/crates/docparse-pptx", optional 
 docparse-srt = { path = "../../vendor/docparse/crates/docparse-srt", optional = true }
 docparse-eml = { path = "../../vendor/docparse/crates/docparse-eml", optional = true }
 docparse-img = { path = "../../vendor/docparse/crates/docparse-img", optional = true }
-# OCR 增强器（PP-OCR，运行时加载 ONNX 模型；重 tract 依赖，仅 parse-ocr feature）。
+# OCR / 表格结构识别增强器（PP-OCR + UniRec，运行时加载 ONNX 模型；重 tract 依赖）。
 docparse-ocr = { path = "../../vendor/docparse/crates/docparse-ocr", optional = true }
+# PDF→图 栅格化（纯 Rust hayro，无 pdfium）：表格识别裁剪区域用。
+docparse-raster = { path = "../../vendor/docparse/crates/docparse-raster", optional = true }
 
 [features]
 # 开启 docparse 多格式解析（core + 轻量格式解析器 + 图片，**无 ONNX/渲染**）；默认不开，保持 CLI 精简。
@@ -59,6 +61,10 @@ parse = [
 # OCR 增强（扫描件/图片无文本层 → PP-OCR 抽文本）：拉入 docparse-ocr（**重 ONNX/tract**）。
 # 运行时需指 ONNX 模型目录（env `FASTSEARCH_OCR_MODELS`，如 docparse-rs/models/ppocr-v5）。
 parse-ocr = ["parse", "dep:docparse-ocr"]
+# 表格结构识别（**非 VLM**，确定性 ONNX）：检测出的表格区域经 UniRec 重识别为结构化 HTML 表格。
+# 拉入 docparse-ocr（UniRec）+ docparse-raster（PDF 栅格化裁剪）。运行时需 env `FASTSEARCH_UNIREC_MODELS`
+# （如 docparse-rs/models/unirec）。VLM 表格识别是另一条路（gated 于 VLM 服务），此为本地 ONNX 路。
+parse-tables = ["parse", "dep:docparse-ocr", "dep:docparse-raster"]
 
 [dev-dependencies]
 tempfile.workspace = true
