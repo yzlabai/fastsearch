@@ -6,7 +6,7 @@
 //! 选后端用 [`EmbedderConfig`]/[`build_embedder`]/[`EmbedderConfig::from_env`]。请求体构造、
 //! 响应解析、维度校验是纯逻辑、有单测；实网调用 env-gated。
 
-use crate::{EmbedKind, Embedder, HashEmbedder};
+use crate::{EmbedCaps, EmbedKind, Embedder, HashEmbedder};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::time::Duration;
@@ -184,6 +184,19 @@ impl HttpEmbedder {
 impl Embedder for HttpEmbedder {
     fn dim(&self) -> usize {
         self.cfg.dim
+    }
+
+    /// 当前 HTTP 后端是**文本语义**嵌入；**图像路由 gated**（`image=false`）——需对接多模态端点
+    /// （SigLIP-2 / JinaCLIP-v2 / jina-v4 / Voyage / Cohere，base64 input）并确认文图同空间
+    /// （`cross_modal`）。该 MM8b 待真多模态模型服务，落地前 `embed_multi(Image)` 走默认实现报错。
+    fn caps(&self) -> EmbedCaps {
+        EmbedCaps {
+            dim: self.cfg.dim,
+            text: true,
+            image: false,
+            cross_modal: false,
+            semantic: true,
+        }
     }
 
     fn embed(&self, texts: &[String], kind: EmbedKind) -> Result<Vec<Vec<f32>>> {
