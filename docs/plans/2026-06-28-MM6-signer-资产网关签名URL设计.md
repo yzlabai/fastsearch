@@ -77,8 +77,7 @@
 - `resolve_citation(cid, acl)` 改为**只做 ACL + 定位、不取字节**：`Inline` 分支返回**新增的 `AssetFetch::InlineRef`**（无字节，仅表"该 cid 有 inline 字节可取"；不复用带 `Vec<u8>` 的 `InlineBytes`）。`Object`→`SignedUrl`、`DocRegion`→`DocRender` 不变。**两个消费方都据此分流**（见 5.2）：authed 直吐端点拿 `InlineRef` 后取字节、resolve 端点拿 `InlineRef` 后签 URL。这样 resolve 全程零取字节、两端逻辑统一。
 - 字节端点支撑：新增 `Engine::fetch_inline_bytes(cid) -> Result<Option<(bytes, media_type)>>`——**不带 acl 参数**（调用方已授权：authed 端点先过了 `resolve_citation` 的 ACL；token 端点已验签=D-C），从 `source_pg` 真源直查（block_in_place，同 MM6-inline）。**文档强标**：此方法绕过 ACL，仅供"已授权"两端点内部调用，不得新挂别的入口。
 - `AssetFetch::InlineBytes(Vec<u8>)` 变体：本设计后 `resolve_citation` 不再产出它（改产 `InlineRef`）；如无其它用法可一并删除（落地时定），避免死变体。
-- `Object` 分支：维持经 `ObjectSigner::sign` → `SignedUrl`（已实现）；本期补一个**真 `ObjectSigner` 实现**（S3 兼容 presign）。
-- `Object` 分支：维持经 `ObjectSigner::sign` → `SignedUrl`（已实现）；本期补一个**真 `ObjectSigner` 实现**（S3 兼容 presign）。
+- `Object` 分支：维持经 `ObjectSigner::sign` → `SignedUrl`（已实现）；真 `ObjectSigner` 实现（S3 兼容 presign）= S4 gated。
 
 ### 5.2 server — [lib.rs](../../crates/fastsearch-server/src/lib.rs) / main.rs
 - **签名密钥 + base_url 装配**：env `FASTSEARCH_ASSET_SIGNING_KEY`（HMAC 密钥，多副本同值）+ `FASTSEARCH_ASSET_URL_TTL`（默认 300s）+ 自身 base path。无密钥 → inline 档退回"仅 authed 直吐字节"（D-G），不签 URL（诚实降级）。
@@ -146,7 +145,7 @@ curl -H "Authorization: Bearer $KEY" -d '{"ids":["kb:report.pdf:42"]}' \
 |---|---|---|---|---|
 | S1 | ✅ engine `AssetFetch::InlineRef`（取代 `InlineBytes`）+ `fetch_inline_bytes(cid)->Result<Option<Vec<u8>>>`（无 acl）；resolve Inline 只定位；server/MCP 消费方分流 | engine,server,mcp | 本环境+Docker | **done**（本环境 `fetch_inline_bytes_without_source_pg_is_none` + Docker `mm6_inline_serves_bytes_from_source_pg` 更新；行为保持）。注：字节面只返字节，`media_type` authed 端经 resolve、token 端经 S2 token 携带 |
 | S2 | ✅ server `AssetSigner`（HMAC-SHA256(`cid\|exp\|ct`)，常量时间验签）+ `GET /v1/asset/{cid}/bytes?exp&ct&sig` token 端点（验签→`fetch_inline_bytes`→吐字节+ct；未配签名器/无效/过期→403）+ env `FASTSEARCH_ASSET_SIGNING_KEY`/`_URL_TTL` 装配 | server | 本环境 | **done**（+5 测试：sign/verify 往返+过期+换 cid/ct/sig/密钥、端点 valid→404(无 source_pg)/bad-sig→403/过期→403/未配→403；收口三绿）。S3 签发端点未到 → token 暂只能内部构造（真用户取 URL 待 S3） |
-| S3 | ✅ server `POST /v1/assets/resolve`（authed 批量解析：每 id resolve_citation→ACL→ InlineRef 签 token URL / Object 签名 URL / DocRender JSON；越权 id 省略）+ `mint_inline_url`（cid/ct 百分号编码） | server | 本环境+Docker | **done**（+2 测试：mint↔字节端点验签闭环、resolve ACL 越权省略 DocRender；收口三绿 server 22 单测）。inline 真字节(valid token+source_pg→200)Docker 验证；OpenAPI 条目=小follow-up。**inline 档"搜索→resolve→`<img src>`"端到端就绪** |
+| S3 | ✅ server `POST /v1/assets/resolve`（authed 批量解析：每 id resolve_citation→ACL→ InlineRef 签 token URL / Object 签名 URL / DocRender JSON；越权 id 省略）+ `mint_inline_url`（cid/ct 百分号编码） | server | 本环境+Docker | **done**（+2 测试：mint↔字节端点验签闭环、resolve ACL 越权省略 DocRender；收口三绿 server 22 单测）。inline 真字节(valid token+source_pg→200)Docker 验证；OpenAPI 两端点条目已入 /openapi.json。**inline 档"搜索→resolve→`<img src>`"端到端就绪** |
 | S4 | object 档真 `ObjectSigner`（S3 兼容 presign） | engine | gated（对象存储） | 待运行验证（MinIO/S3） |
 | S5 | clients SDK `resolve_assets` + 前端示例（可选） | clients | 本环境 | SDK 自测 |
 

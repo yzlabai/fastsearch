@@ -484,6 +484,32 @@ fn openapi_spec() -> Value {
                     }
                 }
             },
+            "/v1/assets/resolve": {
+                "post": {
+                    "summary": "批量把 citation_id 解析成可直接用的短时 URL（前端 <img src>）；ACL 强制，越权 id 省略",
+                    "requestBody": {"required": true, "content": {"application/json":
+                        {"schema": {"type": "object", "required": ["ids"], "properties": {
+                            "ids": {"type": "array", "items": {"type": "string"}}}}}}},
+                    "responses": {"200": {"description": "{assets:[{citation_id,type:inline|object|doc_render,url?,expires_s?,...}]}"},
+                        "401": {"description": "认证失败"}}
+                }
+            },
+            "/v1/asset/{citation_id}/bytes": {
+                "get": {
+                    "summary": "token 门控 inline 字节（HMAC 签名 URL，免 Bearer；让 <img src> 直取）",
+                    "security": [],
+                    "parameters": [
+                        {"name": "exp", "in": "query", "required": true, "schema": {"type": "integer"}},
+                        {"name": "ct", "in": "query", "required": true, "schema": {"type": "string"}},
+                        {"name": "sig", "in": "query", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "inline 字节 + Content-Type=ct"},
+                        "403": {"description": "未配签名器 / token 无效或过期"},
+                        "404": {"description": "无字节"}
+                    }
+                }
+            },
             "/healthz": {"get": {"summary": "存活探针", "security": [], "responses": {"200": {"description": "ok"}}}},
             "/readyz": {"get": {"summary": "就绪探针", "security": [], "responses": {"200": {"description": "ready"}}}},
             "/metrics": {"get": {"summary": "Prometheus 指标", "security": [], "responses": {"200": {"description": "text/plain"}}}}
@@ -1480,6 +1506,9 @@ mod tests {
         assert_eq!(v["openapi"], "3.0.3");
         assert!(v["paths"]["/v1/search"]["post"].is_object());
         assert!(v["paths"]["/v1/index"]["post"].is_object());
+        // MM6-signer 两端点入契约（四张脸契约一致）。
+        assert!(v["paths"]["/v1/assets/resolve"]["post"].is_object());
+        assert!(v["paths"]["/v1/asset/{citation_id}/bytes"]["get"].is_object());
         assert!(v["components"]["schemas"]["SearchRequest"].is_object());
         // 版本来自 crate 版本，非空
         assert!(v["info"]["version"].as_str().unwrap().len() >= 3);
