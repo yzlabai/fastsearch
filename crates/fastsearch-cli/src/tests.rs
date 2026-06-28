@@ -3,6 +3,8 @@
 use super::*;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 /// 完整读取一个 HTTP 请求（headers + Content-Length 指定的 body）再返回——必须在响应前排空，
@@ -187,4 +189,58 @@ fn server_error_surfaced() {
     };
     let err = cmd_search(&opts).unwrap_err().to_string();
     assert!(err.contains("500"), "应含状态码: {err}");
+}
+
+fn index_opts(url: String) -> IndexOpts {
+    IndexOpts {
+        server: Some(url),
+        key: Some("k".into()),
+        collection: "kb".into(),
+        doc_id: "d".into(),
+    }
+}
+const ONE_CHUNK: &[u8] = br#"[{"id":0,"kind":"paragraph","text":"a","page":1,"bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":1}]"#;
+
+#[test]
+fn index_status_error_does_not_retry() {
+    // 500 是确定性拒绝 → post_retry 不应重试（恰好 1 次请求）。
+    let count = Arc::new(AtomicUsize::new(0));
+    let c2 = count.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            c2.fetch_add(1, Ordering::SeqCst);
+            drain_request(&mut s);
+            write_response(&mut s, "500 Internal Server Error", "boom");
+        }
+    });
+    let err = cmd_index(&index_opts(format!("http://{addr}")), ONE_CHUNK).unwrap_err();
+    assert!(err.to_string().contains("500"));
+    assert_eq!(count.load(Ordering::SeqCst), 1, "Status 拒绝不应重试");
+}
+
+#[test]
+fn index_transport_failure_retries_then_succeeds() {
+    // 首次连接不响应即关（传输失败）→ 应重试；第二次成功。
+    let count = Arc::new(AtomicUsize::new(0));
+    let c2 = count.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let n = c2.fetch_add(1, Ordering::SeqCst) + 1;
+            drain_request(&mut s);
+            if n == 1 {
+                drop(s); // 不响应 → 客户端读响应得传输错误
+            } else {
+                write_response(&mut s, "200 OK", r#"{"indexed":1}"#);
+            }
+        }
+    });
+    let n = cmd_index(&index_opts(format!("http://{addr}")), ONE_CHUNK).unwrap();
+    assert_eq!(n, 1);
+    assert!(count.load(Ordering::SeqCst) >= 2, "传输失败后应重试");
 }

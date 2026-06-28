@@ -9,7 +9,7 @@
 #[cfg(feature = "parse")]
 pub mod ingest;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use fastsearch_core::{
     BBox, Chunk, ChunkKind, FieldValue, Filter, GlobalId, SearchMode, SearchRequest,
 };
@@ -41,40 +41,62 @@ impl Client {
         }
     }
 
-    fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<Value> {
-        let url = format!("{}{}", self.base, path);
-        match ureq::post(&url)
+    /// 底层 POST：返回**类型化错误**，让 `post_retry` 精确区分"状态码拒绝"（不重试）vs
+    /// "传输失败"（可重试）——不靠脆弱的错误字符串匹配。
+    fn post_raw<B: Serialize>(&self, url: &str, body: &B) -> std::result::Result<Value, PostError> {
+        match ureq::post(url)
             .set("authorization", &format!("Bearer {}", self.key))
             .send_json(body)
         {
-            Ok(r) => Ok(r.into_json()?),
+            Ok(r) => r
+                .into_json()
+                .map_err(|e| PostError::Transport(e.to_string())),
             Err(ureq::Error::Status(code, r)) => {
-                let msg = r.into_string().unwrap_or_default();
-                bail!("server 返回 {code}: {msg}")
+                Err(PostError::Status(code, r.into_string().unwrap_or_default()))
             }
-            Err(e) => Err(anyhow!(
-                "请求 {url} 失败：{e}（server 在运行吗？检查 --server / FASTSEARCH_SERVER）"
-            )),
+            Err(e) => Err(PostError::Transport(e.to_string())),
         }
     }
 
-    /// 带瞬时失败重试的 POST（批量写入用；非 2xx 的 `Status` 不重试——那是确定性拒绝）。
+    fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<Value> {
+        let url = format!("{}{}", self.base, path);
+        self.post_raw(&url, body).map_err(|e| e.into_anyhow(&url))
+    }
+
+    /// 带瞬时失败重试的 POST（批量写入用）：仅 `Transport`（连接/读写失败）重试；
+    /// `Status`（4xx/5xx 确定性拒绝）立即抛、不重试。
     fn post_retry<B: Serialize>(&self, path: &str, body: &B, retries: usize) -> Result<Value> {
-        let mut last = None;
+        let url = format!("{}{}", self.base, path);
         for attempt in 0..=retries {
-            match self.post(path, body) {
+            match self.post_raw(&url, body) {
                 Ok(v) => return Ok(v),
-                // server 明确拒绝（4xx/5xx）→ 不重试，直接抛。
-                Err(e) if e.to_string().starts_with("server 返回") => return Err(e),
+                Err(e @ PostError::Status(..)) => return Err(e.into_anyhow(&url)),
                 Err(e) => {
-                    last = Some(e);
-                    if attempt < retries {
-                        eprintln!("  传输失败，重试 {}/{retries}…", attempt + 1);
+                    if attempt == retries {
+                        return Err(e.into_anyhow(&url));
                     }
+                    eprintln!("  传输失败，重试 {}/{retries}…", attempt + 1);
                 }
             }
         }
-        Err(last.unwrap_or_else(|| anyhow!("post 失败")))
+        unreachable!("loop returns on last attempt")
+    }
+}
+
+/// POST 失败的类型化原因：`Status`=server 返回非 2xx（确定性拒绝）；`Transport`=连接/读写失败（可重试）。
+enum PostError {
+    Status(u16, String),
+    Transport(String),
+}
+
+impl PostError {
+    fn into_anyhow(self, url: &str) -> anyhow::Error {
+        match self {
+            PostError::Status(code, msg) => anyhow!("server 返回 {code}: {msg}"),
+            PostError::Transport(e) => anyhow!(
+                "请求 {url} 失败：{e}（server 在运行吗？检查 --server / FASTSEARCH_SERVER）"
+            ),
+        }
     }
 }
 

@@ -83,3 +83,32 @@ jobs:
         run: cargo clippy -p fastsearch-cli --features parse --all-targets -- -D warnings
       - name: test (parse multiformat ingest)
         run: cargo test -p fastsearch-cli --features parse
+
+  # CLI↔server 端到端：CLI 是 server 的 REST 客户端，此 job 守住其契约不漂移（无需 PG，
+  # server 用内存/落盘派生索引 + dev key）。喂文件夹→检索 / stdin index→检索 全程经真 server。
+  cli-server-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build server + cli
+        run: cargo build -p fastsearch-server -p fastsearch-cli
+      - name: e2e (feed folder → search; stdin index → search)
+        run: |
+          set -euo pipefail
+          DOCS=$(mktemp -d)
+          printf '# 财报\n\n本季度毛利率提升至百分之四十二。\n\n## 风险\n\n汇率波动是主要风险。\n' > "$DOCS/report.md"
+          FASTSEARCH_DATA=$(mktemp -d) FASTSEARCH_KEYS="dev=:" \
+            ./target/debug/fastsearch-server > /tmp/fss.log 2>&1 &
+          SRV=$!; trap 'kill $SRV 2>/dev/null || true' EXIT
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8642/healthz >/dev/null 2>&1 && break; sleep 0.5; done
+          U=http://127.0.0.1:8642
+          ./target/debug/fastsearch index-dir --server $U --key dev --collection kb "$DOCS"
+          ./target/debug/fastsearch search --server $U --key dev --collection kb --query "毛利率" --mode keyword --json | grep -q "report.md" \
+            || { echo "FAIL: 喂文件夹后未检索到 report.md" >&2; cat /tmp/fss.log >&2; exit 1; }
+          echo '[{"id":0,"kind":"paragraph","text":"独立 chunk alpha","page":1,"bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":5}]' \
+            | ./target/debug/fastsearch index --server $U --key dev --collection kb --doc-id manual -
+          ./target/debug/fastsearch search --server $U --key dev --collection kb --query "alpha" --mode keyword --json | grep -q "kb:manual:0" \
+            || { echo "FAIL: stdin index 后未检索到 manual" >&2; exit 1; }
+          echo "cli-server-e2e OK"
