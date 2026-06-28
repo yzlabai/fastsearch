@@ -42,6 +42,7 @@ fastsearch-text = { path = "crates/fastsearch-text" }
 fastsearch-vector = { path = "crates/fastsearch-vector" }
 fastsearch-engine = { path = "crates/fastsearch-engine" }
 clap = { version = "4", features = ["derive"] }
+ureq = { version = "2", features = ["json"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

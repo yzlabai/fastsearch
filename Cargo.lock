@@ -1245,12 +1245,11 @@ dependencies = [
  "docparse-srt",
  "docparse-xlsx",
  "fastsearch-core",
- "fastsearch-engine",
  "fastsearch-eval",
- "fastsearch-text",
  "serde",
  "serde_json",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]

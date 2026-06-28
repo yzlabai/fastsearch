@@ -16,14 +16,15 @@ name = "fastsearch_cli"
 path = "src/lib.rs"
 
 [dependencies]
+# CLI 是 server 的**纯 REST 客户端**（四张脸之一）：检索/嵌入/落盘全归 server。
+# 仅依赖 core（纯类型，做请求体/响应解析）+ eval（纯指标）+ ureq（HTTP）——不嵌引擎。
 fastsearch-core.workspace = true
-fastsearch-engine.workspace = true
-fastsearch-text.workspace = true
 fastsearch-eval = { path = "../fastsearch-eval" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+ureq.workspace = true
 # 解析（docparse-rs 融合 Option B：摄取热路径，feature 门控，搜索热路径零依赖）。
 # subtree 收编后改本仓内 path（vendor/docparse）；docparse 重依赖（tract/ONNX/OCR/VLM）在其
 # 自有 workspace、被本仓根 `exclude` 隔离，不进 fastsearch 精简构建（见 docparse 融合方案 §4）。

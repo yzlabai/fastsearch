@@ -15,19 +15,22 @@ cargo test -p fastsearch-core fusion           # 按名/模块过滤跑部分测
 cargo clippy --workspace --all-targets -- -D warnings   # lint，目标零 warning
 cargo fmt --all            # 格式化（--check 仅校验）
 
-# 跑二进制（四张脸里的 CLI / REST）
-cargo run -p fastsearch-cli --bin fastsearch -- index --data ./data --collection kb --doc-id r.pdf chunks.json
-cargo run -p fastsearch-cli --bin fastsearch -- search --data ./data --collection kb --query "毛利率" --json
+# 起 server（真源/索引/嵌入/落盘都在这）
 FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" cargo run -p fastsearch-server --bin fastsearch-server  # REST :8642
 
-# 多格式解析摄取（docparse 融合，--features parse）：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML + 图片
-cargo run -p fastsearch-cli --features parse --bin fastsearch -- ingest --data ./data --collection kb --doc-id r.docx r.docx
+# CLI 是 server 的**纯 REST 客户端**（--server/--key，或 env FASTSEARCH_SERVER/FASTSEARCH_KEY）
+cargo run -p fastsearch-cli --bin fastsearch -- index --server http://localhost:8642 --key dev --collection kb --doc-id r.pdf chunks.json
+cargo run -p fastsearch-cli --bin fastsearch -- search --server http://localhost:8642 --key dev --collection kb --query "毛利率" --json
+cargo run -p fastsearch-cli --bin fastsearch -- index-dir --server http://localhost:8642 --key dev --collection kb ./docs   # 喂文件夹（客户端分块→上传）
+
+# 多格式解析摄取（docparse 融合，--features parse；解析在客户端→POST /v1/index）：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML + 图片
+cargo run -p fastsearch-cli --features parse --bin fastsearch -- ingest --server http://localhost:8642 --key dev --collection kb --doc-id r.docx r.docx
 # 扫描件/图片 OCR 抽文本（--features parse-ocr，需 PP-OCR ONNX 模型目录）
 FASTSEARCH_OCR_MODELS=/path/to/docparse-rs/models/ppocr-v5 \
-  cargo run -p fastsearch-cli --features parse-ocr --bin fastsearch -- ingest --data ./data --collection kb --doc-id scan.png scan.png
+  cargo run -p fastsearch-cli --features parse-ocr --bin fastsearch -- ingest --server http://localhost:8642 --key dev --collection kb --doc-id scan.png scan.png
 # 表格结构识别（非 VLM 的确定性 ONNX：UniRec；--features parse-tables，需 UniRec 模型目录）
 FASTSEARCH_UNIREC_MODELS=/path/to/docparse-rs/models/unirec \
-  cargo run -p fastsearch-cli --features parse-tables --bin fastsearch -- ingest --data ./data --collection kb --doc-id r.pdf r.pdf
+  cargo run -p fastsearch-cli --features parse-tables --bin fastsearch -- ingest --server http://localhost:8642 --key dev --collection kb --doc-id r.pdf r.pdf
 
 # Postgres 集成测试（默认跳过；设 DATABASE_URL 才跑，CI 用 pgvector/pgvector 镜像）
 DATABASE_URL=postgres://user@localhost/db cargo test -p fastsearch-pg
@@ -52,7 +55,7 @@ docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(
    fastsearch 引擎（无状态, 可多副本）  ← fastsearch-engine 编排
      派生 BM25 倒排(Tantivy/mmap) + 向量 ANN(filter-aware) + 元数据/ACL
    排序管线：ACL 强制注入 → keyword∥vector 召回 → 融合 → rerank → 高亮/分面 → top-K
-   四张脸：CLI · 库 · REST · MCP（stdio+JSON-RPC，工具 search/resolve_citation，ACL 服务端注入）
+   四张脸：REST(server，嵌引擎) · 库 · MCP(stdio+JSON-RPC) · CLI(REST 客户端) — search/resolve_citation，ACL 服务端注入
 答案层(外部 LLM)：resolve_citation(id) → {page,bbox} → 深链/高亮
 ```
 
@@ -69,7 +72,7 @@ docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(
 | `engine` | 整合 text+vector+rerank+sync sink → 端到端排序管线 | `run()` 是管线主体；`search`/`search_with_facets`；实现 `sync::IndexSink`（适配器，避免 text 反依赖 sync） |
 | `eval` | 相关性评测：nDCG/recall/MRR + `assert_no_regression`(CI 门禁) | 纯函数 |
 | `server` | REST(axum) + API-Key 认证 + **ACL 服务端注入不可绕过** + /metrics | `principal_from_headers`→`acl_for`→`engine.search(req, Some(acl))`；客户端无法传/绕过 ACL |
-| `cli` | `fastsearch` 二进制：`index`(吃 chunks.json) / `search` / `eval` / **`ingest`(多格式进程内解析)** → 落盘索引 → 检索 | 逻辑在 lib，main 是壳；`ingest` 走 `--features parse`（docparse `DocumentParser` 注册表按扩展名分发 9 格式+图片）/ `--features parse-ocr`（扫描件 PP-OCR，env 指模型目录）。解析能力 feature 门控，搜索热路径零 docparse |
+| `cli` | `fastsearch` 二进制：**server 的纯 REST 客户端**（不嵌引擎）。`search`/`similar`/`index`/`index-dir`(喂文件夹)/`eval` 走 server REST；`ingest`(多格式解析) 在**客户端**解析→POST `/v1/index` | 逻辑在 lib，main 是壳；`ureq` HTTP，`--server`/`--key`(env `FASTSEARCH_SERVER`/`_KEY`)。仅依赖 `core`(纯类型)+`eval`(纯指标)，**无 engine/text 依赖**。`ingest` 走 `--features parse`（docparse 注册表分发 9 格式+图片）/`parse-ocr`/`parse-tables`（env 指模型目录）；解析在客户端→守搜索热路径零 docparse。检索/嵌入/落盘全归 server，CLI 因此白嫖全套混合检索 |
 | `mcp` | 第四张脸：MCP（stdio+JSON-RPC）暴露 `search`/`resolve_citation` 工具 | 逻辑在 lib（`McpServer::handle` 纯函数可单测），main 是 stdio 壳；**ACL 服务端注入不可绕过** |
 | `clients/{python,ts}` | 零依赖 SDK（封装 REST）+ LangChain/LlamaIndex 适配 | — |
 

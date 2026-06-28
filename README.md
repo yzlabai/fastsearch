@@ -21,13 +21,18 @@ docparse chunks / text files → Postgres (source of truth: chunk + metadata + A
    Four faces: CLI · library · REST · MCP
 ```
 
-## Five-minute quickstart (zero deps, runs locally)
+## Five-minute quickstart
+
+The CLI is a thin REST client of the server (like the Typesense/Qdrant/Algolia CLIs). Start a server, then the CLI talks to it — feeding a folder uploads chunks and you get full hybrid search back.
 
 ```bash
-cargo build -p fastsearch-cli --bin fastsearch
+cargo build -p fastsearch-server -p fastsearch-cli
+# 1) start the server (truth source / indexing / embedding / persistence all live here)
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" ./target/debug/fastsearch-server &   # REST :8642
+# 2) CLI as client (--server/--key, or env FASTSEARCH_SERVER/FASTSEARCH_KEY)
 # Feed it a folder (recurses .md/.txt; markdown headings become breadcrumbs), then search
-./target/debug/fastsearch index-dir --data ./idx --collection kb  ./my-docs
-./target/debug/fastsearch search    --data ./idx --collection kb --query "gross margin" --json
+./target/debug/fastsearch index-dir --server http://localhost:8642 --key dev --collection kb ./my-docs
+./target/debug/fastsearch search    --server http://localhost:8642 --key dev --collection kb --query "gross margin" --json
 ```
 
 For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs/在Agent中使用fastsearch.md).
@@ -46,7 +51,7 @@ For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs
 | `fastsearch-eval` | Relevance evaluation: golden set + nDCG/recall/MRR + CI regression gate |
 | `fastsearch-server` | REST (axum) + API-key auth + **ACL cannot be bypassed** + metrics/rate-limit/audit + media gateway + CDC lifecycle |
 | `fastsearch-mcp` | The fourth face: MCP (stdio + JSON-RPC) exposing the `search` / `resolve_citation` tools |
-| `fastsearch-cli` | `fastsearch` binary: index / index-dir / search / **ingest (multi-format: PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/image + OCR + table recognition)** / eval — see [Ingestion & parsing](docs/ingestion-and-parsing.md) |
+| `fastsearch-cli` | `fastsearch` binary: **thin REST client of the server** (no embedded engine). index / index-dir (feed a folder) / search / similar / **ingest (client-side multi-format parse: PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/image + OCR + table recognition)** / eval — see [Ingestion & parsing](docs/ingestion-and-parsing.md) |
 | `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters |
 
 **End-to-end usable**: ingest/CDC → index → three search modes (keyword / vector / hybrid) → hits with citations, ACL enforced and unbypassable. All four faces in place.

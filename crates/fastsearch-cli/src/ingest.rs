@@ -8,17 +8,16 @@
 
 use anyhow::{Context, Result};
 use fastsearch_core::{AssetPointer, BBox, Chunk, ChunkKind, MediaRef};
-use fastsearch_text::TokenizerKind;
 use std::path::PathBuf;
 
-/// `fastsearch ingest <file>` 选项。
+/// `fastsearch ingest <file>` 选项（**客户端侧解析** → POST `/v1/index`）。
 pub struct IngestOpts {
     /// 待解析文件（按扩展名分发到对应 docparse 解析器；多格式）。
     pub file: PathBuf,
-    pub data: PathBuf,
+    pub server: Option<String>,
+    pub key: Option<String>,
     pub collection: String,
     pub doc_id: String,
-    pub tokenizer: TokenizerKind,
     pub tenant: Option<String>,
     pub acl: Vec<String>,
 }
@@ -103,10 +102,9 @@ fn apply_tables(
     Ok(doc)
 }
 
-/// **in-process 解析 → 适配 → 索引**（doc 级替换）：按扩展名选 docparse 解析器 → 解析+分块 →
-/// `from_docparse_chunk` 适配 → 灌入现有落盘索引。返回灌入条数。
-/// 融合 Option B 摄取热路径：进程内多格式解析（PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML），
-/// 无需 shell 出 docparse JSON。
+/// **客户端解析 → 适配 → POST /v1/index**（doc 级替换由 server 保证）：按扩展名选 docparse
+/// 解析器 → 解析+分块 → `from_docparse_chunk` 适配 → 上传 server。返回 indexed 条数。
+/// 解析在客户端（守"搜索热路径零 docparse"+ CI 门禁）；检索/嵌入/落盘归 server。
 pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
     let registry = parsers();
     let parser = registry
@@ -135,15 +133,8 @@ pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
         }
     }
 
-    std::fs::create_dir_all(&opts.data)?;
-    let tokenizer = crate::load_or_init_meta(&opts.data, opts.tokenizer)?;
-    let mut engine = crate::open_engine(&opts.data, tokenizer)?;
-    engine.remove_doc(&opts.collection, &opts.doc_id)?; // 替换语义
-    for c in &chunks {
-        engine.ingest(&opts.collection, c)?;
-    }
-    engine.commit()?;
-    Ok(chunks.len())
+    let client = crate::Client::new(opts.server.clone(), opts.key.clone());
+    crate::post_index(&client, &opts.collection, &opts.doc_id, &chunks)
 }
 
 /// docparse ChunkKind → fastsearch ChunkKind（前 6 类同构；Audio/Video 来自媒资预处理，非 PDF）。
