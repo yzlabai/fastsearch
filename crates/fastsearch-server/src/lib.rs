@@ -78,6 +78,38 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// 百分号编码（RFC 3986 unreserved 不编，其余 `%XX`）——cid/ct 放进 URL 路径/查询安全（doc_id 可含空格等）。
+fn pct(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                o.push(b as char)
+            }
+            _ => o.push_str(&format!("%{b:02X}")),
+        }
+    }
+    o
+}
+
+/// 签发 inline 字节的短时 URL（前端 `<img src>` 用）。返回 `(url, expires_s)`。签名对**原始** cid/ct
+/// （字节端点 `Path`/`Query` 解码后验签一致）；URL 里 cid/ct 百分号编码。
+fn mint_inline_url(
+    signer: &AssetSigner,
+    cid: &str,
+    media_type: Option<&str>,
+    now: u64,
+) -> (String, u64) {
+    let ct = media_type.unwrap_or("application/octet-stream");
+    let (exp, sig) = signer.sign(cid, ct, now);
+    let url = format!(
+        "/v1/asset/{}/bytes?exp={exp}&ct={}&sig={sig}",
+        pct(cid),
+        pct(ct)
+    );
+    (url, exp.saturating_sub(now))
+}
+
 /// 调用者身份（由 API Key 解析）。
 #[derive(Debug, Clone)]
 pub struct Principal {
@@ -333,6 +365,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/similar", post(similar))
         .route("/v1/asset/{cid}", get(asset))
         .route("/v1/asset/{cid}/bytes", get(asset_bytes))
+        .route("/v1/assets/resolve", post(assets_resolve))
         .route("/v1/index", post(index))
         .with_state(state)
 }
@@ -793,6 +826,65 @@ async fn asset_bytes(
 }
 
 #[derive(Deserialize)]
+struct ResolveBody {
+    ids: Vec<String>,
+}
+
+/// `POST /v1/assets/resolve`（authed）：批量把 citation_id 解析成**可直接用的短时 URL**（前端
+/// `<img src>`）。每 id 经 `resolve_citation`（**ACL 服务端强制**）→ InlineRef 签短时 token URL、
+/// Object 返签名 URL、DocRender 返跳原文 JSON。**越权/不存在的 id 直接省略**（不暴露存在性，守 #3）。
+async fn assets_resolve(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<ResolveBody>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
+        s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
+        (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid API key".into(),
+        )
+    })?;
+    let acl = acl_for(&principal);
+    let now = unix_now();
+    let engine = s.engine.lock().await;
+    let mut out = Vec::new();
+    for cid in &body.ids {
+        let Some(a) = engine
+            .resolve_citation(cid, Some(&acl))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        else {
+            continue; // 越权/不存在 → 省略（不暴露存在性）
+        };
+        let item = match a.fetch {
+            AssetFetch::InlineRef => match &s.asset_signer {
+                Some(sig) => {
+                    let (url, expires_s) = mint_inline_url(sig, cid, a.media_type.as_deref(), now);
+                    json!({"citation_id": cid, "type": "inline", "url": url, "expires_s": expires_s, "media_type": a.media_type})
+                }
+                // 未配签名器：无法签 URL（不返回字节端点直链——它无 token 会 403）。
+                None => {
+                    json!({"citation_id": cid, "type": "inline", "error": "asset signing not configured"})
+                }
+            },
+            AssetFetch::SignedUrl { url, expires_s } => {
+                json!({"citation_id": cid, "type": "object", "url": url, "expires_s": expires_s})
+            }
+            AssetFetch::DocRender { doc_id, page, bbox } => {
+                json!({"citation_id": cid, "type": "doc_render", "doc_id": doc_id, "page": page, "bbox": bbox, "media_type": a.media_type})
+            }
+        };
+        out.push(item);
+    }
+    drop(engine);
+    Ok(Json(json!({ "assets": out })))
+}
+
+#[derive(Deserialize)]
 struct IndexBody {
     collection: String,
     doc_id: String,
@@ -993,6 +1085,68 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "未配签名器→403");
+    }
+
+    #[tokio::test]
+    async fn mint_inline_url_roundtrips_through_byte_endpoint() {
+        // S3 签发 ↔ S2 验签闭环：mint 出的 URL 直接喂字节端点 → 验签通过（非 403）→ 无 source_pg → 404。
+        let signer = AssetSigner::new(b"k".to_vec(), 300);
+        let (url, expires_s) =
+            mint_inline_url(&signer, "kb:d.pdf:1", Some("image/png"), unix_now());
+        assert_eq!(expires_s, 300);
+        assert!(url.starts_with("/v1/asset/") && url.contains("/bytes?"));
+        assert!(url.contains("ct=image%2Fpng"), "ct 应百分号编码: {url}");
+        let st = get_status(signer_app(), url).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "mint URL 验签过、无字节→404");
+    }
+
+    #[tokio::test]
+    async fn assets_resolve_acl_not_bypassable() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()).with_asset_signer(b"k".to_vec(), 300));
+        let body = r#"{"collection":"kb","doc_id":"rep.pdf","chunks":[
+            {"doc_id":"rep.pdf","chunk_id":1,"kind":"image","text":"fig","page":7,
+             "bbox":{"x0":1.0,"y0":2.0,"x1":3.0,"y1":4.0},"char_len":3,"acl":["team-a"],"tenant":"acme",
+             "media":{"asset":{"kind":"doc_region","page":7,"bbox":{"x0":1.0,"y0":2.0,"x1":3.0,"y1":4.0}},
+                      "media_type":"image/png"}}]}"#;
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let resolve_req = |key: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/assets/resolve")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::from(r#"{"ids":["kb:rep.pdf:1"]}"#))
+                .unwrap()
+        };
+        // 授权 team-a → assets 含 1 条 doc_render。
+        let ok = app.clone().oneshot(resolve_req("k-team-a")).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let v = body_json(ok).await;
+        assert_eq!(v["assets"].as_array().unwrap().len(), 1);
+        assert_eq!(v["assets"][0]["type"], "doc_render");
+        assert_eq!(v["assets"][0]["page"], 7);
+        // 越权 team-b → assets 空（不暴露存在性，不可绕过）。
+        let denied = app.oneshot(resolve_req("k-team-b")).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(denied).await["assets"].as_array().unwrap().len(),
+            0
+        );
     }
 
     fn chunk(id: u64, text: &str, acl: Vec<&str>) -> Chunk {

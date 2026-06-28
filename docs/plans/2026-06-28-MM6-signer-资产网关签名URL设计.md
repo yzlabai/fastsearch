@@ -1,6 +1,6 @@
 # MM6-signer — 资产网关「控制面 + 两档签名 URL」设计
 
-> 状态：**设计（未实施）**｜日期：2026-06-28｜上游：[后续开发计划-三条线](2026-06-28-后续开发计划-三条线.md)（第②条线 MM6-signer 的细化）、[MM2c-bytes+MM6-inline 媒资服务设计](2026-06-27-MM2c-bytes与MM6-inline媒资服务设计.md)、[多模态功能设计](2026-06-25-多模态功能设计与开发计划.md)。
+> 状态：**inline 档已实施**（S1+S2+S3，2026-06-28，本环境收口三绿；inline 真字节路 Docker PG 待运行验证）｜object 档真 presign(S4) `gated`。日期：2026-06-28｜上游：[后续开发计划-三条线](2026-06-28-后续开发计划-三条线.md)（第②条线 MM6-signer 的细化）、[MM2c-bytes+MM6-inline 媒资服务设计](2026-06-27-MM2c-bytes与MM6-inline媒资服务设计.md)、[多模态功能设计](2026-06-25-多模态功能设计与开发计划.md)。
 >
 > **本文目标**：把"搜索命中的图，前端按 id 取到 URL 直接渲染"落成与**项目定位/不变量一致**的设计。核心是把 `/v1/asset` 从"直吐字节"升级为**控制面**（做 ACL 决策 + 按档签发**短时、可直接用的签名 URL**），让浏览器 `<img src>` 开箱即用、同时不破 ACL、不让引擎当 CDN、纯 PG 也能显图。触 ACL 边界，按 [DEV_SPEC §0 复杂需求](../../AI_AGENT_DEV_SPEC.md) 先写计划。
 >
@@ -146,7 +146,7 @@ curl -H "Authorization: Bearer $KEY" -d '{"ids":["kb:report.pdf:42"]}' \
 |---|---|---|---|---|
 | S1 | ✅ engine `AssetFetch::InlineRef`（取代 `InlineBytes`）+ `fetch_inline_bytes(cid)->Result<Option<Vec<u8>>>`（无 acl）；resolve Inline 只定位；server/MCP 消费方分流 | engine,server,mcp | 本环境+Docker | **done**（本环境 `fetch_inline_bytes_without_source_pg_is_none` + Docker `mm6_inline_serves_bytes_from_source_pg` 更新；行为保持）。注：字节面只返字节，`media_type` authed 端经 resolve、token 端经 S2 token 携带 |
 | S2 | ✅ server `AssetSigner`（HMAC-SHA256(`cid\|exp\|ct`)，常量时间验签）+ `GET /v1/asset/{cid}/bytes?exp&ct&sig` token 端点（验签→`fetch_inline_bytes`→吐字节+ct；未配签名器/无效/过期→403）+ env `FASTSEARCH_ASSET_SIGNING_KEY`/`_URL_TTL` 装配 | server | 本环境 | **done**（+5 测试：sign/verify 往返+过期+换 cid/ct/sig/密钥、端点 valid→404(无 source_pg)/bad-sig→403/过期→403/未配→403；收口三绿）。S3 签发端点未到 → token 暂只能内部构造（真用户取 URL 待 S3） |
-| S3 | server `POST /v1/assets/resolve` 批量解析 + ACL 强制 + OpenAPI | server | 本环境+Docker | 越权不返回 URL + 端到端渲染 |
+| S3 | ✅ server `POST /v1/assets/resolve`（authed 批量解析：每 id resolve_citation→ACL→ InlineRef 签 token URL / Object 签名 URL / DocRender JSON；越权 id 省略）+ `mint_inline_url`（cid/ct 百分号编码） | server | 本环境+Docker | **done**（+2 测试：mint↔字节端点验签闭环、resolve ACL 越权省略 DocRender；收口三绿 server 22 单测）。inline 真字节(valid token+source_pg→200)Docker 验证；OpenAPI 条目=小follow-up。**inline 档"搜索→resolve→`<img src>`"端到端就绪** |
 | S4 | object 档真 `ObjectSigner`（S3 兼容 presign） | engine | gated（对象存储） | 待运行验证（MinIO/S3） |
 | S5 | clients SDK `resolve_assets` + 前端示例（可选） | clients | 本环境 | SDK 自测 |
 
