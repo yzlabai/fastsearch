@@ -14,6 +14,15 @@
     }
   },
   "files": ["dist", "src"],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yzlabai/fastsearch.git",
+    "directory": "clients/typescript"
+  },
   "engines": {
     "node": ">=18"
   },
