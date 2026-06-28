@@ -111,4 +111,8 @@ jobs:
             | ./target/debug/fastsearch index --server $U --key dev --collection kb --doc-id manual -
           ./target/debug/fastsearch search --server $U --key dev --collection kb --query "alpha" --mode keyword --json | grep -q "kb:manual:0" \
             || { echo "FAIL: stdin index 后未检索到 manual" >&2; exit 1; }
+          # eval 客户端路径端到端：golden 语料入库 → 逐查询检索 → 算指标（nDCG=1 验证检索正确）
+          printf '%s' '{"collection":"evalkb","corpus":[{"doc_id":"d1","chunk_id":0,"kind":"paragraph","text":"毛利率 提升","page":1,"bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":4}],"queries":[{"query":"毛利率","relevant":{"evalkb:d1:0":2}}]}' > "$DOCS/golden.json"
+          ./target/debug/fastsearch eval --server $U --key dev --golden "$DOCS/golden.json" --k 1 | grep -q '"ndcg": 1' \
+            || { echo "FAIL: eval 客户端路径未得 nDCG=1" >&2; exit 1; }
           echo "cli-server-e2e OK"

@@ -68,7 +68,7 @@ pub fn cmd_eval(opts) -> Result<(Metrics, Option<Result<(),String>>)>;
 2. `chunk_text`：markdown 标题→Heading、heading_path 累积、空行分段。
 3. `build_filter`：必含 collection；+kind/page → And。
 4. mock HTTP server：`cmd_search` 解析 hits、`cmd_index` 取 indexed 数、`cmd_index_dir` 喂文件夹多文件上传、500 错误上浮。
-5. （端到端，真 server）：起 fastsearch-server → `index-dir`/`index`/`search`/`similar` 闭环。
+5. （端到端，真 server，CI `cli-server-e2e` job）：起 fastsearch-server → `index-dir`(喂文件夹)→`search` 命中 / stdin `index`→`search` 命中 / `eval`(golden 入库→检索→nDCG=1) 闭环。
 
 ## 7. 验收标准与状态
 
