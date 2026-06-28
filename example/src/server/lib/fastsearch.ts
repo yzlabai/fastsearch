@@ -1,12 +1,23 @@
-// fastsearch REST 客户端（薄封装；对齐 crates/fastsearch-server 的 /v1/* 接口）。
-// 设计要点：ACL 由服务端按 API Key 强制，客户端无法越权——这里不传 acl 过滤。
+// fastsearch 接入：直接复用已发布的 SDK `fastsearch-client`（零依赖、全局 fetch）。
+// 本例不再手写 REST 客户端——index/search/工具定义/RAG 拼装全走 SDK。
+// ACL 由服务端按 API Key 强制，客户端无法越权，所以这里不传 acl 过滤。
 
-const BASE_URL = (process.env.FASTSEARCH_URL ?? "http://127.0.0.1:8642").replace(
-  /\/+$/,
-  "",
-);
-const API_KEY = process.env.FASTSEARCH_API_KEY ?? "dev";
+import { FastsearchClient, FastsearchError } from "fastsearch-client";
+
+export { FastsearchError };
+
 export const COLLECTION = process.env.FASTSEARCH_COLLECTION ?? "kb";
+
+// 单例：线程安全、可复用。baseUrl/apiKey 走 .env（见 .env.example）。
+export const fastsearch = new FastsearchClient({
+  baseUrl: process.env.FASTSEARCH_URL ?? "http://127.0.0.1:8642",
+  apiKey: process.env.FASTSEARCH_API_KEY ?? "dev",
+  retries: 2,
+});
+
+// ---- 本例本地的 chunk 形状 ----------------------------------------------
+// 仅给朴素切块器（lib/chunk.ts）做类型用；对齐 docparse / core::Chunk 的 snake_case。
+// 真实管线直接喂 docparse 输出，无需手写这个类型。
 
 export interface BBox {
   x0: number;
@@ -15,8 +26,6 @@ export interface BBox {
   y1: number;
 }
 
-// 落库的 chunk 形状，对齐 core::Chunk（snake_case）。
-// 必填：doc_id / chunk_id / kind / text / page / bbox / char_len。
 export interface IndexChunk {
   doc_id: string;
   chunk_id: number;
@@ -38,67 +47,13 @@ export interface IndexChunk {
   acl?: string[];
 }
 
-export interface Hit {
-  citation_id: string;
-  score: number;
-  bm25: number | null;
-  vector: number | null;
-  doc_id: string;
-  chunk_id: number;
-  page: number;
-  bbox: BBox;
-  heading_path: string[];
-  section_id: number;
-  highlight?: string | null;
-}
-
-export class FastsearchError extends Error {}
-
-async function post(path: string, body: unknown): Promise<any> {
-  let resp: Response;
-  try {
-    resp = await fetch(BASE_URL + path, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-API-Key": API_KEY,
-      },
-      body: JSON.stringify(body),
-    });
-  } catch (cause) {
-    throw new FastsearchError(
-      `连不上 fastsearch（${BASE_URL}）。先起服务：FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" cargo run -p fastsearch-server --bin fastsearch-server`,
-      { cause },
-    );
-  }
-  if (!resp.ok) {
-    throw new FastsearchError(`HTTP ${resp.status}: ${await resp.text()}`);
-  }
-  return resp.json();
-}
-
-/** doc 级替换写入一批 chunks，返回写入条数。 */
+/** doc 级替换写入一批 chunks，返回写入条数（薄封装 SDK，便于路由层调用）。 */
 export async function indexDoc(
   docId: string,
   chunks: IndexChunk[],
 ): Promise<number> {
-  const out = await post("/v1/index", {
-    collection: COLLECTION,
-    doc_id: docId,
-    chunks,
-  });
-  return out.indexed ?? 0;
-}
-
-/** 混合检索，返回带 page+bbox 引用的命中列表。 */
-export async function search(
-  query: string,
-  opts: { topK?: number; mode?: "keyword" | "vector" | "hybrid" } = {},
-): Promise<Hit[]> {
-  const out = await post("/v1/search", {
-    query,
-    mode: opts.mode ?? "hybrid",
-    top_k: opts.topK ?? 8,
-  });
-  return out.hits ?? [];
+  return fastsearch.index(COLLECTION, docId, chunks as unknown as Record<
+    string,
+    unknown
+  >[]);
 }

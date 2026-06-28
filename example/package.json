@@ -13,6 +13,7 @@
     "db:generate": "drizzle-kit generate",
     "db:studio": "drizzle-kit studio",
     "typecheck": "tsc -b --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
     "test:e2e": "node test/smoke.mjs"
   },
   "dependencies": {
@@ -24,6 +25,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "drizzle-orm": "^0.45.2",
+    "fastsearch-client": "^0.2.0",
     "hono": "^4.12.27",
     "lucide-react": "^1.21.0",
     "react": "^19.2.7",

@@ -20,5 +20,5 @@
       "@/*": ["./src/web/*"]
     }
   },
-  "include": ["src"]
+  "include": ["src", "test/**/*.test.ts"]
 }

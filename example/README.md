@@ -17,6 +17,7 @@ fastsearch-server (:8642)  ← hybrid search engine (Rust crate in this repo)
 - **Hono**: backend HTTP (streaming chat endpoint + document ingest endpoint).
 - **SQLite + Drizzle**: local store for the "document list" and "chat history" (the source of truth for searchable content lives in fastsearch/PG; this is just a registry).
 - **Vercel AI SDK**: the agent itself — `streamText` runs a tool loop, default model **DeepSeek (`deepseek-v4-flash`)**; the `searchKnowledgeBase` tool calls fastsearch for evidence.
+- **`fastsearch-client`** (the published npm SDK): the retrieval client. `makeSearchTool` turns a collection into a ready agent tool (`run()` does search + `[n]`-marked context + citations); no hand-rolled REST client.
 - **Vite + React + shadcn/ui**: chat interface + document ingest panel, answers carry traceable `citation_id`s.
 
 > This is an *example* shipped alongside fastsearch — it shows "how to build a RAG agent on top of fastsearch."
@@ -56,9 +57,17 @@ npm run dev
 
 Open 5173: paste a document on the left and "ingest" it, then ask questions on the right. The agent searches first, then answers with `[kb:doc:chunk]` citations.
 
-## End-to-end smoke test
+## Tests
 
-With the stack up (① + ③ both running, `.env` has `DEEPSEEK_API_KEY`), open another terminal:
+**Unit / integration** — fast, no external services (an in-process fake fastsearch server stands in for the engine):
+
+```bash
+npm test
+```
+
+Covers the naive chunker (`chunkText`) and the SDK wrapper + agent tool wiring (the write path `indexDoc` request shape; the `searchKnowledgeBase` tool's `search(highlight:true)` call and its `content`/`citations`/`hits` output). Uses Node's built-in test runner via tsx.
+
+**End-to-end smoke** — drives the live stack. With it up (① + ③ both running, `.env` has `DEEPSEEK_API_KEY`), open another terminal:
 
 ```bash
 npm run test:e2e
@@ -78,9 +87,9 @@ src/server/
   env.ts                loads .env first
   db/schema.ts          Drizzle tables: documents / chunks / messages
   db/index.ts           better-sqlite3 + boot-time CREATE TABLE IF NOT EXISTS
-  lib/fastsearch.ts     fastsearch REST client (/v1/index, /v1/search)
+  lib/fastsearch.ts     fastsearch-client SDK singleton (+ local chunk types for the naive chunker)
   lib/chunk.ts          naive chunker (real pipelines use docparse)
-  lib/agent.ts          model + system prompt + searchKnowledgeBase tool
+  lib/agent.ts          model + system prompt + makeSearchTool() from fastsearch-client
   routes/chat.ts        AI SDK streamText tool loop, persists each turn
   routes/documents.ts   ingest: chunk → /v1/index → register in SQLite; list
 src/web/
@@ -89,6 +98,8 @@ src/web/
   components/DocumentsPanel.tsx document ingest + list
   components/ui/*       shadcn primitives (button/card/input/textarea/badge)
 test/
+  chunk.test.ts         unit: naive chunker (npm test)
+  wrapper.test.ts       integration: SDK wrapper + agent tool vs a fake fastsearch (npm test)
   smoke.mjs             end-to-end smoke test (npm run test:e2e)
 ```
 
