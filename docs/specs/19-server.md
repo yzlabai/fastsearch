@@ -8,11 +8,12 @@
 
 REST 服务（四张脸之一）+ 安全 + 基础可观测。
 
-- 端点：`GET /healthz` `/readyz` `/metrics` `/openapi.json`；`POST /v1/search`（含 `search_after` 深分页，命中带 `cursor`）；`POST /v1/similar`（按 citation_id more_like_this）；`GET /v1/asset/{cid}`（媒资 ACL 网关）；`POST /v1/index`。
+- 端点：`GET /healthz` `/readyz` `/metrics` `/openapi.json`；`POST /v1/search`（含 `search_after` 深分页，命中带 `cursor`）；`POST /v1/similar`（按 citation_id more_like_this）；`GET /v1/asset/{cid}`（媒资 ACL 网关，authed）；`GET /v1/asset/{cid}/bytes?exp&ct&sig`（**token 门控** inline 字节，免 Bearer，MM6-signer）；`POST /v1/index`。
 - **认证（F43）**：API Key（`Authorization: Bearer <k>` 或 `X-API-Key`）→ Principal{tenant, tags}；缺/错 → 401。
 - **逐文档 ACL（F44，安全核心）**：Principal → `AclFilter`，**服务端注入**给 engine.search/resolve_citation；**客户端无法在请求里传 ACL/越权**（含 /v1/asset：越权/不存在均 404，不泄漏存在性）。
 - 可观测（F50）：counters + 延迟直方图 `/metrics`（Prometheus 文本）；限流（令牌桶 429）；审计（可插拔 sink）。
-- 向量后端：`FASTSEARCH_VECTOR_BACKEND=brute|hnsw|pgvector`（pgvector 直查需 `DATABASE_URL`，见 [B6 设计](../plans/2026-06-26-B6-pgvector直查档设计.md)）。
+- 向量后端：`FASTSEARCH_VECTOR_BACKEND=brute|brute_binary|brute_binary_rotated|hnsw|pgvector`（pgvector 直查需 `DATABASE_URL`，见 [B6 设计](../plans/2026-06-26-B6-pgvector直查档设计.md)）。
+- 资产 URL 签名（MM6-signer）：`FASTSEARCH_ASSET_SIGNING_KEY` 设密钥即开启 token URL（`/v1/asset/{cid}/bytes` 凭 HMAC token 取 inline 字节，让前端 `<img src>` 免 Bearer）；`FASTSEARCH_ASSET_URL_TTL` 调过期秒（默认 300）。多副本须同密钥。
 
 **不做**：RBAC 细粒度策略引擎、TLS 终止（交给网关）。（MCP 工具面已实现，见 `fastsearch-mcp`；限流/完整指标已实现。）
 
@@ -66,6 +67,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   DocRender JSON / 302 SignedUrl / InlineRef→按需 `fetch_inline_bytes` 吐字节；越权/不存在 404 不泄漏存在性，+测试 `asset_acl_not_bypassable`）；
   **深分页** `search_after` 经 serde 透传 + 响应每命中带 `cursor`（+REST 翻页测试）；media/time 透出命中；
   `FASTSEARCH_VECTOR_BACKEND=hnsw|pgvector`（首启选档 / pgvector `set_pg_vector`）。OpenAPI 同步新端点。
+- [x] v1.8（2026-06-28，MM6-signer S1+S2）：`resolve_citation` Inline→`InlineRef`（只定位）、字节经 engine `fetch_inline_bytes` 按需取；新增 **`AssetSigner`**（HMAC-SHA256(`cid\|exp\|ct`)，常量时间验签）+ **token 门控 `GET /v1/asset/{cid}/bytes`**（验签即授权=presigned 语义，免 Bearer；未配/无效/过期→403；无字节→404）+ env `FASTSEARCH_ASSET_SIGNING_KEY`/`_URL_TTL`。+5 单测（sign/verify 往返/过期/篡改 cid/ct/sig/密钥、端点 403/404 路径，本环境）。**签发端点 `POST /v1/assets/resolve`（S3）下一迭代**——届时前端"按 id 取 URL→`<img src>`"端到端可用。
 - [x] v1.7（2026-06-27，MM6-inline/secure）：main 装配 `set_source_store`（gated DATABASE_URL，任意向量后端）→
   `/v1/asset` 的 **Inline 路径从 PG `media_bytes` 真源吐字节**（+Content-Type）。**server HTTP E2E** `asset_inline_bytes_e2e`
   （Docker 真机：授权 200+image/png+真源字节 / 越权 404 / 无 key 401）。**Object 无签名器→404 不泄露裸 key**（MM6-secure）。

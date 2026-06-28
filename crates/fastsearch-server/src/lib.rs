@@ -6,7 +6,7 @@
 //! 安全核心（需求 F44）：ACL 只来自认证身份，客户端无法在请求体里传 ACL 或越权。
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -23,6 +23,60 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// 资产 URL 签名器（MM6-signer）：用 HMAC-SHA256 对 `cid|exp|ct` 签短时 token，让前端 `<img src>`
+/// **免 Bearer 头**取 inline 字节。签名即"已授权"凭证（presigned 语义）：拿到合法 URL 的前提是
+/// resolve 时过了 ACL（S3 `/v1/assets/resolve` 签发）；字节端点只验签、不再查 ACL（守不变量 #3）。
+/// cid+exp+ct 全入 MAC → 不可篡改/挪用/过期复用。无状态（密钥 env 共享）→ 多副本一致。
+pub struct AssetSigner {
+    key: Vec<u8>,
+    ttl_secs: u64,
+}
+
+impl AssetSigner {
+    pub fn new(key: Vec<u8>, ttl_secs: u64) -> Self {
+        AssetSigner { key, ttl_secs }
+    }
+
+    fn mac_hex(&self, cid: &str, exp: u64, ct: &str) -> String {
+        use hmac::digest::KeyInit; // new_from_slice
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC key 任意长度");
+        mac.update(format!("{cid}|{exp}|{ct}").as_bytes());
+        mac.finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// 签发：返回 `(exp, sig)`。`now`=当前 unix 秒（外部传入，便于纯测）。
+    pub fn sign(&self, cid: &str, ct: &str, now: u64) -> (u64, String) {
+        let exp = now + self.ttl_secs;
+        (exp, self.mac_hex(cid, exp, ct))
+    }
+
+    /// 验签：sig 与 `HMAC(cid|exp|ct)` **常量时间**相等 且 未过期。
+    pub fn verify(&self, cid: &str, exp: u64, ct: &str, sig: &str, now: u64) -> bool {
+        if exp <= now {
+            return false;
+        }
+        ct_eq(self.mac_hex(cid, exp, ct).as_bytes(), sig.as_bytes())
+    }
+}
+
+/// 常量时间比较（等长才可能相等；异或折叠，无早退）。
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// 调用者身份（由 API Key 解析）。
 #[derive(Debug, Clone)]
@@ -129,6 +183,8 @@ pub struct ServerState {
     audit: Option<AuditSink>,
     /// 真语义嵌入后端（None=不嵌入，检索退化为 keyword）。
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
+    /// 资产 URL 签名器（None=不签发短时 URL，`/v1/asset/{cid}/bytes` 一律 403）。
+    asset_signer: Option<Arc<AssetSigner>>,
 }
 
 impl ServerState {
@@ -140,7 +196,15 @@ impl ServerState {
             rate_limiter: None,
             audit: None,
             embedder: None,
+            asset_signer: None,
         }
+    }
+
+    /// 配置资产 URL 签名器（MM6-signer）：开启后 `/v1/assets/resolve` 可签发短时 token URL、
+    /// `/v1/asset/{cid}/bytes` 凭 token 取 inline 字节。`key` 为 HMAC 密钥（多副本须同值）。
+    pub fn with_asset_signer(mut self, key: Vec<u8>, ttl_secs: u64) -> Self {
+        self.asset_signer = Some(Arc::new(AssetSigner::new(key, ttl_secs.max(1))));
+        self
     }
 
     /// 设置嵌入后端：ingest 自动嵌入 passage、search 自动嵌入 query（开启真混合）。
@@ -268,6 +332,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/search", post(search))
         .route("/v1/similar", post(similar))
         .route("/v1/asset/{cid}", get(asset))
+        .route("/v1/asset/{cid}/bytes", get(asset_bytes))
         .route("/v1/index", post(index))
         .with_state(state)
 }
@@ -687,6 +752,46 @@ async fn asset(
     }
 }
 
+/// `/v1/asset/{cid}/bytes` 的签名 token 查询参数。
+#[derive(Deserialize)]
+struct BytesQuery {
+    exp: u64,
+    ct: String,
+    sig: String,
+}
+
+/// **token 门控** inline 字节端点（MM6-signer）：**不走 Bearer**，凭 `/v1/assets/resolve` 签发的
+/// 短时 token 取字节——让前端 `<img src>` 免鉴权头直接渲染。验签（`HMAC(cid|exp|ct)` 常量时间 + 未
+/// 过期）即授权（签名时已过 ACL，presigned 语义，守不变量 #3）；失败 403，不暴露原因细节。
+/// 未配签名器 → 一律 403。验签通过后从 PG 真源取字节（`fetch_inline_bytes`，无字节→404）。
+async fn asset_bytes(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(cid): Path<String>,
+    Query(q): Query<BytesQuery>,
+) -> Response {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if !s.allow(&rate_key(&headers)) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    let Some(signer) = &s.asset_signer else {
+        return (StatusCode::FORBIDDEN, "asset signing not configured").into_response();
+    };
+    if !signer.verify(&cid, q.exp, &q.ct, &q.sig, unix_now()) {
+        return (StatusCode::FORBIDDEN, "invalid or expired token").into_response();
+    }
+    // 验签通过 = 已授权（签发时过的 ACL）→ 取 PG 真源字节，不再查 ACL。
+    let engine = s.engine.lock().await;
+    match engine.fetch_inline_bytes(&cid) {
+        Ok(Some(bytes)) => ([(header::CONTENT_TYPE, q.ct)], bytes).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct IndexBody {
     collection: String,
@@ -781,6 +886,113 @@ mod tests {
             },
         );
         m
+    }
+
+    // ===================== MM6-signer：资产 URL 签名 + token 字节端点 =====================
+
+    #[test]
+    fn asset_signer_sign_verify_roundtrip() {
+        let s = AssetSigner::new(b"secret".to_vec(), 300);
+        let (exp, sig) = s.sign("kb:d.pdf:1", "image/png", 1000);
+        assert_eq!(exp, 1300);
+        assert!(s.verify("kb:d.pdf:1", exp, "image/png", &sig, 1000));
+        assert!(
+            s.verify("kb:d.pdf:1", exp, "image/png", &sig, 1299),
+            "未过期"
+        );
+        assert!(
+            !s.verify("kb:d.pdf:1", exp, "image/png", &sig, 1300),
+            "过期(now>=exp)"
+        );
+        assert!(
+            !s.verify("kb:d.pdf:2", exp, "image/png", &sig, 1000),
+            "换 cid"
+        );
+        assert!(
+            !s.verify("kb:d.pdf:1", exp, "image/jpeg", &sig, 1000),
+            "换 ct"
+        );
+        assert!(
+            !s.verify("kb:d.pdf:1", exp, "image/png", "deadbeef", 1000),
+            "篡改 sig"
+        );
+        assert!(
+            !AssetSigner::new(b"other".to_vec(), 300).verify(
+                "kb:d.pdf:1",
+                exp,
+                "image/png",
+                &sig,
+                1000
+            ),
+            "换密钥"
+        );
+    }
+
+    fn signer_app() -> Router {
+        // 无 source_pg：验签通过也取不到字节（隔离测 token 逻辑与字节面）。
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        router(ServerState::new(engine, keys()).with_asset_signer(b"k".to_vec(), 300))
+    }
+
+    fn bytes_uri(cid: &str, exp: u64, ct: &str, sig: &str) -> String {
+        format!(
+            "/v1/asset/{cid}/bytes?exp={exp}&ct={}&sig={sig}",
+            ct.replace('/', "%2F")
+        )
+    }
+
+    async fn get_status(app: Router, uri: String) -> StatusCode {
+        app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn asset_bytes_valid_token_no_source_pg_is_404() {
+        // 合法 token → 验签通过（非 403）；无 source_pg → 无字节 → 404（证明 token 已验、未误判 403）。
+        let (exp, sig) =
+            AssetSigner::new(b"k".to_vec(), 300).sign("kb:d.pdf:1", "image/png", unix_now());
+        let st = get_status(
+            signer_app(),
+            bytes_uri("kb:d.pdf:1", exp, "image/png", &sig),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "验签过但无字节→404");
+    }
+
+    #[tokio::test]
+    async fn asset_bytes_bad_sig_is_403() {
+        let st = get_status(
+            signer_app(),
+            bytes_uri("kb:d.pdf:1", unix_now() + 300, "image/png", "deadbeef"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "无效 sig→403");
+    }
+
+    #[tokio::test]
+    async fn asset_bytes_expired_is_403() {
+        // now=0 签 → exp=300；真实 now 远大于 300 → 过期。
+        let (exp, sig) = AssetSigner::new(b"k".to_vec(), 300).sign("kb:d.pdf:1", "image/png", 0);
+        let st = get_status(
+            signer_app(),
+            bytes_uri("kb:d.pdf:1", exp, "image/png", &sig),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "过期 token→403");
+    }
+
+    #[tokio::test]
+    async fn asset_bytes_no_signer_is_403() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys())); // 未配签名器
+        let st = get_status(
+            app,
+            bytes_uri("kb:d.pdf:1", 9_999_999_999, "image/png", "x"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "未配签名器→403");
     }
 
     fn chunk(id: u64, text: &str, acl: Vec<&str>) -> Chunk {

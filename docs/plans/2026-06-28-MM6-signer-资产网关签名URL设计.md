@@ -145,7 +145,7 @@ curl -H "Authorization: Bearer $KEY" -d '{"ids":["kb:report.pdf:42"]}' \
 | 序 | 项 | crate | 资源 | 验证 |
 |---|---|---|---|---|
 | S1 | ✅ engine `AssetFetch::InlineRef`（取代 `InlineBytes`）+ `fetch_inline_bytes(cid)->Result<Option<Vec<u8>>>`（无 acl）；resolve Inline 只定位；server/MCP 消费方分流 | engine,server,mcp | 本环境+Docker | **done**（本环境 `fetch_inline_bytes_without_source_pg_is_none` + Docker `mm6_inline_serves_bytes_from_source_pg` 更新；行为保持）。注：字节面只返字节，`media_type` authed 端经 resolve、token 端经 S2 token 携带 |
-| S2 | server inline 签名：HMAC token + `/v1/asset/{cid}/bytes` token 端点 + 装配密钥/TTL（媒资 `ct` 入签名，免 PG 再查 media_type） | server | 本环境 | 签发/验签/过期/篡改单测 |
+| S2 | ✅ server `AssetSigner`（HMAC-SHA256(`cid\|exp\|ct`)，常量时间验签）+ `GET /v1/asset/{cid}/bytes?exp&ct&sig` token 端点（验签→`fetch_inline_bytes`→吐字节+ct；未配签名器/无效/过期→403）+ env `FASTSEARCH_ASSET_SIGNING_KEY`/`_URL_TTL` 装配 | server | 本环境 | **done**（+5 测试：sign/verify 往返+过期+换 cid/ct/sig/密钥、端点 valid→404(无 source_pg)/bad-sig→403/过期→403/未配→403；收口三绿）。S3 签发端点未到 → token 暂只能内部构造（真用户取 URL 待 S3） |
 | S3 | server `POST /v1/assets/resolve` 批量解析 + ACL 强制 + OpenAPI | server | 本环境+Docker | 越权不返回 URL + 端到端渲染 |
 | S4 | object 档真 `ObjectSigner`（S3 兼容 presign） | engine | gated（对象存储） | 待运行验证（MinIO/S3） |
 | S5 | clients SDK `resolve_assets` + 前端示例（可选） | clients | 本环境 | SDK 自测 |

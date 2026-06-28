@@ -221,6 +221,19 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // 资产 URL 签名（MM6-signer）：FASTSEARCH_ASSET_SIGNING_KEY 设密钥即开启短时 token URL
+    // （`/v1/assets/resolve` 签发、`/v1/asset/{cid}/bytes` 凭 token 取字节，让前端 <img src> 免 Bearer）。
+    // FASTSEARCH_ASSET_URL_TTL 调过期秒数（默认 300）。多副本须同密钥。
+    if let Ok(key) = std::env::var("FASTSEARCH_ASSET_SIGNING_KEY") {
+        if !key.is_empty() {
+            let ttl = std::env::var("FASTSEARCH_ASSET_URL_TTL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300);
+            state = state.with_asset_signer(key.into_bytes(), ttl);
+            eprintln!("asset URL signing on (TTL {ttl}s)");
+        }
+    }
     // 审计：FASTSEARCH_AUDIT=1|stderr → stderr JSON 一行一事件
     if matches!(
         std::env::var("FASTSEARCH_AUDIT").as_deref(),
