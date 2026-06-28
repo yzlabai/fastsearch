@@ -1,17 +1,42 @@
 {
   "name": "fastsearch-client",
-  "version": "0.1.0",
-  "description": "Zero-dependency TypeScript client for the fastsearch REST API (hybrid search over docparse chunks).",
+  "version": "0.2.0",
+  "description": "Zero-dependency TypeScript SDK for the fastsearch REST API — hybrid search over docparse chunks, with first-class helpers for LLM agent development (tool definitions, RAG context, retrievers).",
   "license": "Apache-2.0",
   "type": "module",
   "main": "dist/index.js",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist", "src"],
-  "scripts": {
-    "build": "tsc"
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
-  "keywords": ["search", "rag", "hybrid-search", "bm25", "vector-search"],
+  "files": ["dist", "src"],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc -p tsconfig.test.json && node --test \".testbuild/test/**/*.test.js\"",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "search",
+    "rag",
+    "hybrid-search",
+    "bm25",
+    "vector-search",
+    "agent",
+    "llm",
+    "tool-use",
+    "function-calling",
+    "langchain"
+  ],
   "devDependencies": {
+    "@types/node": "^20.0.0",
     "typescript": "^5.4.0"
   }
 }
