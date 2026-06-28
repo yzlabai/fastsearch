@@ -1,10 +1,13 @@
 # fastsearch-client (TypeScript)
 
+[![npm](https://img.shields.io/npm/v/fastsearch-client.svg)](https://www.npmjs.com/package/fastsearch-client)
+
 零依赖（全局 `fetch`）的 fastsearch REST SDK，**为 LLM agent 开发量身定制**。
 Node 18+ / Deno / Bun / 浏览器通用。ACL 由服务端按 API Key 强制，客户端无法越权。
 
 ```bash
 npm install fastsearch-client
+# 或：pnpm add fastsearch-client · yarn add fastsearch-client · bun add fastsearch-client · deno: import "npm:fastsearch-client"
 ```
 
 ## 快速上手

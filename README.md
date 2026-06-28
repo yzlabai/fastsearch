@@ -52,7 +52,7 @@ For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs
 | `fastsearch-server` | REST (axum) + API-key auth + **ACL cannot be bypassed** + metrics/rate-limit/audit + media gateway + CDC lifecycle |
 | `fastsearch-mcp` | The fourth face: MCP (stdio + JSON-RPC) exposing the `search` / `resolve_citation` tools |
 | `fastsearch-cli` | `fastsearch` binary: **thin REST client of the server** (no embedded engine). index / index-dir (feed a folder) / search / similar / **ingest (client-side multi-format parse: PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/image + OCR + table recognition)** / eval — see [Ingestion & parsing](docs/ingestion-and-parsing.md) |
-| `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters |
+| `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters. **TS published on npm: `npm install fastsearch-client`** (agent tool defs + RAG helpers — [README](clients/typescript/README.md)); Python from source ([README](clients/python/README.md)) |
 
 **End-to-end usable**: ingest/CDC → index → three search modes (keyword / vector / hybrid) → hits with citations, ACL enforced and unbypassable. All four faces in place.
 

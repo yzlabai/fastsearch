@@ -161,7 +161,9 @@ curl -s localhost:8642/v1/index -H "x-api-key: dev" -d '{"collection":"kb","doc_
 深分页：把上一页末条命中的 `cursor` 作为下次请求的 `"search_after"`。
 契约：`GET /openapi.json`（OpenAPI 3.0）；可观测：`GET /metrics`（Prometheus）。
 
-### 3.3 Python SDK + LangChain / LlamaIndex
+### 3.3 SDK（Python / TypeScript + LangChain / LlamaIndex）
+
+**Python**（[PyPI 待发布](../clients/python/README.md)，现从源码安装）：
 
 ```python
 from fastsearch_client import FastsearchClient
@@ -180,6 +182,27 @@ nodes = hits_to_llama_nodes(c.search("kb", "毛利率", top_k=8, highlight=True)
 ```
 
 依赖可选：未装 langchain/llama-index 时回退本地等价对象（同形 `page_content`/`metadata`）。
+
+**TypeScript**（已发布 npm：`npm install fastsearch-client`；零依赖、Node 18+/Deno/Bun/浏览器通用）：
+
+```ts
+import { FastsearchClient, makeSearchTool, formatHitsForLLM, FastsearchRetriever } from "fastsearch-client";
+
+const client = new FastsearchClient({ baseUrl: "http://127.0.0.1:8642", apiKey: "dev" });
+await client.index("kb", "report.pdf", chunks);                 // chunks: docparse chunk 列表
+const { hits } = await client.search("kb", "毛利率", { topK: 8, highlight: true });
+
+// 给 agent 加检索工具：一次产出 Anthropic / OpenAI 两家工具定义 + 可执行 run()
+const tool = makeSearchTool(client, "kb");                       // tool.anthropic / tool.openai / tool.run()
+
+// 自己拼 RAG 上下文（带 [n] 引用标记）
+const { content, citations } = formatHitsForLLM(hits);
+
+// LangChain.js 检索器（鸭子兼容，可进 LCEL）
+const docs = await new FastsearchRetriever(client, "kb", { topK: 8 }).invoke("毛利率");
+```
+
+完整用法见 [TS SDK README](../clients/typescript/README.md)（agent 工具、深分页、similar、媒资深链、错误重试）。
 
 ### 3.4 库（Rust）/ CLI
 

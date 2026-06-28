@@ -9,7 +9,7 @@
 - Python：`clients/python/fastsearch_client`（标准库 urllib，无第三方依赖）。
 - TypeScript：`clients/typescript/src`（全局 fetch，Node 18+/浏览器）。
 
-**不做**：流式；重试退避（调用方可包）。（**LangChain/LlamaIndex 适配已实现**——见 §5 A10。）
+**不做**：流式。（**LangChain/LlamaIndex 适配已实现**——见 §5 A10；**TS SDK 已发布 npm**，内建重试退避 + agent 工具定义——见 §5 A11。）
 
 ## 2. 接口（两端一致）
 
@@ -31,4 +31,5 @@
 
 - [x] v1：Python + TS 客户端 + 包元数据（pyproject/package.json）+ README + smoke。
 - [x] **A10（2026-06-26）：LangChain/LlamaIndex 适配已实现**——`clients/python/fastsearch_client/integrations.py`：`FastsearchRetriever`（命中→`Document`）、`hits_to_llama_nodes`（→`NodeWithScore`），依赖可选回退、零硬依赖；`test_integrations.py` 自测绿。
-- 下一迭代：发布到 PyPI/npm；TS 侧 LangChain.js 适配。
+- [x] **A11（2026-06-28）：TS SDK 重写 + 发布 npm**——`fastsearch-client@0.2.0` 已发布 npmjs（`npm install fastsearch-client`）：全量 REST + `makeSearchTool`（Anthropic/OpenAI 工具定义）+ `formatHitsForLLM`（RAG 上下文）+ `FastsearchRetriever`（LangChain.js 检索器）+ `FastsearchError` 重试分流。
+- 下一迭代：Python SDK 发布 PyPI。
