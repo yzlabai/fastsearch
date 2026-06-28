@@ -57,6 +57,9 @@ enum Command {
     IndexDir {
         #[arg(long, default_value = "default")]
         collection: String,
+        /// 并发上传文件数（大文件夹提速）。
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
         /// 资料文件夹路径。
         dir: PathBuf,
     },
@@ -203,11 +206,16 @@ fn main() -> Result<()> {
             let n = cmd_index(&opts, &bytes)?;
             eprintln!("indexed {n} chunk(s) for doc '{}'", opts.doc_id);
         }
-        Command::IndexDir { collection, dir } => {
+        Command::IndexDir {
+            collection,
+            concurrency,
+            dir,
+        } => {
             let opts = IndexDirOpts {
                 server,
                 key,
                 collection,
+                concurrency,
             };
             let (ok, failed, chunks) = cmd_index_dir(&opts, &dir)?;
             eprintln!(

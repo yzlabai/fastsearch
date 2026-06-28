@@ -22,12 +22,12 @@ fastsearch search    --collection <c> --query <q> [--mode hybrid|keyword|vector]
                      [--kind K] [--page-min N] [--page-max N] [--json]
 fastsearch similar   --citation-id <cid> [--top-k N] [--json]
 fastsearch index     --collection <c> --doc-id <id> [INPUT|-]      # docparse chunks JSON/NDJSON
-fastsearch index-dir --collection <c> <DIR>                        # 喂文件夹（客户端分块→上传）
+fastsearch index-dir --collection <c> [--concurrency N] <DIR>      # 喂文件夹（客户端分块→并发上传）
 fastsearch ingest    <FILE> --collection <c> --doc-id <id> [--tenant T]  # 需 --features parse；多格式解析
 fastsearch eval      --golden <g.json> [--baseline <b.json>] [--tol] [--k] [--mode]
 ```
 - **`search`**：默认 `--mode hybrid`——server 有嵌入器则混合，否则自动退化关键词（不报错）。`--collection` 经 `filter: Eq("collection",…)` 限定作用域（collection 两端可过滤）。
-- **`index-dir <DIR>`**：递归遍历 `.md/.txt/.markdown/.text`，每文件 `chunk_text` 切块（markdown 标题→`Heading` + `heading_path`、空行分段）→ POST `/v1/index`（`doc_id`=相对路径）。**进度输出 + 逐文件 continue-on-error**（有失败则退出码 1）。"喂文件夹→检索"经 server → 反得**混合检索**。
+- **`index-dir <DIR>`**：递归遍历 `.md/.txt/.markdown/.text`，每文件 `chunk_text` 切块（markdown 标题→`Heading` + `heading_path`、空行分段）→ POST `/v1/index`（`doc_id`=相对路径）。**有界并发**（`--concurrency`，默认 4，`std::thread::scope` + 原子游标/聚合，抵消单文件 POST 往返延迟）+ **进度输出 + 逐文件 continue-on-error**（有失败则退出码 1；计数确定、进度行可能交错）。"喂文件夹→检索"经 server → 反得**混合检索**。
 - **`ingest`**：客户端 docparse 解析（`parse` feature，9 格式+图片；`parse-ocr`/`parse-tables` env 指模型目录）→ 适配 chunks → POST `/v1/index`。
 - INPUT 为 docparse chunks 文件或 `-`/省略读 stdin；JSON 数组 或 NDJSON。
 
@@ -38,7 +38,7 @@ pub struct Client { /* base, key */ }            // ureq 瘦封装；post(retry)
 pub struct SearchOpts  { server, key, collection, query, mode: SearchMode, top_k, kind, page_min, page_max }
 pub struct SimilarOpts { server, key, citation_id, top_k }
 pub struct IndexOpts   { server, key, collection, doc_id }
-pub struct IndexDirOpts{ server, key, collection }
+pub struct IndexDirOpts{ server, key, collection, concurrency: usize }  // 有界并发上传
 pub struct EvalOpts    { server, key, golden, baseline, tol, k, mode }
 pub fn parse_chunks(bytes, doc_id) -> Result<Vec<Chunk>>;   // docparse→core::Chunk（纯）
 pub fn chunk_text(content, doc_id) -> Vec<Chunk>;            // md/txt 分块（纯）
@@ -79,6 +79,6 @@ pub fn cmd_eval(opts) -> Result<(Metrics, Option<Result<(),String>>)>;
 **已知限制 / 下一迭代：**
 - CLI **不再离线**：所有命令需可达 server（用户决策；喂文件夹改为联网上传，反得混合检索）。
 - 连接配置仅 `--server`/`--key`+env；**多 server profile**（Algolia 式）下一迭代。
-- `index-dir` 单发 POST/文件；大批量并发/分批/进度 ETA（Meilisearch-importer 式）下一迭代。
+- `index-dir` 已有**有界并发**（`--concurrency`）；进度 ETA / 多文件合并为单批 NDJSON（Meilisearch-importer 式）下一迭代。
 - OCR/UniRec 模型需运行时下载；UniRec 自回归 CPU 慢。VLM 自然图语义描述 = `parse-vlm` 下一迭代。
 - `eval` 会写入目标 server 的 golden 集合——指向专用/临时集合或测试 server。

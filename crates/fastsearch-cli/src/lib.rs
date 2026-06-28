@@ -17,6 +17,7 @@ use fastsearch_eval::{evaluate, GoldenSet, Metrics, RankedResults};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ============================ HTTP 客户端（瘦封装 ureq） ============================
 
@@ -323,6 +324,8 @@ pub struct IndexDirOpts {
     pub server: Option<String>,
     pub key: Option<String>,
     pub collection: String,
+    /// 并发上传文件数（≥1）。大文件夹用并发抵消单文件 POST 往返延迟。
+    pub concurrency: usize,
 }
 
 fn is_text_file(p: &Path) -> bool {
@@ -344,43 +347,63 @@ fn collect_text_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+fn rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// 读文件 → 分块 → POST `/v1/index`（doc_id=rel）。返回 chunk 数。
+fn read_chunk_post(client: &Client, collection: &str, rel: &str, path: &Path) -> Result<usize> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let chunks = chunk_text(&content, rel);
+    post_index(client, collection, rel, &chunks)
+}
+
 /// **喂一个文件夹**：递归遍历 `root` 下的 .md/.txt（确定性排序），每文件 `chunk_text` 切块、
-/// 按**文件**POST 到 `/v1/index`（`doc_id`=相对路径）。进度输出 + 逐文件 continue-on-error。
-/// 返回 `(成功文件数, 失败文件数, chunk 总数)`。经 server 索引 → 随后 `search` 可混合检索。
+/// 按**文件**POST 到 `/v1/index`（`doc_id`=相对路径）。**有界并发**（`opts.concurrency`）抵消单
+/// 文件 POST 往返延迟 + 进度输出 + 逐文件 continue-on-error。返回 `(成功, 失败, chunk 总数)`。
+/// 计数确定（原子聚合）；并发下进度行可能交错（无碍正确性，每文件独立 doc）。
 pub fn cmd_index_dir(opts: &IndexDirOpts, root: &Path) -> Result<(usize, usize, usize)> {
     let client = Client::new(opts.server.clone(), opts.key.clone());
     let mut files = Vec::new();
     collect_text_files(root, &mut files)?;
-    files.sort(); // 确定性
-    let (mut ok, mut failed, mut total) = (0usize, 0usize, 0usize);
-    for (i, path) in files.iter().enumerate() {
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("  [{}/{}] {rel} 读取失败：{e}（跳过）", i + 1, files.len());
-                failed += 1;
-                continue;
-            }
-        };
-        let chunks = chunk_text(&content, &rel);
-        match post_index(&client, &opts.collection, &rel, &chunks) {
-            Ok(n) => {
-                eprintln!("  [{}/{}] {rel} → {n} chunk(s)", i + 1, files.len());
-                ok += 1;
-                total += n;
-            }
-            Err(e) => {
-                eprintln!("  [{}/{}] {rel} 上传失败：{e}（跳过）", i + 1, files.len());
-                failed += 1;
-            }
+    files.sort(); // 确定性 doc_id 分配
+    let n = files.len();
+    let (ok, failed, total, done) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    );
+    let cursor = AtomicUsize::new(0);
+    let workers = opts.concurrency.max(1).min(n.max(1));
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let rel = rel_path(root, &files[i]);
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                match read_chunk_post(&client, &opts.collection, &rel, &files[i]) {
+                    Ok(cn) => {
+                        eprintln!("  [{d}/{n}] {rel} → {cn} chunk(s)");
+                        ok.fetch_add(1, Ordering::Relaxed);
+                        total.fetch_add(cn, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        eprintln!("  [{d}/{n}] {rel} 失败：{e}（跳过）");
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
         }
-    }
-    Ok((ok, failed, total))
+    });
+    Ok((ok.into_inner(), failed.into_inner(), total.into_inner()))
 }
 
 /// search 选项。

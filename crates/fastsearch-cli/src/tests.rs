@@ -157,11 +157,36 @@ fn cmd_index_dir_feeds_folder_to_server() {
         server: Some(url),
         key: Some("k".into()),
         collection: "kb".into(),
+        concurrency: 1,
     };
     let (ok, failed, total) = cmd_index_dir(&opts, dir.path()).unwrap();
     assert_eq!(ok, 3, "三个文本文件都应上传");
     assert_eq!(failed, 0);
     assert_eq!(total, 9, "每文件 mock 报 3 chunk → 3×3");
+}
+
+#[test]
+fn cmd_index_dir_concurrent_uploads_all() {
+    // 并发档：20 个文件、concurrency=6 → 全部上传，计数确定（原子聚合不丢/不重）。
+    let url = spawn_mock(r#"{"indexed":1}"#);
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..20 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.md")),
+            format!("# T{i}\n\nbody {i}"),
+        )
+        .unwrap();
+    }
+    let opts = IndexDirOpts {
+        server: Some(url),
+        key: Some("k".into()),
+        collection: "kb".into(),
+        concurrency: 6,
+    };
+    let (ok, failed, total) = cmd_index_dir(&opts, dir.path()).unwrap();
+    assert_eq!(ok, 20, "20 文件应全部上传（并发不丢）");
+    assert_eq!(failed, 0);
+    assert_eq!(total, 20, "每文件 mock 报 1 → 共 20");
 }
 
 #[test]
