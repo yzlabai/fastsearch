@@ -49,3 +49,37 @@ jobs:
       # 全量测试：含 PG 集成（DATABASE_URL）+ CDC 逻辑复制闭环 + eval 相关性回归门禁。
       - name: test (incl. PG integration + CDC + relevance gate)
         run: cargo test --workspace
+
+  # 搜索热路径**零 docparse 依赖**硬门禁（不变量：解析能力 feature 门控、不进检索热路径）。
+  # 故意往 server 加 docparse 依赖会让此 job 变红；移除即绿（守融合 Option B 的隔离约束）。
+  hot-path-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: assert hot-path crates pull zero docparse
+        run: |
+          for c in fastsearch-server fastsearch-engine fastsearch-core fastsearch-text fastsearch-vector; do
+            if cargo tree -p "$c" -e normal | grep -qi docparse; then
+              echo "FAIL: $c 拉入了 docparse（搜索热路径必须零 docparse）" >&2
+              cargo tree -p "$c" -e normal | grep -i docparse >&2
+              exit 1
+            fi
+            echo "ok: $c 无 docparse"
+          done
+
+  # 解析分档（轻量，无 ONNX）：`parse` feature 对 vendored docparse 编译 + 单测绿。
+  # parse-ocr/parse-tables（重 ONNX）需模型目录，CI 仅编译校验、运行测试 env-gated 跳过。
+  parse-feature:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (parse, zero warnings)
+        run: cargo clippy -p fastsearch-cli --features parse --all-targets -- -D warnings
+      - name: test (parse multiformat ingest)
+        run: cargo test -p fastsearch-cli --features parse
