@@ -6,8 +6,9 @@
 //! **不变量取舍（诚实记账）**：
 //! - 精度/ACL **精确**：HNSW 取回候选后仍用 `Filter::eval` + `AclFilter::visible` 精确后过滤，
 //!   并用全精度 f32 重算余弦——结果是暴力精确结果的**子集**，绝不越权、绝不过返。
-//! - 召回 **近似**：ANN 固有。靠 `over_fetch`（取回 `k×over_fetch` 候选）+ `ef_search` 调高召回；
-//!   强过滤下召回可能下降（候选被过滤殆尽）——见设计 §4，小集合回退暴力为下一迭代。
+//! - 召回 **近似**：ANN 固有。靠 `over_fetch`（取回 `k×over_fetch` 候选）+ `ef_search` 调高召回。
+//!   **强选择性过滤**下用 **自适应过取**（filtered-traversal 务实形式）：过滤后不足 `k` 则翻倍
+//!   `want` 重搜、上限全集（最坏退化为对 filter 精确的全扫），不让选择性过滤掉召回（守 #5）。
 //!
 //! **墓碑增长（诚实记账，触不变量 #6）**：删除/更新只把 `entries[id]` 置 None、向量仍留图中，
 //! 故长生命周期进程在高频 upsert/delete 下 `entries` 与图**无界增长**，直到 `save`→`load`
@@ -20,7 +21,8 @@
 //!
 //! 已实现（A9 step 2/3/4/6）：增量 insert + 墓碑删除 + over-fetch 后过滤 + **u8 量化图**
 //! （省 ~4× 图内存）+ **全精度 f32 重排**（量化误差兜底，recall@10≈0.99）+ 持久化（存 f32、
-//! load 重建图）+ 小集合回退暴力 + 接 engine。RaBitQ / filtered-traversal 为下一迭代。
+//! load 重建图）+ 小集合回退暴力 + 接 engine + **自适应过取（强过滤召回兜底）**。真·图内
+//! filtered-traversal（遍历时即过滤、免重搜）需 hnsw_rs 支持，为下一迭代。
 
 use crate::{dot, normalize, tmp_path, VecMeta, VectorBackend};
 use fastsearch_core::{AclFilter, Citation, Filter, GlobalId, Scored};
@@ -296,22 +298,35 @@ impl VectorBackend for HnswVectorIndex {
             return Ok(self.brute_search(&q, k, filter, acl));
         }
         // over-fetch：向 HNSW 多要候选，抵消后过滤 + u8 量化损耗（全精度重排兜底）。
-        let want = k.saturating_mul(self.params.over_fetch).max(k);
-        let ef = self.params.ef_search.max(want);
-        let neighbours = self.hnsw.search(quantize_u8(&q).as_slice(), want, ef);
-
-        let mut scored: Vec<Scored> = neighbours
-            .into_iter()
-            .filter_map(|n| self.entries.get(n.d_id).and_then(|e| e.as_ref()))
-            // 精确后过滤：filter + ACL（不放松、不越权）。
-            .filter(|e| filter.is_none_or(|f| f.eval(&e.meta)))
-            .filter(|e| acl.is_none_or(|a| a.visible(&e.meta)))
-            // 全精度重排：用原始 f32 重算余弦（抵消近似/未来量化误差）。
-            .map(|e| Scored {
-                id: e.gid.clone(),
-                score: dot(&q, &e.vector) as f64,
-            })
-            .collect();
+        let qcode = quantize_u8(&q);
+        let total = self.gid_to_id.len();
+        // **自适应过取（filtered-traversal 的务实形式）**：强选择性 filter/ACL 下，固定 over-fetch
+        // 的候选可能被过滤殆尽 → 召回崩。有 filter/acl 时，若过滤后不足 k 就翻倍 `want` 重搜，
+        // 上限 = 全集（最坏退化为对 filter 精确的全扫，守不变量 #5：选择性过滤不掉召回）。
+        // 无 filter/acl 则单发（纯 ANN 近似，不升级）。确定：同输入 → 同升级路径 → 同结果。
+        let needs_escalation = filter.is_some() || acl.is_some();
+        let mut want = k.saturating_mul(self.params.over_fetch).max(k);
+        let mut scored: Vec<Scored> = loop {
+            let ef = self.params.ef_search.max(want);
+            let s: Vec<Scored> = self
+                .hnsw
+                .search(qcode.as_slice(), want, ef)
+                .into_iter()
+                .filter_map(|n| self.entries.get(n.d_id).and_then(|e| e.as_ref()))
+                // 精确后过滤：filter + ACL（不放松、不越权）。
+                .filter(|e| filter.is_none_or(|f| f.eval(&e.meta)))
+                .filter(|e| acl.is_none_or(|a| a.visible(&e.meta)))
+                // 全精度重排：用原始 f32 重算余弦（抵消近似/量化误差）。
+                .map(|e| Scored {
+                    id: e.gid.clone(),
+                    score: dot(&q, &e.vector) as f64,
+                })
+                .collect();
+            if !needs_escalation || s.len() >= k || want >= total {
+                break s;
+            }
+            want = want.saturating_mul(4).min(total); // 升级过取，封顶全集
+        };
 
         scored.sort_by(|a, b| {
             b.score
@@ -425,6 +440,48 @@ mod tests {
         // 阈值留余量（HNSW 建图非确定，每次略有波动；50 查询平均后稳定 ≥0.9）。
         let recall = hits as f64 / (k * queries) as f64;
         assert!(recall >= 0.9, "recall@{k} = {recall} < 0.9");
+    }
+
+    /// 自适应过取：仅 ~1.7% 条目匹配 filter（固定 over-fetch 会被过滤殆尽 → 召回崩），
+    /// 自适应升级 `want` 仍高召回（vs 暴力对 filtered 集的 ground truth）。守不变量 #5。
+    #[test]
+    fn adaptive_overfetch_selective_filter_recall() {
+        use fastsearch_core::{FieldValue, Filter};
+        let dim = 32;
+        let n = 1500u64; // > BRUTE_FALLBACK_MAX → 走 HNSW 路径
+        let meta_kind = |id: u64, kind: &str| {
+            let mut m = meta("d", id, vec!["public"]);
+            m.kind = kind.into();
+            m
+        };
+        let mut hnsw = HnswVectorIndex::new(HnswParams::default());
+        let mut brute = MemVectorIndex::new();
+        for i in 0..n {
+            let kind = if i % 60 == 0 { "table" } else { "paragraph" }; // ~25 条 table
+            let v = vec_for(i, dim);
+            hnsw.upsert(gid("d", i), v.clone(), meta_kind(i, kind))
+                .unwrap();
+            brute.upsert(gid("d", i), v, meta_kind(i, kind)).unwrap();
+        }
+        let f = Filter::Eq("kind".into(), FieldValue::Str("table".into()));
+        let (k, queries) = (10usize, 30u64);
+        let mut hits = 0usize;
+        for qi in 0..queries {
+            let q = vec_for(200_000 + qi, dim);
+            let truth: std::collections::HashSet<_> = brute
+                .search(&q, k, Some(&f), None)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            let got = hnsw.search(&q, k, Some(&f), None).unwrap();
+            hits += got.iter().filter(|s| truth.contains(&s.id)).count();
+        }
+        let recall = hits as f64 / (k * queries as usize) as f64;
+        assert!(
+            recall >= 0.85,
+            "强选择性 filter recall@{k}={recall} <0.85（自适应过取应兜底）"
+        );
     }
 
     #[test]
