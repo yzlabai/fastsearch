@@ -224,6 +224,8 @@ FASTSEARCH_KEYS="alice=acme:team-a,public; bob=acme:team-b; admin=:public"
 
 ## 6. 多模态
 
+> **文档解析 & OCR/表格**：`fastsearch ingest` 进程内解析 9 格式 + 图片；扫描件走 **PP-OCR** 抽文本、表格走**非 VLM 的 ONNX 结构识别**——见 **[文件解析与摄取](文件解析与摄取.md)**。
+
 图片 caption、音视频转录都作为可检索文本进库；`modality` 是可过滤字段：
 
 ```json

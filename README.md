@@ -46,7 +46,7 @@ For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs
 | `fastsearch-eval` | Relevance evaluation: golden set + nDCG/recall/MRR + CI regression gate |
 | `fastsearch-server` | REST (axum) + API-key auth + **ACL cannot be bypassed** + metrics/rate-limit/audit + media gateway + CDC lifecycle |
 | `fastsearch-mcp` | The fourth face: MCP (stdio + JSON-RPC) exposing the `search` / `resolve_citation` tools |
-| `fastsearch-cli` | `fastsearch` binary: index / index-dir / search / ingest (PDF) / eval |
+| `fastsearch-cli` | `fastsearch` binary: index / index-dir / search / **ingest (multi-format: PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/image + OCR + table recognition)** / eval — see [Ingestion & parsing](docs/文件解析与摄取.md) |
 | `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters |
 
 **End-to-end usable**: ingest/CDC → index → three search modes (keyword / vector / hybrid) → hits with citations, ACL enforced and unbypassable. All four faces in place.
@@ -63,6 +63,7 @@ DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG integration (CI u
 ## Documentation
 
 - **[Using fastsearch in an Agent](docs/using-fastsearch-in-an-agent.md)** (developer usage guide)
+- **[Ingestion & parsing](docs/文件解析与摄取.md)** — multi-format ingest, OCR, table recognition, build tiers, model setup
 - [Architecture cheat-sheet / commands / invariants (CLAUDE.md)](CLAUDE.md)
 - [Module breakdown & spec index](docs/specs/00-模块拆分.md)
 - [Requirements analysis](docs/plans/2026-06-24-需求分析报告.md) · [Product design](docs/plans/2026-06-24-产品设计文档.md)

@@ -46,7 +46,7 @@ cargo build -p fastsearch-cli --bin fastsearch
 | `fastsearch-eval` | 相关性评测：golden 集 + nDCG/recall/MRR + CI 回归门禁 |
 | `fastsearch-server` | REST(axum) + API-Key 认证 + **ACL 不可绕过** + 指标/限流/审计 + 媒资网关 + CDC 生命周期 |
 | `fastsearch-mcp` | 第四张脸：MCP(stdio+JSON-RPC) 暴露 `search`/`resolve_citation` 工具 |
-| `fastsearch-cli` | `fastsearch` 二进制：index / index-dir / search / ingest(PDF) / eval |
+| `fastsearch-cli` | `fastsearch` 二进制：index / index-dir / search / **ingest（多格式：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/图片 + OCR + 表格识别）** / eval —— 见[文件解析与摄取](docs/文件解析与摄取.md) |
 | `clients/{python,ts}` | 零依赖 SDK + LangChain/LlamaIndex 适配 |
 
 **端到端可用**：ingest/CDC → 索引 → 三模式检索（keyword/vector/hybrid）→ 带引用命中，ACL 强制不可绕过。四张脸齐全。
@@ -63,6 +63,7 @@ DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG 集成（CI 用 p
 ## 文档
 
 - **[在 Agent 中使用 fastsearch](docs/在Agent中使用fastsearch.md)**（开发者使用指南）
+- **[文件解析与摄取](docs/文件解析与摄取.md)**（多格式摄取 · OCR · 表格识别 · 构建分档 · 模型配置）
 - [架构速查 / 命令 / 不变量（CLAUDE.md）](CLAUDE.md)
 - [模块拆分与 spec 索引](docs/specs/00-模块拆分.md)
 - [需求分析](docs/plans/2026-06-24-需求分析报告.md) · [产品设计](docs/plans/2026-06-24-产品设计文档.md)
