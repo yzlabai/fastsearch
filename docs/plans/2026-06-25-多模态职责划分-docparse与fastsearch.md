@@ -76,7 +76,7 @@
 | 时间区间 | ⏳ **待加** `time: Option<TimeSpan{start_ms,end_ms}>` | ✅ `TimeSpan` 挂 `MediaRef.time` / `Citation.time` | SRT/VTT 时间码待从 text 迁到此字段（**docparse 侧待对齐**） |
 | 模态 | ⏳ `kind` **待加** `Audio`/`Video` | ✅ `ChunkKind::{Audio,Video}` + `modality()` 派生 | fastsearch 过滤已用（两端 SUPERSET 下推） |
 | 媒资指针 | ✅ 现有 `ImageMeta{file,data_base64,media_type}` | ✅ `MediaRef{asset:AssetPointer,...}`；CLI `map_image` 适配 | docparse `data_base64→Inline`、`file→Object`、皆无→`DocRegion` |
-| inline 字节 | ✅ `data_base64`（base64） | ✅ `Chunk.media_bytes`（PG `media_bytes` 真源，MM2c-bytes） | 字节经 `PgStore::upsert_doc` 落 PG（库/外部写入路径）；**CLI `index` 仅写本地索引、不写 PG**，故无 CLI 字节携带——CLI→PG 属独立命令特性 |
+| inline 字节 | ✅ `data_base64`（base64） | ✅ `Chunk.media_bytes`（PG `media_bytes` 真源，MM2c-bytes） | 字节经 `PgStore::upsert_doc` 落 PG（库/外部写入路径）；**`/v1/index`（含 CLI 客户端）写引擎派生索引、非 PG 真源**，故 inline 字节由 `upsert_doc` 类真源写入者落、不经此路 |
 | caption 来源 | ✅ `caption`/`caption_source` | ✅ 对齐（caption 进 `text`、`caption_source` 进 `MediaRef`） | — |
 
 **现状（2026-06-27）**：**fastsearch 侧 schema 扩展已 MM1 落地**（非 MM1 前置阻塞——该假设已过时）。剩余唯一硬协调点 = **docparse 侧 `chunk.rs` 补 `time` 字段 + `Audio/Video` kind**，使其输出的 chunk 能直接喂 fastsearch（一次 docparse 侧 schema 评审，两仓字段名/语义对齐）。

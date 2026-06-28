@@ -8,6 +8,7 @@
 >
 > ### ⚑ 落地回写（2026-06-27，实施后核对代码修正本计划）
 > - **关键修正**：计划原设"CLI 把 docparse `data_base64` 解码进 `media_bytes`"（§4.1/§5/§8）。**核对代码后此前提不成立**：CLI `cmd_index`/`cmd_ingest` 经 `engine.ingest()` **只写本地 Tantivy 索引、不写 PG**（[engine lib.rs](../../crates/fastsearch-engine/src/lib.rs) `ingest()→text.upsert()`），且 `media_bytes` 是 transient 字段、不进派生索引——**CLI 根本不是 PG 写入者，无字节可携带**。字节生产者是 **`PgStore::upsert_doc`**（库/外部 PG 写入路径，已绑 `media_bytes` 第 13 参）。"CLI 直写 PG 真源"属另一独立命令特性（非 base64 依赖问题），本期不做。故下文 §4.1/§5/§8 中"CLI 携带 base64"已作废，以本框为准。
+> - **更新（2026-06-28）**：CLI 已**改为 server 的纯 REST 客户端**（[设计](2026-06-28-CLI改为REST客户端设计.md)），不再嵌引擎/写本地 Tantivy。上文"CLI 经 engine.ingest 写本地索引"描述是 2026-06-27 的现状；现在 CLI 走 `/v1/index`（server 写**引擎派生索引**、非 PG）。结论不变：inline 字节仍由 `upsert_doc` 类真源写入者落，不经 CLI/`/v1/index`。
 > - **已落地**：E1–E6 全部实现并验证（见 §3 表与 §4 各 crate）。MM2c-bytes（`upsert_doc`→`media_bytes`→`fetch_media_bytes`）、MM6-inline（engine `source_pg` + `resolve_citation` Inline→InlineBytes + server `/v1/asset` 吐字节 + HTTP E2E）、MM6-secure（无签名器 Object→404 不泄露裸 key）均收口三绿 + Docker 真机。
 > - **§4.2 CDC 决策已定**：**CDC 不搬字节**（复制流只搬指针，`media_bytes` 仅供网关按需直查），减小复制流。
 > - **未落地**：MM6-signer（真 S3 presign）、MM6-range（HTTP Range）仍 `gated`（对象存储）。
