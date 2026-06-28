@@ -124,8 +124,9 @@ impl McpServer {
                     AssetFetch::SignedUrl { url, expires_s } => json!({
                         "kind": "signed_url", "url": url, "expires_s": expires_s,
                     }),
-                    AssetFetch::InlineBytes(bytes) => json!({
-                        "kind": "inline_bytes", "len": bytes.len(),
+                    AssetFetch::InlineRef => json!({
+                        // inline 小图：字节在 PG 真源，经 REST `GET /v1/asset/{cid}` 取（MCP 只给指针）。
+                        "kind": "inline_ref",
                     }),
                 };
                 json!({ "found": true, "media_type": a.media_type, "time": a.time, "fetch": fetch })

@@ -63,7 +63,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - [x] v1.2：**限流/admission control**（`with_rate_limit(capacity, refill_per_sec)`，每 key 令牌桶，超限 429 + 计数）+ **审计日志**（`with_audit(sink)`，每个成功请求发 `AuditEvent{endpoint,tenant,tags,query,collection,doc_id,hits,status}`）。二进制经 `FASTSEARCH_RATE_LIMIT="cap,refill"` / `FASTSEARCH_AUDIT=1`（stderr JSON）接入。+2 测试，活服务验证（cap=2→`200 429 429`，审计 JSON 落 stderr）。
 
 - [x] v1.6（2026-06-26）：**媒资 ACL 网关** `GET /v1/asset/{cid}`（`principal→acl_for→resolve_citation`；
-  DocRender JSON / 302 SignedUrl / InlineBytes 字节；越权/不存在 404 不泄漏存在性，+测试 `asset_acl_not_bypassable`）；
+  DocRender JSON / 302 SignedUrl / InlineRef→按需 `fetch_inline_bytes` 吐字节；越权/不存在 404 不泄漏存在性，+测试 `asset_acl_not_bypassable`）；
   **深分页** `search_after` 经 serde 透传 + 响应每命中带 `cursor`（+REST 翻页测试）；media/time 透出命中；
   `FASTSEARCH_VECTOR_BACKEND=hnsw|pgvector`（首启选档 / pgvector `set_pg_vector`）。OpenAPI 同步新端点。
 - [x] v1.7（2026-06-27，MM6-inline/secure）：main 装配 `set_source_store`（gated DATABASE_URL，任意向量后端）→

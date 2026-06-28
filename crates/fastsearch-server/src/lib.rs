@@ -379,7 +379,7 @@ fn openapi_spec() -> Value {
                 "get": {
                     "summary": "媒资 ACL 网关（resolve_citation；不可见/不存在均 404）",
                     "responses": {
-                        "200": {"description": "InlineBytes 字节 / DocRender JSON（跳原文 page+bbox）"},
+                        "200": {"description": "inline 字节（按需从 PG 真源取）/ DocRender JSON（跳原文 page+bbox）"},
                         "302": {"description": "SignedUrl 重定向到短时签名 URL"},
                         "401": {"description": "认证失败"},
                         "404": {"description": "不可见或不存在"}
@@ -618,7 +618,7 @@ async fn similar(
 }
 
 /// 媒资 ACL 网关：`GET /v1/asset/{citation_id}` —— `principal→acl_for→resolve_citation`，
-/// ACL 不可绕过（不可见/不存在均 404，不暴露存在性）。InlineBytes 直吐字节（PG 真源，MM6-inline）、
+/// ACL 不可绕过（不可见/不存在均 404，不暴露存在性）。InlineRef 按需从 PG 真源取字节直吐（MM6-inline）、
 /// SignedUrl 302（由 `ObjectSigner` 签短时 URL；**未配签名器时 Object→404，绝不暴露裸 key**，MM6-secure）、
 /// DocRender 返回跳原文 JSON。Range（音视频 seek）待对象存储接入。
 async fn asset(
@@ -643,7 +643,7 @@ async fn asset(
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
-    drop(engine);
+    // engine 保持锁定到 InlineRef 取字节后（resolve 已定位+ACL；inline 字节按需 fetch_inline_bytes）。
     let status = if resolved.is_some() { 200 } else { 404 };
     s.emit_audit(AuditEvent {
         endpoint: "/v1/asset",
@@ -670,12 +670,20 @@ async fn asset(
         }))
         .into_response(),
         AssetFetch::SignedUrl { url, .. } => Redirect::temporary(&url).into_response(),
-        AssetFetch::InlineBytes(bytes) => {
-            let ct = a
-                .media_type
-                .unwrap_or_else(|| "application/octet-stream".into());
-            ([(header::CONTENT_TYPE, ct)], bytes).into_response()
-        }
+        // inline：resolve 已定位+ACL，按需从 PG 真源取字节（authed 出口，已授权）→ 吐字节 + Content-Type。
+        AssetFetch::InlineRef => match engine.fetch_inline_bytes(&cid) {
+            Ok(Some(bytes)) => {
+                let ct = a
+                    .media_type
+                    .unwrap_or_else(|| "application/octet-stream".into());
+                ([(header::CONTENT_TYPE, ct)], bytes).into_response()
+            }
+            Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+            Err(e) => {
+                s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        },
     }
 }
 

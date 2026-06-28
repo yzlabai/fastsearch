@@ -144,8 +144,8 @@ curl -H "Authorization: Bearer $KEY" -d '{"ids":["kb:report.pdf:42"]}' \
 
 | 序 | 项 | crate | 资源 | 验证 |
 |---|---|---|---|---|
-| S1 | engine `AssetFetch::InlineRef` + `fetch_inline_bytes`（无 acl，token 后用） | engine | 本环境+Docker | 单测 + Docker 取字节一致 |
-| S2 | server inline 签名：HMAC token + `/v1/asset/{cid}/bytes` token 端点 + 装配密钥/TTL | server | 本环境 | 签发/验签/过期/篡改单测 |
+| S1 | ✅ engine `AssetFetch::InlineRef`（取代 `InlineBytes`）+ `fetch_inline_bytes(cid)->Result<Option<Vec<u8>>>`（无 acl）；resolve Inline 只定位；server/MCP 消费方分流 | engine,server,mcp | 本环境+Docker | **done**（本环境 `fetch_inline_bytes_without_source_pg_is_none` + Docker `mm6_inline_serves_bytes_from_source_pg` 更新；行为保持）。注：字节面只返字节，`media_type` authed 端经 resolve、token 端经 S2 token 携带 |
+| S2 | server inline 签名：HMAC token + `/v1/asset/{cid}/bytes` token 端点 + 装配密钥/TTL（媒资 `ct` 入签名，免 PG 再查 media_type） | server | 本环境 | 签发/验签/过期/篡改单测 |
 | S3 | server `POST /v1/assets/resolve` 批量解析 + ACL 强制 + OpenAPI | server | 本环境+Docker | 越权不返回 URL + 端到端渲染 |
 | S4 | object 档真 `ObjectSigner`（S3 兼容 presign） | engine | gated（对象存储） | 待运行验证（MinIO/S3） |
 | S5 | clients SDK `resolve_assets` + 前端示例（可选） | clients | 本环境 | SDK 自测 |

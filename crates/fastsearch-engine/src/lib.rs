@@ -197,11 +197,12 @@ pub struct ResolvedAsset {
     pub media_type: Option<String>,
 }
 
-/// 取媒资字节的方式。
+/// 取媒资字节的方式（`resolve_citation` 只定位、不取字节；inline 字节经 [`Engine::fetch_inline_bytes`] 按需取）。
 #[derive(Debug, Clone)]
 pub enum AssetFetch {
-    /// 内联字节（小裁图，字节在 PG `media_bytes`——MM2 接入；当前引擎索引无字节）。
-    InlineBytes(Vec<u8>),
+    /// inline 小图：字节在 PG `media_bytes` 真源、**此 cid 可取**（已过 ACL）。字节由网关按需经
+    /// `fetch_inline_bytes` 取（不随 resolve 取，省一次 PG 读；也便于签发短时 URL，MM6-signer）。
+    InlineRef,
     /// 对象存储**短时签名 URL**（由 [`ObjectSigner`] 签发；绝不含裸 key，不变量 #3）。
     SignedUrl { url: String, expires_s: u64 },
     /// 无独立字节：跳转到原文位置（page+bbox），答案层据此深链/高亮。
@@ -472,6 +473,33 @@ impl Engine {
         self.source_pg = Some(store);
     }
 
+    /// 取 inline 媒资字节（`AssetFetch::InlineRef` 的字节面，MM6-inline/signer）。从 PG `media_bytes`
+    /// 真源按需直查（block_in_place 桥接异步 PG，要求 multi-thread runtime）。
+    ///
+    /// **不带 ACL**：调用方须已授权——authed 网关先过 `resolve_citation` 的 ACL，或 token 端点已验签
+    /// （token 即"已授权"凭证，MM6-signer）。**仅供这些已授权出口内部调用，勿新挂别的入口。**
+    /// 无 `source_pg` / cid 非法 / 无字节 → `Ok(None)`（网关 404）。
+    pub fn fetch_inline_bytes(&self, cid: &str) -> Result<Option<Vec<u8>>> {
+        let gid = match GlobalId::parse(cid) {
+            Ok(g) => g,
+            Err(_) => return Ok(None),
+        };
+        match &self.source_pg {
+            Some(pg) => {
+                let bytes = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(pg.fetch_media_bytes(
+                        &gid.collection,
+                        &gid.doc_id,
+                        gid.chunk_id,
+                    ))
+                })
+                .map_err(|e| EngineError::Vector(format!("fetch media_bytes: {e}")))?;
+                Ok(bytes)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// 配置 **对象存储签名器（MM6-secure）**：`resolve_citation` 的 `Object` 路径据此签短时 URL。
     /// **不配置则 `Object` 一律 404（不暴露裸 key，不变量 #3）**。真实现（S3 presign 类）gated 对象存储。
     pub fn set_object_signer(&mut self, signer: Box<dyn ObjectSigner>) {
@@ -582,24 +610,11 @@ impl Engine {
                 },
                 None => return Ok(None),
             },
-            // Inline 字节在 PG media_bytes 真源（MM6-inline）：有真源句柄则按需直查取字节；
-            // 无句柄 / 无字节 → None（等同 404）。block_in_place 桥接同步 resolve↔异步 PG
-            // （要求 multi-thread runtime，同 B6）。ACL 已在上方强制，此处仅取已授权 chunk 的字节。
+            // Inline 字节在 PG media_bytes 真源（MM6-inline）：resolve 只**定位**（ACL 已在上方强制）、
+            // 不取字节——返回 InlineRef，字节由网关按需经 `fetch_inline_bytes` 取（省一次 PG 读，
+            // 也便于签发短时 URL）。无真源句柄 → 无从取字节 → None（等同 404）。
             AssetPointer::Inline => match &self.source_pg {
-                Some(pg) => {
-                    let bytes = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(pg.fetch_media_bytes(
-                            &gid.collection,
-                            &gid.doc_id,
-                            gid.chunk_id,
-                        ))
-                    })
-                    .map_err(|e| EngineError::Vector(format!("fetch media_bytes: {e}")))?;
-                    match bytes {
-                        Some(b) => AssetFetch::InlineBytes(b),
-                        None => return Ok(None),
-                    }
-                }
+                Some(_) => AssetFetch::InlineRef,
                 None => return Ok(None),
             },
         };
@@ -1077,6 +1092,14 @@ mod tests {
         Engine::create_in_ram(TextIndexConfig::default()).unwrap()
     }
 
+    /// 无 source_pg 时 fetch_inline_bytes → None（本环境，无 PG）；非法 cid 亦 None。
+    #[test]
+    fn fetch_inline_bytes_without_source_pg_is_none() {
+        let e = engine();
+        assert_eq!(e.fetch_inline_bytes("kb:d.pdf:1").unwrap(), None);
+        assert_eq!(e.fetch_inline_bytes("not-a-valid-cid").unwrap(), None);
+    }
+
     fn req(query: &str) -> SearchRequest {
         SearchRequest {
             query: query.into(),
@@ -1368,16 +1391,23 @@ mod tests {
             tenant: Some("acme".into()),
             allowed_tags: vec!["team-b".into()],
         };
-        // 授权 → InlineBytes（真源字节）+ Content-Type。
+        // 授权 → InlineRef（定位，不取字节）+ Content-Type；字节经 fetch_inline_bytes 取。
         let r = engine
             .resolve_citation("kb:d.pdf:1", Some(&acl_ok))
             .unwrap()
             .expect("authorized → Some");
-        match r.fetch {
-            AssetFetch::InlineBytes(b) => assert_eq!(b, bytes, "应吐 PG 真源字节"),
-            other => panic!("expected InlineBytes, got {other:?}"),
-        }
+        assert!(
+            matches!(r.fetch, AssetFetch::InlineRef),
+            "expected InlineRef, got {:?}",
+            r.fetch
+        );
         assert_eq!(r.media_type.as_deref(), Some("image/png"));
+        // 字节面：fetch_inline_bytes 取 PG 真源字节（已授权出口）。
+        assert_eq!(
+            engine.fetch_inline_bytes("kb:d.pdf:1").unwrap(),
+            Some(bytes.clone()),
+            "应取 PG 真源字节"
+        );
         // 越权 → None（ACL 不可绕过，不暴露存在性/字节）。
         assert!(engine
             .resolve_citation("kb:d.pdf:1", Some(&acl_no))

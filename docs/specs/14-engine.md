@@ -69,11 +69,13 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
   `run()` 末端按"严格在游标之后"过滤后截 top_k；与 fusion/rerank 最终排序一致、平铺无重叠/遗漏。
 - [x] v2.2（A14）：**单集合原地重建** `rebuild_from(rows)`——清空 text+vector → 从真源重灌 → commit。
 - [x] v2.3（MM6）：**媒资解析** `resolve_citation(cid, acl) -> Option<ResolvedAsset{fetch,time,media_type}}`
-  （`AssetFetch::DocRender/SignedUrl/InlineBytes`），ACL 强制（不可见/不存在均 None=404）。
-- [x] v2.5（MM6-inline，2026-06-27，**Docker 真机验证**）：`source_pg` 真源句柄 + `set_source_store`；
-  `resolve_citation` 的 `Inline` 路径从 PG `media_bytes` 真源 `block_in_place` 按需取字节 → `InlineBytes`
-  （字节是真源、引擎派生层不持；要求 multi-thread runtime，同 B6）。集成 `mm6_inline_serves_bytes_from_source_pg`
-  （授权吐真源字节、越权 None）。
+  （`AssetFetch::DocRender/SignedUrl/InlineRef`），ACL 强制（不可见/不存在均 None=404）。
+- [x] v2.5（MM6-inline，2026-06-27/28，**Docker 真机验证**）：`source_pg` 真源句柄 + `set_source_store`。
+  `resolve_citation` 的 `Inline` 路径只**定位**（ACL 强制）→ `AssetFetch::InlineRef`（不随 resolve 取字节，
+  省一次 PG 读、便于签短时 URL，MM6-signer S1）；字节经 **`fetch_inline_bytes(cid)`**（无 acl，已授权出口用：
+  authed 网关先过 resolve ACL / token 端点已验签）从 PG `media_bytes` 真源 `block_in_place` 直查（multi-thread
+  runtime，同 B6）。集成 `mm6_inline_serves_bytes_from_source_pg`（授权 InlineRef + fetch_inline_bytes 吐真源字节、
+  越权 None）；本环境 `fetch_inline_bytes_without_source_pg_is_none`。
 - [x] v2.6（MM6-secure，2026-06-27）：`ObjectSigner` trait + `set_object_signer`；`resolve_citation` 的 `Object`
   路径**必须经签名器签短时 URL，未配签名器 → None（404），绝不回退裸 key**（堵不变量 #3 漏洞）。单测
   `mm6_secure_object_no_signer_is_404` / `mm6_secure_object_with_signer_signs`（签名 URL 不含 `s3://`）。
