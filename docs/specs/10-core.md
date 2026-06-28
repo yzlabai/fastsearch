@@ -33,6 +33,7 @@ pub struct Chunk {
     pub section_id: u64,
     pub char_len: u32,
     pub media: Option<MediaRef>, // 媒资引用（替换原 image_meta，统一目标，MM2b）
+    pub media_bytes: Option<Vec<u8>>, // inline 媒资字节（小裁图，AssetPointer::Inline 时有值；落 PG bytea 真源，MM2c-bytes）。transient 写侧通道：serde skip、不进 JSON 线缆/不上 Citation
     pub tenant: Option<String>,
     pub acl: Vec<String>,         // 默认 ["public"]
 }
@@ -80,14 +81,21 @@ pub struct SearchRequest {
     pub fusion: Fusion,
     pub filter: Option<Filter>,
     pub vector: Option<Vec<f32>>, // 外部提供向量；None 则需 embedder
+    pub query_image: Option<Vec<u8>>, // 以图搜图查询图字节（MM9）；vector=None 时用支持图像的后端嵌成查询向量
     pub embedder: Option<String>,
     pub candidates: usize,        // 宽召回数，默认 150
     pub top_k: usize,             // 最终返回数，默认 20
     pub rerank: Option<RerankSpec>,
     pub auto_merge: bool,
+    pub collapse: Option<Collapse>,    // 分组折叠（None=不折叠）
+    pub search_after: Option<String>,  // 深分页游标（不透明 token，取自上页末条 cursor()）
     pub highlight: bool,
+    pub facets: Vec<String>,           // 请求分面的字段（当前支持 kind / doc_id）
     pub explain: bool,
 }
+
+pub struct RerankSpec { pub model: String, pub top_k: usize /* 默认 20 */ }
+pub struct Collapse  { pub field: String /* doc_id / section_id */, pub max_per_group: usize /* 默认 1，validate 要求 >0 */ }
 ```
 - 默认值：mode=Hybrid，fusion=RRF{60}，candidates=150，top_k=20。
 - `validate() -> Result<(), CoreError>`：top_k>0、candidates>=top_k、semantic_ratio∈[0,1]、rank_constant>0。
@@ -191,3 +199,4 @@ pub enum CoreError { InvalidRequest(String), InvalidCitation(String), InvalidFil
 
 - 2026-06-24 v1：首版，数据模型 + 查询/过滤 AST + 融合 + 引用 + 错误，单测覆盖 §5。
 - 2026-06-27 回写多模态（MM1，代码已实现）：`ChunkKind` 加 `Audio`/`Video` + `ChunkKind::modality()`；新增 `Modality`/`TimeSpan`/`AssetPointer`/`MediaRef`（§2.1b）；`Chunk.image_meta`→`media`（MM2b，`ImageMeta` 降级为迁移用 `to_media`）；`text` 语义放宽为"可空串的可检索文本表示"；`Citation` 加 `time`/`media`（§2.5）。设计见 [多模态功能设计与开发计划](../plans/2026-06-25-多模态功能设计与开发计划.md)；单测覆盖 modality 派生/serde/citation 回环。
+- 2026-06-28 回写 spec 漂移（代码已实现，spec 落后）：`Chunk` 加 `media_bytes`（MM2c-bytes，inline 字节，serde skip）；`SearchRequest` 加 `query_image`（MM9 以图搜图）、`collapse`（分组折叠）、`search_after`（深分页游标）、`facets`（请求分面字段）；补 `RerankSpec`/`Collapse` 类型定义（§2.2）。均为补文档、无代码改动。
