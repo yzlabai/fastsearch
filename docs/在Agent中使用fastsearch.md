@@ -31,13 +31,15 @@
 不需要 PG、不需要模型——喂一个**文件夹**就能检索：
 
 ```bash
-cargo build -p fastsearch-cli --bin fastsearch
+cargo build -p fastsearch-server -p fastsearch-cli
+# ⓪ CLI 是瘦 REST 客户端——先起 server（索引/嵌入/落盘都在 server）
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" ./target/debug/fastsearch-server &   # REST :8642
 
 # ① 喂一个资料文件夹（递归 .md/.txt，markdown 标题自动成面包屑）
-./target/debug/fastsearch index-dir --data ./idx --collection kb  ./我的资料
+./target/debug/fastsearch index-dir --server http://localhost:8642 --key dev --collection kb ./我的资料
 
 # ② 检索（带 page+heading_path 溯源；--json 给结构化输出）
-./target/debug/fastsearch search --data ./idx --collection kb --query "毛利率" --json
+./target/debug/fastsearch search --server http://localhost:8642 --key dev --collection kb --query "毛利率" --json
 ```
 
 输出（每条命中带可溯源引用）：

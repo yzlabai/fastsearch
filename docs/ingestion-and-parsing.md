@@ -16,9 +16,9 @@
 # 1) Build the CLI with parsing (multi-format, lightweight, no ONNX)
 cargo build -p fastsearch-cli --features parse --bin fastsearch
 
-# 2) Ingest a file (parser chosen by extension) → on-disk index
-./target/debug/fastsearch ingest --data ./idx --collection kb --doc-id report.docx report.docx
-./target/debug/fastsearch search --data ./idx --collection kb --query "gross margin" --json
+# 2) Ingest a file: CLI parses client-side (parser chosen by extension) → POST /v1/index (server must be running)
+./target/debug/fastsearch ingest --server http://localhost:8642 --key dev --collection kb --doc-id report.docx report.docx
+./target/debug/fastsearch search --server http://localhost:8642 --key dev --collection kb --query "gross margin" --json
 ```
 
 Supported formats (`--features parse`): **PDF · DOCX · HTML · Markdown · CSV · XLSX · PPTX · SRT (subtitles) · EML (email) · images**.
@@ -60,7 +60,7 @@ documents that already have a text layer **do not trigger OCR** (saves compute).
 ```bash
 cargo build -p fastsearch-cli --features parse-ocr --bin fastsearch
 FASTSEARCH_OCR_MODELS=/path/to/models/ppocr-v5 \
-  ./target/debug/fastsearch ingest --data ./idx --collection kb --doc-id scan.png scan.png
+  ./target/debug/fastsearch ingest --server http://localhost:8642 --key dev --collection kb --doc-id scan.png scan.png
 # stderr: "OCR: 1/1 页经增强（PP-OCR）"
 ```
 
@@ -78,7 +78,7 @@ this line chart say"); that's the part needing an external HTTP service.
 ```bash
 cargo build -p fastsearch-cli --features parse-tables --bin fastsearch
 FASTSEARCH_UNIREC_MODELS=/path/to/models/unirec \
-  ./target/debug/fastsearch ingest --data ./idx --collection kb --doc-id r.pdf r.pdf
+  ./target/debug/fastsearch ingest --server http://localhost:8642 --key dev --collection kb --doc-id r.pdf r.pdf
 # stderr: "UniRec: 重识别 N 个表格结构（非 VLM）"
 ```
 

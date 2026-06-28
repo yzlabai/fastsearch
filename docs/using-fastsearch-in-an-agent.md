@@ -31,13 +31,15 @@ Why pick it for Agent development (vs. a pure vector store / pure keyword index)
 No PG, no model needed — feed it a **folder** and search:
 
 ```bash
-cargo build -p fastsearch-cli --bin fastsearch
+cargo build -p fastsearch-server -p fastsearch-cli
+# ⓪ The CLI is a thin REST client — start a server first (it does indexing/embedding/persistence)
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" ./target/debug/fastsearch-server &   # REST :8642
 
 # ① Feed a folder (recurses .md/.txt; markdown headings auto-become breadcrumbs)
-./target/debug/fastsearch index-dir --data ./idx --collection kb  ./my-docs
+./target/debug/fastsearch index-dir --server http://localhost:8642 --key dev --collection kb ./my-docs
 
 # ② Search (results carry page + heading_path provenance; --json for structured output)
-./target/debug/fastsearch search --data ./idx --collection kb --query "gross margin" --json
+./target/debug/fastsearch search --server http://localhost:8642 --key dev --collection kb --query "gross margin" --json
 ```
 
 Output (each hit carries a traceable citation):
