@@ -8,7 +8,7 @@
 //! - `FASTSEARCH_RATE_LIMIT`：`capacity,refill_per_sec`（每 key 令牌桶）；未设=不限流。
 //! - `FASTSEARCH_AUDIT`：设为 `1`/`stderr` 则每个成功请求向 stderr 输出一行审计 JSON。
 //! - `FASTSEARCH_EMBEDDER` = `hash`|`ollama`|`openai`（+ `FASTSEARCH_EMBED_*`）：真语义嵌入后端。
-//! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`hnsw`|`pgvector`：向量后端。hnsw=引擎侧近似
+//! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`brute_binary`|`brute_binary_rotated`|`hnsw`|`pgvector`：向量后端。hnsw=引擎侧近似
 //!   ANN（大规模、近似+非确定，仅首启生效）；pgvector=直查档（ANN 在 PG 跑，需 `DATABASE_URL` +
 //!   embedding 已入 PG，引擎写穿为下一迭代）。
 //! - `FASTSEARCH_CDC=1`（+ `DATABASE_URL`，可选 `FASTSEARCH_CDC_SLOT`/`_PUBLICATION`/`_INTERVAL_MS`）：
@@ -99,18 +99,22 @@ async fn main() -> anyhow::Result<()> {
     };
     // 向量后端：FASTSEARCH_VECTOR_BACKEND=hnsw 用 HNSW 近似（大规模，近似+非确定）；
     // `brute_binary` 暴力 + 二值量化粗筛（大集合更快、仍确定，oversample 由
-    // FASTSEARCH_BINARY_OVERSAMPLE 调，默认 8）；默认 brute 暴力精确。仅首启（无检查点）生效；
-    // 已建索引沿用其记录的后端。
+    // FASTSEARCH_BINARY_OVERSAMPLE 调，默认 8）；`brute_binary_rotated` 再叠 RaBitQ 随机旋转
+    // （召回更高、尤利各向异性嵌入）；默认 brute 暴力精确。仅首启（无检查点）生效；已建索引沿用记录的后端。
     let backend = match std::env::var("FASTSEARCH_VECTOR_BACKEND").as_deref() {
         Ok("hnsw") => {
             fastsearch_engine::VectorBackendKind::Hnsw(fastsearch_engine::HnswParams::default())
         }
-        Ok("brute_binary") => {
+        Ok(v @ ("brute_binary" | "brute_binary_rotated")) => {
             let m = std::env::var("FASTSEARCH_BINARY_OVERSAMPLE")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(fastsearch_engine::DEFAULT_BINARY_OVERSAMPLE);
-            fastsearch_engine::VectorBackendKind::BruteBinary(m)
+            if v == "brute_binary_rotated" {
+                fastsearch_engine::VectorBackendKind::BruteBinaryRotated(m)
+            } else {
+                fastsearch_engine::VectorBackendKind::BruteBinary(m)
+            }
         }
         _ => fastsearch_engine::VectorBackendKind::Brute,
     };

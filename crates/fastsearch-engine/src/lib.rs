@@ -298,6 +298,9 @@ impl Engine {
             "brute_binary" => {
                 VectorBackendKind::BruteBinary(fastsearch_vector::DEFAULT_BINARY_OVERSAMPLE)
             }
+            "brute_binary_rotated" => {
+                VectorBackendKind::BruteBinaryRotated(fastsearch_vector::DEFAULT_BINARY_OVERSAMPLE)
+            }
             _ => default_backend,
         };
         let vector = VectorStore::load(kind, &vector_path(data_dir))
@@ -2143,6 +2146,45 @@ mod tests {
             e2.vector.kind_str(),
             "brute_binary",
             "检查点应恢复粗筛档（覆盖默认 brute）"
+        );
+        let mut r = req("");
+        r.mode = SearchMode::Vector;
+        r.vector = Some(vec![1.0, 0.0]);
+        assert_eq!(e2.search(&r, None).unwrap()[0].id.chunk_id, 1);
+    }
+
+    /// 旋转粗筛后端化：首启 `BruteBinaryRotated` → 检查点记 `brute_binary_rotated` → 重开（默认
+    /// `Brute`）仍恢复旋转档（load 重建旋转矩阵）；检索可用。
+    #[test]
+    fn persist_reopen_restores_brute_binary_rotated_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut e, _) = Engine::open_with(
+            dir.path(),
+            TextIndexConfig::default(),
+            VectorBackendKind::BruteBinaryRotated(8),
+        )
+        .unwrap();
+        assert_eq!(e.vector.kind_str(), "brute_binary_rotated");
+        e.ingest_vector(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha", 1),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        e.persist(dir.path(), Lsn(9)).unwrap();
+        drop(e);
+
+        let (e2, lsn) = Engine::open_with(
+            dir.path(),
+            TextIndexConfig::default(),
+            VectorBackendKind::Brute,
+        )
+        .unwrap();
+        assert_eq!(lsn, Lsn(9));
+        assert_eq!(
+            e2.vector.kind_str(),
+            "brute_binary_rotated",
+            "检查点应恢复旋转粗筛档（覆盖默认 brute）"
         );
         let mut r = req("");
         r.mode = SearchMode::Vector;

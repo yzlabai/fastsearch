@@ -30,6 +30,9 @@ pub enum VectorBackendKind {
     /// 暴力 + **二值量化两阶段粗筛**（大集合更快、仍确定；on-disk 格式同 `Brute` 的 f32，
     /// 仅检索策略不同）。`usize` = oversample。
     BruteBinary(usize),
+    /// 同 `BruteBinary` + **RaBitQ 随机旋转**（旋转空间打分，召回更高、尤利各向异性数据；
+    /// on-disk 仍 f32，矩阵由固定种子重建不落盘）。`usize` = oversample。
+    BruteBinaryRotated(usize),
     /// HNSW 近似（大规模 opt-in；近似召回 + 非确定，见 [`HnswVectorIndex`]）。
     Hnsw(HnswParams),
 }
@@ -48,6 +51,9 @@ impl VectorStore {
             VectorBackendKind::BruteBinary(m) => {
                 VectorStore::Brute(MemVectorIndex::with_binary_prefilter(m))
             }
+            VectorBackendKind::BruteBinaryRotated(m) => {
+                VectorStore::Brute(MemVectorIndex::with_binary_prefilter_rotated(m))
+            }
             VectorBackendKind::Hnsw(p) => VectorStore::Hnsw(Box::new(HnswVectorIndex::new(p))),
         }
     }
@@ -56,6 +62,11 @@ impl VectorStore {
     /// `"brute_binary"` 以便重开时恢复粗筛档（oversample 取默认，同 HNSW 参数策略）。
     pub fn kind_str(&self) -> &'static str {
         match self {
+            VectorStore::Brute(m)
+                if m.binary_oversample().is_some() && m.rabitq_rotation_enabled() =>
+            {
+                "brute_binary_rotated"
+            }
             VectorStore::Brute(m) if m.binary_oversample().is_some() => "brute_binary",
             VectorStore::Brute(_) => "brute",
             VectorStore::Hnsw(_) => "hnsw",
@@ -109,6 +120,12 @@ impl VectorStore {
             VectorBackendKind::BruteBinary(m) => {
                 let mut idx = MemVectorIndex::load(path)?;
                 idx.set_binary_prefilter(Some(m));
+                VectorStore::Brute(idx)
+            }
+            VectorBackendKind::BruteBinaryRotated(m) => {
+                let mut idx = MemVectorIndex::load(path)?;
+                idx.set_binary_prefilter(Some(m));
+                idx.set_rabitq_rotation(true); // 重建旋转矩阵 + 旋转空间重算 code/l1
                 VectorStore::Brute(idx)
             }
             VectorBackendKind::Hnsw(_) => VectorStore::Hnsw(Box::new(HnswVectorIndex::load(path)?)),
@@ -298,6 +315,28 @@ impl MemVectorIndex {
     /// 当前二值粗筛 oversample（`None`=精确暴力档）。
     pub fn binary_oversample(&self) -> Option<usize> {
         self.binary_oversample
+    }
+
+    /// 是否开了 RaBitQ 随机旋转粗筛（`kind_str` 据此区分 `brute_binary` / `brute_binary_rotated`）。
+    pub fn rabitq_rotation_enabled(&self) -> bool {
+        self.rabitq_rotation
+    }
+
+    /// 开/关 RaBitQ 随机旋转并**在新空间重算所有 code/l1**（供 load 后翻档；同 `set_binary_prefilter`
+    /// 的"策略不落盘、调用方设"模式）。开启时按固定种子重建旋转矩阵。
+    pub fn set_rabitq_rotation(&mut self, enabled: bool) {
+        self.rabitq_rotation = enabled;
+        self.rotation = None;
+        if enabled {
+            self.ensure_rotation();
+        }
+        let rot = self.rotation.take(); // 取出避免与 entries 可变借用冲突
+        for e in self.entries.values_mut() {
+            let coded = rot.as_ref().map(|r| r.apply(&e.vector));
+            e.code = binary::pack_signs(coded.as_deref().unwrap_or(&e.vector));
+            e.l1 = binary::l1_norm(coded.as_deref().unwrap_or(&e.vector));
+        }
+        self.rotation = rot;
     }
 
     /// 取某 gid 的引用（命中组装用）。
@@ -1051,6 +1090,45 @@ mod tests {
             .map(|s| s.id.chunk_id)
             .collect();
         assert_eq!(before, after, "落盘往返结果应一致");
+    }
+
+    /// 旋转档后端化：`VectorStore` 的 `BruteBinaryRotated`——`kind_str="brute_binary_rotated"`、
+    /// 落盘往返（load 重建旋转矩阵 + 旋转空间重算 code）后仍旋转档、结果一致。
+    #[test]
+    fn vectorstore_brute_binary_rotated_roundtrip() {
+        let mut s = VectorStore::new(VectorBackendKind::BruteBinaryRotated(8));
+        assert_eq!(s.kind_str(), "brute_binary_rotated");
+        for i in 0..40u64 {
+            s.upsert(
+                gid("d", i),
+                aniso_vec(i, 48),
+                meta("d", i, "paragraph", i as u32, vec!["public"]),
+            )
+            .unwrap();
+        }
+        let q = aniso_vec(777, 48);
+        let before: Vec<u64> = s
+            .search(&q, 6, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vector.bin");
+        s.save(&path).unwrap();
+        let reloaded = VectorStore::load(VectorBackendKind::BruteBinaryRotated(8), &path).unwrap();
+        assert_eq!(
+            reloaded.kind_str(),
+            "brute_binary_rotated",
+            "重载应保持旋转粗筛档"
+        );
+        let after: Vec<u64> = reloaded
+            .search(&q, 6, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+        assert_eq!(before, after, "旋转档落盘往返结果应一致");
     }
 
     /// 二值档仍 filter-aware：预过滤在粗筛**之前**施加，过滤外的项不进候选（守不变量 #5）。
