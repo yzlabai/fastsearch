@@ -1,10 +1,16 @@
 # MM2c-bytes + MM6 inline 媒资服务 — 设计计划
 
-> 状态：**设计（未实施）**｜日期：2026-06-27｜上游：[多模态功能设计与开发计划](2026-06-25-多模态功能设计与开发计划.md)（MM2c/MM6）、[职责划分](2026-06-25-多模态职责划分-docparse与fastsearch.md)、[devlog](../devlog/2026-06-27-多模态完善.md)。
+> 状态：**已实施**（MM2c-bytes / MM6-inline / MM6-secure，2026-06-27，收口三绿 + Docker pgvector 真机验证）｜真签名 URL(MM6-signer) / Range(MM6-range) 仍 `gated`（对象存储）。日期：2026-06-27｜上游：[多模态功能设计与开发计划](2026-06-25-多模态功能设计与开发计划.md)（MM2c/MM6）、[职责划分](2026-06-25-多模态职责划分-docparse与fastsearch.md)、[devlog](../devlog/2026-06-27-多模态完善.md)（落地回写见 §5/§6/§7）。
 >
-> **本文目标**：把"无 caption 文档图的字节端到端服务"（docparse 导出 inline 字节 → PG 真源 → `/v1/asset` 网关吐字节）落成可施工设计。这是 MM2c-time 之后剩下的、**触及架构边界**（PG 真源 vs 引擎派生、sync↔async、新数据出口）的部分，按 [DEV_SPEC §0 复杂需求](../../AI_AGENT_DEV_SPEC.md) 先写计划再做。
+> **本文目标**：把"无 caption 文档图的字节端到端服务"（inline 字节 → PG 真源 → `/v1/asset` 网关吐字节）落成可施工设计。这是 MM2c-time 之后剩下的、**触及架构边界**（PG 真源 vs 引擎派生、sync↔async、新数据出口）的部分，按 [DEV_SPEC §0 复杂需求](../../AI_AGENT_DEV_SPEC.md) 先写计划再做。
 >
 > **代码现状是真源**：签名为设计意图，落地以代码为准并回写。未真机验证项标 `待运行验证`/`gated`。
+>
+> ### ⚑ 落地回写（2026-06-27，实施后核对代码修正本计划）
+> - **关键修正**：计划原设"CLI 把 docparse `data_base64` 解码进 `media_bytes`"（§4.1/§5/§8）。**核对代码后此前提不成立**：CLI `cmd_index`/`cmd_ingest` 经 `engine.ingest()` **只写本地 Tantivy 索引、不写 PG**（[engine lib.rs](../../crates/fastsearch-engine/src/lib.rs) `ingest()→text.upsert()`），且 `media_bytes` 是 transient 字段、不进派生索引——**CLI 根本不是 PG 写入者，无字节可携带**。字节生产者是 **`PgStore::upsert_doc`**（库/外部 PG 写入路径，已绑 `media_bytes` 第 13 参）。"CLI 直写 PG 真源"属另一独立命令特性（非 base64 依赖问题），本期不做。故下文 §4.1/§5/§8 中"CLI 携带 base64"已作废，以本框为准。
+> - **已落地**：E1–E6 全部实现并验证（见 §3 表与 §4 各 crate）。MM2c-bytes（`upsert_doc`→`media_bytes`→`fetch_media_bytes`）、MM6-inline（engine `source_pg` + `resolve_citation` Inline→InlineBytes + server `/v1/asset` 吐字节 + HTTP E2E）、MM6-secure（无签名器 Object→404 不泄露裸 key）均收口三绿 + Docker 真机。
+> - **§4.2 CDC 决策已定**：**CDC 不搬字节**（复制流只搬指针，`media_bytes` 仅供网关按需直查），减小复制流。
+> - **未落地**：MM6-signer（真 S3 presign）、MM6-range（HTTP Range）仍 `gated`（对象存储）。
 
 ---
 
@@ -12,7 +18,7 @@
 
 - **要做什么**：让"文档内嵌图（无 caption/小裁图）"的**字节**能被检索命中后**内联展示**。链路：docparse `--image-embed`(base64) → CLI ingest 携带字节 → PG `media_bytes bytea` 真源（随逻辑复制走）→ `GET /v1/asset/{cid}` 经 ACL 校验后吐图字节。
 - **为什么**：场景 A 的核心是"答案里把图显示出来"。MM2c-time 做了时间维，但 `AssetPointer::Inline` 当前 `resolve_citation` 返回 `None`（字节在 PG 但无人取）——inline 路是死的。这块打通，纯文档（图都是小裁图）场景"一个 PG 即可跑"的内联展示才成立，**无需对象存储**。
-- **验收**：① CLI 灌入带 `data_base64` 的图 chunk → PG `media_bytes` 有字节；② 授权身份 `GET /v1/asset/{cid}` 返回该图字节 + 正确 `Content-Type`；③ 越权身份 404（不暴露存在性）；④ 无字节/无媒资/不可见均 404；⑤ 全程不依赖对象存储。
+- **验收**（✅ 全部达成；①修正：字节生产者是 PG 写入路径 `upsert_doc`，非 CLI——见回写框）：① 经 `PgStore::upsert_doc` 写入带 `media_bytes` 的图 chunk → PG `media_bytes` 有字节，`fetch_media_bytes` 取回一致；② 授权身份 `GET /v1/asset/{cid}` 返回该图字节 + 正确 `Content-Type`；③ 越权身份 404（不暴露存在性）；④ 无字节/无媒资/不可见均 404；⑤ 全程不依赖对象存储。
 
 ---
 
@@ -51,7 +57,7 @@
 - DDL 加 `media_bytes bytea`（MM2c-bytes，承接 MM2c-time 同段注释）。
 - `ChunkRow` 加 `media_bytes: Option<Vec<u8>>`；`from_chunk`/`to_chunk` 往返；INSERT 参数 16→17、fetch SELECT 携带；**DDL/SQL 形态 golden 同 commit 更新**（DEV_SPEC §3）。
 - **新方法** `PgStore::fetch_media_bytes(collection, doc_id, chunk_id) -> Result<Option<Vec<u8>>>`：`SELECT media_bytes WHERE pk`（E3）。
-- sync `row_to_chunk`（[replication.rs](../../crates/fastsearch-sync/src/replication.rs)）：CDC 解码携带 `media_bytes`（bytea 文本/二进制解码——pgoutput 文本协议下 bytea 是 `\x..` hex，需解码；评估是否值得让 CDC 搬小图字节，或 CDC 只搬指针、字节由网关按需从 PG 拉 → **倾向后者**：CDC 不搬字节，`media_bytes` 仅供网关直查，减小复制流）。**待定，落地时定**。
+- sync `row_to_chunk`（[replication.rs](../../crates/fastsearch-sync/src/replication.rs)）：~~CDC 解码携带 `media_bytes`~~ → **已定：CDC 不搬字节**（`row_to_chunk` 设 `media_bytes: None`），复制流只搬指针、字节由网关按需从 PG `media_bytes` 直查，减小复制流。
 
 ### 4.3 engine — [lib.rs](../../crates/fastsearch-engine/src/lib.rs)
 - 字段 `source_pg: Option<Arc<PgStore>>` + `set_source_store`（E4）。
@@ -68,16 +74,19 @@
 
 ## 5. 用户使用例子
 
+> ⚠️ 落地修正（见顶部回写框）：**字节生产者是 PG 写入路径 `PgStore::upsert_doc`，不是 CLI**。CLI `index`/`ingest` 只写本地 Tantivy 索引、不写 PG，故无法把字节落进 PG `media_bytes`。下例以"库/外部写入 PG 真源 + server 网关读"为准。
+
+```rust
+// 1) 写入 PG 真源（库/外部写入路径）：带 inline 字节的图 chunk → upsert_doc → media_bytes bytea
+let chunk = Chunk { /* kind=Image, media: MediaRef{ asset: Inline, .. }, */
+                    media_bytes: Some(png_bytes), .. };
+pg_store.upsert_doc("kb", "report.pdf", &[chunk]).await?;   // 字节落 PG media_bytes
+```
+
 ```bash
-# 1) docparse 导出带 inline 字节的 chunks（小裁图 base64）
-docparse report.pdf --image-embed --out chunks.json
-
-# 2) 灌入（字节落 PG media_bytes 真源）
-fastsearch index --data ./data --collection kb --doc-id report.pdf chunks.json
-
-# 3) 检索命中图 chunk → 答案层拿 citation_id 取字节内联展示
+# 2) server 装配 source_pg（DATABASE_URL）后，检索命中图 chunk → 答案层拿 citation_id 取字节内联展示
 curl -H "Authorization: Bearer <key>" http://localhost:8642/v1/asset/kb:report.pdf:42 -o fig.png
-#   → 200 image/png 字节；越权身份 → 404
+#   → 200 image/png 字节（engine resolve_citation Inline→从 PG media_bytes 直查）；越权身份 → 404
 ```
 
 ---
@@ -98,26 +107,26 @@ curl -H "Authorization: Bearer <key>" http://localhost:8642/v1/asset/kb:report.p
 
 ---
 
-## 7. 验收标准
+## 7. 验收标准（✅ 全部达成，2026-06-27）
 
-- §6 单测 + Docker 集成全绿；收口三绿（fmt/clippy -D warnings/test --workspace）。
-- ACL 越权用例（inline 字节）硬门禁通过；`Object` 无签名器不泄露裸 key。
-- DDL 改动与 golden 同 commit；devlog 记录 + 回写 12-pg/14-engine/19-server spec + 看板。
-- 诚实记账：真签名 URL / Range 标 `下一迭代`/`gated`，CDC 是否搬字节的决策落地后回写。
+- ✅ §6 单测 + Docker 集成全绿；收口三绿（fmt/clippy -D warnings/test --workspace 30 套件）。
+- ✅ ACL 越权用例（inline 字节）硬门禁通过（`mm6_inline_serves_bytes_from_source_pg` 越权 None + server `asset_inline_bytes_e2e` 越权 404）；`Object` 无签名器不泄露裸 key（MM6-secure 单测）。
+- ✅ DDL 改动与 golden 同 commit；devlog 记录（§5/§6/§7）+ 回写 12-pg/14-engine/19-server/17-cli spec + 看板。
+- ✅ 诚实记账：真签名 URL(MM6-signer) / Range(MM6-range) 标 `gated`；CDC 不搬字节决策已落地回写（§4.2）。
 
 ---
 
 ## 8. 里程碑拆分（一项一 commit、独立收口）
 
-| 序 | 项 | crate | 资源 | 验证 |
-|---|---|---|---|---|
-| MM2c-bytes | `Chunk.media_bytes` 通道 + PG `media_bytes` 列 + `fetch_media_bytes` + CLI 携带 docparse base64 | core,pg,cli | 本环境 + Docker | 单测往返 + Docker 字节存取一致 |
-| MM6-inline | engine `source_pg` + `resolve_citation` Inline→InlineBytes（block_in_place）；server 装配 + Content-Type + 越权用例 | engine,server | 本环境 + Docker（multi-thread） | 端到端取字节 + 越权 404 |
-| MM6-secure | `ObjectSigner` trait + 无签名器 Object→404（不泄露裸 key）安全兜底 | engine,server | 本环境 | 单测：无签名器不返回 uri |
-| MM6-signer | 真对象存储签名 URL（S3 presign 类） | engine | gated（对象存储） | 待运行验证 |
-| MM6-range | HTTP Range（对象存储大媒资 seek） | server | gated（对象存储） | 待运行验证 |
+| 序 | 项 | crate | 资源 | 状态 | 验证 |
+|---|---|---|---|---|---|
+| MM2c-bytes | `Chunk.media_bytes` 通道 + PG `media_bytes` 列 + `fetch_media_bytes`；字节经 `upsert_doc` 落 PG（~~CLI 携带 base64~~ 作废：CLI 不写 PG，见回写框） | core,pg | ✅ 完成 | 单测往返 + Docker `integration_media_bytes_roundtrip` 字节存取一致 |
+| MM6-inline | engine `source_pg` + `resolve_citation` Inline→InlineBytes（block_in_place）；server 装配 + Content-Type + 越权用例 | engine,server | ✅ 完成 | Docker `mm6_inline_serves_bytes_from_source_pg` + server HTTP `asset_inline_bytes_e2e`（200+image/png / 越权 404 / 无 key 401） |
+| MM6-secure | `ObjectSigner` trait + 无签名器 Object→404（不泄露裸 key）安全兜底 | engine,server | ✅ 完成 | 单测：无签名器不返回 uri / signed-url 不含裸 key |
+| MM6-signer | 真对象存储签名 URL（S3 presign 类） | engine | ⏸ gated（对象存储） | 待运行验证 |
+| MM6-range | HTTP Range（对象存储大媒资 seek） | server | ⏸ gated（对象存储） | 待运行验证 |
 
-**执行序**：MM2c-bytes（地基，本环境+Docker 完整验证）→ MM6-inline（端到端，Docker）→ MM6-secure（安全兜底，本环境）；MM6-signer/range 待对象存储。
+**执行序**：MM2c-bytes（地基，本环境+Docker 完整验证）→ MM6-inline（端到端，Docker）→ MM6-secure（安全兜底，本环境）均已完成；MM6-signer/range 待对象存储。
 
 ---
 
@@ -127,4 +136,4 @@ curl -H "Authorization: Bearer <key>" http://localhost:8642/v1/asset/kb:report.p
 - **#2 PG 真源 / 引擎派生**：字节存 PG 真源、引擎派生层不持字节、网关从真源取（E1/E3）✓。
 - **#3 ACL 不可绕过**：字节出口经 `resolve_citation` 强制 ACL；无签名器不泄露裸 key（E6）✓——本期最大安全面。
 - **#5 预过滤**：不涉过滤路径。
-- **风险**：① CDC 是否搬字节未定（§4.2）——倾向不搬，落地确认；② `block_in_place` 要求 multi-thread runtime（B6 已有约束，文档强调）；③ `media_bytes` 大字段进 PG 的 TOAST/复制放大——仅限 KB 级小图，超阈值应走 Object（D1），需在 ingest 加大小阈值校验（落地补）。
+- **风险**：① ~~CDC 是否搬字节未定~~ → **已定不搬**（§4.2，`row_to_chunk` 设 None）✓；② `block_in_place` 要求 multi-thread runtime（B6 已有约束，文档强调）——已落地并验证（集成测试用 multi-thread runtime）✓；③ `media_bytes` 大字段进 PG 的 TOAST/复制放大——仅限 KB 级小图，超阈值应走 Object（D1）。**注**：字节写入者是 `upsert_doc`（非 CLI），大小阈值校验应在写入侧 producer 落（当前未强约束，标 `下一迭代`）。
