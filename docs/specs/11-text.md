@@ -1,7 +1,7 @@
 # spec · fastsearch-text
 
 > 模块 #2，依赖：fastsearch-core。阶段 P1。上游：[产品设计 §3.2](../plans/2026-06-24-产品设计文档.md)、[模块拆分](00-模块拆分.md)。
-> 状态：**开发中**（见 §8）。
+> 状态：**已落地**（BM25 + 分词 + 过滤 + ACL + 高亮 + 分面 + **k1/b 自定义打分生效** + 短语/前缀；见 §8）。
 
 ## 1. 目的与范围
 
@@ -98,7 +98,7 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 
 ## 8. 验收标准与状态
 
-- [x] `cargo test -p fastsearch-text` 全绿（10 测试）；clippy 零 warning；fmt 净。
+- [x] `cargo test -p fastsearch-text` 全绿（含 BM25 k1/b 生效 +3 测试）；clippy 零 warning；fmt 净。
 - [x] §7 用例覆盖：建索引/citation、BM25 排序、中文 jieba、kind+page 过滤、ACL 阻断越权、upsert 覆盖、delete_by_doc、确定性。
 
 **已知限制 / 下一迭代（诚实记账）：**

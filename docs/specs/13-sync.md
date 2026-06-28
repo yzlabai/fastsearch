@@ -2,7 +2,7 @@
 
 > 模块 #4，依赖：fastsearch-core、fastsearch-pg、（sink）fastsearch-text/vector。阶段 P1。
 > 上游：[产品设计 §2.4/§3.13](../plans/2026-06-24-产品设计文档.md)、需求 F30/F51–F53。
-> 状态：**开发中**。
+> 状态：**已落地核心**（pgoutput 解码 + CDC 消费 + 初始快照 bootstrap + LSN 检查点续传 + 幂等替换，Docker pgvector 端到端验证）。流式 pgoutput 线缆层（替代 SQL 轮询）= 下一迭代。
 
 ## 1. 目的与范围
 

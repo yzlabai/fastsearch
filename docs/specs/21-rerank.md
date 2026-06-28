@@ -1,7 +1,7 @@
 # spec · fastsearch-rerank
 
-> 模块 #11，依赖：fastsearch-core。阶段 P2/P3。上游：[产品设计 §3.4 排序管线](../plans/2026-06-24-产品设计文档.md)、需求 F15。
-> 状态：**开发中**。
+> 模块 #7，依赖：fastsearch-core。阶段 P2/P3。上游：[产品设计 §3.4 排序管线](../plans/2026-06-24-产品设计文档.md)、需求 F15。
+> 状态：**已落地基线**（`Reranker` trait + `LexicalOverlapReranker` 确定性基线 + `set_reranker` 注入）。神经 cross-encoder **决定不做**（ADR）；轻量 LTR 仅"无 LLM 兜底"入口需要时做（下一迭代）。
 
 ## 1. 目的与范围
 

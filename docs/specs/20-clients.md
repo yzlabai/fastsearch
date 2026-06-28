@@ -1,6 +1,6 @@
 # spec · clients (Python / TypeScript SDK)
 
-> 模块 #10，依赖：fastsearch-server REST 契约。阶段 P5。需求 F55。状态：**v1 完成**。
+> 模块 #13，依赖：fastsearch-server REST 契约。阶段 P5。需求 F55。状态：**v1 完成**（Python/TS SDK + LangChain/LlamaIndex 适配）。
 
 ## 1. 目的与范围
 

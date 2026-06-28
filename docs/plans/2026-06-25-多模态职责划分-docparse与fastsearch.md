@@ -6,7 +6,7 @@
 >
 > **本文目标**：从 localkb 整体架构出发，回答"多模态预处理的哪些功能应该放到 **docparse-rs**（解析上游），哪些留在 **fastsearch**（检索下游）"，并指出两者必须**锁步协调**的契约。
 >
-> 范围：`/Users/ale/works2026/localai/localkb/docparse-rs`（解析）与本仓 `fastsearch`（检索）。结论以两边代码为真源。
+> 范围：解析(`vendor/docparse`，**已 subtree 并入本仓**) + 检索(`crates/*`)——**现为单一 git 仓**（融合 Option B，见 §0 更新）。结论以代码为真源。
 
 ---
 

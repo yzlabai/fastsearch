@@ -24,7 +24,8 @@ pub struct IngestOpts {
 }
 
 /// docparse 多格式解析器注册表（轻量、无 ONNX）：按 `DocumentParser::supports`（扩展名/magic）
-/// 派发。OCR/VLM/raster 增强器需运行时模型，属 `parse-ocr`/`parse-vlm`（下一迭代）。
+/// 派发。重增强器经 feature + 模型目录接入：OCR=`parse-ocr`（已落地）、表格=`parse-tables`（已落地）；
+/// 自然图 VLM 描述=`parse-vlm`（下一迭代，需服务）。
 fn parsers() -> Vec<Box<dyn docparse_core::parser::DocumentParser>> {
     vec![
         Box::new(docparse_pdf::PdfParser::default()),

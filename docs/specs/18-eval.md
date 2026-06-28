@@ -1,7 +1,7 @@
 # spec · fastsearch-eval
 
 > 模块 #8，依赖：fastsearch-core。阶段 P1+（贯穿）。上游：[产品设计 §3.7](../plans/2026-06-24-产品设计文档.md)、需求 F39（评测护栏）。
-> 状态：**开发中**。
+> 状态：**已落地**（nDCG/recall/MRR/precision + golden 集 + `assert_no_regression` CI 门禁；中英双 golden 接入 engine）。
 
 ## 1. 目的与范围
 

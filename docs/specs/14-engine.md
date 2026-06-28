@@ -1,6 +1,6 @@
 # spec · fastsearch-engine
 
-> 模块 #4.5（整合层），依赖：fastsearch-core、fastsearch-text、fastsearch-sync。阶段 P1→P2。
+> 模块 #9（整合层），依赖：core/text/vector/rerank/sync/embed/pg。阶段 P1→P2。
 > 上游：[产品设计 §3.4 排序管线](../plans/2026-06-24-产品设计文档.md)。状态：**已完成 v2.3**
 > （三向量后端档 + 深分页 + 重建 + 媒资解析 + 多模态 + 崩溃安全 CDC）。
 

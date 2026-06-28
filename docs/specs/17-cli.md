@@ -1,7 +1,7 @@
 # spec · fastsearch-cli
 
-> 模块 #7，依赖：fastsearch-core、fastsearch-engine。阶段 P1→P5。上游：[产品设计 §3.9/§4](../plans/2026-06-24-产品设计文档.md)。
-> 状态：**开发中**。
+> 模块 #12，依赖：fastsearch-core、fastsearch-engine（+ `parse*` feature 下的 docparse）。阶段 P1→P5。上游：[产品设计 §3.9/§4](../plans/2026-06-24-产品设计文档.md)。
+> 状态：**已落地**（index/search/eval + `ingest` 多格式解析 9 格式+图片 / parse-ocr 扫描件 OCR / parse-tables 非 VLM 表格识别，真机验证；见 §7）。
 
 ## 1. 目的与范围
 

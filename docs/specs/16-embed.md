@@ -17,11 +17,16 @@
 
 ```rust
 pub enum EmbedKind { Query, Passage }
+pub enum Modality { Text, Image }
+pub enum EmbedInput { Text(String), Image(Vec<u8>) }            // 多模态输入（MM8a）
+pub struct EmbedCaps { dim, text, image, cross_modal, semantic } // 后端能力自描述
 pub trait Embedder {
     fn dim(&self) -> usize;
     fn embed(&self, texts: &[String], kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>>;
+    fn caps(&self) -> EmbedCaps;                                 // 默认：纯文本语义
+    fn embed_multi(&self, inputs: &[EmbedInput], kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>>; // 默认：仅 Text，遇 Image 报错
 }
-pub struct HashEmbedder { dim: usize }
+pub struct HashEmbedder { dim: usize }                          // 覆写 caps（图像基线）+ embed_multi
 impl HashEmbedder { pub fn new(dim: usize) -> Self; }
 ```
 

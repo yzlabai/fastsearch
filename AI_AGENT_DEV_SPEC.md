@@ -32,7 +32,7 @@
 - **PG 是真源，引擎索引是派生**：写路径落 PG；引擎侧 Tantivy/向量索引可从 PG 重建。别在引擎侧造"PG 没有"的权威数据；崩溃恢复靠重放复制流/快照，不靠引擎自建 WAL。
 - **ACL 不可绕过**：新增任何检索入口（REST 路由 / MCP 工具 / 库 API），ACL 必须由认证身份在服务端经 `engine.search(req, Some(&acl))` 注入，客户端不能传/放宽。新增入口要有"越权用例进测试"（见 server 的 `acl_not_bypassable`）。
 - **代码完成 ≠ 完成**：未经**运行/真机验证**前，文档与提交里如实标 **`待运行验证`**，别写"已完成"。本仓惯例：纯逻辑用单测验证；PG 路径用 `DATABASE_URL` 集成（无则 env-gated 跳过）；CLI/server 用**实跑二进制 + curl/SDK** 验证（见各 spec"活服务验证"）。验证通过再改状态。
-- **重依赖 opt-in、诚实记账**：未落地的重件——HNSW+量化、流式 CDC、k1/b 自定义 BM25、MCP——文档里如实标 `下一迭代`，当前用确定性基线占位（HashEmbedder / MemVectorIndex 暴力余弦 / LexicalOverlapReranker / sync apply 核心 + pgoutput 解码 + SQL 轮询消费）。**别把基线说成语义/生产级**。真语义嵌入经**可配置 HTTP 后端**（Ollama / OpenAI 兼容，见 `fastsearch-embed::HttpEmbedder`）接入，**不引进程内模型推理（Candle/ort）依赖**。
+- **重依赖 opt-in、诚实记账**：未落地的重件——**流式 pgoutput 线缆层**、**进程内跨模态/ColPali 模型**、**对象存储签名 URL/Range**——文档里如实标 `下一迭代`/`gated`，当前用确定性基线占位（HashEmbedder / MemVectorIndex 暴力余弦 / LexicalOverlapReranker / sync apply 核心 + pgoutput 解码 + SQL 轮询消费）。**别把基线说成语义/生产级**。（**已落地、不再属"未落地"**：HNSW+u8 量化 + 二值量化粗筛、k1/b 自定义 BM25、MCP 第四张脸、B6 CDC 写穿、docparse 多格式/OCR/表格摄取——见各 spec 与看板。）真语义嵌入经**可配置 HTTP 后端**（Ollama / OpenAI 兼容，见 `fastsearch-embed::HttpEmbedder`）接入，**不引进程内模型推理（Candle/ort）依赖**。
 - **预过滤两端一致**：改 `core::Filter` 或过滤翻译时，`text`（Tantivy query 翻译）与 `vector`（filter-aware 召回）+ 各自的精确后过滤都要同步守住"SUPERSET 预过滤 + 精确后过滤"语义（CLAUDE.md 不变量 §5）。
 - **确定性**：新增排序/融合/检索路径，并列项一律按 `GlobalId` 升序 tie-break，保证可复现、便于 golden 回归。
 - **依赖集中管理**：版本写在根 `Cargo.toml` 的 `[workspace.dependencies]`，crate 用 `dep.workspace = true` 继承；新依赖先问/在 plan 写清，优先纯 Rust、MIT/Apache（注意 lindera 中文字典 CC-BY-SA，分发前审）。
