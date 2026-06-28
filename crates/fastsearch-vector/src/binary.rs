@@ -48,6 +48,69 @@ pub(crate) fn rabitq_estimate(q: &[f32], code: &[u64], l1: f32) -> f32 {
     s / l1
 }
 
+/// 固定种子的 xorshift64 → (0,1] 均匀数（确定、无 RNG 依赖；多副本/重开一致）。
+fn next_unit(s: &mut u64) -> f64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    ((*s >> 11) as f64 / (1u64 << 53) as f64).max(f64::MIN_POSITIVE)
+}
+
+/// RaBitQ 随机正交旋转：量化前对向量做一次**数据无关**的正交变换，把信息/量化误差摊匀到各维，
+/// 使符号码（`sign`）更均匀有信息、估计器趋近**无偏**——对各向异性（能量集中在少数维）数据增益尤大。
+/// 由**固定种子 + 维度**确定生成（多副本/重开一致，无需持久化矩阵；正交变换不改内积，故精排仍用原向量）。
+pub(crate) struct Rotation {
+    dim: usize,
+    mat: Vec<f32>, // d×d 行主序，行单位正交（高斯随机 + 改进 Gram-Schmidt）
+}
+
+impl Rotation {
+    pub(crate) fn new(dim: usize, seed: u64) -> Self {
+        let mut s = seed | 1;
+        // 高斯随机矩阵（Box–Muller）。
+        let mut mat = vec![0f32; dim * dim];
+        for x in mat.iter_mut() {
+            let u1 = next_unit(&mut s);
+            let u2 = next_unit(&mut s);
+            *x = ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32;
+        }
+        // 改进 Gram-Schmidt：逐行减去对前行的投影 + 归一化 → 行单位正交。
+        for i in 0..dim {
+            for j in 0..i {
+                let mut d = 0f32;
+                for c in 0..dim {
+                    d += mat[i * dim + c] * mat[j * dim + c];
+                }
+                for c in 0..dim {
+                    mat[i * dim + c] -= d * mat[j * dim + c];
+                }
+            }
+            let mut n = 0f32;
+            for c in 0..dim {
+                n += mat[i * dim + c] * mat[i * dim + c];
+            }
+            let n = n.sqrt();
+            if n > f32::EPSILON {
+                for c in 0..dim {
+                    mat[i * dim + c] /= n;
+                }
+            }
+        }
+        Rotation { dim, mat }
+    }
+
+    /// 旋转向量：`(M·v)[i] = ⟨row_i, v⟩`。`v.len()` 须等于 `dim`。
+    pub(crate) fn apply(&self, v: &[f32]) -> Vec<f32> {
+        let d = self.dim;
+        (0..d)
+            .map(|i| {
+                let row = &self.mat[i * d..(i + 1) * d];
+                row.iter().zip(v).map(|(a, b)| a * b).sum()
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

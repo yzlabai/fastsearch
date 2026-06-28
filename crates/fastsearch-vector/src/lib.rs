@@ -247,7 +247,15 @@ pub struct MemVectorIndex {
     entries: HashMap<GlobalId, Entry>,
     /// None=精确暴力；Some(m)=二值粗筛取 `k·m` 候选再 f32 重排。
     binary_oversample: Option<usize>,
+    /// 二值粗筛是否在 **RaBitQ 随机旋转空间**打分（意图标志；dim 已知后惰性建矩阵）。
+    /// 旋转把量化误差摊匀 → 估计器趋无偏、对各向异性数据增益更大。正交变换不改内积，精排仍用原向量。
+    rabitq_rotation: bool,
+    /// 惰性构建的旋转矩阵（`rabitq_rotation` 且 dim 已知时建；search 只读）。
+    rotation: Option<binary::Rotation>,
 }
+
+/// RaBitQ 旋转的固定种子（数据无关、定常 → 多副本/重开生成同一矩阵，无需持久化）。
+const RABITQ_ROTATION_SEED: u64 = 0x5261_4269_7451_5631; // "RaBitQV1"
 
 impl MemVectorIndex {
     pub fn new() -> Self {
@@ -263,9 +271,28 @@ impl MemVectorIndex {
         }
     }
 
+    /// 二值粗筛 + **RaBitQ 随机旋转**（旋转空间打分，召回更高，尤利各向异性数据）。
+    /// 旋转矩阵由固定种子在首次 upsert（dim 已知）时惰性构建。
+    pub fn with_binary_prefilter_rotated(oversample: usize) -> Self {
+        MemVectorIndex {
+            binary_oversample: Some(oversample.max(1)),
+            rabitq_rotation: true,
+            ..Self::default()
+        }
+    }
+
     /// 设置/关闭二值粗筛（`None`=精确暴力）。供 load 后翻档（检查点存格式、调档运行期定）。
     pub fn set_binary_prefilter(&mut self, oversample: Option<usize>) {
         self.binary_oversample = oversample.map(|m| m.max(1));
+    }
+
+    /// dim 已知且开了旋转但矩阵未建 → 惰性构建（固定种子，确定）。
+    fn ensure_rotation(&mut self) {
+        if self.rabitq_rotation && self.rotation.is_none() {
+            if let Some(d) = self.dim {
+                self.rotation = Some(binary::Rotation::new(d, RABITQ_ROTATION_SEED));
+            }
+        }
     }
 
     /// 当前二值粗筛 oversample（`None`=精确暴力档）。
@@ -351,6 +378,8 @@ impl MemVectorIndex {
             dim: snap.dim,
             entries,
             binary_oversample: None, // 落盘不持搜索策略；如需开二值由调用方 with_binary_prefilter
+            rabitq_rotation: false, // 旋转同属搜索策略、不落盘；调用方按需重启用（engine 接线下一迭代）
+            rotation: None,
         })
     }
 }
@@ -398,8 +427,11 @@ impl VectorBackend for MemVectorIndex {
             _ => {}
         }
         let normalized = normalize(&vector);
-        let code = binary::pack_signs(&normalized);
-        let l1 = binary::l1_norm(&normalized);
+        self.ensure_rotation();
+        // 二值码在（可选）旋转空间打：code/l1 由旋转后向量派生；原向量仍存供精排（正交不改内积）。
+        let coded = self.rotation.as_ref().map(|r| r.apply(&normalized));
+        let code = binary::pack_signs(coded.as_deref().unwrap_or(&normalized));
+        let l1 = binary::l1_norm(coded.as_deref().unwrap_or(&normalized));
         self.entries.insert(
             gid,
             Entry {
@@ -449,9 +481,12 @@ impl VectorBackend for MemVectorIndex {
         // 二值粗筛档：RaBitQ 估计器取 top-(k·oversample) → 仅对候选做 f32 精确重排。
         let rerank_set: Vec<(&GlobalId, &Entry)> = if let Some(m) = self.binary_oversample {
             let want = k.saturating_mul(m).max(k);
+            // 估计器须在与 code 相同的空间打分：开了旋转则查询也旋转（正交，精排仍用原 q）。
+            let qcoarse = self.rotation.as_ref().map(|r| r.apply(&q));
+            let qc = qcoarse.as_deref().unwrap_or(&q);
             // 粗排键：(估计余弦 降, gid 升)——估计越大越近；同估计按 gid tie-break（确定）。
             let mut coarse: Vec<(f32, &GlobalId, &Entry)> = candidates
-                .map(|(gid, e)| (binary::rabitq_estimate(&q, &e.code, e.l1), gid, e))
+                .map(|(gid, e)| (binary::rabitq_estimate(qc, &e.code, e.l1), gid, e))
                 .collect();
             coarse.sort_by(|a, b| {
                 b.0.partial_cmp(&a.0)
@@ -860,6 +895,126 @@ mod tests {
             er >= 0.85,
             "估计器 recall@{k}={er:.3} 应 ≥0.85（oversample={m}）"
         );
+    }
+
+    // ===================== RaBitQ 随机旋转（迭代②） =====================
+
+    /// 各向异性合成向量：能量随维指数衰减集中在低维（旋转前符号码信息少，旋转后摊匀）。
+    fn aniso_vec(seed: u64, dim: usize) -> Vec<f32> {
+        pseudo_vec(seed, dim)
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| x * 0.5f32.powf(i as f32 * 6.0 / dim as f32))
+            .collect()
+    }
+
+    fn build_aniso(n: usize, dim: usize, rotated: bool, oversample: usize) -> MemVectorIndex {
+        let mut idx = if rotated {
+            MemVectorIndex::with_binary_prefilter_rotated(oversample)
+        } else {
+            MemVectorIndex::with_binary_prefilter(oversample)
+        };
+        for i in 0..n as u64 {
+            idx.upsert(
+                gid("d", i),
+                aniso_vec(i, dim),
+                meta("d", i, "paragraph", i as u32, vec!["public"]),
+            )
+            .unwrap();
+        }
+        idx
+    }
+
+    /// 旋转在**各向异性**数据上提升粗筛召回：旋转档 recall ≥ 非旋转档（两档精排同、仅候选选择不同）。
+    #[test]
+    fn rabitq_rotation_helps_anisotropic() {
+        let (n, dim, k, m) = (400usize, 64usize, 10usize, 3usize);
+        // ground truth：同数据的精确暴力（无二值、无旋转）。
+        let mut exact = MemVectorIndex::new();
+        for i in 0..n as u64 {
+            exact
+                .upsert(
+                    gid("d", i),
+                    aniso_vec(i, dim),
+                    meta("d", i, "paragraph", i as u32, vec!["public"]),
+                )
+                .unwrap();
+        }
+        let rot = build_aniso(n, dim, true, m);
+        let norot = build_aniso(n, dim, false, m);
+        let recall = |idx: &MemVectorIndex| -> f32 {
+            let (mut hit, mut total) = (0usize, 0usize);
+            for qseed in [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+                let q = aniso_vec(qseed.wrapping_add(700_000), dim);
+                let want: std::collections::HashSet<u64> = exact
+                    .search(&q, k, None, None)
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.id.chunk_id)
+                    .collect();
+                hit += idx
+                    .search(&q, k, None, None)
+                    .unwrap()
+                    .iter()
+                    .filter(|s| want.contains(&s.id.chunk_id))
+                    .count();
+                total += k;
+            }
+            hit as f32 / total as f32
+        };
+        let (rr, nr) = (recall(&rot), recall(&norot));
+        // 实测 rot≈0.97 vs norot≈0.78（dim=64 强衰减, oversample=3）——~19pt 增益。门禁留 5pt 余量防抖。
+        assert!(
+            rr >= nr + 0.05,
+            "各向异性下旋转档 recall({rr:.3}) 应显著 ≥ 非旋转({nr:.3})"
+        );
+    }
+
+    /// 旋转不破正确性：旋转档全覆盖 oversample 仍**逐条等于**精确暴力（精排用原向量，正交不改内积）。
+    #[test]
+    fn rabitq_rotation_full_oversample_equals_exact() {
+        let (n, dim, k) = (120usize, 48usize, 10usize);
+        let mut exact = MemVectorIndex::new();
+        for i in 0..n as u64 {
+            exact
+                .upsert(
+                    gid("d", i),
+                    aniso_vec(i, dim),
+                    meta("d", i, "paragraph", 0, vec!["public"]),
+                )
+                .unwrap();
+        }
+        let rot = build_aniso(n, dim, true, n); // k·n ≥ n → 候选覆盖全集
+        let q = aniso_vec(424_242, dim);
+        let re: Vec<_> = exact
+            .search(&q, k, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+        let rr: Vec<_> = rot
+            .search(&q, k, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+        assert_eq!(re, rr, "旋转档全覆盖 oversample 应等于精确暴力");
+    }
+
+    /// 旋转确定：固定种子 → 两次独立构建的旋转档检索结果逐条一致（多副本/重开一致前提）。
+    #[test]
+    fn rabitq_rotation_deterministic() {
+        let (n, dim) = (60usize, 32usize);
+        let a = build_aniso(n, dim, true, 4);
+        let b = build_aniso(n, dim, true, 4);
+        let q = aniso_vec(9_001, dim);
+        let ra = a.search(&q, 8, None, None).unwrap();
+        let rb = b.search(&q, 8, None, None).unwrap();
+        assert_eq!(ra.len(), rb.len());
+        for (x, y) in ra.iter().zip(&rb) {
+            assert_eq!(x.id, y.id);
+            assert!((x.score - y.score).abs() < 1e-9);
+        }
     }
 
     /// 后端化：`VectorStore` 的 `BruteBinary` 档——`kind_str="brute_binary"`、落盘按粗筛档重载、
