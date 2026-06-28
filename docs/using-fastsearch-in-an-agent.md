@@ -224,7 +224,7 @@ FASTSEARCH_KEYS="alice=acme:team-a,public; bob=acme:team-b; admin=:public"
 
 ## 6. Multimodal
 
-> **Document parsing & OCR/tables**: `fastsearch ingest` parses 9 formats + images in-process; scanned docs get **PP-OCR** text and tables get **non-VLM ONNX structure recognition** — see **[Ingestion & parsing](文件解析与摄取.md)**.
+> **Document parsing & OCR/tables**: `fastsearch ingest` parses 9 formats + images in-process; scanned docs get **PP-OCR** text and tables get **non-VLM ONNX structure recognition** — see **[Ingestion & parsing](ingestion-and-parsing.md)**.
 
 Image captions and audio/video transcripts are ingested as searchable text; `modality` is a filterable field:
 
