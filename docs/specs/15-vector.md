@@ -15,7 +15,7 @@
 三个后端档（同 `VectorBackend` trait）：`MemVectorIndex`（暴力，默认确定）、`HnswVectorIndex`
 （HNSW+u8 量化，A9，大规模近似）、**pgvector 直查**（ANN 在 PG 跑，B6，经 `fastsearch-pg::PgStore::vector_search`）。
 
-**不做**：嵌入计算（embed 模块）；RaBitQ 量化 / filtered-traversal（下一迭代）；CDC 自动写穿 PG embedding（**已落地**，见 §6 已知限制 + [pg spec](12-pg.md)）；**多向量 MaxSim（ColPali，M2/MM11）`gated`**——只在引擎派生层、不入 PG 真源（不变量 #1），待多模态模型与规模信封。当前后端全是**单向量**（文本嵌入产出；视觉/跨模态向量属 M1 gated，本 crate 不感知模态、只存 `VecMeta.modality` 供过滤下推）。
+**不做**：嵌入计算（embed 模块）；RaBitQ 随机旋转 / filtered-traversal（下一迭代；二值粗筛 + RaBitQ 无偏估计器**已落地**，见 §6）；CDC 自动写穿 PG embedding（**已落地**，见 §6 已知限制 + [pg spec](12-pg.md)）；**多向量 MaxSim（ColPali，M2/MM11）`gated`**——只在引擎派生层、不入 PG 真源（不变量 #1），待多模态模型与规模信封。当前后端全是**单向量**（文本嵌入产出；视觉/跨模态向量属 M1 gated，本 crate 不感知模态、只存 `VecMeta.modality` 供过滤下推）。
 
 ## 2. 公开接口
 
@@ -71,7 +71,8 @@ pub struct VecMeta { pub kind, doc_id, collection, tenant, page, section_id, hea
   同步↔异步桥）+ server `FASTSEARCH_VECTOR_BACKEND=pgvector`。Docker 实测。
 
 **已知限制 / 下一迭代：**
-- ✅ **二值量化（1-bit）两阶段粗筛已落地**（2026-06-27，RaBitQ/BQ 核心）：`MemVectorIndex::with_binary_prefilter(oversample)` 开启——符号位 bit code（`binary.rs` `pack_signs`）Hamming 粗筛 top-`k·oversample`（`popcount`，~`d/64` 字操作 vs 精确 `d` flops）→ f32 精确重排，filter/ACL 仍在粗筛前（守 #5）、重排 + GlobalId tie-break 仍确定。+5 单测：全覆盖 oversample **逐条等于精确**、recall@10 ≥0.85(oversample=8)、filter-aware、pack/hamming 原语。**默认仍精确暴力**（`None`，零回归）。**✅ 已后端化**（2026-06-27）：`VectorBackendKind::BruteBinary(oversample)` + `VectorStore` 接线（`kind_str="brute_binary"`、与 brute 共享 on-disk f32 格式、load 后翻档）+ engine `open_with` 检查点恢复（记格式、oversample 取默认 `DEFAULT_BINARY_OVERSAMPLE=8`，同 HNSW 参数策略）+ server `FASTSEARCH_VECTOR_BACKEND=brute_binary`（`FASTSEARCH_BINARY_OVERSAMPLE` 调档）。+2 测试（VectorStore 落盘往返保持粗筛档；engine 重开恢复 `brute_binary` 覆盖默认）+ server 实跑 boot 200。**下一迭代**：完整 RaBitQ（随机旋转 + 无偏内积估计器，比纯符号粗筛召回更高）。
+- ✅ **二值量化（1-bit）两阶段粗筛已落地**（2026-06-27，RaBitQ/BQ 核心）：`MemVectorIndex::with_binary_prefilter(oversample)` 开启——符号位 bit code（`binary.rs` `pack_signs`）Hamming 粗筛 top-`k·oversample`（`popcount`，~`d/64` 字操作 vs 精确 `d` flops）→ f32 精确重排，filter/ACL 仍在粗筛前（守 #5）、重排 + GlobalId tie-break 仍确定。+5 单测：全覆盖 oversample **逐条等于精确**、recall@10 ≥0.85(oversample=8)、filter-aware、pack/hamming 原语。**默认仍精确暴力**（`None`，零回归）。**✅ 已后端化**（2026-06-27）：`VectorBackendKind::BruteBinary(oversample)` + `VectorStore` 接线（`kind_str="brute_binary"`、与 brute 共享 on-disk f32 格式、load 后翻档）+ engine `open_with` 检查点恢复（记格式、oversample 取默认 `DEFAULT_BINARY_OVERSAMPLE=8`，同 HNSW 参数策略）+ server `FASTSEARCH_VECTOR_BACKEND=brute_binary`（`FASTSEARCH_BINARY_OVERSAMPLE` 调档）。+2 测试（VectorStore 落盘往返保持粗筛档；engine 重开恢复 `brute_binary` 覆盖默认）+ server 实跑 boot 200。
+- ✅ **RaBitQ 无偏估计器粗筛已落地**（2026-06-28，替换对称 Hamming 为粗排打分）：粗筛改用 `binary::rabitq_estimate` = `⟨q, sign(x)⟩ / ‖x‖₁`——**用查询真实分量**（非对称）+ **逐向量 `‖x‖₁` 校正**（`Entry.l1`，由归一化向量派生、不落盘）。比 Hamming（只数符号一致维、丢 `q` 幅度）更接近真实余弦：同符号库向量 Hamming 必打平、估计器仍能按 `q` 幅度分开。只读 `code`（不取全精度 x），内存轻；估计降序 + GlobalId tie-break 仍确定；filter/ACL 仍在粗筛前（守 #5）；全覆盖 oversample 仍逐条等于精确。**实测**：recall@10 估计器 **0.87** vs Hamming **0.71**（oversample=4，~16pt 增益）。+2 单测（`estimate_separates_what_hamming_ties`、`rabitq_estimator_beats_hamming` 头对头 ≥+5pt 门禁）。devlog [2026-06-28](../devlog/2026-06-28-RaBitQ估计器.md)。**下一迭代**：随机旋转（把量化误差摊匀 → 升级为带误差界的**无偏**估计，对各向异性数据增益更大）。
 - filtered-traversal（HNSW 选择性过滤下遍历）；HNSW 大 N 的 p95 与暴力交叉点实测（见 [容量/SLO](../governance/2026-06-26-容量与SLO.md)）。
 - ✅ pgvector 直查的 **CDC 自动写穿已落地**（2026-06-27，B6 续作）：engine `apply_upsert` 在配了 `set_pg_vector` 时把嵌入写回 PG `embedding` 列（`PgStore::set_embedding`，block_in_place 桥），而非引擎派生索引——直查读 PG、写也归 PG，闭环。**CDC 反馈环**经"列清单 publication 排除派生列（`embedding`/`embed_model`/`updated_at`）+ `set_embedding` 幂等守卫（0 行不复制）"双防线断开。Docker pgvector 验证（见 [pg spec §7](12-pg.md)、devlog）。
 - 向量经 CDC 落地路径自动嵌入（`engine.set_embedder` + `apply_upsert`）或 `ingest_vector` 灌入。

@@ -232,6 +232,7 @@ pub trait VectorBackend {
 struct Entry {
     vector: Vec<f32>, // 归一化后存储（内积即余弦）
     code: Vec<u64>,   // 符号位 bit code（二值粗筛用，由 vector 派生）
+    l1: f32,          // ‖vector‖₁（RaBitQ 估计器的逐向量校正因子，由 vector 派生）
     meta: VecMeta,
 }
 
@@ -333,12 +334,15 @@ impl MemVectorIndex {
         let snap: Snapshot = serde_json::from_slice(&bytes)?;
         let mut entries = HashMap::with_capacity(snap.entries.len());
         for e in snap.entries {
-            let code = binary::pack_signs(&e.vector); // 由存储的归一化向量重建（不落盘）
+            // 由存储的归一化向量重建（code/l1 不落盘，省盘且与 upsert 一致）。
+            let code = binary::pack_signs(&e.vector);
+            let l1 = binary::l1_norm(&e.vector);
             entries.insert(
                 e.gid,
                 Entry {
                     vector: e.vector,
                     code,
+                    l1,
                     meta: e.meta,
                 },
             );
@@ -395,11 +399,13 @@ impl VectorBackend for MemVectorIndex {
         }
         let normalized = normalize(&vector);
         let code = binary::pack_signs(&normalized);
+        let l1 = binary::l1_norm(&normalized);
         self.entries.insert(
             gid,
             Entry {
                 vector: normalized,
                 code,
+                l1,
                 meta,
             },
         );
@@ -440,15 +446,18 @@ impl VectorBackend for MemVectorIndex {
             .filter(|(_, e)| filter.is_none_or(|f| f.eval(&e.meta)))
             .filter(|(_, e)| acl.is_none_or(|a| a.visible(&e.meta)));
 
-        // 二值粗筛档：Hamming 取 top-(k·oversample) → 仅对候选做 f32 精确重排。
+        // 二值粗筛档：RaBitQ 估计器取 top-(k·oversample) → 仅对候选做 f32 精确重排。
         let rerank_set: Vec<(&GlobalId, &Entry)> = if let Some(m) = self.binary_oversample {
-            let qcode = binary::pack_signs(&q);
             let want = k.saturating_mul(m).max(k);
-            // 粗排键：(Hamming 升, gid 升)——确定的候选集（边界同 Hamming 不抖）。
-            let mut coarse: Vec<(u32, &GlobalId, &Entry)> = candidates
-                .map(|(gid, e)| (binary::hamming(&qcode, &e.code), gid, e))
+            // 粗排键：(估计余弦 降, gid 升)——估计越大越近；同估计按 gid tie-break（确定）。
+            let mut coarse: Vec<(f32, &GlobalId, &Entry)> = candidates
+                .map(|(gid, e)| (binary::rabitq_estimate(&q, &e.code, e.l1), gid, e))
                 .collect();
-            coarse.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+            coarse.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(b.1))
+            });
             coarse.truncate(want);
             coarse.into_iter().map(|(_, gid, e)| (gid, e)).collect()
         } else {
@@ -797,6 +806,59 @@ mod tests {
         assert!(
             recall >= 0.85,
             "二值粗筛 recall@{k}={recall:.3} 应 ≥0.85（oversample=8）"
+        );
+    }
+
+    /// 对称 Hamming（符号不一致维数，越小越近）——仅测内用，对照 RaBitQ 估计器。
+    fn hamming_inline(a: &[u64], b: &[u64]) -> u32 {
+        a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+    }
+
+    /// RaBitQ 估计器 vs 对称 Hamming 同 oversample 头对头：估计器用查询幅度 + 逐向量 ‖x‖₁ 校正，
+    /// 粗筛候选更优 → 候选内 f32 重排后 recall **≥** Hamming（证明本迭代的精化确有增益）。
+    #[test]
+    fn rabitq_estimator_beats_hamming() {
+        let (n, dim, k, m) = (400usize, 96usize, 10usize, 4usize);
+        let idx = build(n, dim, None); // 直接读 entries 做两种粗筛对照
+        let want_n = k * m;
+        let (mut est_hit, mut ham_hit, mut total) = (0usize, 0usize, 0usize);
+        for qseed in [1u64, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+            let q = normalize(&pseudo_vec(qseed.wrapping_add(900_000), dim));
+            let qcode = binary::pack_signs(&q);
+            // 真 top-k（全精度暴力 ground truth）
+            let mut exact: Vec<(f32, u64)> = idx
+                .entries
+                .values()
+                .map(|e| (dot(&q, &e.vector), e.meta.chunk_id))
+                .collect();
+            exact.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let want: std::collections::HashSet<u64> = exact.iter().take(k).map(|x| x.1).collect();
+            // 用给定粗筛打分（越大越近）选 want_n 候选 → 候选内 f32 重排取 top-k → 命中真 top-k 数
+            let recall_of = |score: &dyn Fn(&Entry) -> f32| -> usize {
+                let mut c: Vec<(f32, u64, &Vec<f32>)> = idx
+                    .entries
+                    .values()
+                    .map(|e| (score(e), e.meta.chunk_id, &e.vector))
+                    .collect();
+                c.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                c.truncate(want_n);
+                let mut r: Vec<(f32, u64)> = c.iter().map(|(_, id, v)| (dot(&q, v), *id)).collect();
+                r.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+                r.iter().take(k).filter(|x| want.contains(&x.1)).count()
+            };
+            est_hit += recall_of(&|e| binary::rabitq_estimate(&q, &e.code, e.l1));
+            ham_hit += recall_of(&|e| -(hamming_inline(&qcode, &e.code) as f32));
+            total += k;
+        }
+        let (er, hr) = (est_hit as f32 / total as f32, ham_hit as f32 / total as f32);
+        // 实测 est≈0.87 vs ham≈0.71（oversample=4）——~16pt 增益。门禁留 5pt 余量防抖。
+        assert!(
+            er >= hr + 0.05,
+            "RaBitQ 估计器 recall({er:.3}) 应显著 ≥ 对称 Hamming({hr:.3})"
+        );
+        assert!(
+            er >= 0.85,
+            "估计器 recall@{k}={er:.3} 应 ≥0.85（oversample={m}）"
         );
     }
 
