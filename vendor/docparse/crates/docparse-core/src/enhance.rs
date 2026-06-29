@@ -58,6 +58,8 @@ fn total_physical_ram() -> Option<u64> {
         let mut len = std::mem::size_of::<u64>();
         // hw.memsize is the physical RAM size in bytes.
         let name = c"hw.memsize";
+        // SAFETY: sysctlbyname reads a u64 into our stack `mem`; `len` matches its
+        // size, name is a valid NUL-terminated C string, newp is null (read-only).
         let rc = unsafe {
             libc::sysctlbyname(
                 name.as_ptr(),
@@ -71,7 +73,10 @@ fn total_physical_ram() -> Option<u64> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        // SAFETY: sysconf takes an int name and returns a long; no pointers, no
+        // shared state. Returns -1 on unsupported names, handled below.
         let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        // SAFETY: see above — pure scalar query of the page size.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
         (pages > 0 && page_size > 0).then(|| pages as u64 * page_size as u64)
     }
