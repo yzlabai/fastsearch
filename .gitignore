@@ -1,9 +1,37 @@
+# Rust 构建产物（Cargo.lock 保留入仓：本仓产二进制/应用）
 /target
 **/*.rs.bk
+Cargo.lock.bak
 *.pdb
-.DS_Store
 
 # docparse（vendor/docparse，subtree 融合）构建产物 / 下载的模型 — 不进仓（模型走 fetch-models.sh）
 /vendor/docparse/target
 /vendor/docparse/models
 /vendor/docparse/tmp
+
+# Node / TS（example、clients/typescript 另有各自 .gitignore 兜更细的）
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python（clients/python 等）
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地配置 / 密钥 / 数据 — 不进仓（保留 *.example 模板）
+.env
+.env.*
+!.env.example
+/data
+*.log
+
+# 编辑器 / OS
+.DS_Store
+.idea/
+*.swp
