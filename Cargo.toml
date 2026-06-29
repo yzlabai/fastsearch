@@ -26,6 +26,13 @@ license = "Apache-2.0"
 repository = "https://github.com/yzlabai/fastsearch"
 rust-version = "1.85"
 
+[workspace.lints.rust]
+# 不变量（CLAUDE.md §关键不变量）：fastsearch 主仓零 unsafe。引擎是纯逻辑 + trait
+# 边界 + 外部 HTTP 嵌入，无手写 FFI/SIMD 需求，故 forbid 把「零 unsafe」固化成 CI
+# 守得住的硬约束（forbid 不可被内层 allow 解除）。vendor/docparse 自有 workspace，
+# 经根 exclude 隔离，不受此约束（其 5 处 libc unsafe + vendored tract 在彼处）。
+unsafe_code = "forbid"
+
 [workspace.dependencies]
 # 集中管理依赖版本；crate 用 `dep.workspace = true` 继承（仿 docparse-rs）
 serde = { version = "1", features = ["derive"] }

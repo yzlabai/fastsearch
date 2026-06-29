@@ -16,3 +16,6 @@ hnsw_rs = { version = "0.3.4", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

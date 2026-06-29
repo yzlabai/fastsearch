@@ -34,3 +34,6 @@ sha2.workspace = true
 [dev-dependencies]
 tower.workspace = true
 http-body-util.workspace = true
+
+[lints]
+workspace = true

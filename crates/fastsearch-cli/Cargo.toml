@@ -69,3 +69,6 @@ parse-tables = ["parse", "dep:docparse-ocr", "dep:docparse-raster"]
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

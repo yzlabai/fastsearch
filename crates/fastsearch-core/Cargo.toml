@@ -11,3 +11,6 @@ description = "Core data model, query/filter AST, and fusion algorithms for fast
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -9,3 +9,6 @@ description = "Reranker trait for fastsearch + a deterministic lexical-overlap b
 
 [dependencies]
 anyhow.workspace = true
+
+[lints]
+workspace = true

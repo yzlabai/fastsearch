@@ -12,3 +12,6 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq = "2"
+
+[lints]
+workspace = true
