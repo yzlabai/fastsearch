@@ -444,7 +444,9 @@ impl MemVectorIndex {
             dim: snap.dim,
             entries,
             binary_oversample: None, // 落盘不持搜索策略；如需开二值由调用方 with_binary_prefilter
-            rabitq_rotation: false, // 旋转同属搜索策略、不落盘；调用方按需重启用（engine 接线下一迭代）
+            // 旋转同属搜索策略、不落盘；翻档由调用方 set_rabitq_rotation 重启用（engine `open_with`
+            // 据 checkpoint 的 `brute_binary_rotated` 已接线，重建旋转矩阵 + 旋转空间重算 code/l1）。
+            rabitq_rotation: false,
             rotation: None,
         })
     }

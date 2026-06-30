@@ -10,9 +10,10 @@
 //!   **强选择性过滤**下用 **自适应过取**（filtered-traversal 务实形式）：过滤后不足 `k` 则翻倍
 //!   `want` 重搜、上限全集（最坏退化为对 filter 精确的全扫），不让选择性过滤掉召回（守 #5）。
 //!
-//! **墓碑增长（诚实记账，触不变量 #6）**：删除/更新只把 `entries[id]` 置 None、向量仍留图中，
-//! 故长生命周期进程在高频 upsert/delete 下 `entries` 与图**无界增长**，直到 `save`→`load`
-//! （只持久化活条目、重建图）或 `rebuild_from` 压实。无进程内自动压实（下一迭代）。
+//! **墓碑回收（守不变量 #6）**：删除/更新只把 `entries[id]` 置 None、向量仍留图中。为防长
+//! 生命周期进程在高频 upsert/delete 下 `entries`/图无界增长，删除/更新后按墓碑比例**自动压实**
+//! （[`HnswVectorIndex::compact`]：墓碑过半且超下限时，用活条目原地重建图与稠密 id 映射；摊还
+//! O(1)）。亦可手动 `compact`，或经 `save`→`load`（只持久化活条目、重建图）压实。
 //!
 //! **非确定性（诚实记账，触不变量 #4）**：`hnsw_rs` 用 `StdRng::from_os_rng()` 生成层级、
 //! **未暴露 seed**，故每次建图不同 → 检索结果有近似抖动、`save`→`load`（重建图）结果可能微异。
@@ -21,7 +22,8 @@
 //!
 //! 已实现（A9 step 2/3/4/6）：增量 insert + 墓碑删除 + over-fetch 后过滤 + **u8 量化图**
 //! （省 ~4× 图内存）+ **全精度 f32 重排**（量化误差兜底，recall@10≈0.99）+ 持久化（存 f32、
-//! load 重建图）+ 小集合回退暴力 + 接 engine + **自适应过取（强过滤召回兜底）**。真·图内
+//! load 重建图）+ 小集合回退暴力 + 接 engine + **自适应过取（强过滤召回兜底）** + **墓碑
+//! 自动压实**。真·图内
 //! filtered-traversal（遍历时即过滤、免重搜）需 hnsw_rs 支持，为下一迭代。
 
 use crate::{dot, normalize, tmp_path, VecMeta, VectorBackend};
@@ -33,6 +35,10 @@ use std::path::Path;
 
 /// 活条目数 ≤ 此值时检索回退暴力精确（保召回=1.0、确定）；超过才用 HNSW 近似图。
 const BRUTE_FALLBACK_MAX: usize = 1000;
+
+/// 进程内自动压实下限：`entries`（含墓碑）总量 ≤ 此值不触发压实，避免微小索引在
+/// 增删抖动中反复重建图（重建是 O(活条目) re-insert）。超过此量且墓碑过半才压实。
+const COMPACT_MIN_TOTAL: usize = 32;
 
 /// 把**归一化** f32 分量（∈[-1,1]）对称量化到 u8（∈[0,255]）：图存 u8（省 ~4× 图内存），
 /// 全精度重排仍用旁挂 f32。仿射平移对所有向量一致 → u8 L2 序与原始一致（modulo 取整）。
@@ -130,6 +136,46 @@ impl HnswVectorIndex {
             self.params.ef_construction,
             DistL2 {},
         );
+    }
+
+    /// 墓碑数 = 已分配槽位 - 活条目数（删除/更新只置 `None`，向量仍留图中）。
+    pub fn dead_count(&self) -> usize {
+        self.entries.len() - self.gid_to_id.len()
+    }
+
+    /// 进程内压实：丢弃墓碑，用**活条目**重建图与稠密 id 映射（绕 hnsw_rs 无原地删除）。
+    /// 等价 `save`→`load` 的活集重建，但全程内存、不落盘——回收墓碑占用的图内存/槽位。
+    /// 活集与检索语义不变（图内部 id 重排；HNSW 近似抖动本就是其固有性质，见模块注）。
+    pub fn compact(&mut self) {
+        if self.dead_count() == 0 {
+            return; // 无墓碑，免重建
+        }
+        let live: Vec<HnswEntry> = self.entries.drain(..).flatten().collect();
+        self.hnsw = Hnsw::<u8, DistL2>::new(
+            self.params.max_nb_connection,
+            10_000,
+            self.params.max_layer,
+            self.params.ef_construction,
+            DistL2 {},
+        );
+        self.entries = Vec::with_capacity(live.len());
+        self.gid_to_id.clear();
+        for e in live {
+            let id = self.entries.len();
+            // e.vector 已归一化（存入即归一化）；图存 u8 量化、entries 留 f32 供精排。
+            self.hnsw.insert((quantize_u8(&e.vector).as_slice(), id));
+            self.gid_to_id.insert(e.gid.clone(), id);
+            self.entries.push(Some(e));
+        }
+    }
+
+    /// 增删后按墓碑比例触发自动压实：总槽位超下限且**墓碑过半**（dead > live）时压实。
+    /// 「过半才压实」给出摊还 O(1) 重建代价（仿动态数组倍增），长跑高频 upsert/delete 下
+    /// `entries`/图不再无界增长（守不变量 #6 的墓碑增长项）。
+    fn maybe_compact(&mut self) {
+        if self.entries.len() > COMPACT_MIN_TOTAL && self.dead_count() > self.gid_to_id.len() {
+            self.compact();
+        }
     }
 
     /// 小集合**暴力精确**扫描（保召回=1.0）：免 ANN 抖动 + 规避强过滤下召回坑。
@@ -237,9 +283,12 @@ impl VectorBackend for HnswVectorIndex {
             _ => {}
         }
         // 更新：墓碑旧 id（向量留图中，检索时跳过），插入新 id。
-        if let Some(old) = self.gid_to_id.remove(&gid) {
+        let was_update = if let Some(old) = self.gid_to_id.remove(&gid) {
             self.entries[old] = None;
-        }
+            true
+        } else {
+            false
+        };
         let id = self.entries.len();
         let normalized = normalize(&vector);
         // 图存 u8 量化向量；entries 存 f32 供全精度重排。
@@ -250,12 +299,17 @@ impl VectorBackend for HnswVectorIndex {
             meta,
         }));
         self.gid_to_id.insert(gid, id);
+        // 仅更新（产生新墓碑）时检查压实；纯新增 dead=0 永不触发，不扰 bulk load。
+        if was_update {
+            self.maybe_compact();
+        }
         Ok(())
     }
 
     fn delete(&mut self, gid: &GlobalId) -> anyhow::Result<()> {
         if let Some(id) = self.gid_to_id.remove(gid) {
             self.entries[id] = None;
+            self.maybe_compact();
         }
         Ok(())
     }
@@ -272,6 +326,7 @@ impl VectorBackend for HnswVectorIndex {
                 self.entries[id] = None;
             }
         }
+        self.maybe_compact();
         Ok(())
     }
 
@@ -657,5 +712,60 @@ mod tests {
         assert_eq!(hnsw.len(), 1);
         let got = hnsw.search(&v, 10, None, None).unwrap();
         assert!(got.iter().all(|s| s.id != gid("d", 1)), "已删 gid 不应命中");
+    }
+
+    #[test]
+    fn auto_compaction_reclaims_tombstones() {
+        let dim = 8;
+        let mut hnsw = HnswVectorIndex::new(HnswParams::default());
+        // 插入 40 条（超 COMPACT_MIN_TOTAL=32）；纯新增 → 无墓碑、不触发压实。
+        for i in 1..=40u64 {
+            hnsw.upsert(gid("d", i), vec_for(i, dim), meta("d", i, vec!["public"]))
+                .unwrap();
+        }
+        assert_eq!(hnsw.entries.len(), 40, "纯新增不压实，槽位=条目数");
+        assert_eq!(hnsw.dead_count(), 0);
+        // 逐条删除，直到墓碑过半（dead > live）触发自动压实。
+        for i in 1..=21u64 {
+            hnsw.delete(&gid("d", i)).unwrap();
+        }
+        let live = hnsw.len();
+        assert_eq!(live, 19, "应剩 19 活条目");
+        // 压实已发生：槽位回落到活条目数，墓碑清零（否则槽位仍为 40）。
+        assert_eq!(hnsw.dead_count(), 0, "自动压实后应无墓碑");
+        assert_eq!(hnsw.entries.len(), live, "槽位回落到活条目数");
+        // 活集检索语义不变：剩余 gid 仍可被自身向量召回为 top-1。
+        let probe = 30u64;
+        let got = hnsw.search(&vec_for(probe, dim), 1, None, None).unwrap();
+        assert_eq!(got[0].id, gid("d", probe), "压实后活条目仍可检索");
+    }
+
+    #[test]
+    fn manual_compact_preserves_live_set() {
+        let dim = 8;
+        let mut hnsw = HnswVectorIndex::new(HnswParams::default());
+        for i in 1..=10u64 {
+            hnsw.upsert(gid("d", i), vec_for(i, dim), meta("d", i, vec!["public"]))
+                .unwrap();
+        }
+        // 小集合（<COMPACT_MIN_TOTAL）删除不自动压实 → 留墓碑，正好测手动 compact。
+        hnsw.delete(&gid("d", 3)).unwrap();
+        hnsw.delete(&gid("d", 7)).unwrap();
+        assert_eq!(hnsw.dead_count(), 2, "小集合不自动压实，墓碑留存");
+        let before: Vec<_> = hnsw.search(&vec_for(5, dim), 5, None, None).unwrap();
+        hnsw.compact();
+        assert_eq!(hnsw.dead_count(), 0, "手动压实清墓碑");
+        assert_eq!(hnsw.len(), 8, "活条目数不变");
+        let after: Vec<_> = hnsw.search(&vec_for(5, dim), 5, None, None).unwrap();
+        // 小集合走暴力精确路径，压实前后 top-k 完全一致。
+        assert_eq!(
+            before.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            after.iter().map(|s| &s.id).collect::<Vec<_>>(),
+            "压实保活集检索结果不变"
+        );
+        // 已删 gid 压实后仍不命中。
+        assert!(after
+            .iter()
+            .all(|s| s.id != gid("d", 3) && s.id != gid("d", 7)));
     }
 }

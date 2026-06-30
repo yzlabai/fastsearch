@@ -10,8 +10,11 @@
 //! 比对称 Hamming（只数符号一致维、丢掉 `q` 的幅度）更接近真实余弦：两条同符号的库向量 Hamming
 //! 必打平，估计器仍能按 `q` 的幅度把它们分开 → 同 oversample 下召回更高（单测 `..._beats_hamming` 佐证）。
 //!
-//! 无偏性需**随机旋转**把量化误差摊匀（下一迭代）；当前未旋转，估计器已严格优于 Hamming，
-//! 旋转后再升级为带误差界的无偏估计。重排 + `GlobalId` tie-break 保持确定。
+//! 无偏性需**随机旋转**把量化误差摊匀：见下方 [`Rotation`]（数据无关正交变换，量化前施加），
+//! 经 `MemVectorIndex::with_binary_prefilter_rotated` / `set_rabitq_rotation` 启用，并由 engine
+//! `open_with` 据 checkpoint 翻档接线。未旋转档（默认二值）估计器已严格优于 Hamming；旋转档
+//! 对各向异性数据进一步增益（单测 `rabitq_rotation_helps_anisotropic` 佐证）。重排 +
+//! `GlobalId` tie-break 保持确定。
 
 /// 把归一化向量的符号位打包成 u64 字序列（`v[i] >= 0 → 1`）。长度 `ceil(d/64)`。
 pub(crate) fn pack_signs(v: &[f32]) -> Vec<u64> {
