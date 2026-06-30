@@ -36,6 +36,10 @@ impl PgConfig {
     }
 }
 
+/// `ensure_schema` 的事务级 advisory lock key（固定常量，全副本同值才能互斥）。任意 i64；
+/// 取自 ASCII `"fss_ddl\0"` 的高位字节，避免与运维自用 advisory key 偶然撞号。
+const SCHEMA_DDL_LOCK_KEY: i64 = 0x6673_735f_6464_6c00;
+
 /// Postgres 真源句柄。
 pub struct PgStore {
     client: Client,
@@ -58,9 +62,22 @@ impl PgStore {
 
     /// 幂等建表/扩展/索引/publication。
     pub async fn ensure_schema(&self) -> Result<()> {
+        // **并发 boot 安全**：引擎是多副本/无状态（CLAUDE.md），多副本同时 boot 都会跑这段
+        // 幂等 DDL。`CREATE EXTENSION/TABLE/INDEX/PUBLICATION ... IF NOT EXISTS` 在 Postgres
+        // 里**仍有 TOCTOU 竞态窗口**（并发执行可报 "tuple concurrently updated" / 重复键 /
+        // "relation already exists"）。用**事务级 advisory lock**把整段 DDL 串行化：同 key 的
+        // 并发调用排队，锁随 COMMIT/ROLLBACK 自动释放（异常安全，无需手动解锁）。DDL 幂等，
+        // 后到的副本拿锁后看到 schema 已建好、各 IF NOT EXISTS 空转。
+        let mut batch = String::from("BEGIN;\n");
+        batch.push_str(&format!(
+            "SELECT pg_advisory_xact_lock({SCHEMA_DDL_LOCK_KEY});\n"
+        ));
         for stmt in sql::ddl(&self.cfg.table, self.cfg.vector_type, self.cfg.vector_dim) {
-            self.client.batch_execute(&stmt).await?;
+            batch.push_str(&stmt);
+            batch.push('\n');
         }
+        batch.push_str("COMMIT;\n");
+        self.client.batch_execute(&batch).await?;
         Ok(())
     }
 
@@ -451,6 +468,32 @@ mod tests {
         assert!(validate_identifier("a;DROP TABLE x").is_err());
         assert!(validate_identifier("a b").is_err());
         assert!(validate_identifier("a\"b").is_err());
+    }
+
+    /// 并发 boot 回归（需 DATABASE_URL）：8 个连接同时对**同一 schema** `ensure_schema`，
+    /// 事务级 advisory lock 串行化 DDL → 全部成功、无 "tuple concurrently updated"/重复键竞态
+    /// （守多副本并发 boot；此前并发 DDL 会非确定失败）。
+    #[tokio::test]
+    async fn ensure_schema_concurrent_no_race() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip ensure_schema_concurrent_no_race: DATABASE_URL not set");
+            return;
+        };
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let url = url.clone();
+            handles.push(tokio::spawn(async move {
+                let mut cfg = PgConfig::new(url);
+                cfg.table = "fastsearch_chunks_it".into();
+                let store = PgStore::connect(cfg).await.expect("connect");
+                store.ensure_schema().await
+            }));
+        }
+        for h in handles {
+            h.await
+                .expect("join")
+                .expect("并发 ensure_schema 应成功（advisory lock 串行化 DDL）");
+        }
     }
 
     /// 集成测试：仅当 `DATABASE_URL` 设置时运行；否则跳过（不算失败）。
