@@ -3,6 +3,8 @@
 > 目标：给 fastsearch（单二进制混合检索引擎，托管 Postgres+pgvector 为真源；BM25 用 Tantivy，向量支持暴力/HNSW+u8量化/pgvector直连，融合 RRF/归一化/加权，带页码+bbox 引用溯源）设计一套**可信、可复现、可对标主流竞品**的评测方法。
 >
 > 调研日期 2026-06-29，来源经多源对抗验证（详见末尾「来源」）。**结论先行：没有任何现成 harness 能端到端测 fastsearch 的完整混合管线，质量与性能要用两条互补工具链分别评。**
+>
+> 📊 **已有第一份实测数字**（2026-06-30，fastsearch HNSW vs Qdrant，自包含合成数据）：见 [benchmarks/RESULTS.md](../benchmarks/RESULTS.md) + harness [benchmarks/vector_bench.py](../benchmarks/vector_bench.py)。摘要：recall@10 ≈ 0.99（vs Qdrant 1.0），延迟 ~5–7ms vs ~1ms（每查询固定开销主导，非 ANN）。
 
 ## 0. 一图：评测分两条线
 
