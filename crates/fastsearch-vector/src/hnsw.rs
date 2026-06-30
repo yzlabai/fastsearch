@@ -7,8 +7,9 @@
 //! - 精度/ACL **精确**：HNSW 取回候选后仍用 `Filter::eval` + `AclFilter::visible` 精确后过滤，
 //!   并用全精度 f32 重算余弦——结果是暴力精确结果的**子集**，绝不越权、绝不过返。
 //! - 召回 **近似**：ANN 固有。靠 `over_fetch`（取回 `k×over_fetch` 候选）+ `ef_search` 调高召回。
-//!   **强选择性过滤**下用 **自适应过取**（filtered-traversal 务实形式）：过滤后不足 `k` 则翻倍
-//!   `want` 重搜、上限全集（最坏退化为对 filter 精确的全扫），不让选择性过滤掉召回（守 #5）。
+//!   **强选择性过滤**下用 **图内 filtered-traversal**（hnsw_rs `search_filter`：把 filter+ACL 谓词
+//!   下推进遍历，结果堆只收合规候选，遍历仍穿过被裁节点保连通）+ **自适应过取**安全网（过滤后不足
+//!   `k` 则翻倍 `want` 重搜、上限全集，最坏退化对 filter 精确全扫），不让选择性过滤掉召回（守 #5）。
 //!
 //! **墓碑回收（守不变量 #6）**：删除/更新只把 `entries[id]` 置 None、向量仍留图中。为防长
 //! 生命周期进程在高频 upsert/delete 下 `entries`/图无界增长，删除/更新后按墓碑比例**自动压实**
@@ -22,13 +23,12 @@
 //!
 //! 已实现（A9 step 2/3/4/6）：增量 insert + 墓碑删除 + over-fetch 后过滤 + **u8 量化图**
 //! （省 ~4× 图内存）+ **全精度 f32 重排**（量化误差兜底，recall@10≈0.99）+ 持久化（存 f32、
-//! load 重建图）+ 小集合回退暴力 + 接 engine + **自适应过取（强过滤召回兜底）** + **墓碑
-//! 自动压实**。真·图内
-//! filtered-traversal（遍历时即过滤、免重搜）需 hnsw_rs 支持，为下一迭代。
+//! load 重建图）+ 小集合回退暴力 + 接 engine + **图内 filtered-traversal**（hnsw_rs
+//! `search_filter` 谓词下推）+ **自适应过取（强过滤召回兜底）** + **墓碑自动压实**。
 
 use crate::{dot, normalize, tmp_path, VecMeta, VectorBackend};
 use fastsearch_core::{AclFilter, Citation, Filter, GlobalId, Scored};
-use hnsw_rs::prelude::{DistL2, Hnsw};
+use hnsw_rs::prelude::{DistL2, FilterT, Hnsw};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -382,20 +382,36 @@ impl HnswVectorIndex {
         let qcode = quantize_u8(&q);
         let total = self.gid_to_id.len();
         let ef_base = ef_override.unwrap_or(self.params.ef_search);
-        // **自适应过取（filtered-traversal 的务实形式）**：强选择性 filter/ACL 下，固定 over-fetch
-        // 的候选可能被过滤殆尽 → 召回崩。有 filter/acl 时，若过滤后不足 k 就翻倍 `want` 重搜，
-        // 上限 = 全集（最坏退化为对 filter 精确的全扫，守不变量 #5：选择性过滤不掉召回）。
-        // 无 filter/acl 则单发（纯 ANN 近似，不升级）。确定：同输入 → 同升级路径 → 同结果。
+        // **图内 filtered-traversal**（hnsw_rs `search_filter`）：有 filter/acl 时把 filter+ACL
+        // 谓词下推进图遍历——`hnsw_filter(d_id)` 在遍历期即裁掉不合规节点，结果堆只收合规候选，
+        // 强选择性下命中更密（无需"搜一大批再筛"），且遍历仍穿过被裁节点保连通性、不掉召回（守 #5）。
+        // 谓词同时滤掉墓碑（`entries[id]=None`）。无 filter/acl 走纯 `search`（零谓词开销）。
+        // **自适应过取仍作安全网**：过滤后不足 k 就翻倍 `want` 重搜，上限=全集（最坏退化全扫）。
+        // 确定：同输入 → 同遍历 → 同升级路径 → 同结果。
         let needs_escalation = filter.is_some() || acl.is_some();
         let mut want = k.saturating_mul(self.params.over_fetch).max(k);
         let mut scored: Vec<Scored> = loop {
             let ef = ef_base.max(want);
-            let s: Vec<Scored> = self
-                .hnsw
-                .search(qcode.as_slice(), want, ef)
+            let neighbours = if needs_escalation {
+                // 谓词：内部 DataId（=entries 下标）→ 活条目且过 filter+ACL 才保留。
+                let pred = |id: &usize| -> bool {
+                    self.entries
+                        .get(*id)
+                        .and_then(|e| e.as_ref())
+                        .is_some_and(|e| {
+                            filter.is_none_or(|f| f.eval(&e.meta))
+                                && acl.is_none_or(|a| a.visible(&e.meta))
+                        })
+                };
+                self.hnsw
+                    .search_filter(qcode.as_slice(), want, ef, Some(&pred as &dyn FilterT))
+            } else {
+                self.hnsw.search(qcode.as_slice(), want, ef)
+            };
+            let s: Vec<Scored> = neighbours
                 .into_iter()
                 .filter_map(|n| self.entries.get(n.d_id).and_then(|e| e.as_ref()))
-                // 精确后过滤：filter + ACL（不放松、不越权）。
+                // 精确后过滤：与遍历谓词同口径（防御性兜底，确保不放松/不越权）。
                 .filter(|e| filter.is_none_or(|f| f.eval(&e.meta)))
                 .filter(|e| acl.is_none_or(|a| a.visible(&e.meta)))
                 // 全精度重排：用原始 f32 重算余弦（抵消近似/量化误差）。
@@ -611,6 +627,44 @@ mod tests {
             recall >= 0.85,
             "强选择性 filter recall@{k}={recall} <0.85（自适应过取应兜底）"
         );
+    }
+
+    /// 图内 filtered-traversal 的 ACL 谓词下推：在 HNSW 路径（>BRUTE_FALLBACK_MAX）上，
+    /// 遍历期即裁掉越权节点 → 结果绝不含越权命中（守不变量 #3/#5），且仍有召回。
+    #[test]
+    fn filtered_traversal_acl_no_leak_at_scale() {
+        use fastsearch_core::AclFilter;
+        let dim = 32;
+        let n = 1500u64; // > BRUTE_FALLBACK_MAX → 走 HNSW search_filter 路径
+        let mut hnsw = HnswVectorIndex::new(HnswParams::default());
+        for i in 0..n {
+            let acl = if i % 2 == 0 {
+                vec!["team-a"]
+            } else {
+                vec!["team-b"]
+            };
+            hnsw.upsert(gid("d", i), vec_for(i, dim), meta("d", i, acl))
+                .unwrap();
+        }
+        let acl = AclFilter {
+            tenant: None,
+            allowed_tags: vec!["team-a".into()],
+        };
+        let mut total = 0usize;
+        for qi in 0..20u64 {
+            let got = hnsw
+                .search(&vec_for(500_000 + qi, dim), 10, None, Some(&acl))
+                .unwrap();
+            for s in &got {
+                assert_eq!(
+                    s.id.chunk_id % 2,
+                    0,
+                    "filtered-traversal 越权泄漏（应只见 team-a 偶数 id）"
+                );
+            }
+            total += got.len();
+        }
+        assert!(total > 0, "filtered-traversal 应有合规召回，非全空");
     }
 
     #[test]
