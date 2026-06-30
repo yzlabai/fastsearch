@@ -83,6 +83,43 @@ jobs:
         run: cargo clippy -p fastsearch-cli --features parse --all-targets -- -D warnings
       - name: test (parse multiformat ingest)
         run: cargo test -p fastsearch-cli --features parse
+      # parse-ocr/parse-tables（重 ONNX/tract）：CI 仅**编译校验**防 bit-rot；运行测试需 ONNX
+      # 模型目录、env-gated 跳过（见 CLAUDE.md 构建分档）。本机已验证两档 cargo check 均通过。
+      - name: check (parse-ocr, compile only)
+        run: cargo check -p fastsearch-cli --features parse-ocr
+      - name: check (parse-tables, compile only)
+        run: cargo check -p fastsearch-cli --features parse-tables
+
+  # 依赖许可 + 安全公告 + 来源守门（治理 [C1 §4.3]）+ 产出第三方许可清单。GA 出口判据：
+  # 拒绝意外引入 copyleft/share-alike（GPL/CC-BY-SA，如换 lindera 系词典），并把
+  # THIRD-PARTY-NOTICES.md 作为发布产物（MIT/Apache 归属义务）。
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-deny + cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-about
+      # 许可 + 来源门禁（确定性，不依赖外部 DB）：allow-list 外的许可 / 未知 registry 即变红。
+      # 这是 GA 合规硬门禁（治理 C1 §4.3）。
+      - name: deny check (licenses + sources)
+        run: cargo deny check licenses sources
+      # bans（多版本/通配）+ advisories（RustSec，需联网）：信息性，不阻塞 PR——内部 path 依赖会
+      # 被判通配（误报），新 CVE 也不应让无关 PR 变红。供人工巡检。
+      - name: deny check (bans + advisories, informational)
+        run: cargo deny check bans advisories
+        continue-on-error: true
+      # 生成第三方许可清单并存档（发布物随附）。
+      - name: generate third-party notices
+        run: cargo about generate about.hbs > THIRD-PARTY-NOTICES.md
+      - name: upload notices artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-notices
+          path: THIRD-PARTY-NOTICES.md
 
   # CLI↔server 端到端：CLI 是 server 的 REST 客户端，此 job 守住其契约不漂移（无需 PG，
   # server 用内存/落盘派生索引 + dev key）。喂文件夹→检索 / stdin index→检索 全程经真 server。

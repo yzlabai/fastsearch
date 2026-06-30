@@ -1,0 +1,22 @@
+# 第三方依赖许可清单 · THIRD-PARTY-NOTICES
+
+> 本文件由 `cargo about generate about.hbs` **自动产出，勿手改**。
+>
+> fastsearch 本体以 Apache-2.0 分发。下列第三方依赖按各自宽松许可（MIT / Apache-2.0 /
+> BSD 等，无 share-alike）并入分发，以下为其归属与许可全文。许可面与 `deny.toml` 门禁一致。
+
+依赖按许可分组如下（每组附许可全文）。
+
+{{#each licenses}}
+## {{name}}
+
+被以下 crate 使用：
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}
+{{/each}}
+
+```
+{{text}}
+```
+
+{{/each}}

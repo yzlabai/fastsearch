@@ -1,0 +1,60 @@
+# cargo-deny 配置 — 依赖许可 + 安全公告 + 来源守门（发布前合规）。
+#
+# 背景：治理文档 [C1 词典与第三方许可审 §4.3](docs/governance/2026-06-26-词典与第三方许可审.md)
+# 把「`cargo deny check licenses` + allow-list，拒绝意外引入 GPL/CC-BY-SA 等 copyleft/
+# share-alike 依赖」列为发布工程的 CI 守门项。本文件即落地该守门，也是「换词典需重审」
+# （§4.4）的机器可执行基线——任何引入 share-alike 许可（如 lindera 系 CC-BY-SA 词典）的
+# 改动会让 CI 变红，强制人工重审。
+#
+# 校验范围：fastsearch 主仓 workspace（vendor/docparse 自有 workspace、被根 exclude，
+# 其重 ONNX 依赖在彼处单独治理）。
+
+[graph]
+# 主流目标平台；只查实际分发到的依赖，避免冷门平台的 cfg-gated crate 噪声。
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+
+[licenses]
+# 允许的宽松许可：均可并入 Apache-2.0 分发，无 share-alike 传染。
+# 与 about.toml 的 accepted 保持一致（清单生成与门禁同一许可面）。
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    # CDLA-Permissive-2.0：宽松数据许可（无 share-alike），ONNX 生态 feature-gated 依赖用作
+    # 唯一许可（parse-ocr/parse-tables 档），与 Apache-2.0 分发相容。本机审计实测存在 2 个。
+    "CDLA-Permissive-2.0",
+]
+# 许可文本匹配置信度阈值（默认 0.8）；低于此的模糊声明要求人工 clarify，不静默放行。
+confidence-threshold = 0.8
+# 个别 crate 用 license-file 而非 SPDX 标识时，在此逐个澄清（当前无；保留占位说明）。
+# [[licenses.clarify]] name = "..." expression = "MIT" license-files = [...]
+
+[bans]
+# 同一 crate 多版本：仅告警（依赖树常态，不阻塞合规门禁）。
+multiple-versions = "warn"
+# 通配版本依赖：告警而非拒绝。本工作区内部 `fastsearch-* = { path = ... }` 无 version 字段，
+# cargo-deny 视作通配；allow-wildcard-paths 对「未标 publish=false 的 crate」不生效，故这些内部
+# path 依赖会被判通配。它们是工作区常态、非外部供应链风险，降级为 warn 避免误报；真正来自
+# registry 的 `*` 仍会显警以便人工注意（合规门禁只跑 licenses+sources，见 CI `licenses` job）。
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[advisories]
+# RustSec 安全公告库：有已知漏洞即 deny，yank 告警（cargo-deny v2 默认行为，显式固化）。
+version = 2
+
+[sources]
+# 只允许官方 crates.io；未知 registry / git 源一律拒绝（供应链守门）。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

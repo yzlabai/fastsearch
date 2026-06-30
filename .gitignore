@@ -31,6 +31,9 @@ venv/
 /data
 *.log
 
+# cargo-about 产物（CI 生成、随发布物存档，不入库）
+/THIRD-PARTY-NOTICES.md
+
 # 编辑器 / OS
 .DS_Store
 .idea/

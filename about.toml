@@ -1,0 +1,14 @@
+# cargo-about 配置 — 生成第三方许可清单 THIRD-PARTY-NOTICES.md（发布物归属义务）。
+# accepted 与 deny.toml 的 [licenses].allow 同一许可面（清单生成与门禁一致）。
+# 治理依据见 [C1 词典与第三方许可审 §4.2](docs/governance/2026-06-26-词典与第三方许可审.md)。
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
