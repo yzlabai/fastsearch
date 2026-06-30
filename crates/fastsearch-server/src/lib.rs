@@ -565,12 +565,15 @@ fn openapi_spec() -> Value {
                     "parameters": [
                         {"name": "exp", "in": "query", "required": true, "schema": {"type": "integer"}},
                         {"name": "ct", "in": "query", "required": true, "schema": {"type": "string"}},
-                        {"name": "sig", "in": "query", "required": true, "schema": {"type": "string"}}
+                        {"name": "sig", "in": "query", "required": true, "schema": {"type": "string"}},
+                        {"name": "Range", "in": "header", "required": false, "schema": {"type": "string"}, "description": "bytes=A-B / A- / -N（单段；音视频 seek/断点续传）"}
                     ],
                     "responses": {
-                        "200": {"description": "inline 字节 + Content-Type=ct"},
+                        "200": {"description": "inline 全量字节 + Content-Type=ct + Accept-Ranges: bytes"},
+                        "206": {"description": "Partial Content：单段 Range 命中，带 Content-Range: bytes A-B/total"},
                         "403": {"description": "未配签名器 / token 无效或过期"},
-                        "404": {"description": "无字节"}
+                        "404": {"description": "无字节"},
+                        "416": {"description": "Range 不可满足（起点越界），带 Content-Range: bytes */total"}
                     }
                 }
             },
@@ -805,10 +808,107 @@ async fn similar(
     Ok(Json(json!({ "hits": hits_json(&hits) })))
 }
 
+/// 单段 `Range: bytes=…` 头的解析结果。多段（含逗号）不支持 → `None`（退 200 全量，RFC 7233
+/// 允许服务端忽略 Range）。
+enum RangeSpec {
+    /// 无 Range 头或语法非法/不支持 → 返回 200 全量。
+    None,
+    /// 闭区间 `[start, end]`（0-based、含端，已对总长截断）→ 206 Partial Content。
+    Range(u64, u64),
+    /// 语法可解析但不可满足（起点越界 / 后缀 0 / 空体）→ 416。
+    Unsatisfiable,
+}
+
+/// 解析 `Range: bytes=A-B`（支持 `A-`、`-N` 后缀式）为闭区间。仅支持单段；`total` 为资源总字节。
+fn parse_range(headers: &HeaderMap, total: u64) -> RangeSpec {
+    let Some(spec) = headers
+        .get(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("bytes="))
+        .map(str::trim)
+    else {
+        return RangeSpec::None;
+    };
+    // 多段 byte-range 不支持 → 忽略 Range、退回 200 全量。
+    if spec.contains(',') {
+        return RangeSpec::None;
+    }
+    let Some((a, b)) = spec.split_once('-') else {
+        return RangeSpec::None; // 语法非法 → 当作无 Range
+    };
+    let (start, end) = if a.is_empty() {
+        // 后缀式 `-N`：末尾 N 字节。
+        let Ok(n) = b.parse::<u64>() else {
+            return RangeSpec::None;
+        };
+        if n == 0 || total == 0 {
+            return RangeSpec::Unsatisfiable;
+        }
+        (total.saturating_sub(n), total - 1)
+    } else {
+        let Ok(start) = a.parse::<u64>() else {
+            return RangeSpec::None;
+        };
+        let end = if b.is_empty() {
+            total.saturating_sub(1)
+        } else {
+            match b.parse::<u64>() {
+                Ok(e) => e.min(total.saturating_sub(1)),
+                Err(_) => return RangeSpec::None,
+            }
+        };
+        (start, end)
+    };
+    if total == 0 || start >= total || start > end {
+        return RangeSpec::Unsatisfiable;
+    }
+    RangeSpec::Range(start, end)
+}
+
+/// 把 inline 字节按 `Range` 头组装响应：无 Range→200 全量 + `Accept-Ranges: bytes`；
+/// 单段→206 + `Content-Range`；不可满足→416 + `Content-Range: bytes */total`。两个 inline
+/// 出口（authed `asset` / token 门控 `asset_bytes`）共用，确保 Range 语义一致。
+fn serve_inline_bytes(headers: &HeaderMap, ct: String, bytes: Vec<u8>) -> Response {
+    let total = bytes.len() as u64;
+    match parse_range(headers, total) {
+        RangeSpec::None => (
+            [
+                (header::CONTENT_TYPE, ct),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        RangeSpec::Range(start, end) => {
+            let slice = bytes[start as usize..=end as usize].to_vec();
+            (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, ct),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (
+                        header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{total}"),
+                    ),
+                ],
+                slice,
+            )
+                .into_response()
+        }
+        RangeSpec::Unsatisfiable => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{total}"))],
+            "range not satisfiable",
+        )
+            .into_response(),
+    }
+}
+
 /// 媒资 ACL 网关：`GET /v1/asset/{citation_id}` —— `principal→acl_for→resolve_citation`，
 /// ACL 不可绕过（不可见/不存在均 404，不暴露存在性）。InlineRef 按需从 PG 真源取字节直吐（MM6-inline）、
 /// SignedUrl 302（由 `ObjectSigner` 签短时 URL；**未配签名器时 Object→404，绝不暴露裸 key**，MM6-secure）、
-/// DocRender 返回跳原文 JSON。Range（音视频 seek）待对象存储接入。
+/// DocRender 返回跳原文 JSON。inline 字节支持 `Range`（音视频 seek / 断点续传）；对象存储档 Range
+/// 由签名 URL 转交对象存储处理。
 async fn asset(
     State(s): State<ServerState>,
     headers: HeaderMap,
@@ -864,7 +964,7 @@ async fn asset(
                 let ct = a
                     .media_type
                     .unwrap_or_else(|| "application/octet-stream".into());
-                ([(header::CONTENT_TYPE, ct)], bytes).into_response()
+                serve_inline_bytes(&headers, ct, bytes)
             }
             Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
             Err(e) => {
@@ -906,7 +1006,7 @@ async fn asset_bytes(
     // 验签通过 = 已授权（签发时过的 ACL）→ 取 PG 真源字节，不再查 ACL。
     let engine = s.engine.lock().await;
     match engine.fetch_inline_bytes(&cid) {
-        Ok(Some(bytes)) => ([(header::CONTENT_TYPE, q.ct)], bytes).into_response(),
+        Ok(Some(bytes)) => serve_inline_bytes(&headers, q.ct, bytes),
         Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
         Err(e) => {
             s.metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -1314,6 +1414,101 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "未配签名器→403");
+    }
+
+    // --- inline 字节 Range 支持（serve_inline_bytes 纯函数；端到端取字节需 PG，env-gated）---
+
+    fn hdr_range(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::RANGE, v.parse().unwrap());
+        h
+    }
+
+    async fn resp_parts(resp: Response) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let (p, body) = resp.into_parts();
+        let b = body.collect().await.unwrap().to_bytes().to_vec();
+        (p.status, p.headers, b)
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_no_range_is_200_with_accept_ranges() {
+        let (st, h, body) = resp_parts(serve_inline_bytes(
+            &HeaderMap::new(),
+            "text/plain".into(),
+            b"hello".to_vec(),
+        ))
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            h.get(header::ACCEPT_RANGES).unwrap(),
+            "bytes",
+            "应宣告支持 Range"
+        );
+        assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_range_is_206_partial() {
+        let (st, h, body) = resp_parts(serve_inline_bytes(
+            &hdr_range("bytes=1-3"),
+            "text/plain".into(),
+            b"hello".to_vec(),
+        ))
+        .await;
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(h.get(header::CONTENT_RANGE).unwrap(), "bytes 1-3/5");
+        assert_eq!(h.get(header::ACCEPT_RANGES).unwrap(), "bytes");
+        assert_eq!(body, b"ell", "闭区间含端");
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_suffix_and_open_ranges() {
+        // 后缀 `-2` → 末 2 字节。
+        let (_, h, body) = resp_parts(serve_inline_bytes(
+            &hdr_range("bytes=-2"),
+            "x".into(),
+            b"hello".to_vec(),
+        ))
+        .await;
+        assert_eq!(h.get(header::CONTENT_RANGE).unwrap(), "bytes 3-4/5");
+        assert_eq!(body, b"lo");
+        // 开区间 `2-` → 到末尾；末端越界自动截断到 total-1。
+        let (_, h2, body2) = resp_parts(serve_inline_bytes(
+            &hdr_range("bytes=2-99"),
+            "x".into(),
+            b"hello".to_vec(),
+        ))
+        .await;
+        assert_eq!(h2.get(header::CONTENT_RANGE).unwrap(), "bytes 2-4/5");
+        assert_eq!(body2, b"llo");
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_unsatisfiable_is_416() {
+        let (st, h, _) = resp_parts(serve_inline_bytes(
+            &hdr_range("bytes=10-20"),
+            "x".into(),
+            b"hello".to_vec(),
+        ))
+        .await;
+        assert_eq!(st, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            h.get(header::CONTENT_RANGE).unwrap(),
+            "bytes */5",
+            "416 须带总长"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_multirange_falls_back_to_200() {
+        let (st, _, body) = resp_parts(serve_inline_bytes(
+            &hdr_range("bytes=0-1,3-4"),
+            "x".into(),
+            b"hello".to_vec(),
+        ))
+        .await;
+        assert_eq!(st, StatusCode::OK, "多段 Range 不支持 → 退 200 全量");
+        assert_eq!(body, b"hello");
     }
 
     #[tokio::test]

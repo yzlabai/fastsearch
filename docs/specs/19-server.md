@@ -1,8 +1,8 @@
 # spec · fastsearch-server
 
 > 模块 #10，依赖：core、engine。阶段 P4。上游：[产品设计 §3.6/§3.8/§4](../plans/2026-06-24-产品设计文档.md)、需求 F43–F46/F50/F54。
-> 状态：**已完成 v1.6**（认证/ACL 不可绕过 + 指标/限流/审计 + 嵌入 + CDC 生命周期 +
-> 媒资网关 + 深分页 + 多向量后端 env）。MCP 第四张脸已独立成 `fastsearch-mcp` crate。
+> 状态：**已完成 v1.9**（认证/ACL 不可绕过 + 指标/限流/审计 + 嵌入 + CDC 生命周期 +
+> 媒资网关 + 签名 URL + inline Range + 深分页 + 多向量后端 env）。MCP 第四张脸已独立成 `fastsearch-mcp` crate。
 
 ## 1. 目的与范围
 
@@ -68,9 +68,10 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   **深分页** `search_after` 经 serde 透传 + 响应每命中带 `cursor`（+REST 翻页测试）；media/time 透出命中；
   `FASTSEARCH_VECTOR_BACKEND=hnsw|pgvector`（首启选档 / pgvector `set_pg_vector`）。OpenAPI 同步新端点。
 - [x] v1.8（2026-06-28，MM6-signer S1+S2）：`resolve_citation` Inline→`InlineRef`（只定位）、字节经 engine `fetch_inline_bytes` 按需取；新增 **`AssetSigner`**（HMAC-SHA256(`cid\|exp\|ct`)，常量时间验签）+ **token 门控 `GET /v1/asset/{cid}/bytes`**（验签即授权=presigned 语义，免 Bearer；未配/无效/过期→403；无字节→404）+ env `FASTSEARCH_ASSET_SIGNING_KEY`/`_URL_TTL`。+5 单测（sign/verify 往返/过期/篡改 cid/ct/sig/密钥、端点 403/404 路径，本环境）。**S3：`POST /v1/assets/resolve`**（authed 批量：每 id resolve_citation→ACL→ InlineRef 签 token URL / Object 签名 URL / DocRender JSON；**越权 id 省略不暴露**）+ `mint_inline_url`（cid/ct 百分号编码）。+2 单测（mint↔字节端点验签闭环、resolve 越权省略）。**inline 档"搜索→resolve→`<img src>`"端到端就绪**（真字节路 Docker PG 验证）；object 真 presign(S4) gated；OpenAPI 两端点已入 /openapi.json。
+- [x] v1.9（2026-06-30，inline Range）：两个 inline 字节出口（authed `GET /v1/asset/{cid}` + token 门控 `/bytes`）支持 **HTTP `Range`**（音视频 seek / 断点续传）。`parse_range` 解析单段 `bytes=A-B`/`A-`/`-N`（后缀式）→ `serve_inline_bytes` 共用组装：无 Range→**200** 全量 + `Accept-Ranges: bytes`；命中→**206** + `Content-Range: bytes A-B/total`（闭区间含端、末端越界自动截断）；起点越界/空体→**416** + `Content-Range: bytes */total`；多段（逗号）→退 200 全量（RFC 7233 允许忽略）。+6 单测（200/206/后缀+开区间/416/多段退化，纯函数确定）。OpenAPI 补 206/416/Range 头。
 - [x] v1.7（2026-06-27，MM6-inline/secure）：main 装配 `set_source_store`（gated DATABASE_URL，任意向量后端）→
   `/v1/asset` 的 **Inline 路径从 PG `media_bytes` 真源吐字节**（+Content-Type）。**server HTTP E2E** `asset_inline_bytes_e2e`
   （Docker 真机：授权 200+image/png+真源字节 / 越权 404 / 无 key 401）。**Object 无签名器→404 不泄露裸 key**（MM6-secure）。
-  真签名 URL（S3 presign）/ Range 待对象存储（gated）。
+  真签名 URL（S3 presign）/ **对象存储档 Range**（交对象存储）随 S4 presign（gated）；**inline 档 Range 已落地**（见 v1.9）。
 
 **已知限制 / 下一迭代：** RBAC 细粒度策略引擎、TLS（交网关）、并发优化（当前 Mutex 串行；后续 RwLock/副本，见 [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。MCP 工具面已独立实现（`fastsearch-mcp`）。
