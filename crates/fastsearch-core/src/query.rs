@@ -61,6 +61,10 @@ pub struct SearchRequest {
     pub embedder: Option<String>,
     #[serde(default = "default_candidates")]
     pub candidates: usize,
+    /// HNSW 检索期探索宽度 `ef_search` 的**逐查询覆盖**（None=用后端配置默认）。越大召回越高、越慢——
+    /// 画 recall-vs-QPS 曲线时固定索引、只转此钮即可（暴力/pgvector 档忽略；仅 HNSW 档生效）。
+    #[serde(default)]
+    pub ef_search: Option<usize>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
     #[serde(default)]
@@ -101,6 +105,7 @@ impl Default for SearchRequest {
             query_image: None,
             embedder: None,
             candidates: default_candidates(),
+            ef_search: None,
             top_k: default_top_k(),
             rerank: None,
             auto_merge: false,

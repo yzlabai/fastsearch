@@ -164,6 +164,20 @@ impl VectorBackend for VectorStore {
             VectorStore::Hnsw(h) => h.search(query, k, filter, acl),
         }
     }
+    fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&Filter>,
+        acl: Option<&AclFilter>,
+        ef_search: Option<usize>,
+    ) -> anyhow::Result<Vec<Scored>> {
+        match self {
+            // 暴力档精确，ef 无意义 → 忽略覆盖。
+            VectorStore::Brute(m) => m.search(query, k, filter, acl),
+            VectorStore::Hnsw(h) => h.search_with_ef(query, k, filter, acl, ef_search),
+        }
+    }
 }
 
 /// 随向量存储的元数据：用于 filter/ACL 判定（实现 [`FieldSource`]）与组装引用。
@@ -244,6 +258,19 @@ pub trait VectorBackend {
         filter: Option<&Filter>,
         acl: Option<&AclFilter>,
     ) -> anyhow::Result<Vec<Scored>>;
+
+    /// 同 [`search`](Self::search)，但带**逐查询 `ef_search` 覆盖**（None=用后端默认）。
+    /// 默认实现忽略 `ef_search`（暴力/精确档与 ef 无关）；HNSW 档覆盖以接受调参。
+    fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&Filter>,
+        acl: Option<&AclFilter>,
+        _ef_search: Option<usize>,
+    ) -> anyhow::Result<Vec<Scored>> {
+        self.search(query, k, filter, acl)
+    }
 }
 
 struct Entry {

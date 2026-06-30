@@ -217,6 +217,21 @@ pub struct ServerState {
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     /// 资产 URL 签名器（None=不签发短时 URL，`/v1/asset/{cid}/bytes` 一律 403）。
     asset_signer: Option<Arc<AssetSigner>>,
+    /// **集合注册表**（咨询性、内存态、可重建）：记录集合期望的 `dim`/`distance`，供 ingest 维度
+    /// 校验 + introspection。**不是真源、不跨副本共享**（多副本各自一份）；向量后端是**服务端级**
+    /// 选择（`FASTSEARCH_VECTOR_BACKEND` env），不在此处按集合实例化。见 [docs/benchmark-strategy.md]。
+    collections: Arc<Mutex<HashMap<String, CollectionSpec>>>,
+}
+
+/// 集合的咨询性配置（注册表项）。`dim` 设了则 ingest 校验预计算向量维度一致；`distance` 仅记录。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CollectionSpec {
+    /// 期望向量维度（None=不校验，首条预计算向量隐含确定）。
+    #[serde(default)]
+    pub dim: Option<usize>,
+    /// 距离度量（信息性：`cosine`(默认)/`dot`/`l2`；引擎侧暴力档为余弦）。
+    #[serde(default)]
+    pub distance: Option<String>,
 }
 
 impl ServerState {
@@ -229,6 +244,7 @@ impl ServerState {
             audit: None,
             embedder: None,
             asset_signer: None,
+            collections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -346,6 +362,21 @@ pub fn principal_from_headers(
     keys.get(key.trim()).cloned()
 }
 
+/// 鉴权门：解析 Principal，失败则记 `unauthorized` 指标并返回 401。供无 ACL 注入需求的端点
+/// （集合注册/introspection）复用，避免重复样板。
+fn require_principal(
+    s: &ServerState,
+    headers: &HeaderMap,
+) -> Result<Principal, (StatusCode, String)> {
+    principal_from_headers(headers, &s.keys).ok_or_else(|| {
+        s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
+        (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid API key".to_string(),
+        )
+    })
+}
+
 /// Principal → 强制 ACL 过滤（服务端注入，客户端不可绕过）。纯函数。
 pub fn acl_for(p: &Principal) -> AclFilter {
     AclFilter {
@@ -367,6 +398,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/asset/{cid}/bytes", get(asset_bytes))
         .route("/v1/assets/resolve", post(assets_resolve))
         .route("/v1/index", post(index))
+        .route(
+            "/v1/collections",
+            post(create_collection).get(list_collections),
+        )
+        .route("/v1/collections/{name}", get(get_collection))
         .with_state(state)
 }
 
@@ -416,6 +452,8 @@ fn openapi_spec() -> Value {
                         "filter": {"type": ["object", "null"], "description": "core::Filter AST"},
                         "vector": {"type": ["array", "null"], "items": {"type": "number"}},
                         "candidates": {"type": "integer", "default": 150},
+                        "ef_search": {"type": ["integer", "null"], "description":
+                            "HNSW 检索期探索宽度逐查询覆盖（越大召回越高越慢；暴力/pgvector 档忽略）"},
                         "top_k": {"type": "integer", "default": 20},
                         "rerank": {"type": ["object", "null"]},
                         "auto_merge": {"type": "boolean", "default": false},
@@ -432,7 +470,9 @@ fn openapi_spec() -> Value {
                     "properties": {
                         "collection": {"type": "string"},
                         "doc_id": {"type": "string"},
-                        "chunks": {"type": "array", "items": {"type": "object"}}
+                        "chunks": {"type": "array", "items": {"type": "object",
+                            "description": "core::Chunk 字段；可附 `vector`(number[]) 携带预计算向量，\
+                                则跳过服务端嵌入直接入向量索引（benchmark/外部 ETL 用）"}}
                     }
                 }
             }
@@ -460,8 +500,32 @@ fn openapi_spec() -> Value {
                     "summary": "灌入一个 doc 的 chunks（doc 级替换）",
                     "requestBody": {"required": true, "content": {"application/json":
                         {"schema": {"$ref": "#/components/schemas/IndexRequest"}}}},
-                    "responses": {"200": {"description": "{indexed: n}"}, "401": {"description": "认证失败"}}
+                    "responses": {"200": {"description": "{indexed: n}"},
+                        "400": {"description": "维度不符（集合已注册 dim 且预计算向量等维不符）"},
+                        "401": {"description": "认证失败"}}
                 }
+            },
+            "/v1/collections": {
+                "post": {
+                    "summary": "注册/更新集合的咨询配置（dim/distance）。回显 + 服务端实际向量后端",
+                    "description": "咨询性、内存态、不跨副本共享。向量后端是服务端级 env 选择，\
+                        不在此按集合实例化。",
+                    "requestBody": {"required": true, "content": {"application/json":
+                        {"schema": {"type": "object", "required": ["name"], "properties": {
+                            "name": {"type": "string"},
+                            "dim": {"type": ["integer", "null"]},
+                            "distance": {"type": ["string", "null"], "enum": ["cosine", "dot", "l2"]}}}}}},
+                    "responses": {"200": {"description": "{name, dim, distance, server:{vector_backend,...}}"},
+                        "401": {"description": "认证失败"}}
+                },
+                "get": {"summary": "列出已注册集合 + 服务端向量配置",
+                    "responses": {"200": {"description": "{collections:[..], server:{..}}"},
+                        "401": {"description": "认证失败"}}}
+            },
+            "/v1/collections/{name}": {
+                "get": {"summary": "读回集合咨询配置 + 服务端实际向量配置（introspection）",
+                    "responses": {"200": {"description": "集合配置"},
+                        "404": {"description": "未注册"}, "401": {"description": "认证失败"}}}
             },
             "/v1/similar": {
                 "post": {
@@ -910,11 +974,22 @@ async fn assets_resolve(
     Ok(Json(json!({ "assets": out })))
 }
 
+/// 单个待索引 chunk：正常 chunk 字段（flatten）+ 可选**预计算向量**旁路。
+/// 携带 `vector` 时直接入向量索引、**跳过服务端嵌入**（benchmark / 外部 ETL 已自带向量；
+/// 见 [docs/benchmark-strategy.md]）；不带则照旧走嵌入后端（无后端→纯全文）。
+#[derive(Deserialize)]
+struct IndexChunk {
+    #[serde(flatten)]
+    chunk: Chunk,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
 #[derive(Deserialize)]
 struct IndexBody {
     collection: String,
     doc_id: String,
-    chunks: Vec<Chunk>,
+    chunks: Vec<IndexChunk>,
 }
 
 async fn index(
@@ -938,27 +1013,70 @@ async fn index(
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     };
 
-    // 锁外嵌入每个 chunk 的正文（passage）；无嵌入后端则空向量、退化为纯全文。
-    let vectors: Vec<Vec<f32>> = if s.embedder.is_some() {
-        let texts: Vec<String> = body.chunks.iter().map(|c| c.text.clone()).collect();
-        s.embed(texts, EmbedKind::Passage).await.map_err(|e| {
-            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        })?
-    } else {
-        vec![]
-    };
+    // 维度校验：集合若已注册 `dim`，则携带的预计算向量必须等维（benchmark/ETL 误配早失败，
+    // 而非静默写入坏向量）。仅校验显式向量；嵌入产物维度由 embedder 保证一致。
+    if let Some(dim) = s
+        .collections
+        .lock()
+        .await
+        .get(&body.collection)
+        .and_then(|c| c.dim)
+    {
+        for ic in &body.chunks {
+            if let Some(v) = &ic.vector {
+                if v.len() != dim {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "collection '{}' expects dim {dim}, chunk {} has {}",
+                            body.collection,
+                            ic.chunk.chunk_id,
+                            v.len()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 每 chunk 一个向量槽：携带预计算向量者直接占位；其余锁外嵌入正文（passage）。
+    // 无嵌入后端且无预计算向量 → 该槽留空、退化为纯全文。
+    let mut vectors: Vec<Option<Vec<f32>>> = body.chunks.iter().map(|c| c.vector.clone()).collect();
+    if s.embedder.is_some() {
+        let need: Vec<usize> = body
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.vector.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        if !need.is_empty() {
+            let texts: Vec<String> = need
+                .iter()
+                .map(|&i| body.chunks[i].chunk.text.clone())
+                .collect();
+            let embedded = s.embed(texts, EmbedKind::Passage).await.map_err(|e| {
+                s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::INTERNAL_SERVER_ERROR, e)
+            })?;
+            for (&i, v) in need.iter().zip(embedded) {
+                vectors[i] = Some(v);
+            }
+        }
+    }
 
     let mut engine = s.engine.lock().await;
     engine
         .remove_doc(&body.collection, &body.doc_id)
         .map_err(&err500)?;
-    for (i, c) in body.chunks.iter().enumerate() {
-        match vectors.get(i) {
+    for (ic, v) in body.chunks.iter().zip(vectors) {
+        match v {
             Some(v) => engine
-                .ingest_vector(&body.collection, c, v.clone())
+                .ingest_vector(&body.collection, &ic.chunk, v)
                 .map_err(&err500)?,
-            None => engine.ingest(&body.collection, c).map_err(&err500)?,
+            None => engine
+                .ingest(&body.collection, &ic.chunk)
+                .map_err(&err500)?,
         }
     }
     engine.commit().map_err(&err500)?;
@@ -975,6 +1093,91 @@ async fn index(
         status: 200,
     });
     Ok(Json(json!({ "indexed": n })))
+}
+
+/// `POST /v1/collections` 请求体：注册/更新集合的咨询性配置。
+#[derive(Deserialize)]
+struct CreateCollectionBody {
+    name: String,
+    #[serde(default)]
+    dim: Option<usize>,
+    #[serde(default)]
+    distance: Option<String>,
+}
+
+/// 服务端实际向量配置（introspection，取自运行中的引擎；benchmark 据此确认"被测后端"）。
+async fn server_vector_info(s: &ServerState) -> Value {
+    let engine = s.engine.lock().await;
+    json!({
+        // pgvector 直查档下后端索引仍是底层暴力档，但召回在 PG → 用 "pgvector" 如实标注。
+        "vector_backend": if engine.has_pg_vector() { "pgvector" } else { engine.vector_backend() },
+        "vector_dim": engine.vector_dim(),
+        "vector_count": engine.vector_len(),
+        "embedded": s.embedder.is_some(),
+    })
+}
+
+/// 注册/更新一个集合的咨询配置（幂等 upsert）。返回回显 + 服务端实际向量配置。
+/// **不实例化按集合后端**——后端是服务端级 env 选择（见模块/策略文档）。
+async fn create_collection(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateCollectionBody>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    require_principal(&s, &headers)?;
+    if body.name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name must not be empty".into()));
+    }
+    let spec = CollectionSpec {
+        dim: body.dim,
+        distance: body.distance.clone(),
+    };
+    s.collections
+        .lock()
+        .await
+        .insert(body.name.clone(), spec.clone());
+    let info = server_vector_info(&s).await;
+    Ok(Json(json!({
+        "name": body.name,
+        "dim": spec.dim,
+        "distance": spec.distance.unwrap_or_else(|| "cosine".into()),
+        "server": info,
+    })))
+}
+
+/// 读回一个集合的咨询配置 + 服务端实际向量配置（introspection）。未注册返回 404。
+async fn get_collection(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    require_principal(&s, &headers)?;
+    let spec = s.collections.lock().await.get(&name).cloned();
+    let Some(spec) = spec else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("collection '{name}' not registered"),
+        ));
+    };
+    let info = server_vector_info(&s).await;
+    Ok(Json(json!({
+        "name": name,
+        "dim": spec.dim,
+        "distance": spec.distance.unwrap_or_else(|| "cosine".into()),
+        "server": info,
+    })))
+}
+
+/// 列出已注册集合名 + 服务端实际向量配置。
+async fn list_collections(State(s): State<ServerState>, headers: HeaderMap) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    require_principal(&s, &headers)?;
+    let mut names: Vec<String> = s.collections.lock().await.keys().cloned().collect();
+    names.sort();
+    let info = server_vector_info(&s).await;
+    Ok(Json(json!({ "collections": names, "server": info })))
 }
 
 #[cfg(test)]
@@ -1327,6 +1530,185 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["page"], 7);
         assert_eq!(hits[0]["citation_id"], "kb:d.pdf:1");
+    }
+
+    // 预计算向量旁路：chunk 携带 `vector` 时跳过嵌入直接入向量索引，纯向量检索可命中。
+    // 无嵌入后端（ServerState::new 不配 embedder）也能用——benchmark 正是这条路径。
+    #[tokio::test]
+    async fn index_with_precomputed_vector_then_vector_search() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let body = r#"{"collection":"kb","doc_id":"d","chunks":[
+            {"doc_id":"d","chunk_id":1,"kind":"paragraph","text":"","page":0,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":0.0,"y1":0.0},"char_len":0,"acl":["team-a"],"tenant":"acme",
+             "vector":[1.0,0.0,0.0]},
+            {"doc_id":"d","chunk_id":2,"kind":"paragraph","text":"","page":0,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":0.0,"y1":0.0},"char_len":0,"acl":["team-a"],"tenant":"acme",
+             "vector":[0.0,1.0,0.0]}]}"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["indexed"], 2);
+        // 纯向量检索：查询向量贴近 chunk_id=1，应排第一。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(
+                        r#"{"query":"","mode":"vector","vector":[1.0,0.0,0.0],"top_k":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        let hits = v["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "vector search should return hits");
+        assert_eq!(hits[0]["chunk_id"], 1);
+    }
+
+    // 集合注册 + introspection：POST 回显配置且带服务端实际后端；GET 读回；列表含名。
+    #[tokio::test]
+    async fn collections_register_and_introspect() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let post = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/collections")
+                .header("content-type", "application/json")
+                .header("x-api-key", "k-team-a")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(post(r#"{"name":"kb","dim":3}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["name"], "kb");
+        assert_eq!(v["dim"], 3);
+        assert_eq!(v["distance"], "cosine"); // 默认
+        assert_eq!(v["server"]["vector_backend"], "brute"); // 服务端实际后端
+        assert_eq!(v["server"]["embedded"], false);
+
+        // GET 读回
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/collections/kb")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["dim"], 3);
+
+        // 未注册 → 404
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/collections/nope")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // 列表
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/collections")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["collections"], json!(["kb"]));
+    }
+
+    // 注册 dim 后，ingest 携带不等维预计算向量 → 400（benchmark 误配早失败）。
+    #[tokio::test]
+    async fn index_dim_mismatch_rejected() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"name":"kb","dim":4}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // dim=4 注册，传 3 维向量 → 400
+        let body = r#"{"collection":"kb","doc_id":"d","chunks":[
+            {"doc_id":"d","chunk_id":1,"kind":"paragraph","text":"","page":0,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":0.0,"y1":0.0},"char_len":0,"acl":["team-a"],"tenant":"acme",
+             "vector":[1.0,0.0,0.0]}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // 无鉴权 → 401。
+    #[tokio::test]
+    async fn collections_require_auth() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"kb"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

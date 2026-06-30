@@ -35,3 +35,5 @@ venv/
 .DS_Store
 .idea/
 *.swp
+
+tmp/

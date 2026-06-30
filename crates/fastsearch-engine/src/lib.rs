@@ -381,6 +381,27 @@ impl Engine {
         Ok(rows.len())
     }
 
+    /// 向量后端名（`brute`/`brute_binary`/`brute_binary_rotated`/`hnsw`）。pgvector 直查档
+    /// 下后端索引仍为底层暴力档，但 `vector_pg` 已配——见 [`Self::has_pg_vector`]。供 introspection。
+    pub fn vector_backend(&self) -> &'static str {
+        self.vector.kind_str()
+    }
+
+    /// 向量维度（首条 upsert 确定；空库 None）。
+    pub fn vector_dim(&self) -> Option<usize> {
+        self.vector.dim()
+    }
+
+    /// 引擎侧向量条目数（pgvector 直查档下恒 0，向量在 PG）。
+    pub fn vector_len(&self) -> usize {
+        self.vector.len()
+    }
+
+    /// 是否启用了 **pgvector 直查档**（向量召回绕引擎索引、在 PG 跑 ANN）。
+    pub fn has_pg_vector(&self) -> bool {
+        self.vector_pg.is_some()
+    }
+
     /// **崩溃安全地**消费一批 CDC 变更并落地（生产 CDC 主循环的一拍）：
     /// `peek`（不推进 slot）→ 幂等应用全部（`apply_upsert` 含嵌入）→ `persist`（索引 +
     /// 检查点=slot 高水位）→ **落盘成功后才** `advance_slot`。返回应用条数。
@@ -712,11 +733,12 @@ impl Engine {
                 .collect()
         } else {
             self.vector
-                .search(
+                .search_with_ef(
                     query_vec.as_ref().unwrap(),
                     candidates,
                     req.filter.as_ref(),
                     acl,
+                    req.ef_search,
                 )
                 .map_err(|e| EngineError::Vector(e.to_string()))?
         };

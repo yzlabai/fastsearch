@@ -282,6 +282,32 @@ impl VectorBackend for HnswVectorIndex {
         filter: Option<&Filter>,
         acl: Option<&AclFilter>,
     ) -> anyhow::Result<Vec<Scored>> {
+        self.search_impl(query, k, filter, acl, None)
+    }
+
+    fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&Filter>,
+        acl: Option<&AclFilter>,
+        ef_search: Option<usize>,
+    ) -> anyhow::Result<Vec<Scored>> {
+        self.search_impl(query, k, filter, acl, ef_search)
+    }
+}
+
+impl HnswVectorIndex {
+    /// 检索实现：`ef_override` 为逐查询 `ef_search` 覆盖（None=用 `self.params.ef_search`）。
+    /// 覆盖只调高/低本次遍历宽度，不改图结构——recall-vs-QPS 曲线由此一钮扫出。
+    fn search_impl(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&Filter>,
+        acl: Option<&AclFilter>,
+        ef_override: Option<usize>,
+    ) -> anyhow::Result<Vec<Scored>> {
         match self.dim {
             Some(d) if query.len() != d => {
                 anyhow::bail!("query dim {} != index dim {d}", query.len())
@@ -300,6 +326,7 @@ impl VectorBackend for HnswVectorIndex {
         // over-fetch：向 HNSW 多要候选，抵消后过滤 + u8 量化损耗（全精度重排兜底）。
         let qcode = quantize_u8(&q);
         let total = self.gid_to_id.len();
+        let ef_base = ef_override.unwrap_or(self.params.ef_search);
         // **自适应过取（filtered-traversal 的务实形式）**：强选择性 filter/ACL 下，固定 over-fetch
         // 的候选可能被过滤殆尽 → 召回崩。有 filter/acl 时，若过滤后不足 k 就翻倍 `want` 重搜，
         // 上限 = 全集（最坏退化为对 filter 精确的全扫，守不变量 #5：选择性过滤不掉召回）。
@@ -307,7 +334,7 @@ impl VectorBackend for HnswVectorIndex {
         let needs_escalation = filter.is_some() || acl.is_some();
         let mut want = k.saturating_mul(self.params.over_fetch).max(k);
         let mut scored: Vec<Scored> = loop {
-            let ef = self.params.ef_search.max(want);
+            let ef = ef_base.max(want);
             let s: Vec<Scored> = self
                 .hnsw
                 .search(qcode.as_slice(), want, ef)
@@ -440,6 +467,53 @@ mod tests {
         // 阈值留余量（HNSW 建图非确定，每次略有波动；50 查询平均后稳定 ≥0.9）。
         let recall = hits as f64 / (k * queries) as f64;
         assert!(recall >= 0.9, "recall@{k} = {recall} < 0.9");
+    }
+
+    // 逐查询 ef_search 覆盖被真正接受：① None 等同默认 search（路径不变）；
+    // ② 调大 ef 召回不低于很小 ef（同索引、只转此钮——recall-vs-QPS 曲线的核心机制）。
+    #[test]
+    fn ef_search_override_honored() {
+        let dim = 32;
+        let n = 1500u64; // > BRUTE_FALLBACK_MAX → 真走 HNSW
+        let mut hnsw = HnswVectorIndex::new(HnswParams::default());
+        let mut brute = MemVectorIndex::new();
+        for i in 0..n {
+            let v = vec_for(i, dim);
+            hnsw.upsert(gid("d", i), v.clone(), meta("d", i, vec!["public"]))
+                .unwrap();
+            brute
+                .upsert(gid("d", i), v, meta("d", i, vec!["public"]))
+                .unwrap();
+        }
+        let (k, queries) = (10usize, 40u64);
+        let recall_at = |ef: Option<usize>| -> f64 {
+            let mut hits = 0usize;
+            for qi in 0..queries {
+                let q = vec_for(300_000 + qi, dim);
+                let truth: std::collections::HashSet<_> = brute
+                    .search(&q, k, None, None)
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect();
+                let got = hnsw.search_with_ef(&q, k, None, None, ef).unwrap();
+                hits += got.iter().filter(|s| truth.contains(&s.id)).count();
+            }
+            hits as f64 / (k * queries as usize) as f64
+        };
+        // None ⇒ 与默认 search 路径一致（用 params.ef_search）。
+        let r_default = recall_at(None);
+        let r_low = recall_at(Some(k)); // ef≈k，最窄遍历
+        let r_high = recall_at(Some(512)); // 宽遍历
+                                           // 调大 ef 不会降低召回（务实下界，避开 ANN 非确定抖动）。
+        assert!(
+            r_high + 1e-9 >= r_low,
+            "ef 调大召回不应更差: low(ef={k})={r_low} high(ef=512)={r_high}"
+        );
+        assert!(
+            r_default > 0.0 && r_high >= 0.9,
+            "default={r_default} high={r_high}"
+        );
     }
 
     /// 自适应过取：仅 ~1.7% 条目匹配 filter（固定 over-fetch 会被过滤殆尽 → 召回崩），
