@@ -13,6 +13,7 @@ pub use sql::{
 };
 
 use fastsearch_core::Chunk;
+use tokio::sync::Mutex;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, NoTls, Row};
 
@@ -41,8 +42,29 @@ impl PgConfig {
 const SCHEMA_DDL_LOCK_KEY: i64 = 0x6673_735f_6464_6c00;
 
 /// Postgres 真源句柄。
+///
+/// # 为什么 `client` 是 `Mutex<Client>`
+///
+/// `tokio_postgres::Client::query/execute/batch_execute` 都只借 `&self`（内部走 channel 与连接
+/// task 通信，`Client` 本身 `Send + Sync`），唯独 `transaction()` 要 `&mut self`（类型系统强制
+/// 同一时刻只能有一个活跃事务）。`upsert_doc` 走事务，又要支持 `Arc<PgStore>` 共享
+/// （server 端 `/v1/index` 与 engine 都持有同一 Arc；不再走 `Arc::try_unwrap` + 重连的丑陋路径），
+/// 所以必须借 `Mutex` 拿到独占借用。
+///
+/// ## 性能影响
+///
+/// **读路径**（`vector_search`/`fetch_inline_bytes`/`fetch_doc` 等）全部经由 engine 的
+/// `engine.lock()` 串行化——同一时刻只有一个 search 在跑，Mutex 在搜索路径上实质**无竞争**。
+/// 唯一真实竞争：`/v1/index` 的 `upsert_doc` 不持 engine.lock()，与并发的 search 抢
+/// Mutex。但此竞争恰好是**期望行为**：写事务进行中不该让 search 看到半写状态。
+///
+/// ## 后续演进
+///
+/// 若未来需要真并发读写（多 search 并行 + 不阻塞 ingest），迁移到连接池（`deadpool-postgres`
+/// / `bb8`）：读走池化连接，写事务独占一个连接，彻底解除 Mutex 串行化。当前单连接 + Mutex
+/// 是"正确性优先、最小依赖"的 v1 选择。
 pub struct PgStore {
-    client: Client,
+    client: Mutex<Client>,
     cfg: PgConfig,
 }
 
@@ -57,7 +79,10 @@ impl PgStore {
                 eprintln!("fastsearch-pg connection error: {e}");
             }
         });
-        Ok(PgStore { client, cfg })
+        Ok(PgStore {
+            client: Mutex::new(client),
+            cfg,
+        })
     }
 
     /// 幂等建表/扩展/索引/publication。
@@ -77,20 +102,21 @@ impl PgStore {
             batch.push('\n');
         }
         batch.push_str("COMMIT;\n");
-        self.client.batch_execute(&batch).await?;
+        self.client.lock().await.batch_execute(&batch).await?;
         Ok(())
     }
 
     /// doc_id 级替换：事务内先删后批量插，保证原子（CDC 看到 delete+insert）。
     pub async fn upsert_doc(
-        &mut self,
+        &self,
         collection: &str,
         doc_id: &str,
         chunks: &[Chunk],
     ) -> Result<u64> {
         let del = sql::delete_doc_sql(&self.cfg.table);
         let ins = sql::insert_sql(&self.cfg.table);
-        let tx = self.client.transaction().await?;
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
         tx.execute(&del, &[&collection, &doc_id]).await?;
         let mut n = 0u64;
         for c in chunks {
@@ -124,13 +150,23 @@ impl PgStore {
     /// 删除某 doc 全部 chunk。
     pub async fn delete_doc(&self, collection: &str, doc_id: &str) -> Result<u64> {
         let del = sql::delete_doc_sql(&self.cfg.table);
-        Ok(self.client.execute(&del, &[&collection, &doc_id]).await?)
+        Ok(self
+            .client
+            .lock()
+            .await
+            .execute(&del, &[&collection, &doc_id])
+            .await?)
     }
 
     /// 读取某 doc 全部 chunk（按 chunk_id 升序）。
     pub async fn fetch_doc(&self, collection: &str, doc_id: &str) -> Result<Vec<Chunk>> {
         let q = sql::fetch_doc_sql(&self.cfg.table);
-        let rows = self.client.query(&q, &[&collection, &doc_id]).await?;
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(&q, &[&collection, &doc_id])
+            .await?;
         rows.iter().map(row_to_chunk).collect()
     }
 
@@ -145,6 +181,8 @@ impl PgStore {
         let q = sql::fetch_media_bytes_sql(&self.cfg.table);
         let rows = self
             .client
+            .lock()
+            .await
             .query(&q, &[&collection, &doc_id, &(chunk_id as i64)])
             .await?;
         match rows.first() {
@@ -156,7 +194,7 @@ impl PgStore {
     /// 全表读取 `(collection, Chunk)`（初始快照 bootstrap 用）。v1 全量；超大表分页为后续。
     pub async fn fetch_all_chunks(&self) -> Result<Vec<(String, Chunk)>> {
         let q = sql::fetch_all_sql(&self.cfg.table);
-        let rows = self.client.query(&q, &[]).await?;
+        let rows = self.client.lock().await.query(&q, &[]).await?;
         rows.iter()
             .map(|r| Ok((r.try_get::<_, String>("collection")?, row_to_chunk(r)?)))
             .collect()
@@ -187,6 +225,8 @@ impl PgStore {
         let v = format_vector(embedding);
         Ok(self
             .client
+            .lock()
+            .await
             .execute(
                 &sql,
                 &[&v, &collection, &doc_id, &(chunk_id as i64), &model],
@@ -209,6 +249,8 @@ impl PgStore {
         );
         Ok(self
             .client
+            .lock()
+            .await
             .execute(&sql, &[&collection, &doc_id, &(chunk_id as i64)])
             .await?)
     }
@@ -231,7 +273,8 @@ impl PgStore {
         let limit = k.saturating_mul(over_fetch.max(1)).max(k);
         let (sql, sparams) = pgvector_search_sql(&self.cfg.table, limit, acl, filter);
         // filter-aware：iterative scan + 提高 ef_search（会话级，对本直查连接生效）。
-        self.client
+        let client = self.client.lock().await;
+        client
             .batch_execute("SET hnsw.iterative_scan = relaxed_order; SET hnsw.ef_search = 100;")
             .await
             .ok(); // 旧版 pgvector 无此 GUC 时忽略（退化为普通后过滤）。
@@ -247,7 +290,7 @@ impl PgStore {
         }
         let params: Vec<&(dyn ToSql + Sync)> =
             owned.iter().map(|b| &**b as &(dyn ToSql + Sync)).collect();
-        let rows = self.client.query(&sql, &params).await?;
+        let rows = client.query(&sql, &params).await?;
 
         // Rust 精确后过滤（filter + ACL 复核）+ 组装 Scored + Citation（含 page/bbox，供溯源）。
         let mut hits: Vec<(fastsearch_core::Scored, fastsearch_core::Citation)> =
@@ -508,7 +551,7 @@ mod tests {
         };
         let mut cfg = PgConfig::new(url);
         cfg.table = "fastsearch_chunks_it".into();
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         store.ensure_schema().await.expect("schema");
 
         // 替换写入 3 个
@@ -549,9 +592,11 @@ mod tests {
         use fastsearch_core::{AssetPointer, MediaRef};
         let mut cfg = PgConfig::new(url);
         cfg.table = "fastsearch_mbytes_it".into();
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         store
             .client
+            .lock()
+            .await
             .batch_execute("DROP TABLE IF EXISTS fastsearch_mbytes_it")
             .await
             .ok();
@@ -621,9 +666,11 @@ mod tests {
         cfg.table = "fastsearch_time_null_it".into();
         cfg.vector_dim = 2;
         cfg.vector_type = VectorType::Vector;
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         store
             .client
+            .lock()
+            .await
             .batch_execute("DROP TABLE IF EXISTS fastsearch_time_null_it")
             .await
             .ok();
@@ -655,6 +702,8 @@ mod tests {
         // 模拟"遗留行"：把反规范化列清成 NULL（media.time 仍在 jsonb）。
         store
             .client
+            .lock()
+            .await
             .execute(
                 "UPDATE fastsearch_time_null_it SET time_start_ms = NULL, time_end_ms = NULL",
                 &[],
@@ -684,6 +733,8 @@ mod tests {
 
         store
             .client
+            .lock()
+            .await
             .batch_execute("DROP TABLE fastsearch_time_null_it")
             .await
             .ok();
@@ -702,7 +753,7 @@ mod tests {
         cfg.table = "fastsearch_b6_guard_it".into();
         cfg.vector_dim = 4;
         cfg.vector_type = VectorType::Vector;
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         store.ensure_schema().await.expect("schema");
         // 再跑一次确认 DDL 幂等（publication 已存在 → 不抢占分支）。
         store.ensure_schema().await.expect("schema idempotent");
@@ -737,6 +788,8 @@ mod tests {
 
         store
             .client
+            .lock()
+            .await
             .batch_execute("DROP TABLE fastsearch_b6_guard_it CASCADE")
             .await
             .ok();
@@ -753,16 +806,20 @@ mod tests {
         cfg.table = "fastsearch_vec_it".into();
         cfg.vector_dim = 4;
         cfg.vector_type = VectorType::Vector; // 精确 vector(4)，便于断言
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         // 干净重建表（schema 可能变）。
         store
             .client
+            .lock()
+            .await
             .batch_execute("DROP TABLE IF EXISTS fastsearch_vec_it")
             .await
             .ok();
         store.ensure_schema().await.expect("schema");
         store
             .client
+            .lock()
+            .await
             .batch_execute(&sql::ann_index_sql("fastsearch_vec_it"))
             .await
             .ok();
@@ -788,11 +845,16 @@ mod tests {
         for id in 1..=4u64 {
             let mut e = vec![0.0f32; 4];
             e[(id - 1) as usize] = 1.0;
+            let v = format_vector(&e);
+            let chunk_id = id as i64;
+            let params: [&(dyn ToSql + Sync); 2] = [&v, &chunk_id];
             store
                 .client
+                .lock()
+                .await
                 .execute(
                     "UPDATE fastsearch_vec_it SET embedding = $1::text::vector WHERE chunk_id = $2",
-                    &[&format_vector(&e), &(id as i64)],
+                    &params,
                 )
                 .await
                 .expect("set embedding");
@@ -832,6 +894,8 @@ mod tests {
 
         store
             .client
+            .lock()
+            .await
             .batch_execute("DROP TABLE IF EXISTS fastsearch_vec_it")
             .await
             .ok();

@@ -3,6 +3,10 @@
 fastsearch 部署制品：容器镜像 + 一键 compose + K8s/CloudNativePG 样例。守"托管 PG 可移植"
 硬约束——PG 侧只用 **pgvector + 逻辑复制**，无任何需 `shared_preload_libraries` 的原生扩展。
 
+## 当前状态
+
+**2026-07-01 已部署到 K8s test ns**（具体入口/IP 见团队内部 wiki，避免提交到版本库）。
+
 ## 制品
 
 | 文件 | 用途 |

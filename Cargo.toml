@@ -53,6 +53,7 @@ clap = { version = "4", features = ["derive"] }
 ureq = { version = "2", features = ["json"] }
 hmac = "0.13"
 sha2 = "0.11"
+getrandom = "0.2"
 axum = { version = "0.8", features = ["multipart"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

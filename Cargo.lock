@@ -1350,6 +1350,7 @@ dependencies = [
  "fastsearch-pg",
  "fastsearch-sync",
  "fastsearch-text",
+ "getrandom 0.2.17",
  "hmac",
  "http-body-util",
  "serde",

@@ -233,7 +233,7 @@ pub enum AssetFetch {
 /// 使客户端能取大媒资字节而**不暴露裸 key**（不变量 #3）。返回 `(签名 URL, 过期秒数)`；
 /// `None` = 不可签（如 key 非法）→ 网关 404。真实现（S3 presign 类）属对象存储接入，gated。
 pub trait ObjectSigner: Send + Sync {
-    fn sign(&self, uri: &str, media_type: Option<&str>) -> Option<(String, u64)>;
+    fn sign(&self, cid: &str, uri: &str, media_type: Option<&str>) -> Option<(String, u64)>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1166,8 +1166,7 @@ impl Engine {
     }
 
     /// Clone 出 source_pg 的 Arc（不耗所有权；server 端 `/v1/index` 用于回写真源 PG）。
-    /// **限制**：调用方若要写 PG（`upsert_doc` 等 `&mut self`），需保证此 Arc 唯一持有（启动时
-    /// set_source_store 通常唯一；多 engine 实例共享同一 store 时不应调用此路径）。
+    /// PgStore 内部串行化写事务，所以调用方无需重新连接或独占 Arc。
     pub fn source_pg_clone(&self) -> Option<Arc<fastsearch_pg::PgStore>> {
         self.source_pg.clone()
     }
@@ -1422,7 +1421,7 @@ impl Engine {
             // Object 大媒资在对象存储：必须经签名器签短时 URL（绝不暴露裸 key，不变量 #3）。
             // 无签名器 → None（404），**不回退到裸 uri**。真签名器（S3 presign 类）gated 对象存储。
             AssetPointer::Object { uri } => match &self.object_signer {
-                Some(signer) => match signer.sign(&uri, media_type.as_deref()) {
+                Some(signer) => match signer.sign(cid, &uri, media_type.as_deref()) {
                     Some((url, expires_s)) => AssetFetch::SignedUrl { url, expires_s },
                     None => return Ok(None),
                 },
@@ -2190,7 +2189,7 @@ mod tests {
         cfg.table = "fastsearch_eng_vec_it".into();
         cfg.vector_dim = 4;
         cfg.vector_type = VectorType::Vector;
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         store.ensure_schema().await.expect("schema");
         // 3 个 chunk（page 各异），写正交向量。
         let mk = |id: u64, page: u32| Chunk {
@@ -2243,7 +2242,7 @@ mod tests {
         cfg.table = "fastsearch_b6_wt_it".into();
         cfg.vector_dim = 16;
         cfg.vector_type = VectorType::Vector;
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         store.ensure_schema().await.expect("schema");
 
         // 源行（embedding 留 NULL，模拟上游/CDC 投递）。doc 级替换 → 重复跑亦干净。
@@ -2304,7 +2303,7 @@ mod tests {
         use fastsearch_pg::{PgConfig, PgStore};
         let mut cfg = PgConfig::new(url);
         cfg.table = "fastsearch_eng_mb_it".into();
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         store.ensure_schema().await.expect("schema");
 
         // 带 inline 字节的图 chunk（无 caption，text=""），限 team-a 可见。
@@ -2722,7 +2721,12 @@ mod tests {
         use fastsearch_core::{AssetPointer, MediaRef};
         struct TestSigner;
         impl ObjectSigner for TestSigner {
-            fn sign(&self, uri: &str, _media_type: Option<&str>) -> Option<(String, u64)> {
+            fn sign(
+                &self,
+                _cid: &str,
+                uri: &str,
+                _media_type: Option<&str>,
+            ) -> Option<(String, u64)> {
                 // 真实现会 S3 presign；测试桩只证明：签出的 URL 不含裸 key。
                 let name = uri.rsplit('/').next().unwrap_or("asset");
                 Some((format!("https://signed.example/{name}?token=abc"), 300))

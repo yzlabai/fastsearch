@@ -87,7 +87,7 @@ async fn cdc_closed_loop_pg_to_search() {
     reset(&url, slot).await;
 
     // 1) 真源 schema（建表 + publication FOR TABLE fastsearch_chunks）。
-    let mut store = PgStore::connect(PgConfig::new(url.clone()))
+    let store = PgStore::connect(PgConfig::new(url.clone()))
         .await
         .expect("pg connect");
     store.ensure_schema().await.expect("ensure_schema");
@@ -166,7 +166,7 @@ async fn cdc_consume_persist_crashsafe() {
     };
     reset(&url, slot).await;
 
-    let mut store = PgStore::connect(PgConfig::new(url.clone()))
+    let store = PgStore::connect(PgConfig::new(url.clone()))
         .await
         .expect("pg connect");
     store.ensure_schema().await.expect("ensure_schema");
@@ -259,7 +259,7 @@ async fn cdc_initial_snapshot_bootstrap() {
     };
     reset(&url, slot).await;
 
-    let mut store = PgStore::connect(PgConfig::new(url.clone()))
+    let store = PgStore::connect(PgConfig::new(url.clone()))
         .await
         .expect("pg connect");
     store.ensure_schema().await.expect("ensure_schema");
@@ -370,7 +370,7 @@ async fn cdc_embed_hybrid_full_loop() {
     };
     reset(&url, slot).await;
 
-    let mut store = PgStore::connect(PgConfig::new(url.clone()))
+    let store = PgStore::connect(PgConfig::new(url.clone()))
         .await
         .expect("pg connect");
     store.ensure_schema().await.expect("ensure_schema");
