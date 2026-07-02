@@ -6,8 +6,9 @@
 //! 选后端用 [`EmbedderConfig`]/[`build_embedder`]/[`EmbedderConfig::from_env`]。请求体构造、
 //! 响应解析、维度校验是纯逻辑、有单测；实网调用 env-gated。
 
-use crate::{EmbedCaps, EmbedKind, Embedder, HashEmbedder};
+use crate::{EmbedCaps, EmbedInput, EmbedKind, Embedder, HashEmbedder};
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -29,6 +30,17 @@ pub enum EmbedderKind {
     Http(HttpProtocol),
 }
 
+/// HTTP 图片输入格式。只影响 `EmbedInput::Image` 的 JSON 表达；文本路径保持兼容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageInputFormat {
+    /// `"data:image/png;base64,..."` 作为 `input[]` 元素。
+    DataUrl,
+    /// `{"image":"<base64>","media_type":"image/png"}` 作为 `input[]` 元素。
+    Base64Object,
+    /// OpenAI 风格 content parts：`[{"type":"input_image","image_url":"data:..."}]`。
+    OpenAiContent,
+}
+
 /// 统一嵌入配置（CLI/server 据此构造后端）。
 #[derive(Debug, Clone)]
 pub struct EmbedderConfig {
@@ -47,6 +59,12 @@ pub struct EmbedderConfig {
     pub passage_prefix: String,
     /// 请求超时秒数。
     pub timeout_secs: u64,
+    /// 是否启用 HTTP 图片输入。开启后 `caps.image=true`。
+    pub image: bool,
+    /// 文本和图片是否同空间。文搜图/图搜文的向量召回必须显式开启。
+    pub cross_modal: bool,
+    /// 图片输入 JSON 形态。
+    pub image_input_format: ImageInputFormat,
 }
 
 impl EmbedderConfig {
@@ -61,6 +79,9 @@ impl EmbedderConfig {
             query_prefix: String::new(),
             passage_prefix: String::new(),
             timeout_secs: 30,
+            image: false,
+            cross_modal: false,
+            image_input_format: ImageInputFormat::DataUrl,
         }
     }
 
@@ -69,8 +90,12 @@ impl EmbedderConfig {
     /// - `FASTSEARCH_EMBED_URL`（默认 ollama `http://localhost:11434`）
     /// - `FASTSEARCH_EMBED_MODEL` / `FASTSEARCH_EMBED_DIM` / `FASTSEARCH_EMBED_API_KEY`
     /// - `FASTSEARCH_EMBED_QUERY_PREFIX` / `FASTSEARCH_EMBED_PASSAGE_PREFIX`
+    /// - `FASTSEARCH_EMBED_IMAGE` / `FASTSEARCH_EMBED_CROSS_MODAL`
+    /// - `FASTSEARCH_EMBED_IMAGE_INPUT_FORMAT` = `data_url` | `base64_object` | `openai_content`
     pub fn from_env() -> Self {
         let var = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let bool_var =
+            |k: &str| var(k).is_some_and(|s| matches!(s.as_str(), "1" | "true" | "yes" | "on"));
         let dim = var("FASTSEARCH_EMBED_DIM")
             .and_then(|s| s.parse().ok())
             .unwrap_or(384);
@@ -93,6 +118,13 @@ impl EmbedderConfig {
             query_prefix: var("FASTSEARCH_EMBED_QUERY_PREFIX").unwrap_or_default(),
             passage_prefix: var("FASTSEARCH_EMBED_PASSAGE_PREFIX").unwrap_or_default(),
             timeout_secs: 30,
+            image: bool_var("FASTSEARCH_EMBED_IMAGE"),
+            cross_modal: bool_var("FASTSEARCH_EMBED_CROSS_MODAL"),
+            image_input_format: match var("FASTSEARCH_EMBED_IMAGE_INPUT_FORMAT").as_deref() {
+                Some("base64_object") => ImageInputFormat::Base64Object,
+                Some("openai_content") => ImageInputFormat::OpenAiContent,
+                _ => ImageInputFormat::DataUrl,
+            },
         }
     }
 }
@@ -153,6 +185,55 @@ impl HttpEmbedder {
         serde_json::json!({ "model": self.cfg.model, "input": inputs })
     }
 
+    fn request_body_values(&self, inputs: Vec<Value>) -> Value {
+        serde_json::json!({ "model": self.cfg.model, "input": inputs })
+    }
+
+    fn input_value(&self, input: &EmbedInput, kind: EmbedKind) -> Result<Value> {
+        match input {
+            EmbedInput::Text(t) => Ok(Value::String(format!("{}{}", self.prefix(kind), t))),
+            EmbedInput::Image(bytes) => {
+                if !self.cfg.image {
+                    bail!("HTTP embedder image input disabled (FASTSEARCH_EMBED_IMAGE=false)");
+                }
+                let media_type = guess_image_media_type(bytes);
+                let b64 = B64.encode(bytes);
+                let data_url = format!("data:{media_type};base64,{b64}");
+                Ok(match self.cfg.image_input_format {
+                    ImageInputFormat::DataUrl => Value::String(data_url),
+                    ImageInputFormat::Base64Object => {
+                        serde_json::json!({"image": b64, "media_type": media_type})
+                    }
+                    ImageInputFormat::OpenAiContent => serde_json::json!([
+                        {"type": "input_image", "image_url": data_url}
+                    ]),
+                })
+            }
+        }
+    }
+
+    fn send_embedding_body(&self, body: &str) -> Result<String> {
+        let url = self.endpoint();
+        let mut req = self
+            .agent
+            .post(&url)
+            .set("Content-Type", "application/json");
+        if let Some(k) = &self.cfg.api_key {
+            req = req.set("Authorization", &format!("Bearer {k}"));
+        }
+        match req.send_string(body) {
+            Ok(resp) => resp.into_string().context("read embedding response"),
+            Err(ureq::Error::Status(code, resp)) => {
+                let detail = resp.into_string().unwrap_or_default();
+                bail!(
+                    "embedding endpoint {url} returned {code}: {}",
+                    truncate(&detail, 300)
+                );
+            }
+            Err(e) => Err(e).with_context(|| format!("POST {url}")),
+        }
+    }
+
     /// 解析响应体 → 向量（纯逻辑，可测）。按协议取字段、按维度校验。
     fn parse_response(&self, body: &str, n: usize) -> Result<Vec<Vec<f32>>> {
         let v: Value = serde_json::from_str(body).context("parse embedding response json")?;
@@ -186,15 +267,12 @@ impl Embedder for HttpEmbedder {
         self.cfg.dim
     }
 
-    /// 当前 HTTP 后端是**文本语义**嵌入；**图像路由 gated**（`image=false`）——需对接多模态端点
-    /// （SigLIP-2 / JinaCLIP-v2 / jina-v4 / Voyage / Cohere，base64 input）并确认文图同空间
-    /// （`cross_modal`）。该 MM8b 待真多模态模型服务，落地前 `embed_multi(Image)` 走默认实现报错。
     fn caps(&self) -> EmbedCaps {
         EmbedCaps {
             dim: self.cfg.dim,
             text: true,
-            image: false,
-            cross_modal: false,
+            image: self.cfg.image,
+            cross_modal: self.cfg.cross_modal,
             semantic: true,
         }
     }
@@ -205,27 +283,35 @@ impl Embedder for HttpEmbedder {
         }
         let inputs = self.inputs(texts, kind);
         let body = serde_json::to_string(&self.request_body(&inputs))?;
-        let url = self.endpoint();
-        let mut req = self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/json");
-        if let Some(k) = &self.cfg.api_key {
-            req = req.set("Authorization", &format!("Bearer {k}"));
-        }
-        let text = match req.send_string(&body) {
-            Ok(resp) => resp.into_string().context("read embedding response")?,
-            // ureq 把 4xx/5xx 当 Err(Status)；带上状态码与响应体便于诊断。
-            Err(ureq::Error::Status(code, resp)) => {
-                let detail = resp.into_string().unwrap_or_default();
-                bail!(
-                    "embedding endpoint {url} returned {code}: {}",
-                    truncate(&detail, 300)
-                );
-            }
-            Err(e) => return Err(e).with_context(|| format!("POST {url}")),
-        };
+        let text = self.send_embedding_body(&body)?;
         self.parse_response(&text, texts.len())
+    }
+
+    fn embed_multi(&self, inputs: &[EmbedInput], kind: EmbedKind) -> Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(vec![]);
+        }
+        let vals = inputs
+            .iter()
+            .map(|i| self.input_value(i, kind))
+            .collect::<Result<Vec<_>>>()?;
+        let body = serde_json::to_string(&self.request_body_values(vals))?;
+        let text = self.send_embedding_body(&body)?;
+        self.parse_response(&text, inputs.len())
+    }
+}
+
+fn guess_image_media_type(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
     }
 }
 
@@ -293,6 +379,9 @@ mod tests {
             query_prefix: "query: ".into(),
             passage_prefix: "passage: ".into(),
             timeout_secs: 5,
+            image: false,
+            cross_modal: false,
+            image_input_format: ImageInputFormat::DataUrl,
         }
     }
 
@@ -365,6 +454,35 @@ mod tests {
         let cfg = EmbedderConfig::hash(128);
         let emb = build_embedder(&cfg);
         assert_eq!(emb.dim(), 128);
+    }
+
+    #[test]
+    fn image_caps_and_request_body() {
+        let mut cfg = http_cfg(HttpProtocol::OpenAI, 2);
+        cfg.image = true;
+        cfg.cross_modal = true;
+        cfg.image_input_format = ImageInputFormat::DataUrl;
+        let e = HttpEmbedder::new(cfg);
+        let caps = e.caps();
+        assert!(caps.image);
+        assert!(caps.cross_modal);
+        let val = e
+            .input_value(
+                &crate::EmbedInput::Image(b"\x89PNG\r\n\x1a\nabc".to_vec()),
+                EmbedKind::Query,
+            )
+            .unwrap();
+        assert!(val.as_str().unwrap().starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn image_input_disabled_errors() {
+        let e = HttpEmbedder::new(http_cfg(HttpProtocol::OpenAI, 2));
+        let err = e
+            .input_value(&crate::EmbedInput::Image(vec![1, 2, 3]), EmbedKind::Query)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("image input disabled"), "got: {err}");
     }
 
     /// 实网集成（env-gated）：设 `FASTSEARCH_EMBED_TEST_URL` 才跑，需本地 Ollama。

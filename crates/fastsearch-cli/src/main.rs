@@ -4,8 +4,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use fastsearch_cli::{
-    cmd_eval, cmd_index, cmd_index_dir, cmd_search, cmd_similar, EvalOpts, IndexDirOpts, IndexOpts,
-    SearchOpts, SimilarOpts,
+    cmd_eval, cmd_index, cmd_index_dir, cmd_search, cmd_similar, cmd_upload_image, EvalOpts,
+    ImageUploadOpts, IndexDirOpts, IndexOpts, SearchOpts, SimilarOpts, StoreMedia,
 };
 use fastsearch_core::SearchMode;
 use serde_json::Value;
@@ -50,8 +50,28 @@ enum Command {
         collection: String,
         #[arg(long)]
         doc_id: String,
+        /// 媒资存储策略：inline 保持现状；object/auto 由 server 上传到对象存储；reference 校验已有 object 引用。
+        #[arg(long, value_enum)]
+        store_media: Option<StoreMediaArg>,
         /// 输入文件；省略或 `-` 读 stdin。
         input: Option<PathBuf>,
+    },
+    /// 上传单张原始图片文件 → POST /v1/images（server 负责对象存储、嵌入、索引）。
+    UploadImage {
+        /// 图片文件路径。
+        file: PathBuf,
+        #[arg(long, default_value = "default")]
+        collection: String,
+        #[arg(long)]
+        doc_id: String,
+        /// 图片 caption/OCR/描述文本，可为空；文本搜图依赖 server 的跨模态 embedder。
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        page: u32,
+        /// 媒资存储策略，默认由 server 的 /v1/images 使用 object。
+        #[arg(long, value_enum)]
+        store_media: Option<StoreMediaArg>,
     },
     /// 喂一个文件夹：递归 .md/.txt（每文件一 doc，doc_id=相对路径）客户端分块 → POST /v1/index。
     IndexDir {
@@ -67,7 +87,7 @@ enum Command {
     Search {
         #[arg(long, default_value = "default")]
         collection: String,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         query: String,
         #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
         mode: Mode,
@@ -75,6 +95,12 @@ enum Command {
         top_k: usize,
         #[arg(long)]
         kind: Option<String>,
+        /// 限定模态（如 image/text/audio/video），编译为普通 Filter，不是服务端特权参数。
+        #[arg(long)]
+        modality: Option<String>,
+        /// 图片 query（以图搜图）。会作为 query_image_base64 发给 server。
+        #[arg(long)]
+        image: Option<PathBuf>,
         #[arg(long)]
         page_min: Option<u32>,
         #[arg(long)]
@@ -115,12 +141,31 @@ enum Mode {
     Hybrid,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum StoreMediaArg {
+    Inline,
+    Auto,
+    Object,
+    Reference,
+}
+
 impl From<Mode> for SearchMode {
     fn from(m: Mode) -> Self {
         match m {
             Mode::Keyword => SearchMode::Keyword,
             Mode::Vector => SearchMode::Vector,
             Mode::Hybrid => SearchMode::Hybrid,
+        }
+    }
+}
+
+impl From<StoreMediaArg> for StoreMedia {
+    fn from(v: StoreMediaArg) -> Self {
+        match v {
+            StoreMediaArg::Inline => StoreMedia::Inline,
+            StoreMediaArg::Auto => StoreMedia::Auto,
+            StoreMediaArg::Object => StoreMedia::Object,
+            StoreMediaArg::Reference => StoreMedia::Reference,
         }
     }
 }
@@ -194,6 +239,7 @@ fn main() -> Result<()> {
         Command::Index {
             collection,
             doc_id,
+            store_media,
             input,
         } => {
             let bytes = read_input(&input)?;
@@ -202,9 +248,30 @@ fn main() -> Result<()> {
                 key,
                 collection,
                 doc_id,
+                store_media: store_media.map(Into::into),
             };
             let n = cmd_index(&opts, &bytes)?;
             eprintln!("indexed {n} chunk(s) for doc '{}'", opts.doc_id);
+        }
+        Command::UploadImage {
+            file,
+            collection,
+            doc_id,
+            text,
+            page,
+            store_media,
+        } => {
+            let opts = ImageUploadOpts {
+                server,
+                key,
+                collection,
+                doc_id,
+                text,
+                page,
+                store_media: store_media.map(Into::into),
+            };
+            let v = cmd_upload_image(&opts, &file)?;
+            eprintln!("{}", serde_json::to_string_pretty(&v)?);
         }
         Command::IndexDir {
             collection,
@@ -237,6 +304,8 @@ fn main() -> Result<()> {
             mode,
             top_k,
             kind,
+            modality,
+            image,
             page_min,
             page_max,
             json,
@@ -249,6 +318,8 @@ fn main() -> Result<()> {
                 mode: mode.into(),
                 top_k,
                 kind,
+                modality,
+                image,
                 page_min,
                 page_max,
             };

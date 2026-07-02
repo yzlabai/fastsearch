@@ -212,6 +212,7 @@ mod tests {
             char_len: text.chars().count() as u32,
             media: None,
             media_bytes: None,
+            image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
         }

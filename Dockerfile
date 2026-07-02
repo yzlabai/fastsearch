@@ -3,11 +3,12 @@
 # 运行：docker run -p 8642:8642 -e FASTSEARCH_KEYS="dev=:public" -v fsdata:/data fastsearch-server
 
 # ---- 构建阶段 ----
-FROM rust:1.85-slim AS builder
+FROM rust:1.88-slim AS builder
 WORKDIR /build
 # 先拷 manifest 预热依赖缓存（源码改动不必重编依赖）。
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 # 仅构建 server 二进制（release，lto=thin）。
 RUN cargo build --release -p fastsearch-server --bin fastsearch-server
 

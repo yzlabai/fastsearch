@@ -7,6 +7,7 @@
 //! 搜索热路径（core/server/engine/...）不依赖任何 docparse crate；解析能力仅在本 feature 编译。
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use fastsearch_core::{AssetPointer, BBox, Chunk, ChunkKind, MediaRef};
 use std::path::PathBuf;
 
@@ -179,6 +180,13 @@ fn map_image(im: &docparse_core::chunk::ImageMeta, page: u32, bbox: BBox) -> Med
     }
 }
 
+fn decode_image_bytes(im: &docparse_core::chunk::ImageMeta) -> Option<Vec<u8>> {
+    im.data_base64.as_ref().and_then(|s| {
+        let raw = s.rsplit_once(',').map(|(_, b64)| b64).unwrap_or(s);
+        B64.decode(raw.trim()).ok()
+    })
+}
+
 /// 把 docparse chunk 适配成 fastsearch chunk，注入摄取期元数据（`doc_id`/`tenant`/`acl`）。
 pub fn from_docparse_chunk(
     dc: &docparse_core::chunk::Chunk,
@@ -202,7 +210,8 @@ pub fn from_docparse_chunk(
             .image
             .as_ref()
             .map(|im| map_image(im, dc.page as u32, bbox)),
-        media_bytes: None, // docparse base64 → 字节携带待 base64 依赖（MM2c-bytes follow-up）
+        media_bytes: dc.image.as_ref().and_then(decode_image_bytes),
+        image_vector_status: None,
         tenant,
         acl,
     }

@@ -10,6 +10,7 @@
 pub mod ingest;
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use fastsearch_core::{
     BBox, Chunk, ChunkKind, FieldValue, Filter, GlobalId, SearchMode, SearchRequest,
 };
@@ -64,6 +65,29 @@ impl Client {
         self.post_raw(&url, body).map_err(|e| e.into_anyhow(&url))
     }
 
+    fn post_multipart(&self, path: &str, boundary: &str, body: Vec<u8>) -> Result<Value> {
+        let url = format!("{}{}", self.base, path);
+        match ureq::post(&url)
+            .set("authorization", &format!("Bearer {}", self.key))
+            .set(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send_bytes(&body)
+        {
+            Ok(r) => r
+                .into_json()
+                .map_err(|e| anyhow!("server returned non-json response: {e}")),
+            Err(ureq::Error::Status(code, r)) => Err(anyhow!(
+                "server 返回 {code}: {}",
+                r.into_string().unwrap_or_default()
+            )),
+            Err(e) => Err(anyhow!(
+                "请求 {url} 失败：{e}（server 在运行吗？检查 --server / FASTSEARCH_SERVER）"
+            )),
+        }
+    }
+
     /// 带瞬时失败重试的 POST（批量写入用）：仅 `Transport`（连接/读写失败）重试；
     /// `Status`（4xx/5xx 确定性拒绝）立即抛、不重试。
     fn post_retry<B: Serialize>(&self, path: &str, body: &B, retries: usize) -> Result<Value> {
@@ -106,7 +130,18 @@ impl PostError {
 struct IndexBody<'a> {
     collection: &'a str,
     doc_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_media: Option<StoreMedia>,
     chunks: &'a [Chunk],
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreMedia {
+    Inline,
+    Auto,
+    Object,
+    Reference,
 }
 
 #[derive(Serialize)]
@@ -116,10 +151,17 @@ struct SimilarBody<'a> {
 }
 
 /// POST 一个 doc 的 chunks 到 `/v1/index`（带重试）。返回 server 报告的 indexed 数。
-fn post_index(client: &Client, collection: &str, doc_id: &str, chunks: &[Chunk]) -> Result<usize> {
+fn post_index(
+    client: &Client,
+    collection: &str,
+    doc_id: &str,
+    store_media: Option<StoreMedia>,
+    chunks: &[Chunk],
+) -> Result<usize> {
     let body = IndexBody {
         collection,
         doc_id,
+        store_media,
         chunks,
     };
     let v = client.post_retry("/v1/index", &body, 3)?;
@@ -154,6 +196,7 @@ struct DocparseChunk {
 }
 
 fn to_core(dc: DocparseChunk, doc_id: &str) -> Chunk {
+    let media_bytes = dc.image.as_ref().and_then(decode_image_bytes);
     Chunk {
         doc_id: doc_id.to_string(),
         chunk_id: dc.id,
@@ -165,10 +208,17 @@ fn to_core(dc: DocparseChunk, doc_id: &str) -> Chunk {
         section_id: dc.section_id,
         char_len: dc.char_len,
         media: dc.image.as_ref().map(|im| im.to_media(dc.page, dc.bbox)),
-        media_bytes: None,
+        media_bytes,
+        image_vector_status: None,
         tenant: None,
         acl: vec!["public".to_string()],
     }
+}
+
+fn decode_image_bytes(im: &fastsearch_core::ImageMeta) -> Option<Vec<u8>> {
+    let raw = im.data_base64.as_ref()?.trim();
+    let b64 = raw.rsplit_once(',').map(|(_, v)| v).unwrap_or(raw);
+    B64.decode(b64).ok()
 }
 
 /// 解析 docparse chunks（JSON 数组 或 NDJSON），注入 doc_id → core::Chunk。
@@ -241,6 +291,7 @@ fn mk_text_chunk(
         section_id: 0,
         media: None,
         media_bytes: None,
+        image_vector_status: None,
         tenant: None,
         acl: vec!["public".to_string()],
     };
@@ -310,13 +361,120 @@ pub struct IndexOpts {
     pub key: Option<String>,
     pub collection: String,
     pub doc_id: String,
+    pub store_media: Option<StoreMedia>,
+}
+
+/// 原始图片上传选项（multipart → `/v1/images`）。
+pub struct ImageUploadOpts {
+    pub server: Option<String>,
+    pub key: Option<String>,
+    pub collection: String,
+    pub doc_id: String,
+    pub text: Option<String>,
+    pub page: u32,
+    pub store_media: Option<StoreMedia>,
 }
 
 /// 灌入一个 doc 的 chunks（chunks.json/NDJSON → server）。返回 indexed 数。
 pub fn cmd_index(opts: &IndexOpts, input: &[u8]) -> Result<usize> {
     let chunks = parse_chunks(input, &opts.doc_id)?;
     let client = Client::new(opts.server.clone(), opts.key.clone());
-    post_index(&client, &opts.collection, &opts.doc_id, &chunks)
+    post_index(
+        &client,
+        &opts.collection,
+        &opts.doc_id,
+        opts.store_media,
+        &chunks,
+    )
+}
+
+fn media_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        _ => "application/octet-stream",
+    }
+}
+
+fn multipart_text(out: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    out.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+        .as_bytes(),
+    );
+}
+
+fn multipart_file(
+    out: &mut Vec<u8>,
+    boundary: &str,
+    field: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) {
+    out.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// 上传一个原始图片文件到 `/v1/images`，由 server 负责对象存储、嵌入、索引和真源写入。
+pub fn cmd_upload_image(opts: &ImageUploadOpts, path: &Path) -> Result<Value> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let client = Client::new(opts.server.clone(), opts.key.clone());
+    let boundary = format!(
+        "fastsearch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut body = Vec::new();
+    multipart_text(&mut body, &boundary, "collection", &opts.collection);
+    multipart_text(&mut body, &boundary, "doc_id", &opts.doc_id);
+    multipart_text(&mut body, &boundary, "page", &opts.page.to_string());
+    if let Some(text) = &opts.text {
+        multipart_text(&mut body, &boundary, "text", text);
+    }
+    if let Some(store_media) = opts.store_media {
+        let raw = match store_media {
+            StoreMedia::Inline => "inline",
+            StoreMedia::Auto => "auto",
+            StoreMedia::Object => "object",
+            StoreMedia::Reference => "reference",
+        };
+        multipart_text(&mut body, &boundary, "store_media", raw);
+    }
+    let filename = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("image.bin");
+    multipart_file(
+        &mut body,
+        &boundary,
+        "image",
+        filename,
+        media_type_for_path(path),
+        &bytes,
+    );
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    client.post_multipart("/v1/images", &boundary, body)
 }
 
 /// index-dir 选项（喂整个文件夹 → 客户端分块 → POST /v1/index）。
@@ -359,7 +517,7 @@ fn read_chunk_post(client: &Client, collection: &str, rel: &str, path: &Path) ->
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let chunks = chunk_text(&content, rel);
-    post_index(client, collection, rel, &chunks)
+    post_index(client, collection, rel, None, &chunks)
 }
 
 /// **喂一个文件夹**：递归遍历 `root` 下的 .md/.txt（确定性排序），每文件 `chunk_text` 切块、
@@ -415,6 +573,8 @@ pub struct SearchOpts {
     pub mode: SearchMode,
     pub top_k: usize,
     pub kind: Option<String>,
+    pub modality: Option<String>,
+    pub image: Option<PathBuf>,
     pub page_min: Option<u32>,
     pub page_max: Option<u32>,
 }
@@ -423,6 +583,7 @@ pub struct SearchOpts {
 pub fn build_filter(
     collection: &str,
     kind: Option<&str>,
+    modality: Option<&str>,
     page_min: Option<u32>,
     page_max: Option<u32>,
 ) -> Filter {
@@ -432,6 +593,12 @@ pub fn build_filter(
     )];
     if let Some(k) = kind {
         clauses.push(Filter::Eq("kind".into(), FieldValue::Str(k.to_string())));
+    }
+    if let Some(m) = modality {
+        clauses.push(Filter::Eq(
+            "modality".into(),
+            FieldValue::Str(m.to_string()),
+        ));
     }
     if let Some(lo) = page_min {
         clauses.push(Filter::Gte("page".into(), FieldValue::Int(lo as i64)));
@@ -457,12 +624,18 @@ pub fn cmd_search(opts: &SearchOpts) -> Result<Vec<Value>> {
         filter: Some(build_filter(
             &opts.collection,
             opts.kind.as_deref(),
+            opts.modality.as_deref(),
             opts.page_min,
             opts.page_max,
         )),
         ..Default::default()
     };
-    Ok(hits_of(client.post("/v1/search", &req)?))
+    let mut body = serde_json::to_value(&req)?;
+    if let Some(path) = &opts.image {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        body["query_image_base64"] = Value::String(B64.encode(bytes));
+    }
+    Ok(hits_of(client.post("/v1/search", &body)?))
 }
 
 /// similar 选项。
@@ -509,7 +682,7 @@ pub fn cmd_eval(opts: &EvalOpts) -> Result<(Metrics, Option<std::result::Result<
         by_doc.entry(c.doc_id.clone()).or_default().push(c.clone());
     }
     for (doc_id, chunks) in &by_doc {
-        post_index(&client, &set.collection, doc_id, chunks)?;
+        post_index(&client, &set.collection, doc_id, None, chunks)?;
     }
 
     // 逐查询检索 → 收集排名 GlobalId（限定到 set.collection）。
@@ -520,7 +693,7 @@ pub fn cmd_eval(opts: &EvalOpts) -> Result<(Metrics, Option<std::result::Result<
             mode: opts.mode,
             top_k: opts.k,
             candidates: opts.k.max(150),
-            filter: Some(build_filter(&set.collection, None, None, None)),
+            filter: Some(build_filter(&set.collection, None, None, None, None)),
             ..Default::default()
         };
         let hits = hits_of(client.post("/v1/search", &req)?);

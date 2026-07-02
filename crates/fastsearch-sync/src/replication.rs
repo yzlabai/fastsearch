@@ -227,6 +227,11 @@ fn row_to_chunk(rel: &Relation, tuple: &TupleData) -> Result<(String, Chunk)> {
         // CDC 不搬 inline 字节（MM2c-bytes 决策 §4.2）：字节是 PG 真源、网关按需直查，
         // 复制流只搬指针。派生索引不需字节 → None。
         media_bytes: None,
+        image_vector_status: m
+            .get("image_vector_status")
+            .copied()
+            .flatten()
+            .map(String::from),
         // 时间区间为可空 bigint 列（MM2c）；to_chunk 的 time 由 media 恢复，这两列仅写侧下推用。
         time_start_ms: m
             .get("time_start_ms")

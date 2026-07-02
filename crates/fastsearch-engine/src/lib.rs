@@ -10,8 +10,8 @@
 //! **分组折叠**（req.collapse 每 doc/section 限 N 条）均已接入。
 
 use fastsearch_core::{
-    fuse, AclFilter, AssetPointer, BBox, Chunk, ChunkKind, Citation, GlobalId, Scored, SearchMode,
-    SearchRequest, TimeSpan,
+    fuse, AclFilter, AssetPointer, BBox, Chunk, ChunkKind, Citation, FieldValue, Filter, GlobalId,
+    Scored, SearchMode, SearchRequest, TimeSpan,
 };
 use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
@@ -22,7 +22,9 @@ pub use fastsearch_vector::{HnswParams, VectorBackendKind, DEFAULT_BINARY_OVERSA
 use fastsearch_vector::{VecMeta, VectorBackend, VectorStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -137,6 +139,20 @@ fn vec_meta(collection: &str, c: &Chunk) -> VecMeta {
     }
 }
 
+fn filter_targets_image(filter: Option<&Filter>) -> bool {
+    match filter {
+        Some(Filter::Eq(field, FieldValue::Str(v))) => field == "modality" && v == "image",
+        Some(Filter::In(field, vals)) if field == "modality" => vals
+            .iter()
+            .any(|v| matches!(v, FieldValue::Str(s) if s == "image")),
+        Some(Filter::And(parts)) | Some(Filter::Or(parts)) => {
+            parts.iter().any(|f| filter_targets_image(Some(f)))
+        }
+        Some(Filter::Not(_)) | Some(Filter::Ne(_, _)) => false,
+        _ => false,
+    }
+}
+
 /// 一条检索命中（带引用与分数明细）。
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -217,7 +233,656 @@ pub enum AssetFetch {
 /// 使客户端能取大媒资字节而**不暴露裸 key**（不变量 #3）。返回 `(签名 URL, 过期秒数)`；
 /// `None` = 不可签（如 key 非法）→ 网关 404。真实现（S3 presign 类）属对象存储接入，gated。
 pub trait ObjectSigner: Send + Sync {
-    fn sign(&self, uri: &str) -> Option<(String, u64)>;
+    fn sign(&self, uri: &str, media_type: Option<&str>) -> Option<(String, u64)>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectErrorKind {
+    NotFound,
+    Forbidden,
+    Transient,
+    InvalidMetadata,
+    TooLarge,
+    UnsupportedMediaType,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectError {
+    pub kind: ObjectErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for ObjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.kind, self.message)
+    }
+}
+
+impl std::error::Error for ObjectError {}
+
+pub type ObjectResult<T> = std::result::Result<T, ObjectError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRef {
+    pub uri: String,
+    pub bucket: String,
+    pub key: String,
+    pub provider: String,
+    pub content_type: String,
+    pub size: u64,
+    pub sha256: String,
+    pub etag: Option<String>,
+    pub owner_tenant: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectBytes {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresignedUrl {
+    pub url: String,
+    pub expires_s: u64,
+}
+
+/// 对象存储后端 trait（P4 地基）。默认构建只编译 trait；S3/MinIO 真实现必须 feature-gated。
+pub trait ObjectStore: Send + Sync {
+    fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef>;
+    fn get(&self, uri: &str, max_bytes: usize) -> ObjectResult<ObjectBytes>;
+    fn presign_get(&self, uri: &str, content_type: Option<&str>) -> ObjectResult<PresignedUrl>;
+    fn validate_ref(&self, uri: &str, principal_tenant: Option<&str>) -> ObjectResult<ObjectRef>;
+    fn delete(&self, uri: &str) -> ObjectResult<()>;
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn parse_object_uri(uri: &str) -> ObjectResult<(&str, &str, &str)> {
+    let Some((provider, rest)) = uri.split_once("://") else {
+        return Err(ObjectError {
+            kind: ObjectErrorKind::InvalidMetadata,
+            message: "object uri must be scheme://bucket/key".into(),
+        });
+    };
+    if provider != "s3" && provider != "minio" && provider != "local" {
+        return Err(ObjectError {
+            kind: ObjectErrorKind::InvalidMetadata,
+            message: format!("unsupported object uri scheme: {provider}"),
+        });
+    }
+    let Some((bucket, key)) = rest.split_once('/') else {
+        return Err(ObjectError {
+            kind: ObjectErrorKind::InvalidMetadata,
+            message: "object uri must include bucket and key".into(),
+        });
+    };
+    if bucket.is_empty()
+        || bucket == "."
+        || bucket == ".."
+        || bucket.contains('/')
+        || bucket.contains('\\')
+        || bucket.chars().any(char::is_whitespace)
+        || key.is_empty()
+        || key
+            .split('/')
+            .any(|p| p.is_empty() || p == "." || p == "..")
+        || key.contains('\\')
+        || key.starts_with('/')
+    {
+        return Err(ObjectError {
+            kind: ObjectErrorKind::InvalidMetadata,
+            message: "invalid bucket or key".into(),
+        });
+    }
+    Ok((provider, bucket, key))
+}
+
+/// 本地目录对象存储。它保留 S3-compatible 的 `s3://bucket/key` / `minio://bucket/key`
+/// URI 语义，用于默认构建和本地 MinIO 替身测试；真实 SDK 后端可实现同一个 trait。
+#[derive(Debug, Clone)]
+pub struct LocalObjectStore {
+    root: PathBuf,
+    default_bucket: String,
+    max_bytes: usize,
+}
+
+impl LocalObjectStore {
+    pub fn new(root: impl Into<PathBuf>, default_bucket: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            default_bucket: default_bucket.into(),
+            max_bytes: 20 * 1024 * 1024,
+        }
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes.max(1);
+        self
+    }
+
+    fn path_for(&self, bucket: &str, key: &str) -> PathBuf {
+        let mut p = self.root.join(bucket);
+        for part in key.split('/') {
+            p.push(part);
+        }
+        p
+    }
+
+    fn read_ref(&self, provider: &str, bucket: &str, key: &str) -> ObjectResult<ObjectRef> {
+        let path = self.path_for(bucket, key);
+        let meta = std::fs::metadata(&path).map_err(|e| ObjectError {
+            kind: if e.kind() == std::io::ErrorKind::NotFound {
+                ObjectErrorKind::NotFound
+            } else {
+                ObjectErrorKind::Transient
+            },
+            message: format!("stat object: {e}"),
+        })?;
+        if meta.len() as usize > self.max_bytes {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::TooLarge,
+                message: format!("object is {} bytes, limit {}", meta.len(), self.max_bytes),
+            });
+        }
+        let bytes = std::fs::read(&path).map_err(|e| ObjectError {
+            kind: ObjectErrorKind::Transient,
+            message: format!("read object: {e}"),
+        })?;
+        Ok(ObjectRef {
+            uri: format!("{provider}://{bucket}/{key}"),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            provider: provider.to_string(),
+            content_type: content_type_for_key(key).to_string(),
+            size: meta.len(),
+            sha256: sha256_hex(&bytes),
+            etag: None,
+            owner_tenant: None,
+        })
+    }
+
+    fn validate_scope(
+        &self,
+        bucket: &str,
+        key: &str,
+        principal_tenant: Option<&str>,
+    ) -> ObjectResult<()> {
+        validate_object_scope(bucket, key, &self.default_bucket, principal_tenant)
+    }
+}
+
+fn validate_object_scope(
+    bucket: &str,
+    key: &str,
+    allowed_bucket: &str,
+    principal_tenant: Option<&str>,
+) -> ObjectResult<()> {
+    if bucket != allowed_bucket {
+        return Err(ObjectError {
+            kind: ObjectErrorKind::Forbidden,
+            message: "object bucket is not allowed".into(),
+        });
+    }
+    if let Some(tenant) = principal_tenant {
+        let prefix = format!("{tenant}/");
+        if !key.starts_with(&prefix) {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::Forbidden,
+                message: "object key is outside tenant namespace".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn content_type_for_key(key: &str) -> &'static str {
+    match key
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+impl ObjectStore for LocalObjectStore {
+    fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef> {
+        if bytes.len() > self.max_bytes {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::TooLarge,
+                message: format!("object is {} bytes, limit {}", bytes.len(), self.max_bytes),
+            });
+        }
+        if key.is_empty() || key.split('/').any(|p| p == "..") || key.starts_with('/') {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::InvalidMetadata,
+                message: "invalid object key".into(),
+            });
+        }
+        let path = self.path_for(&self.default_bucket, key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ObjectError {
+                kind: ObjectErrorKind::Transient,
+                message: format!("create object parent: {e}"),
+            })?;
+        }
+        std::fs::write(&path, bytes).map_err(|e| ObjectError {
+            kind: ObjectErrorKind::Transient,
+            message: format!("write object: {e}"),
+        })?;
+        Ok(ObjectRef {
+            uri: format!("s3://{}/{key}", self.default_bucket),
+            bucket: self.default_bucket.clone(),
+            key: key.to_string(),
+            provider: "s3".into(),
+            content_type: content_type.to_string(),
+            size: bytes.len() as u64,
+            sha256: sha256_hex(bytes),
+            etag: None,
+            owner_tenant: None,
+        })
+    }
+
+    fn get(&self, uri: &str, max_bytes: usize) -> ObjectResult<ObjectBytes> {
+        let (_, bucket, key) = parse_object_uri(uri)?;
+        let limit = max_bytes.min(self.max_bytes).max(1);
+        let path = self.path_for(bucket, key);
+        let meta = std::fs::metadata(&path).map_err(|e| ObjectError {
+            kind: if e.kind() == std::io::ErrorKind::NotFound {
+                ObjectErrorKind::NotFound
+            } else {
+                ObjectErrorKind::Transient
+            },
+            message: format!("stat object: {e}"),
+        })?;
+        if meta.len() as usize > limit {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::TooLarge,
+                message: format!("object is {} bytes, limit {limit}", meta.len()),
+            });
+        }
+        let bytes = std::fs::read(&path).map_err(|e| ObjectError {
+            kind: ObjectErrorKind::Transient,
+            message: format!("read object: {e}"),
+        })?;
+        Ok(ObjectBytes {
+            bytes,
+            content_type: Some(content_type_for_key(key).to_string()),
+            size: meta.len(),
+        })
+    }
+
+    fn presign_get(&self, _uri: &str, _content_type: Option<&str>) -> ObjectResult<PresignedUrl> {
+        Err(ObjectError {
+            kind: ObjectErrorKind::Forbidden,
+            message: "presign is provided by server token signer".into(),
+        })
+    }
+
+    fn validate_ref(&self, uri: &str, principal_tenant: Option<&str>) -> ObjectResult<ObjectRef> {
+        let (provider, bucket, key) = parse_object_uri(uri)?;
+        self.validate_scope(bucket, key, principal_tenant)?;
+        self.read_ref(provider, bucket, key)
+    }
+
+    fn delete(&self, uri: &str) -> ObjectResult<()> {
+        let (_, bucket, key) = parse_object_uri(uri)?;
+        std::fs::remove_file(self.path_for(bucket, key)).map_err(|e| ObjectError {
+            kind: if e.kind() == std::io::ErrorKind::NotFound {
+                ObjectErrorKind::NotFound
+            } else {
+                ObjectErrorKind::Transient
+            },
+            message: format!("delete object: {e}"),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct S3ObjectStore {
+    endpoint: String,
+    region: String,
+    bucket: String,
+    access_key: String,
+    secret_key: String,
+    max_bytes: usize,
+}
+
+impl S3ObjectStore {
+    pub fn new(
+        endpoint: impl Into<String>,
+        region: impl Into<String>,
+        bucket: impl Into<String>,
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            region: region.into(),
+            bucket: bucket.into(),
+            access_key: access_key.into(),
+            secret_key: secret_key.into(),
+            max_bytes: 20 * 1024 * 1024,
+        }
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes.max(1);
+        self
+    }
+
+    fn url(&self, bucket: &str, key: &str) -> String {
+        format!("{}/{}/{}", self.endpoint, bucket, pct_path(key))
+    }
+
+    fn host(&self) -> String {
+        self.endpoint
+            .strip_prefix("https://")
+            .or_else(|| self.endpoint.strip_prefix("http://"))
+            .unwrap_or(&self.endpoint)
+            .to_string()
+    }
+
+    fn signed(
+        &self,
+        method: &str,
+        bucket: &str,
+        key: &str,
+        payload_hash: &str,
+    ) -> (String, String, String) {
+        let (date, amz_date) = sigv4_dates();
+        let host = self.host();
+        let canonical_uri = format!("/{}/{}", bucket, pct_path(key));
+        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let canonical_headers =
+            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+        let canonical_request = format!(
+            "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+        );
+        let scope = format!("{date}/{}/s3/aws4_request", self.region);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let signing_key = sigv4_key(&self.secret_key, &date, &self.region, "s3");
+        let signature = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
+        let auth = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            self.access_key
+        );
+        (auth, amz_date, host)
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        bucket: &str,
+        key: &str,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> ObjectResult<ureq::Response> {
+        let payload_hash = sha256_hex(body.unwrap_or(&[]));
+        let (auth, amz_date, host) = self.signed(method, bucket, key, &payload_hash);
+        let url = self.url(bucket, key);
+        let mut req = ureq::request(method, &url)
+            .set("authorization", &auth)
+            .set("host", &host)
+            .set("x-amz-date", &amz_date)
+            .set("x-amz-content-sha256", &payload_hash);
+        if let Some(ct) = content_type {
+            req = req.set("content-type", ct);
+        }
+        let resp = match body {
+            Some(bytes) => req.send_bytes(bytes),
+            None => req.call(),
+        };
+        resp.map_err(|e| object_http_error(method, &url, e))
+    }
+}
+
+impl ObjectStore for S3ObjectStore {
+    fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef> {
+        if bytes.len() > self.max_bytes {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::TooLarge,
+                message: format!("object is {} bytes, limit {}", bytes.len(), self.max_bytes),
+            });
+        }
+        if key.is_empty() || key.starts_with('/') || key.split('/').any(|p| p == "..") {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::InvalidMetadata,
+                message: "invalid object key".into(),
+            });
+        }
+        self.request("PUT", &self.bucket, key, Some(bytes), Some(content_type))?;
+        Ok(ObjectRef {
+            uri: format!("s3://{}/{key}", self.bucket),
+            bucket: self.bucket.clone(),
+            key: key.to_string(),
+            provider: "s3".into(),
+            content_type: content_type.to_string(),
+            size: bytes.len() as u64,
+            sha256: sha256_hex(bytes),
+            etag: None,
+            owner_tenant: None,
+        })
+    }
+
+    fn get(&self, uri: &str, max_bytes: usize) -> ObjectResult<ObjectBytes> {
+        let (_, bucket, key) = parse_object_uri(uri)?;
+        let resp = self.request("GET", bucket, key, None, None)?;
+        let ct = resp
+            .header("content-type")
+            .map(str::to_string)
+            .or_else(|| Some(content_type_for_key(key).to_string()));
+        let reader = resp
+            .into_reader()
+            .take(max_bytes.min(self.max_bytes).saturating_add(1) as u64);
+        let mut reader = std::io::BufReader::new(reader);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).map_err(|e| ObjectError {
+            kind: ObjectErrorKind::Transient,
+            message: format!("read response: {e}"),
+        })?;
+        if bytes.len() > max_bytes.min(self.max_bytes) {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::TooLarge,
+                message: "object exceeds max bytes".into(),
+            });
+        }
+        Ok(ObjectBytes {
+            size: bytes.len() as u64,
+            bytes,
+            content_type: ct,
+        })
+    }
+
+    fn presign_get(&self, _uri: &str, _content_type: Option<&str>) -> ObjectResult<PresignedUrl> {
+        Err(ObjectError {
+            kind: ObjectErrorKind::Forbidden,
+            message: "public presign is served by fastsearch token endpoint".into(),
+        })
+    }
+
+    fn validate_ref(&self, uri: &str, principal_tenant: Option<&str>) -> ObjectResult<ObjectRef> {
+        let (provider, bucket, key) = parse_object_uri(uri)?;
+        validate_object_scope(bucket, key, &self.bucket, principal_tenant)?;
+        let resp = self.request("HEAD", bucket, key, None, None)?;
+        let size = resp
+            .header("content-length")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if size as usize > self.max_bytes {
+            return Err(ObjectError {
+                kind: ObjectErrorKind::TooLarge,
+                message: format!("object is {size} bytes, limit {}", self.max_bytes),
+            });
+        }
+        Ok(ObjectRef {
+            uri: uri.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            provider: provider.to_string(),
+            content_type: resp
+                .header("content-type")
+                .unwrap_or(content_type_for_key(key))
+                .to_string(),
+            size,
+            sha256: String::new(),
+            etag: resp.header("etag").map(str::to_string),
+            owner_tenant: None,
+        })
+    }
+
+    fn delete(&self, uri: &str) -> ObjectResult<()> {
+        let (_, bucket, key) = parse_object_uri(uri)?;
+        self.request("DELETE", bucket, key, None, None).map(|_| ())
+    }
+}
+
+fn object_http_error(method: &str, url: &str, e: ureq::Error) -> ObjectError {
+    match e {
+        ureq::Error::Status(404, _) => ObjectError {
+            kind: ObjectErrorKind::NotFound,
+            message: format!("{method} {url}: not found"),
+        },
+        ureq::Error::Status(403, _) | ureq::Error::Status(401, _) => ObjectError {
+            kind: ObjectErrorKind::Forbidden,
+            message: format!("{method} {url}: forbidden"),
+        },
+        ureq::Error::Status(code, r) if (400..500).contains(&code) => ObjectError {
+            kind: ObjectErrorKind::InvalidMetadata,
+            message: format!("{method} {url}: status {code}: {}", r.status_text()),
+        },
+        other => ObjectError {
+            kind: ObjectErrorKind::Transient,
+            message: format!("{method} {url}: {other}"),
+        },
+    }
+}
+
+fn pct_path(key: &str) -> String {
+    key.split('/')
+        .map(pct_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn pct_component(s: &str) -> String {
+    let mut o = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                o.push(b as char)
+            }
+            _ => o.push_str(&format!("%{b:02X}")),
+        }
+    }
+    o
+}
+
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    use hmac::digest::KeyInit;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts arbitrary key length");
+    mac.update(msg);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    hmac_sha256(key, msg)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn sigv4_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    hmac_sha256(&k_service, b"aws4_request")
+}
+
+fn sigv4_dates() -> (String, String) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let hh = sod / 3600;
+    let mm = (sod % 3600) / 60;
+    let ss = sod % 60;
+    (
+        format!("{y:04}{m:02}{d:02}"),
+        format!("{y:04}{m:02}{d:02}T{hh:02}{mm:02}{ss:02}Z"),
+    )
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
+}
+
+/// 空对象存储：未配置 S3/MinIO 时使用。所有操作明确返回 Forbidden，不泄露对象存在性。
+#[derive(Debug, Default)]
+pub struct NoopObjectStore;
+
+impl NoopObjectStore {
+    fn err(&self) -> ObjectError {
+        ObjectError {
+            kind: ObjectErrorKind::Forbidden,
+            message: "object store not configured".into(),
+        }
+    }
+}
+
+impl ObjectStore for NoopObjectStore {
+    fn put(&self, _key: &str, _bytes: &[u8], _content_type: &str) -> ObjectResult<ObjectRef> {
+        Err(self.err())
+    }
+
+    fn get(&self, _uri: &str, _max_bytes: usize) -> ObjectResult<ObjectBytes> {
+        Err(self.err())
+    }
+
+    fn presign_get(&self, _uri: &str, _content_type: Option<&str>) -> ObjectResult<PresignedUrl> {
+        Err(self.err())
+    }
+
+    fn validate_ref(&self, _uri: &str, _principal_tenant: Option<&str>) -> ObjectResult<ObjectRef> {
+        Err(self.err())
+    }
+
+    fn delete(&self, _uri: &str) -> ObjectResult<()> {
+        Err(self.err())
+    }
 }
 
 /// 端到端检索引擎。
@@ -231,11 +896,13 @@ pub struct Engine {
     /// 可选 **pgvector 直查档（B6）**：设置后，向量召回**绕过引擎侧索引、在 PG 跑 ANN**
     /// （filter/ACL 下推 + iterative scan + 精确后过滤）。仅在 **multi-thread tokio runtime** 下可用
     /// （`run` 内 `block_in_place` 桥接同步检索↔异步 PG 查询）。详见 `set_pg_vector`。
-    vector_pg: Option<std::sync::Arc<fastsearch_pg::PgStore>>,
+    vector_pg: Option<Arc<fastsearch_pg::PgStore>>,
     /// 可选 **真源 PG 句柄**（MM6-inline）：媒资网关 `resolve_citation` 的 `Inline` 路径用它
     /// 按需直查 PG `media_bytes` 字节（字节是真源、引擎派生层不持）。与 `vector_pg` 解耦（语义不同，
     /// 可指向同一 `PgStore`）。仅在 **multi-thread tokio runtime** 下可用（`block_in_place` 桥接）。
-    source_pg: Option<std::sync::Arc<fastsearch_pg::PgStore>>,
+    source_pg: Option<Arc<fastsearch_pg::PgStore>>,
+    /// 可选对象存储。Object 图片嵌入和 token 字节端点从这里读取；默认未配置。
+    object_store: Option<Arc<dyn ObjectStore>>,
     /// 可选 **对象存储签名器**（MM6-secure）：`resolve_citation` 的 `Object` 路径用它签短时 URL；
     /// **未配置 → `Object` 返回 None（404），绝不回退到裸 key**（不变量 #3）。
     object_signer: Option<Box<dyn ObjectSigner>>,
@@ -257,6 +924,7 @@ impl Engine {
             embedder: None,
             vector_pg: None,
             source_pg: None,
+            object_store: None,
             object_signer: None,
             embed_model: None,
         })
@@ -270,6 +938,7 @@ impl Engine {
             embedder: None,
             vector_pg: None,
             source_pg: None,
+            object_store: None,
             object_signer: None,
             embed_model: None,
         })
@@ -320,6 +989,7 @@ impl Engine {
                 embedder: None,
                 vector_pg: None,
                 source_pg: None,
+                object_store: None,
                 object_signer: None,
                 embed_model: None,
             },
@@ -468,7 +1138,8 @@ impl Engine {
 
     /// 以图搜图查询嵌入（MM9）：`req.query_image` 存在且配了**支持图像**的后端 → 嵌成查询向量；
     /// 无 `query_image`/无 embedder → `None`（不报错，退化为纯文本/无向量）。后端不支持图像 → 报错
-    /// （避免静默拿文本后端嵌图）。真跨模态（文→图）还需 `caps.cross_modal`，与本路径正交。
+    /// （避免静默拿文本后端嵌图）。写入侧只把 `caps.cross_modal=true` 的图片向量放入共享索引，
+    /// 避免不可比较的图像向量污染文本向量空间。
     fn embed_query_image(&self, req: &SearchRequest) -> Result<Option<Vec<f32>>> {
         let (Some(bytes), Some(emb)) = (req.query_image.as_ref(), &self.embedder) else {
             return Ok(None);
@@ -490,8 +1161,15 @@ impl Engine {
     /// 开启 **媒资真源直查（MM6-inline）**：`resolve_citation` 的 `Inline` 路径据此从 PG
     /// `media_bytes` 按需取字节（字节是真源、引擎派生层不持）。可与 `set_pg_vector` 共用同一
     /// `PgStore`。**要求 multi-thread tokio runtime**（`resolve_citation` 内 `block_in_place` 桥接）。
-    pub fn set_source_store(&mut self, store: std::sync::Arc<fastsearch_pg::PgStore>) {
+    pub fn set_source_store(&mut self, store: Arc<fastsearch_pg::PgStore>) {
         self.source_pg = Some(store);
+    }
+
+    /// Clone 出 source_pg 的 Arc（不耗所有权；server 端 `/v1/index` 用于回写真源 PG）。
+    /// **限制**：调用方若要写 PG（`upsert_doc` 等 `&mut self`），需保证此 Arc 唯一持有（启动时
+    /// set_source_store 通常唯一；多 engine 实例共享同一 store 时不应调用此路径）。
+    pub fn source_pg_clone(&self) -> Option<Arc<fastsearch_pg::PgStore>> {
+        self.source_pg.clone()
     }
 
     /// 取 inline 媒资字节（`AssetFetch::InlineRef` 的字节面，MM6-inline/signer）。从 PG `media_bytes`
@@ -518,6 +1196,124 @@ impl Engine {
                 Ok(bytes)
             }
             None => Ok(None),
+        }
+    }
+
+    /// 配置对象存储。Object 图片嵌入和 token 字节端点都会从这里取字节。
+    pub fn set_object_store(&mut self, store: Arc<dyn ObjectStore>) {
+        self.object_store = Some(store);
+    }
+
+    /// 已授权的 Object 字节读取。调用方必须已通过 ACL 或 token 验证。
+    pub fn fetch_object_bytes(&self, uri: &str, max_bytes: usize) -> Result<Option<ObjectBytes>> {
+        match &self.object_store {
+            Some(store) => match store.get(uri, max_bytes) {
+                Ok(obj) => Ok(Some(obj)),
+                Err(e) if e.kind == ObjectErrorKind::NotFound => Ok(None),
+                Err(e) => Err(EngineError::Vector(format!("fetch object bytes: {e}"))),
+            },
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_object(&self, key: &str, bytes: &[u8], content_type: &str) -> Result<ObjectRef> {
+        let Some(store) = &self.object_store else {
+            return Err(EngineError::Vector("object store not configured".into()));
+        };
+        store
+            .put(key, bytes, content_type)
+            .map_err(|e| EngineError::Vector(format!("put object: {e}")))
+    }
+
+    pub fn validate_object_ref(
+        &self,
+        uri: &str,
+        principal_tenant: Option<&str>,
+    ) -> Result<ObjectRef> {
+        let Some(store) = &self.object_store else {
+            return Err(EngineError::Vector("object store not configured".into()));
+        };
+        store
+            .validate_ref(uri, principal_tenant)
+            .map_err(|e| EngineError::Vector(format!("validate object ref: {e}")))
+    }
+
+    pub fn delete_object(&self, uri: &str) -> Result<()> {
+        let Some(store) = &self.object_store else {
+            return Ok(());
+        };
+        match store.delete(uri) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind == ObjectErrorKind::NotFound => Ok(()),
+            Err(e) => Err(EngineError::Vector(format!("delete object: {e}"))),
+        }
+    }
+
+    pub fn object_uris_for_doc(&self, collection: &str, doc_id: &str) -> Result<Vec<String>> {
+        let rows = self.text.stored_rows_by_doc(collection, doc_id)?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Some(media) = row.media {
+                if let AssetPointer::Object { uri } = media.asset {
+                    if !out.contains(&uri) {
+                        out.push(uri);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn doc_visible_for_delete(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        acl: Option<&AclFilter>,
+    ) -> Result<Option<bool>> {
+        let rows = self.text.stored_rows_by_doc(collection, doc_id)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(match acl {
+            Some(a) => rows.iter().all(|row| a.visible(row)),
+            None => true,
+        }))
+    }
+
+    pub fn object_uri_for_gid(&self, gid: &GlobalId) -> Result<Option<String>> {
+        let row = self.text.stored_row_by_gid(gid)?;
+        Ok(row.and_then(|r| {
+            r.media.and_then(|m| match m.asset {
+                AssetPointer::Object { uri } => Some(uri),
+                _ => None,
+            })
+        }))
+    }
+
+    fn chunk_image_bytes(&self, chunk: &Chunk) -> anyhow::Result<Option<Vec<u8>>> {
+        if let Some(bytes) = &chunk.media_bytes {
+            return Ok(Some(bytes.clone()));
+        }
+        let Some(media) = &chunk.media else {
+            return Ok(None);
+        };
+        let AssetPointer::Object { uri } = &media.asset else {
+            return Ok(None);
+        };
+        let Some(store) = &self.object_store else {
+            return Ok(None);
+        };
+        match store.get(uri, 20 * 1024 * 1024) {
+            Ok(obj) => Ok(Some(obj.bytes)),
+            Err(e)
+                if matches!(
+                    e.kind,
+                    ObjectErrorKind::NotFound | ObjectErrorKind::Forbidden
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(anyhow::anyhow!("object get: {e}")),
         }
     }
 
@@ -616,6 +1412,7 @@ impl Engine {
             Some(m) => m,
             None => return Ok(None), // 该 chunk 无媒资
         };
+        let media_type = media.media_type.clone();
         let fetch = match media.asset {
             AssetPointer::DocRegion { page, bbox } => AssetFetch::DocRender {
                 doc_id: row.doc_id,
@@ -625,7 +1422,7 @@ impl Engine {
             // Object 大媒资在对象存储：必须经签名器签短时 URL（绝不暴露裸 key，不变量 #3）。
             // 无签名器 → None（404），**不回退到裸 uri**。真签名器（S3 presign 类）gated 对象存储。
             AssetPointer::Object { uri } => match &self.object_signer {
-                Some(signer) => match signer.sign(&uri) {
+                Some(signer) => match signer.sign(&uri, media_type.as_deref()) {
                     Some((url, expires_s)) => AssetFetch::SignedUrl { url, expires_s },
                     None => return Ok(None),
                 },
@@ -642,7 +1439,7 @@ impl Engine {
         Ok(Some(ResolvedAsset {
             fetch,
             time: media.time,
-            media_type: media.media_type,
+            media_type,
         }))
     }
 
@@ -682,11 +1479,24 @@ impl Engine {
     ) -> Result<(Vec<SearchHit>, Facets)> {
         req.validate()?;
         let candidates = req.candidates.max(req.top_k);
+        if req.vector.is_some()
+            && req.query_image.is_none()
+            && !req.query.trim().is_empty()
+            && filter_targets_image(req.filter.as_ref())
+            && self
+                .embedder
+                .as_ref()
+                .is_some_and(|emb| !emb.caps().cross_modal)
+        {
+            return Err(EngineError::Vector(
+                "text-to-image vector search requires caps.cross_modal=true".into(),
+            ));
+        }
 
         let want_kw = matches!(req.mode, SearchMode::Keyword | SearchMode::Hybrid);
         // 查询向量：显式 `req.vector` 优先；否则若带 `query_image` 且后端支持图像 → 嵌图
-        // （**以图搜图**，MM9）。真跨模态（以文搜图/以图搜文）还需后端 `caps.cross_modal`——
-        // 当前 HashEmbedder 基线 cross_modal=false，仅图→图有意义；文→图待真跨模态模型。
+        // （**以图搜图**，MM9）。写入侧要求 `caps.cross_modal=true` 才把图片向量放入共享索引，
+        // 因此真实图文/图图向量检索都依赖同空间多模态后端。
         let query_vec: Option<Vec<f32>> = match &req.vector {
             Some(v) => Some(v.clone()),
             None => self.embed_query_image(req)?,
@@ -966,19 +1776,23 @@ impl fastsearch_sync::IndexSink for Engine {
     fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()> {
         self.text.upsert(collection, chunk)?;
         // 配了嵌入后端则同步写向量索引（CDC 主循环：复制→解码→嵌入→派生向量）。
-        // **模态路由（MM5/MM10）**：① 有可检索文本（正文/caption/转录）→ 文本嵌入；② 否则无文本但
-        // 后端**支持图像**（`caps.image`）且有 inline 字节 → **图像嵌入**（M1/MM10，视觉向量进检索）；
+        // **模态路由（MM5/MM10）**：① 图片 chunk 且后端支持图像、有 inline 字节、且
+        // 文图同空间（cross_modal）→ 图像嵌入；
+        // ② 其余有可检索文本（正文/caption/转录）→ 文本嵌入；
         // ③ 都不满足（无文本图、纯文本后端）→ **不嵌**（避免空串退化向量污染 ANN；仍在 BM25 +
         // modality fast field 可按模态召回）。真跨模态文↔图还需 `caps.cross_modal`（HashEmbedder 基线
         // 为 false，仅图→图有意义；文→图待真跨模态模型）。
         if let Some(emb) = &self.embedder {
-            let input: Option<EmbedInput> = if !chunk.text.trim().is_empty() {
-                Some(EmbedInput::Text(chunk.text.clone()))
-            } else if emb.caps().image {
-                chunk.media_bytes.clone().map(EmbedInput::Image)
-            } else {
-                None
-            };
+            let input: Option<EmbedInput> =
+                if chunk.kind == ChunkKind::Image && emb.caps().image && emb.caps().cross_modal {
+                    self.chunk_image_bytes(chunk)?.map(EmbedInput::Image)
+                } else if !chunk.text.trim().is_empty() {
+                    Some(EmbedInput::Text(chunk.text.clone()))
+                } else if emb.caps().image && emb.caps().cross_modal {
+                    self.chunk_image_bytes(chunk)?.map(EmbedInput::Image)
+                } else {
+                    None
+                };
             match input {
                 Some(inp) => {
                     let v = emb
@@ -1085,7 +1899,41 @@ pub mod golden {
 mod tests {
     use super::*;
     use fastsearch_core::{BBox, ChunkKind, FieldValue, Filter};
+    use fastsearch_embed::{EmbedCaps, EmbedInput, EmbedKind, Embedder, HashEmbedder};
     use fastsearch_sync::{Applier, Change, ChangeEvent, Lsn};
+
+    struct CrossModalHashEmbedder(HashEmbedder);
+
+    impl CrossModalHashEmbedder {
+        fn new(dim: usize) -> Self {
+            Self(HashEmbedder::new(dim))
+        }
+    }
+
+    impl Embedder for CrossModalHashEmbedder {
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+
+        fn embed(&self, texts: &[String], kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.0.embed(texts, kind)
+        }
+
+        fn embed_multi(
+            &self,
+            inputs: &[EmbedInput],
+            kind: EmbedKind,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.0.embed_multi(inputs, kind)
+        }
+
+        fn caps(&self) -> EmbedCaps {
+            EmbedCaps {
+                cross_modal: true,
+                ..self.0.caps()
+            }
+        }
+    }
 
     fn chunk(doc: &str, id: u64, kind: ChunkKind, text: &str, page: u32) -> Chunk {
         Chunk {
@@ -1105,6 +1953,7 @@ mod tests {
             char_len: text.chars().count() as u32,
             media: None,
             media_bytes: None,
+            image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
         }
@@ -1139,10 +1988,9 @@ mod tests {
     // MM10（apply_upsert 图像路由）+ MM9（query_image 以图搜图）端到端基线（HashEmbedder，确定）。
     #[test]
     fn mm10_image_routing_and_mm9_query_image() {
-        use fastsearch_embed::HashEmbedder;
         use fastsearch_sync::IndexSink;
         let mut e = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
-        e.set_embedder(Box::new(HashEmbedder::new(32))); // caps.image=true
+        e.set_embedder(Box::new(CrossModalHashEmbedder::new(32))); // caps.image=true + cross_modal=true
 
         let img = |id: u64, bytes: Vec<u8>| {
             let mut c = chunk("d.pdf", id, ChunkKind::Image, "", id as u32); // text="" 无 caption
@@ -1177,6 +2025,84 @@ mod tests {
             hits.iter().all(|h| h.id.chunk_id != 9),
             "无字节无文本图不应进向量召回"
         );
+    }
+
+    #[test]
+    fn non_cross_modal_image_vectors_are_not_mixed_into_shared_index() {
+        use fastsearch_sync::IndexSink;
+        let mut e = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        e.set_embedder(Box::new(HashEmbedder::new(32))); // image=true, cross_modal=false
+        let mut c = chunk("d.pdf", 1, ChunkKind::Image, "", 1);
+        c.media_bytes = Some(vec![0x89, 0x50, 0x4E, 0x47, 10, 20, 30, 40, 50]);
+        e.apply_upsert("kb", &c).unwrap();
+        e.commit().unwrap();
+
+        let hits = e
+            .search(
+                &SearchRequest {
+                    mode: SearchMode::Vector,
+                    query_image: c.media_bytes.clone(),
+                    top_k: 10,
+                    candidates: 10,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "non-cross-modal image vectors must not share the text vector index"
+        );
+    }
+
+    #[test]
+    fn object_image_bytes_are_embedded_from_object_store() {
+        use fastsearch_core::MediaRef;
+        use fastsearch_sync::IndexSink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalObjectStore::new(tmp.path(), "assets"));
+        let bytes = vec![0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4];
+        let obj = store.put("kb/img-a/1.png", &bytes, "image/png").unwrap();
+
+        let mut e = engine();
+        e.set_object_store(store);
+        e.set_embedder(Box::new(CrossModalHashEmbedder::new(32)));
+        let mut c = chunk("img-a", 1, ChunkKind::Image, "", 1);
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Object { uri: obj.uri },
+            media_type: Some("image/png".into()),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        e.apply_upsert("kb", &c).unwrap();
+        e.commit().unwrap();
+
+        let hits = e
+            .search(
+                &SearchRequest {
+                    query: String::new(),
+                    mode: SearchMode::Vector,
+                    query_image: Some(bytes),
+                    top_k: 3,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(hits[0].id.to_citation_id(), "kb:img-a:1");
+    }
+
+    #[test]
+    fn local_object_store_rejects_bucket_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path(), "assets");
+        let err = store
+            .get("s3://../secret.png", 1024)
+            .expect_err("bucket traversal must be rejected");
+        assert_eq!(err.kind, ObjectErrorKind::InvalidMetadata);
     }
 
     fn img2_no_bytes() -> Chunk {
@@ -1796,7 +2722,7 @@ mod tests {
         use fastsearch_core::{AssetPointer, MediaRef};
         struct TestSigner;
         impl ObjectSigner for TestSigner {
-            fn sign(&self, uri: &str) -> Option<(String, u64)> {
+            fn sign(&self, uri: &str, _media_type: Option<&str>) -> Option<(String, u64)> {
                 // 真实现会 S3 presign；测试桩只证明：签出的 URL 不含裸 key。
                 let name = uri.rsplit('/').next().unwrap_or("asset");
                 Some((format!("https://signed.example/{name}?token=abc"), 300))

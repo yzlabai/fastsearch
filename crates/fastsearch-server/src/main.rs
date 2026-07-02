@@ -7,6 +7,11 @@
 //!   （tenant 留空=管理员/无租户限制）。未设则建一个 dev key `dev`（无租户限制）。
 //! - `FASTSEARCH_RATE_LIMIT`：`capacity,refill_per_sec`（每 key 令牌桶）；未设=不限流。
 //! - `FASTSEARCH_AUDIT`：设为 `1`/`stderr` 则每个成功请求向 stderr 输出一行审计 JSON。
+//! - `FASTSEARCH_S3_ENDPOINT` / `_REGION` / `_BUCKET` / `_ACCESS_KEY` / `_SECRET_KEY`：
+//!   真实 S3/MinIO 对象存储（SigV4）。设了 endpoint 时优先使用。
+//! - `FASTSEARCH_OBJECT_DIR`：本地对象存储根目录（S3-compatible URI 的 bucket/key 映射到此目录）。
+//! - `FASTSEARCH_OBJECT_BUCKET`：本地对象存储默认 bucket（默认 `fastsearch-assets`）。
+//! - `FASTSEARCH_S3_MAX_IMAGE_BYTES`：对象读写最大字节数（默认 20MiB）。
 //! - `FASTSEARCH_EMBEDDER` = `hash`|`ollama`|`openai`（+ `FASTSEARCH_EMBED_*`）：真语义嵌入后端。
 //! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`brute_binary`|`brute_binary_rotated`|`hnsw`|`pgvector`：向量后端。hnsw=引擎侧近似
 //!   ANN（大规模、近似+非确定，仅首启生效）；pgvector=直查档（ANN 在 PG 跑，需 `DATABASE_URL` +
@@ -140,13 +145,54 @@ async fn main() -> anyhow::Result<()> {
     // 媒资真源（MM6-inline）：媒资网关 `/v1/asset` 的 Inline 路径从 PG `media_bytes` 按需取字节。
     // 与向量后端无关——只要有 PG 真源（DATABASE_URL）即开启（字节是真源、引擎派生层不持）。
     if let Ok(url) = std::env::var("DATABASE_URL") {
-        match fastsearch_pg::PgStore::connect(fastsearch_pg::PgConfig::new(url)).await {
+        match fastsearch_pg::PgStore::connect(fastsearch_pg::PgConfig::new(url.clone())).await {
             Ok(pg) => {
+                // 幂等建表 + vector 扩展 + publication（并发 boot 安全：advisory lock 串行化）
+                if let Err(e) = pg.ensure_schema().await {
+                    eprintln!("warn: ensure_schema failed: {e}（`/v1/index` 真源回写将失败）");
+                }
                 engine.set_source_store(std::sync::Arc::new(pg));
                 eprintln!("media source: PG media_bytes（/v1/asset inline 字节）");
             }
             Err(e) => eprintln!("media source store 连接失败: {e}（inline 字节不可用）"),
         }
+    }
+
+    if let Ok(endpoint) = std::env::var("FASTSEARCH_S3_ENDPOINT") {
+        let region = std::env::var("FASTSEARCH_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+        let bucket = std::env::var("FASTSEARCH_S3_BUCKET").map_err(|_| {
+            anyhow::anyhow!("FASTSEARCH_S3_BUCKET is required when FASTSEARCH_S3_ENDPOINT is set")
+        })?;
+        let access_key = std::env::var("FASTSEARCH_S3_ACCESS_KEY").map_err(|_| {
+            anyhow::anyhow!(
+                "FASTSEARCH_S3_ACCESS_KEY is required when FASTSEARCH_S3_ENDPOINT is set"
+            )
+        })?;
+        let secret_key = std::env::var("FASTSEARCH_S3_SECRET_KEY").map_err(|_| {
+            anyhow::anyhow!(
+                "FASTSEARCH_S3_SECRET_KEY is required when FASTSEARCH_S3_ENDPOINT is set"
+            )
+        })?;
+        let max_bytes = std::env::var("FASTSEARCH_S3_MAX_IMAGE_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20 * 1024 * 1024);
+        let store =
+            fastsearch_engine::S3ObjectStore::new(endpoint, region, bucket, access_key, secret_key)
+                .with_max_bytes(max_bytes);
+        engine.set_object_store(Arc::new(store));
+        eprintln!("object store on: S3-compatible endpoint");
+    } else if let Ok(root) = std::env::var("FASTSEARCH_OBJECT_DIR") {
+        let bucket = std::env::var("FASTSEARCH_OBJECT_BUCKET")
+            .unwrap_or_else(|_| "fastsearch-assets".into());
+        let max_bytes = std::env::var("FASTSEARCH_S3_MAX_IMAGE_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20 * 1024 * 1024);
+        let store =
+            fastsearch_engine::LocalObjectStore::new(root, bucket).with_max_bytes(max_bytes);
+        engine.set_object_store(Arc::new(store));
+        eprintln!("object store on: local S3-compatible directory");
     }
 
     // 嵌入后端配置（FASTSEARCH_EMBEDDER=ollama|openai；默认 hash→不嵌入）。
@@ -224,14 +270,36 @@ async fn main() -> anyhow::Result<()> {
     // 资产 URL 签名（MM6-signer）：FASTSEARCH_ASSET_SIGNING_KEY 设密钥即开启短时 token URL
     // （`/v1/assets/resolve` 签发、`/v1/asset/{cid}/bytes` 凭 token 取字节，让前端 <img src> 免 Bearer）。
     // FASTSEARCH_ASSET_URL_TTL 调过期秒数（默认 300）。多副本须同密钥。
-    if let Ok(key) = std::env::var("FASTSEARCH_ASSET_SIGNING_KEY") {
+    let signer_enabled = if let Ok(key) = std::env::var("FASTSEARCH_ASSET_SIGNING_KEY") {
         if !key.is_empty() {
             let ttl = std::env::var("FASTSEARCH_ASSET_URL_TTL")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300);
             state = state.with_asset_signer(key.into_bytes(), ttl);
+            state = state.enable_object_url_signer().await;
             eprintln!("asset URL signing on (TTL {ttl}s)");
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    // 公网入口 base：`search`/`similar` 命中拼 `media.url` 时用。
+    // 单独配置无效（签发需 signer）；仅设 base 时启动日志 warn，但不留 `media.url`。
+    if let Ok(base) = std::env::var("FASTSEARCH_PUBLIC_URL") {
+        let base = base.trim().to_string();
+        if !base.is_empty() {
+            state = state.with_public_base(base.clone());
+            if !signer_enabled {
+                eprintln!(
+                    "warn: FASTSEARCH_PUBLIC_URL={base} 已设但 asset signer 未启用，\
+                     `media.url` 不会出现在 search 命中"
+                );
+            } else {
+                eprintln!("media url base: {base}");
+            }
         }
     }
     // 审计：FASTSEARCH_AUDIT=1|stderr → stderr JSON 一行一事件
@@ -269,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = router(state);
 
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!(
         "fastsearch-server listening on http://{addr}  (data: {})",

@@ -160,6 +160,7 @@ mod tests {
             char_len: 1,
             media: None,
             media_bytes: None,
+            image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
         })

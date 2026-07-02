@@ -11,7 +11,9 @@
 //! [`EmbedderConfig::from_env`] 读环境变量。
 
 mod http;
-pub use http::{build_embedder, EmbedderConfig, EmbedderKind, HttpEmbedder, HttpProtocol};
+pub use http::{
+    build_embedder, EmbedderConfig, EmbedderKind, HttpEmbedder, HttpProtocol, ImageInputFormat,
+};
 
 use std::hash::{Hash, Hasher};
 
