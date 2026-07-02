@@ -26,6 +26,7 @@ axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+base64.workspace = true
 anyhow.workspace = true
 # 资产 URL 签名（MM6-signer）：HMAC-SHA256 签短时 token，让前端 <img src> 免 Bearer 取 inline 字节。
 hmac.workspace = true
@@ -34,6 +35,7 @@ sha2.workspace = true
 [dev-dependencies]
 tower.workspace = true
 http-body-util.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

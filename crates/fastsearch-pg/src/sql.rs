@@ -42,6 +42,7 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              modality text NOT NULL DEFAULT 'text',\n\
              media jsonb,\n\
              media_bytes bytea,\n\
+             image_vector_status text,\n\
              time_start_ms bigint,\n\
              time_end_ms bigint,\n\
              tenant text,\n\
@@ -287,6 +288,7 @@ pub const COLUMNS: &[&str] = &[
     "modality",
     "media",
     "media_bytes",
+    "image_vector_status",
     "time_start_ms",
     "time_end_ms",
     "tenant",
@@ -300,8 +302,8 @@ pub const COLUMNS: &[&str] = &[
 pub fn insert_sql(table: &str) -> String {
     format!(
         "INSERT INTO {table} \
-         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, modality, media, media_bytes, time_start_ms, time_end_ms, tenant, acl) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11, $12::text::jsonb, $13, $14, $15, $16, $17)"
+         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, modality, media, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11, $12::text::jsonb, $13, $14, $15, $16, $17, $18)"
     )
 }
 
@@ -323,7 +325,7 @@ pub fn delete_doc_sql(table: &str) -> String {
 pub fn fetch_doc_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, modality, media::text, media_bytes, time_start_ms, time_end_ms, tenant, acl \
+         section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 ORDER BY chunk_id"
     )
 }
@@ -332,7 +334,7 @@ pub fn fetch_doc_sql(table: &str) -> String {
 pub fn fetch_all_sql(table: &str) -> String {
     format!(
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
-         section_id, char_len, modality, media::text, media_bytes, time_start_ms, time_end_ms, tenant, acl \
+         section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} ORDER BY collection, doc_id, chunk_id"
     )
 }
@@ -370,6 +372,8 @@ pub struct ChunkRow {
     pub media: Option<String>,
     /// inline 媒资字节（`bytea`，`AssetPointer::Inline` 时有值；PG 真源，MM2c-bytes）。
     pub media_bytes: Option<Vec<u8>>,
+    /// 图片视觉向量状态（PG 真源）。
+    pub image_vector_status: Option<String>,
     /// 时间区间（毫秒）：从 `media.time` 派生落列（MM2c），供 SQL 侧 SUPERSET 下推/排序。
     /// 读路径 `to_chunk` 的 `time` 仍由 `media` 恢复（这两列是写侧反规范化，非权威源）。
     pub time_start_ms: Option<i64>,
@@ -394,6 +398,7 @@ impl ChunkRow {
             modality: c.kind.modality().as_str().to_string(),
             media: c.media.as_ref().map(serde_json::to_string).transpose()?,
             media_bytes: c.media_bytes.clone(),
+            image_vector_status: c.image_vector_status.map(|s| s.as_str().to_string()),
             // 时间区间从 media.time 派生落列（与后过滤同源 → 下推/后过滤一致）。
             time_start_ms: c
                 .media
@@ -428,8 +433,18 @@ impl ChunkRow {
             char_len: self.char_len as u32,
             media, // 媒资从 media jsonb 列恢复（modality 在 Chunk 侧由 kind 派生）
             media_bytes: self.media_bytes.clone(),
+            image_vector_status: self.image_vector_status(),
             tenant: self.tenant.clone(),
             acl: self.acl.clone(),
+        })
+    }
+
+    fn image_vector_status(&self) -> Option<fastsearch_core::ImageVectorStatus> {
+        self.image_vector_status.as_deref().and_then(|s| {
+            serde_json::from_value::<fastsearch_core::ImageVectorStatus>(serde_json::Value::String(
+                s.to_string(),
+            ))
+            .ok()
         })
     }
 }
@@ -457,6 +472,7 @@ mod tests {
             char_len: 8,
             media: None,
             media_bytes: None,
+            image_vector_status: None,
             tenant: Some("acme".into()),
             acl: vec!["team-a".into(), "public".into()],
         }
@@ -499,9 +515,12 @@ mod tests {
         assert!(ins.contains("$17"));
         assert!(ins.contains("$7::text::jsonb")); // bbox（先 ::text 再 ::jsonb，见 insert_sql 注释）
         assert!(ins.contains("$12::text::jsonb")); // media
-        assert!(ins.contains("modality, media, media_bytes, time_start_ms, time_end_ms")); // 新列（MM2c）
+        assert!(ins.contains(
+            "modality, media, media_bytes, image_vector_status, time_start_ms, time_end_ms"
+        )); // 新列（MM2c + image vector status）
         assert!(!ins.contains("image_meta")); // 遗留列已移除
-        assert!(!ins.contains("$18")); // exactly 17 params
+        assert!(ins.contains("$18"));
+        assert!(!ins.contains("$19")); // exactly 18 params
         let del = delete_doc_sql("t");
         assert_eq!(del, "DELETE FROM t WHERE collection = $1 AND doc_id = $2");
     }

@@ -95,7 +95,7 @@ impl PgStore {
         let mut n = 0u64;
         for c in chunks {
             let row = ChunkRow::from_chunk(collection, c)?;
-            let params: [&(dyn ToSql + Sync); 17] = [
+            let params: [&(dyn ToSql + Sync); 18] = [
                 &row.collection,
                 &row.doc_id,
                 &row.chunk_id,
@@ -109,6 +109,7 @@ impl PgStore {
                 &row.modality,
                 &row.media,
                 &row.media_bytes,
+                &row.image_vector_status,
                 &row.time_start_ms,
                 &row.time_end_ms,
                 &row.tenant,
@@ -423,6 +424,7 @@ fn row_to_chunk(r: &Row) -> Result<Chunk> {
         modality: r.try_get("modality")?,
         media: r.try_get("media")?,
         media_bytes: r.try_get("media_bytes")?,
+        image_vector_status: r.try_get("image_vector_status")?,
         time_start_ms: r.try_get("time_start_ms")?,
         time_end_ms: r.try_get("time_end_ms")?,
         tenant: r.try_get("tenant")?,
@@ -454,6 +456,7 @@ mod tests {
             char_len: 5,
             media: None,
             media_bytes: None,
+            image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
         }

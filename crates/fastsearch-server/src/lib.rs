@@ -6,16 +6,24 @@
 //! 安全核心（需求 F44）：ACL 只来自认证身份，客户端无法在请求体里传 ACL 或越权。
 
 use axum::{
-    extract::{Path, Query, State},
+    body::{to_bytes, Body},
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
-use fastsearch_core::{AclFilter, Chunk, GlobalId, SearchMode, SearchRequest};
-use fastsearch_embed::{EmbedKind, Embedder};
-use fastsearch_engine::AssetFetch;
+use base64::{
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL},
+    Engine as _,
+};
+use fastsearch_core::{
+    AclFilter, AssetPointer, BBox, Chunk, ChunkKind, FieldValue, Filter, GlobalId, MediaRef,
+    PublicMediaRef, SearchMode, SearchRequest,
+};
+use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_engine::Engine;
+use fastsearch_engine::{AssetFetch, ObjectSigner};
 use fastsearch_sync::replication::ReplicationConfig;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -108,6 +116,36 @@ fn mint_inline_url(
         pct(ct)
     );
     (url, exp.saturating_sub(now))
+}
+
+fn object_mac_id(uri: &str) -> String {
+    format!("object:{uri}")
+}
+
+fn mint_object_url(
+    signer: &AssetSigner,
+    uri: &str,
+    media_type: Option<&str>,
+    now: u64,
+) -> (String, u64) {
+    let ct = media_type.unwrap_or("application/octet-stream");
+    let (exp, sig) = signer.sign(&object_mac_id(uri), ct, now);
+    let encoded = B64URL.encode(uri.as_bytes());
+    let url = format!(
+        "/v1/object/{encoded}/bytes?exp={exp}&ct={}&sig={sig}",
+        pct(ct)
+    );
+    (url, exp.saturating_sub(now))
+}
+
+struct ServerObjectSigner {
+    signer: Arc<AssetSigner>,
+}
+
+impl ObjectSigner for ServerObjectSigner {
+    fn sign(&self, uri: &str, media_type: Option<&str>) -> Option<(String, u64)> {
+        Some(mint_object_url(&self.signer, uri, media_type, unix_now()))
+    }
 }
 
 /// 调用者身份（由 API Key 解析）。
@@ -217,6 +255,9 @@ pub struct ServerState {
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     /// 资产 URL 签名器（None=不签发短时 URL，`/v1/asset/{cid}/bytes` 一律 403）。
     asset_signer: Option<Arc<AssetSigner>>,
+    /// 公网入口 base（用于在 `media.url` 中拼出完整 URL）；
+    /// 与 `asset_signer` 共同决定 search hit 是否带 `media.url`。
+    public_base: Option<String>,
     /// **集合注册表**（咨询性、内存态、可重建）：记录集合期望的 `dim`/`distance`，供 ingest 维度
     /// 校验 + introspection。**不是真源、不跨副本共享**（多副本各自一份）；向量后端是**服务端级**
     /// 选择（`FASTSEARCH_VECTOR_BACKEND` env），不在此处按集合实例化。见 [docs/benchmark-strategy.md]。
@@ -244,6 +285,7 @@ impl ServerState {
             audit: None,
             embedder: None,
             asset_signer: None,
+            public_base: None,
             collections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -252,6 +294,27 @@ impl ServerState {
     /// `/v1/asset/{cid}/bytes` 凭 token 取 inline 字节。`key` 为 HMAC 密钥（多副本须同值）。
     pub fn with_asset_signer(mut self, key: Vec<u8>, ttl_secs: u64) -> Self {
         self.asset_signer = Some(Arc::new(AssetSigner::new(key, ttl_secs.max(1))));
+        self
+    }
+
+    /// 配置公网入口 base：`search`/`similar` 命中附带 `media.url` 时拼前缀（去掉末尾 `/`）。
+    /// 配 signer 后才生效；二者缺一 → `media.url` 字段不出。
+    pub fn with_public_base(mut self, base: impl Into<String>) -> Self {
+        let s = base.into();
+        self.public_base = Some(s.trim_end_matches('/').to_string());
+        self
+    }
+
+    /// 让 engine 的 Object resolve 分支使用同一 HMAC 签发 object byte token URL。
+    pub async fn enable_object_url_signer(self) -> Self {
+        if let Some(signer) = &self.asset_signer {
+            self.engine
+                .lock()
+                .await
+                .set_object_signer(Box::new(ServerObjectSigner {
+                    signer: signer.clone(),
+                }));
+        }
         self
     }
 
@@ -267,6 +330,20 @@ impl ServerState {
             return Ok(vec![]);
         };
         tokio::task::spawn_blocking(move || emb.embed(&texts, kind))
+            .await
+            .map_err(|e| format!("embed task join: {e}"))?
+            .map_err(|e| format!("embed: {e}"))
+    }
+
+    async fn embed_inputs(
+        &self,
+        inputs: Vec<EmbedInput>,
+        kind: EmbedKind,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let Some(emb) = self.embedder.clone() else {
+            return Ok(vec![]);
+        };
+        tokio::task::spawn_blocking(move || emb.embed_multi(&inputs, kind))
             .await
             .map_err(|e| format!("embed task join: {e}"))?
             .map_err(|e| format!("embed: {e}"))
@@ -396,13 +473,17 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/similar", post(similar))
         .route("/v1/asset/{cid}", get(asset))
         .route("/v1/asset/{cid}/bytes", get(asset_bytes))
+        .route("/v1/object/{opaque}/bytes", get(object_bytes))
         .route("/v1/assets/resolve", post(assets_resolve))
         .route("/v1/index", post(index))
+        .route("/v1/images", post(image_upload))
+        .route("/v1/docs/{collection}/{*doc_id}", delete(delete_doc))
         .route(
             "/v1/collections",
             post(create_collection).get(list_collections),
         )
         .route("/v1/collections/{name}", get(get_collection))
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -451,6 +532,7 @@ fn openapi_spec() -> Value {
                         "mode": {"type": "string", "enum": ["keyword", "vector", "hybrid"], "default": "hybrid"},
                         "filter": {"type": ["object", "null"], "description": "core::Filter AST"},
                         "vector": {"type": ["array", "null"], "items": {"type": "number"}},
+                        "query_image_base64": {"type": ["string", "null"], "description": "图片 query 的 base64 字节；服务端解码为内部 query_image"},
                         "candidates": {"type": "integer", "default": 150},
                         "ef_search": {"type": ["integer", "null"], "description":
                             "HNSW 检索期探索宽度逐查询覆盖（越大召回越高越慢；暴力/pgvector 档忽略）"},
@@ -470,6 +552,8 @@ fn openapi_spec() -> Value {
                     "properties": {
                         "collection": {"type": "string"},
                         "doc_id": {"type": "string"},
+                        "store_media": {"type": ["string", "null"], "enum": ["inline", "auto", "object", "reference", null],
+                            "description": "媒资存储策略：object/auto 上传 media_bytes 到对象存储；reference 校验已有 Object 引用"},
                         "chunks": {"type": "array", "items": {"type": "object",
                             "description": "core::Chunk 字段；可附 `vector`(number[]) 携带预计算向量，\
                                 则跳过服务端嵌入直接入向量索引（benchmark/外部 ETL 用）"}}
@@ -482,8 +566,13 @@ fn openapi_spec() -> Value {
             "/v1/search": {
                 "post": {
                     "summary": "混合检索",
-                    "requestBody": {"required": true, "content": {"application/json":
-                        {"schema": {"$ref": "#/components/schemas/SearchRequest"}}}},
+                    "requestBody": {"required": true, "content": {
+                        "application/json": {"schema": {"$ref": "#/components/schemas/SearchRequest"}},
+                        "multipart/form-data": {"schema": {"type": "object", "properties": {
+                            "request": {"type": "string", "description": "SearchRequest JSON 字符串，不含 query_image"},
+                            "image": {"type": "string", "format": "binary"}
+                        }}}
+                    }},
                     "responses": {
                         "200": {"description": "命中 + 分面", "content": {"application/json": {"schema": {"type": "object",
                             "properties": {
@@ -503,6 +592,36 @@ fn openapi_spec() -> Value {
                     "responses": {"200": {"description": "{indexed: n}"},
                         "400": {"description": "维度不符（集合已注册 dim 且预计算向量等维不符）"},
                         "401": {"description": "认证失败"}}
+                }
+            },
+            "/v1/images": {
+                "post": {
+                    "summary": "上传单张原始图片文件并索引为 image chunk",
+                    "description": "multipart 上传：server 负责对象存储、图像/跨模态嵌入、索引和 PG 真源写入。默认 store_media=object。",
+                    "requestBody": {"required": true, "content": {"multipart/form-data":
+                        {"schema": {"type": "object", "required": ["collection", "doc_id", "image"], "properties": {
+                            "collection": {"type": "string"},
+                            "doc_id": {"type": "string"},
+                            "image": {"type": "string", "format": "binary"},
+                            "text": {"type": "string", "description": "caption/OCR/描述文本；可为空"},
+                            "page": {"type": "integer", "default": 1},
+                            "store_media": {"type": "string", "enum": ["inline", "auto", "object", "reference"], "default": "object"}
+                        }}}}},
+                    "responses": {"200": {"description": "{indexed: 1}"},
+                        "400": {"description": "缺少字段或 multipart 非法"},
+                        "401": {"description": "认证失败"}}
+                }
+            },
+            "/v1/docs/{collection}/{doc_id}": {
+                "delete": {
+                    "summary": "删除一个文档（PG 真源 + 派生索引 + 托管对象清理）",
+                    "parameters": [
+                        {"name": "collection", "in": "path", "required": true, "schema": {"type": "string"}},
+                        {"name": "doc_id", "in": "path", "required": true, "schema": {"type": "string"}}
+                    ],
+                    "responses": {"200": {"description": "{deleted:true, pg_deleted, objects_deleted, object_errors}"},
+                        "401": {"description": "认证失败"},
+                        "404": {"description": "不可见或不存在"}}
                 }
             },
             "/v1/collections": {
@@ -574,6 +693,26 @@ fn openapi_spec() -> Value {
                         "403": {"description": "未配签名器 / token 无效或过期"},
                         "404": {"description": "无字节"},
                         "416": {"description": "Range 不可满足（起点越界），带 Content-Range: bytes */total"}
+                    }
+                }
+            },
+            "/v1/object/{opaque}/bytes": {
+                "get": {
+                    "summary": "token 门控 Object 字节（HMAC 签名 URL，免 Bearer；让 <img src> 直取）",
+                    "security": [],
+                    "parameters": [
+                        {"name": "opaque", "in": "path", "required": true, "schema": {"type": "string"}},
+                        {"name": "exp", "in": "query", "required": true, "schema": {"type": "integer"}},
+                        {"name": "ct", "in": "query", "required": true, "schema": {"type": "string"}},
+                        {"name": "sig", "in": "query", "required": true, "schema": {"type": "string"}},
+                        {"name": "Range", "in": "header", "required": false, "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Object 全量字节 + Content-Type=ct + Accept-Ranges: bytes"},
+                        "206": {"description": "Partial Content"},
+                        "403": {"description": "未配签名器 / token 无效或过期"},
+                        "404": {"description": "无对象或对象存储未配置"},
+                        "416": {"description": "Range 不可满足"}
                     }
                 }
             },
@@ -657,10 +796,67 @@ async fn metrics(State(s): State<ServerState>) -> String {
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
+fn public_media(media: &Option<fastsearch_core::MediaRef>) -> Option<PublicMediaRef> {
+    media.as_ref().map(|m| m.to_public())
+}
+
+fn filter_targets_image(filter: Option<&Filter>) -> bool {
+    match filter {
+        Some(Filter::Eq(field, FieldValue::Str(v))) => field == "modality" && v == "image",
+        Some(Filter::In(field, vals)) if field == "modality" => vals
+            .iter()
+            .any(|v| matches!(v, FieldValue::Str(s) if s == "image")),
+        Some(Filter::And(parts)) | Some(Filter::Or(parts)) => {
+            parts.iter().any(|f| filter_targets_image(Some(f)))
+        }
+        Some(Filter::Not(_)) | Some(Filter::Ne(_, _)) => false,
+        _ => false,
+    }
+}
+
 /// 命中列表 → JSON 数组（search / similar 共用）。
-fn hits_json(hits: &[fastsearch_engine::SearchHit]) -> Vec<Value> {
+/// `signer` + `public_base` 都设了才会签 `media.url`，否则只吐 `media.asset`（脱敏）。
+fn hits_json(
+    hits: &[fastsearch_engine::SearchHit],
+    signer: Option<&AssetSigner>,
+    public_base: Option<&str>,
+) -> Vec<Value> {
+    let now = unix_now();
     hits.iter()
         .map(|h| {
+            let media_pub = public_media(&h.citation.media);
+            // 给命中拼 `media.url`：Inline → /v1/asset/.../bytes；Object → /v1/object/.../bytes；
+            // DocRegion → 无字节，url=null。签发时已过 ACL，验签端点免 Bearer。
+            let media_url = match (
+                &h.citation.media,
+                signer,
+                public_base,
+                &h.citation.citation_id(),
+            ) {
+                (Some(m), Some(sg), Some(base), cid) => match &m.asset {
+                    AssetPointer::Inline => {
+                        let (path, _exp_s) = mint_inline_url(sg, cid, m.media_type.as_deref(), now);
+                        Some(format!("{base}{path}"))
+                    }
+                    AssetPointer::Object { uri } => {
+                        let (path, _exp_s) = mint_object_url(sg, uri, m.media_type.as_deref(), now);
+                        Some(format!("{base}{path}"))
+                    }
+                    AssetPointer::DocRegion { .. } => None,
+                },
+                _ => None,
+            };
+            // 在 public MediaRef 上挂 `url`（其余字段已被 `to_public` 脱敏）
+            let media_json = match media_pub {
+                Some(m) => {
+                    let mut obj = serde_json::to_value(&m).unwrap_or(Value::Null);
+                    if let (Some(u), Some(map)) = (media_url, obj.as_object_mut()) {
+                        map.insert("url".into(), Value::String(u));
+                    }
+                    Some(obj)
+                }
+                None => None,
+            };
             json!({
                 "citation_id": h.citation.citation_id(),
                 "score": h.score,
@@ -676,7 +872,7 @@ fn hits_json(hits: &[fastsearch_engine::SearchHit]) -> Vec<Value> {
                 "highlight": h.highlight,
                 "merged_chunk_ids": h.merged_chunk_ids,
                 "time": h.citation.time,
-                "media": h.citation.media,
+                "media": media_json,
                 // 深分页游标：把末条命中的此值作为下次请求的 search_after 即续取下一页。
                 "cursor": h.cursor(),
             })
@@ -684,11 +880,106 @@ fn hits_json(hits: &[fastsearch_engine::SearchHit]) -> Vec<Value> {
         .collect()
 }
 
-async fn search(
-    State(s): State<ServerState>,
-    headers: HeaderMap,
-    Json(req): Json<SearchRequest>,
-) -> ApiResult {
+fn decode_search_value(mut v: Value) -> Result<SearchRequest, (StatusCode, String)> {
+    if v.get("query_image").is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "query_image is internal; use query_image_base64 or multipart image".into(),
+        ));
+    }
+    let query_image = v
+        .as_object_mut()
+        .and_then(|obj| obj.remove("query_image_base64"))
+        .map(|raw| {
+            raw.as_str()
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "query_image_base64 must be a string".into(),
+                    )
+                })
+                .and_then(|s| {
+                    B64.decode(s).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid query_image_base64: {e}"),
+                        )
+                    })
+                })
+        })
+        .transpose()?;
+    let mut req: SearchRequest = serde_json::from_value(v).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid search request: {e}"),
+        )
+    })?;
+    req.query_image = query_image;
+    Ok(req)
+}
+
+async fn search(State(s): State<ServerState>, headers: HeaderMap, req: Request<Body>) -> ApiResult {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let req = if content_type.starts_with("multipart/form-data") {
+        let mut mp = Multipart::from_request(req, &s).await.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid multipart body: {e}"),
+            )
+        })?;
+        let mut request_json: Option<Value> = None;
+        let mut image: Option<Vec<u8>> = None;
+        while let Some(field) = mp.next_field().await.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid multipart field: {e}"),
+            )
+        })? {
+            match field.name().unwrap_or_default() {
+                "request" => {
+                    let text = field.text().await.map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid request field: {e}"),
+                        )
+                    })?;
+                    request_json = Some(serde_json::from_str(&text).map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid request json: {e}"),
+                        )
+                    })?);
+                }
+                "image" => {
+                    let bytes = field.bytes().await.map_err(|e| {
+                        (StatusCode::BAD_REQUEST, format!("invalid image field: {e}"))
+                    })?;
+                    image = Some(bytes.to_vec());
+                }
+                _ => {}
+            }
+        }
+        let mut req = decode_search_value(request_json.unwrap_or_else(|| json!({"query": ""})))?;
+        if image.is_some() {
+            req.query_image = image;
+        }
+        req
+    } else {
+        let bytes = to_bytes(req.into_body(), 20 * 1024 * 1024)
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid body: {e}")))?;
+        let v: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid json: {e}")))?;
+        decode_search_value(v)?
+    };
+    search_request(s, headers, req).await
+}
+
+async fn search_request(s: ServerState, headers: HeaderMap, req: SearchRequest) -> ApiResult {
     let started = std::time::Instant::now();
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
     if !s.allow(&rate_key(&headers)) {
@@ -708,7 +999,19 @@ async fn search(
     // 留 `vector=None` 交引擎 `embed_query_image` 嵌图。
     let mut req = req;
     let needs_vec = matches!(req.mode, SearchMode::Hybrid | SearchMode::Vector);
-    if needs_vec && req.vector.is_none() && req.query_image.is_none() && s.embedder.is_some() {
+    let text_to_image = req.query_image.is_none()
+        && !req.query.trim().is_empty()
+        && filter_targets_image(req.filter.as_ref());
+    let cross_modal_ok = s
+        .embedder
+        .as_ref()
+        .is_none_or(|emb| !text_to_image || emb.caps().cross_modal);
+    if needs_vec
+        && req.vector.is_none()
+        && req.query_image.is_none()
+        && s.embedder.is_some()
+        && cross_modal_ok
+    {
         match s.embed(vec![req.query.clone()], EmbedKind::Query).await {
             Ok(mut v) if !v.is_empty() => req.vector = Some(v.remove(0)),
             Ok(_) => {}
@@ -730,7 +1033,7 @@ async fn search(
     s.metrics
         .observe_search_latency(started.elapsed().as_secs_f64());
 
-    let arr = hits_json(&hits);
+    let arr = hits_json(&hits, s.asset_signer.as_deref(), s.public_base.as_deref());
     // 分面 → {field: [{value, count}]}
     let facets_json: Value = facets
         .into_iter()
@@ -805,7 +1108,9 @@ async fn similar(
         hits: Some(hits.len()),
         status: 200,
     });
-    Ok(Json(json!({ "hits": hits_json(&hits) })))
+    Ok(Json(
+        json!({ "hits": hits_json(&hits, s.asset_signer.as_deref(), s.public_base.as_deref()) }),
+    ))
 }
 
 /// 单段 `Range: bytes=…` 头的解析结果。多段（含逗号）不支持 → `None`（退 200 全量，RFC 7233
@@ -1015,6 +1320,41 @@ async fn asset_bytes(
     }
 }
 
+/// Object 字节端点：`/v1/assets/resolve` 先过 ACL 并签 token；这里仅验 token 后从对象存储取字节。
+async fn object_bytes(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(opaque): Path<String>,
+    Query(q): Query<BytesQuery>,
+) -> Response {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if !s.allow(&rate_key(&headers)) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    let Some(signer) = &s.asset_signer else {
+        return (StatusCode::FORBIDDEN, "asset signing not configured").into_response();
+    };
+    let uri = match B64URL.decode(opaque.as_bytes()) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return (StatusCode::FORBIDDEN, "invalid token").into_response(),
+        },
+        Err(_) => return (StatusCode::FORBIDDEN, "invalid token").into_response(),
+    };
+    if !signer.verify(&object_mac_id(&uri), q.exp, &q.ct, &q.sig, unix_now()) {
+        return (StatusCode::FORBIDDEN, "invalid or expired token").into_response();
+    }
+    let engine = s.engine.lock().await;
+    match engine.fetch_object_bytes(&uri, 20 * 1024 * 1024) {
+        Ok(Some(obj)) => serve_inline_bytes(&headers, q.ct, obj.bytes),
+        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ResolveBody {
     ids: Vec<String>,
@@ -1089,13 +1429,224 @@ struct IndexChunk {
 struct IndexBody {
     collection: String,
     doc_id: String,
+    #[serde(default)]
+    store_media: StoreMedia,
     chunks: Vec<IndexChunk>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StoreMedia {
+    #[default]
+    Inline,
+    Auto,
+    Object,
+    Reference,
+}
+
+async fn image_upload(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    req: Request<Body>,
+) -> ApiResult {
+    let principal = require_principal(&s, &headers)?;
+    let mut mp = Multipart::from_request(req, &s).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid multipart body: {e}"),
+        )
+    })?;
+    let mut collection: Option<String> = None;
+    let mut doc_id: Option<String> = None;
+    let mut text = String::new();
+    let mut page: u32 = 1;
+    let mut image: Option<(Vec<u8>, String)> = None;
+    let mut store_media = StoreMedia::Object;
+
+    while let Some(field) = mp.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid multipart field: {e}"),
+        )
+    })? {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "image" => {
+                let ct = field
+                    .content_type()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "application/octet-stream".into());
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid image field: {e}")))?;
+                image = Some((bytes.to_vec(), ct));
+            }
+            "collection" => {
+                collection = Some(field.text().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid collection field: {e}"),
+                    )
+                })?);
+            }
+            "doc_id" => {
+                doc_id = Some(field.text().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid doc_id field: {e}"),
+                    )
+                })?);
+            }
+            "text" => {
+                text = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid text field: {e}")))?;
+            }
+            "page" => {
+                let raw = field
+                    .text()
+                    .await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid page field: {e}")))?;
+                page = raw
+                    .parse()
+                    .map_err(|_| (StatusCode::BAD_REQUEST, "page must be u32".into()))?;
+            }
+            "store_media" => {
+                let raw = field.text().await.map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid store_media field: {e}"),
+                    )
+                })?;
+                store_media = match raw.as_str() {
+                    "inline" => StoreMedia::Inline,
+                    "auto" => StoreMedia::Auto,
+                    "object" => StoreMedia::Object,
+                    "reference" => StoreMedia::Reference,
+                    _ => return Err((StatusCode::BAD_REQUEST, "invalid store_media".into())),
+                };
+            }
+            _ => {}
+        }
+    }
+    let collection =
+        collection.ok_or_else(|| (StatusCode::BAD_REQUEST, "collection is required".into()))?;
+    let doc_id = doc_id.ok_or_else(|| (StatusCode::BAD_REQUEST, "doc_id is required".into()))?;
+    let (bytes, media_type) =
+        image.ok_or_else(|| (StatusCode::BAD_REQUEST, "image is required".into()))?;
+    let acl = ingest_acl_for(&principal);
+    let chunk = Chunk {
+        doc_id: doc_id.clone(),
+        chunk_id: 1,
+        kind: ChunkKind::Image,
+        text,
+        page,
+        bbox: BBox {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 1.0,
+            y1: 1.0,
+        },
+        heading_path: vec![],
+        section_id: 0,
+        char_len: 0,
+        media: Some(MediaRef {
+            asset: AssetPointer::Inline,
+            media_type: Some(media_type),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        }),
+        media_bytes: Some(bytes),
+        image_vector_status: Some(fastsearch_core::ImageVectorStatus::Pending),
+        tenant: principal.tenant.clone(),
+        acl,
+    };
+    index(
+        State(s),
+        headers,
+        Json(IndexBody {
+            collection,
+            doc_id,
+            store_media,
+            chunks: vec![IndexChunk {
+                chunk,
+                vector: None,
+            }],
+        }),
+    )
+    .await
+}
+
+fn ext_for_media_type(media_type: Option<&str>) -> &'static str {
+    match media_type.unwrap_or_default() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
+}
+
+fn short_sha(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn object_namespace(tenant: Option<&str>) -> Result<String, (StatusCode, String)> {
+    match tenant {
+        Some(t)
+            if !t.is_empty()
+                && t != "."
+                && t != ".."
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) =>
+        {
+            Ok(t.to_string())
+        }
+        Some(_) => Err((StatusCode::BAD_REQUEST, "invalid tenant namespace".into())),
+        None => Ok("_global".into()),
+    }
+}
+
+fn ingest_acl_for(principal: &Principal) -> Vec<String> {
+    if principal.tags.is_empty() {
+        vec!["public".into()]
+    } else {
+        principal.tags.clone()
+    }
+}
+
+fn image_has_declared_bytes(chunk: &Chunk) -> bool {
+    chunk.media_bytes.is_some()
+        || chunk
+            .media
+            .as_ref()
+            .is_some_and(|m| matches!(&m.asset, AssetPointer::Object { .. }))
+}
+
+fn initial_image_vector_status(ic: &IndexChunk) -> Option<fastsearch_core::ImageVectorStatus> {
+    (ic.chunk.kind == ChunkKind::Image).then(|| {
+        if ic.vector.is_some() {
+            fastsearch_core::ImageVectorStatus::Embedded
+        } else {
+            ic.chunk
+                .image_vector_status
+                .unwrap_or(fastsearch_core::ImageVectorStatus::Pending)
+        }
+    })
 }
 
 async fn index(
     State(s): State<ServerState>,
     headers: HeaderMap,
-    Json(body): Json<IndexBody>,
+    Json(mut body): Json<IndexBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
     if !s.allow(&rate_key(&headers)) {
@@ -1112,6 +1663,70 @@ async fn index(
         s.metrics.errors.fetch_add(1, Ordering::Relaxed);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     };
+    let namespace = object_namespace(principal.tenant.as_deref())?;
+    let old_object_uris = {
+        let engine = s.engine.lock().await;
+        engine
+            .object_uris_for_doc(&body.collection, &body.doc_id)
+            .map_err(&err500)?
+    };
+    let mut new_object_uris = Vec::new();
+
+    if matches!(body.store_media, StoreMedia::Auto | StoreMedia::Object) {
+        let engine = s.engine.lock().await;
+        for ic in &mut body.chunks {
+            let Some(bytes) = ic.chunk.media_bytes.clone() else {
+                continue;
+            };
+            let media_type = ic
+                .chunk
+                .media
+                .as_ref()
+                .and_then(|m| m.media_type.as_deref())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let key = format!(
+                "{}/{}/{}/{}-{}.{}",
+                namespace,
+                body.collection,
+                body.doc_id,
+                ic.chunk.chunk_id,
+                short_sha(&bytes),
+                ext_for_media_type(Some(&media_type))
+            );
+            let obj = engine
+                .put_object(&key, &bytes, &media_type)
+                .map_err(&err500)?;
+            new_object_uris.push(obj.uri.clone());
+            let asset = AssetPointer::Object { uri: obj.uri };
+            match &mut ic.chunk.media {
+                Some(media) => media.asset = asset,
+                None => {
+                    ic.chunk.media = Some(MediaRef {
+                        asset,
+                        media_type: Some(media_type.clone()),
+                        time: None,
+                        region: None,
+                        caption_source: None,
+                        thumbnail: None,
+                    });
+                }
+            }
+            ic.chunk.media_bytes = None;
+        }
+    }
+    {
+        let engine = s.engine.lock().await;
+        for ic in &body.chunks {
+            let Some(AssetPointer::Object { uri }) = ic.chunk.media.as_ref().map(|m| &m.asset)
+            else {
+                continue;
+            };
+            engine
+                .validate_object_ref(uri, principal.tenant.as_deref())
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        }
+    }
 
     // 维度校验：集合若已注册 `dim`，则携带的预计算向量必须等维（benchmark/ETL 误配早失败，
     // 而非静默写入坏向量）。仅校验显式向量；嵌入产物维度由 embedder 保证一致。
@@ -1139,29 +1754,149 @@ async fn index(
         }
     }
 
-    // 每 chunk 一个向量槽：携带预计算向量者直接占位；其余锁外嵌入正文（passage）。
+    // 每 chunk 一个向量槽：携带预计算向量者直接占位；其余锁外嵌入。
+    // 图片 chunk 优先用 inline/object 字节；没有字节才退化为 caption/OCR 文本。
     // 无嵌入后端且无预计算向量 → 该槽留空、退化为纯全文。
     let mut vectors: Vec<Option<Vec<f32>>> = body.chunks.iter().map(|c| c.vector.clone()).collect();
-    if s.embedder.is_some() {
-        let need: Vec<usize> = body
-            .chunks
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.vector.is_none())
-            .map(|(i, _)| i)
-            .collect();
-        if !need.is_empty() {
-            let texts: Vec<String> = need
-                .iter()
-                .map(|&i| body.chunks[i].chunk.text.clone())
-                .collect();
-            let embedded = s.embed(texts, EmbedKind::Passage).await.map_err(|e| {
-                s.metrics.errors.fetch_add(1, Ordering::Relaxed);
-                (StatusCode::INTERNAL_SERVER_ERROR, e)
-            })?;
-            for (&i, v) in need.iter().zip(embedded) {
-                vectors[i] = Some(v);
+    let mut image_statuses: Vec<Option<fastsearch_core::ImageVectorStatus>> = body
+        .chunks
+        .iter()
+        .map(initial_image_vector_status)
+        .collect();
+    if let Some(embedder) = &s.embedder {
+        let caps = embedder.caps();
+        let mut need: Vec<(
+            usize,
+            EmbedInput,
+            Option<fastsearch_core::ImageVectorStatus>,
+        )> = Vec::new();
+        for (i, ic) in body.chunks.iter().enumerate() {
+            if ic.vector.is_some() {
+                continue;
             }
+            let chunk = &ic.chunk;
+            let (input, status) = if chunk.kind == ChunkKind::Image {
+                if caps.image && caps.cross_modal {
+                    if let Some(bytes) = &chunk.media_bytes {
+                        (
+                            Some(EmbedInput::Image(bytes.clone())),
+                            Some(fastsearch_core::ImageVectorStatus::Embedded),
+                        )
+                    } else if let Some(uri) = chunk.media.as_ref().and_then(|m| match &m.asset {
+                        AssetPointer::Object { uri } => Some(uri.as_str()),
+                        _ => None,
+                    }) {
+                        let engine = s.engine.lock().await;
+                        match engine.fetch_object_bytes(uri, 20 * 1024 * 1024) {
+                            Ok(Some(obj)) => (
+                                Some(EmbedInput::Image(obj.bytes)),
+                                Some(fastsearch_core::ImageVectorStatus::Embedded),
+                            ),
+                            Ok(None) if !chunk.text.trim().is_empty() => (
+                                Some(EmbedInput::Text(chunk.text.clone())),
+                                Some(fastsearch_core::ImageVectorStatus::TextFallback),
+                            ),
+                            Ok(None) => {
+                                image_statuses[i] =
+                                    Some(fastsearch_core::ImageVectorStatus::AssetMissing);
+                                (None, None)
+                            }
+                            Err(e) => {
+                                s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                            }
+                        }
+                    } else if !chunk.text.trim().is_empty() {
+                        (
+                            Some(EmbedInput::Text(chunk.text.clone())),
+                            Some(fastsearch_core::ImageVectorStatus::TextFallback),
+                        )
+                    } else {
+                        image_statuses[i] = Some(fastsearch_core::ImageVectorStatus::MissingBytes);
+                        (None, None)
+                    }
+                } else if !chunk.text.trim().is_empty() {
+                    (
+                        Some(EmbedInput::Text(chunk.text.clone())),
+                        Some(fastsearch_core::ImageVectorStatus::TextFallback),
+                    )
+                } else if image_has_declared_bytes(chunk) {
+                    image_statuses[i] = Some(fastsearch_core::ImageVectorStatus::Pending);
+                    (None, None)
+                } else {
+                    image_statuses[i] = Some(fastsearch_core::ImageVectorStatus::MissingBytes);
+                    (None, None)
+                }
+            } else {
+                (
+                    (!chunk.text.trim().is_empty()).then(|| EmbedInput::Text(chunk.text.clone())),
+                    None,
+                )
+            };
+            if let Some(input) = input {
+                need.push((i, input, status));
+            }
+        }
+        if !need.is_empty() {
+            let inputs: Vec<EmbedInput> = need.iter().map(|(_, input, _)| input.clone()).collect();
+            let embedded = s
+                .embed_inputs(inputs, EmbedKind::Passage)
+                .await
+                .map_err(|e| {
+                    s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                    (StatusCode::INTERNAL_SERVER_ERROR, e)
+                })?;
+            for ((i, _, status), v) in need.into_iter().zip(embedded) {
+                vectors[i] = Some(v);
+                if let Some(status) = status {
+                    image_statuses[i] = Some(status);
+                }
+            }
+        }
+    }
+    for (ic, status) in body.chunks.iter_mut().zip(image_statuses) {
+        if ic.chunk.kind == ChunkKind::Image {
+            ic.chunk.image_vector_status = status;
+        }
+    }
+
+    let pg = {
+        let engine = s.engine.lock().await;
+        engine.source_pg_clone()
+    };
+    if let Some(pg_arc) = pg {
+        let raw_chunks: Vec<fastsearch_core::Chunk> =
+            body.chunks.iter().map(|ic| ic.chunk.clone()).collect();
+        let upsert_err = match Arc::try_unwrap(pg_arc) {
+            Ok(mut owned) => owned
+                .upsert_doc(&body.collection, &body.doc_id, &raw_chunks)
+                .await
+                .err()
+                .map(|e| format!("{e}")),
+            Err(_) => match std::env::var("DATABASE_URL") {
+                Ok(url) if !url.is_empty() => {
+                    let cfg = fastsearch_pg::PgConfig::new(url);
+                    match fastsearch_pg::PgStore::connect(cfg).await {
+                        Ok(mut owned) => owned
+                            .upsert_doc(&body.collection, &body.doc_id, &raw_chunks)
+                            .await
+                            .err()
+                            .map(|e| format!("{e}")),
+                        Err(e) => Some(format!("pg connect: {e}")),
+                    }
+                }
+                _ => Some("source_pg shared; set DATABASE_URL for write path".into()),
+            },
+        };
+        if let Some(e) = upsert_err {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            let engine = s.engine.lock().await;
+            for uri in &new_object_uris {
+                if let Err(cleanup_err) = engine.delete_object(uri) {
+                    eprintln!("object cleanup after pg upsert failure failed: {cleanup_err}");
+                }
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("pg upsert: {e}")));
         }
     }
 
@@ -1180,6 +1915,14 @@ async fn index(
         }
     }
     engine.commit().map_err(&err500)?;
+    for uri in old_object_uris
+        .iter()
+        .filter(|uri| !new_object_uris.iter().any(|new_uri| new_uri == *uri))
+    {
+        if let Err(e) = engine.delete_object(uri) {
+            eprintln!("old object cleanup after doc replace failed: {e}");
+        }
+    }
     let n = body.chunks.len();
     s.metrics.indexed.fetch_add(n as u64, Ordering::Relaxed);
     s.emit_audit(AuditEvent {
@@ -1193,6 +1936,79 @@ async fn index(
         status: 200,
     });
     Ok(Json(json!({ "indexed": n })))
+}
+
+async fn delete_doc(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path((collection, doc_id)): Path<(String, String)>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let principal = require_principal(&s, &headers)?;
+    let acl = acl_for(&principal);
+
+    let (object_uris, pg) = {
+        let engine = s.engine.lock().await;
+        let Some(visible) = engine
+            .doc_visible_for_delete(&collection, &doc_id, Some(&acl))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        else {
+            return Err((StatusCode::NOT_FOUND, "not found".into()));
+        };
+        if !visible {
+            return Err((StatusCode::NOT_FOUND, "not found".into()));
+        }
+        (
+            engine
+                .object_uris_for_doc(&collection, &doc_id)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            engine.source_pg_clone(),
+        )
+    };
+
+    let pg_deleted = if let Some(pg) = pg {
+        pg.delete_doc(&collection, &doc_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pg delete: {e}")))?
+    } else {
+        0
+    };
+
+    let mut object_errors = Vec::new();
+    {
+        let mut engine = s.engine.lock().await;
+        engine
+            .remove_doc(&collection, &doc_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        engine
+            .commit()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for uri in &object_uris {
+            if let Err(e) = engine.delete_object(uri) {
+                object_errors.push(e.to_string());
+            }
+        }
+    }
+
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/docs/{collection}/{doc_id}",
+        tenant: principal.tenant.clone(),
+        tags: principal.tags.clone(),
+        query: None,
+        collection: Some(collection.clone()),
+        doc_id: Some(doc_id.clone()),
+        hits: Some(pg_deleted as usize),
+        status: 200,
+    });
+    Ok(Json(json!({
+        "deleted": true,
+        "pg_deleted": pg_deleted,
+        "objects_deleted": object_uris.len().saturating_sub(object_errors.len()),
+        "object_errors": object_errors
+    })))
 }
 
 /// `POST /v1/collections` 请求体：注册/更新集合的咨询性配置。
@@ -1285,10 +2101,59 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use fastsearch_core::{BBox, ChunkKind};
+    use fastsearch_core::{AssetPointer, BBox, ChunkKind, MediaRef};
+    use fastsearch_engine::ObjectStore;
     use fastsearch_text::TextIndexConfig;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    struct PairEmbedder;
+
+    impl Embedder for PairEmbedder {
+        fn dim(&self) -> usize {
+            3
+        }
+
+        fn embed(&self, texts: &[String], _kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    if t.contains("red chart") {
+                        vec![1.0, 0.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0, 0.0]
+                    }
+                })
+                .collect())
+        }
+
+        fn caps(&self) -> fastsearch_embed::EmbedCaps {
+            fastsearch_embed::EmbedCaps {
+                dim: 3,
+                text: true,
+                image: true,
+                cross_modal: true,
+                semantic: true,
+            }
+        }
+
+        fn embed_multi(
+            &self,
+            inputs: &[EmbedInput],
+            kind: EmbedKind,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            inputs
+                .iter()
+                .map(|i| match i {
+                    EmbedInput::Text(t) => self
+                        .embed(std::slice::from_ref(t), kind)
+                        .map(|mut v| v.remove(0)),
+                    EmbedInput::Image(bytes) if bytes == b"red-image" => Ok(vec![1.0, 0.0, 0.0]),
+                    EmbedInput::Image(_) => Ok(vec![0.0, 1.0, 0.0]),
+                })
+                .collect()
+        }
+    }
 
     fn keys() -> HashMap<String, Principal> {
         let mut m = HashMap::new();
@@ -1307,6 +2172,54 @@ mod tests {
             },
         );
         m
+    }
+
+    #[test]
+    fn ingest_acl_comes_from_principal_tags() {
+        let tagged = Principal {
+            tenant: Some("acme".into()),
+            tags: vec!["team-a".into()],
+        };
+        assert_eq!(ingest_acl_for(&tagged), vec!["team-a".to_string()]);
+
+        let untagged = Principal {
+            tenant: None,
+            tags: vec![],
+        };
+        assert_eq!(ingest_acl_for(&untagged), vec!["public".to_string()]);
+    }
+
+    #[test]
+    fn image_status_initialization_does_not_claim_missing_bytes() {
+        let mut c = chunk(1, "", vec!["team-a"]);
+        c.kind = ChunkKind::Image;
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Inline,
+            media_type: Some("image/png".into()),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        c.media_bytes = Some(b"image-bytes".to_vec());
+        c.image_vector_status = Some(fastsearch_core::ImageVectorStatus::Pending);
+        let ic = IndexChunk {
+            chunk: c,
+            vector: None,
+        };
+        assert_eq!(
+            initial_image_vector_status(&ic),
+            Some(fastsearch_core::ImageVectorStatus::Pending)
+        );
+
+        let with_vector = IndexChunk {
+            vector: Some(vec![1.0, 0.0]),
+            ..ic
+        };
+        assert_eq!(
+            initial_image_vector_status(&with_vector),
+            Some(fastsearch_core::ImageVectorStatus::Embedded)
+        );
     }
 
     // ===================== MM6-signer：资产 URL 签名 + token 字节端点 =====================
@@ -1367,6 +2280,44 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    fn upload_image_request(doc_id: &str, text: &str, bytes: &[u8]) -> Request<Body> {
+        let boundary = "fastsearch-upload-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nkb\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"doc_id\"\r\n\r\n{doc_id}\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\n{text}\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"img.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        Request::builder()
+            .method("POST")
+            .uri("/v1/images")
+            .header("x-api-key", "k-team-a")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1573,6 +2524,236 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn object_asset_resolve_returns_token_url_and_serves_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(fastsearch_engine::LocalObjectStore::new(
+            tmp.path(),
+            "assets",
+        ));
+        let bytes = b"fake png bytes".to_vec();
+        let obj = store.put("kb/img.png", &bytes, "image/png").unwrap();
+
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_object_store(store);
+        let mut c = chunk(1, "object image", vec!["team-a"]);
+        c.kind = ChunkKind::Image;
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Object { uri: obj.uri },
+            media_type: Some("image/png".into()),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        engine.ingest("kb", &c).unwrap();
+        engine.commit().unwrap();
+        let state = ServerState::new(engine, keys())
+            .with_asset_signer(b"k".to_vec(), 300)
+            .enable_object_url_signer()
+            .await;
+        let app = router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assets/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"ids":["kb:rep.pdf:1"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let url = v["assets"][0]["url"].as_str().unwrap();
+        assert!(url.starts_with("/v1/object/"));
+        assert!(!url.contains("s3://"));
+        assert!(!url.contains("kb/img.png"));
+
+        let resp = app
+            .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        assert_eq!(got, bytes);
+    }
+
+    #[tokio::test]
+    async fn index_validates_object_refs_for_default_store_media() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(fastsearch_engine::LocalObjectStore::new(
+            tmp.path(),
+            "assets",
+        ));
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_object_store(store);
+        let app = router(ServerState::new(engine, keys()));
+        let body = r#"{"collection":"kb","doc_id":"rep.pdf","chunks":[
+            {"doc_id":"rep.pdf","chunk_id":1,"kind":"image","text":"missing","page":1,
+             "bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":7,"acl":["team-a"],"tenant":"acme",
+             "media":{"asset":{"kind":"object","uri":"s3://assets/missing.png"},"media_type":"image/png"}}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn index_rejects_cross_tenant_object_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(fastsearch_engine::LocalObjectStore::new(
+            tmp.path(),
+            "assets",
+        ));
+        let obj = store
+            .put("other/img.png", b"tenant b bytes", "image/png")
+            .unwrap();
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_object_store(store);
+        let app = router(ServerState::new(engine, keys()));
+        let body = serde_json::to_string(&json!({
+            "collection": "kb",
+            "doc_id": "rep.pdf",
+            "store_media": "reference",
+            "chunks": [{
+                "doc_id": "rep.pdf",
+                "chunk_id": 1,
+                "kind": "image",
+                "text": "cross tenant",
+                "page": 1,
+                "bbox": {"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},
+                "char_len": 12,
+                "acl": ["team-a"],
+                "tenant": "acme",
+                "media": {"asset": {"kind": "object", "uri": obj.uri}, "media_type": "image/png"}
+            }]
+        }))
+        .unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn object_bytes_missing_object_is_404_not_500() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(fastsearch_engine::LocalObjectStore::new(
+            tmp.path(),
+            "assets",
+        ));
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_object_store(store);
+        let app = router(ServerState::new(engine, keys()).with_asset_signer(b"k".to_vec(), 300));
+        let signer = AssetSigner::new(b"k".to_vec(), 300);
+        let (url, _) = mint_object_url(
+            &signer,
+            "s3://assets/missing.png",
+            Some("image/png"),
+            unix_now(),
+        );
+        let resp = app
+            .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn replacing_object_doc_cleans_old_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(fastsearch_engine::LocalObjectStore::new(
+            tmp.path(),
+            "assets",
+        ));
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_object_store(store);
+        let state = ServerState::new(engine, keys())
+            .with_asset_signer(b"k".to_vec(), 300)
+            .enable_object_url_signer()
+            .await;
+        let app = router(state);
+
+        let first = app
+            .clone()
+            .oneshot(upload_image_request(
+                "img-1",
+                "first caption",
+                b"first-image",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let resolved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assets/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"ids":["kb:img-1:1"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let old_url = body_json(resolved).await["assets"][0]["url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let second = app
+            .clone()
+            .oneshot(upload_image_request(
+                "img-1",
+                "second caption",
+                b"second-image",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let old = app
+            .oneshot(
+                Request::builder()
+                    .uri(&old_url)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old.status(), StatusCode::NOT_FOUND);
+    }
+
     fn chunk(id: u64, text: &str, acl: Vec<&str>) -> Chunk {
         Chunk {
             doc_id: "rep.pdf".into(),
@@ -1591,6 +2772,7 @@ mod tests {
             char_len: text.len() as u32,
             media: None,
             media_bytes: None,
+            image_vector_status: None,
             tenant: Some("acme".into()),
             acl: acl.into_iter().map(String::from).collect(),
         }
@@ -1725,6 +2907,341 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["page"], 7);
         assert_eq!(hits[0]["citation_id"], "kb:d.pdf:1");
+    }
+
+    #[tokio::test]
+    async fn delete_doc_accepts_slash_in_doc_id() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let body = r#"{"collection":"kb","doc_id":"sub/d.md","chunks":[
+            {"doc_id":"sub/d.md","chunk_id":1,"kind":"paragraph","text":"slash doc","page":1,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":9,"acl":["team-a"],"tenant":"acme"}]}"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/docs/kb/sub/d.md")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["deleted"], true);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"query":"slash","top_k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["hits"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_missing_doc_is_404() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/docs/kb/missing")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn text_query_retrieves_image_via_cross_modal_vector() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()).with_embedder(Arc::new(PairEmbedder)));
+        let body = serde_json::to_string(&json!({
+            "collection": "kb",
+            "doc_id": "image-doc",
+            "chunks": [{
+                "doc_id": "image-doc",
+                "chunk_id": 1,
+                "kind": "image",
+                "text": "",
+                "page": 3,
+                "bbox": {"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},
+                "char_len": 0,
+                "acl": ["team-a"],
+                "tenant": "acme",
+                "media": {"asset": {"kind": "inline"}, "media_type": "image/png"},
+                "media_bytes": b"red-image".to_vec()
+            }]
+        }))
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = SearchRequest {
+            query: "red chart".into(),
+            mode: SearchMode::Hybrid,
+            top_k: 5,
+            candidates: 20,
+            filter: Some(Filter::And(vec![
+                Filter::Eq("collection".into(), FieldValue::Str("kb".into())),
+                Filter::Eq("modality".into(), FieldValue::Str("image".into())),
+            ])),
+            ..Default::default()
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let hits = v["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["citation_id"], "kb:image-doc:1");
+        assert_eq!(hits[0]["page"], 3);
+    }
+
+    #[tokio::test]
+    async fn image_upload_resolve_delete_cleans_index_and_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(fastsearch_engine::LocalObjectStore::new(
+            tmp.path(),
+            "assets",
+        ));
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_object_store(store);
+        let state = ServerState::new(engine, keys())
+            .with_asset_signer(b"k".to_vec(), 300)
+            .enable_object_url_signer()
+            .await;
+        let app = router(state);
+
+        let boundary = "fastsearch-upload-boundary";
+        let img = b"uploaded-image-bytes";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nkb\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"doc_id\"\r\n\r\nimg-1\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nupload caption\r\n").as_bytes(),
+        );
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"img.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(img);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/images")
+                    .header("x-api-key", "k-team-a")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["indexed"], 1);
+
+        let req = SearchRequest {
+            query: "upload caption".into(),
+            top_k: 5,
+            filter: Some(Filter::And(vec![
+                Filter::Eq("collection".into(), FieldValue::Str("kb".into())),
+                Filter::Eq("modality".into(), FieldValue::Str("image".into())),
+            ])),
+            ..Default::default()
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = body_json(resp).await["hits"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["citation_id"], "kb:img-1:1");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-b")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["hits"].as_array().unwrap().len(), 0);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assets/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-b")
+                    .body(Body::from(r#"{"ids":["kb:img-1:1"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["assets"].as_array().unwrap().len(), 0);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assets/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"ids":["kb:img-1:1"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resolved = body_json(resp).await;
+        let url = resolved["assets"][0]["url"].as_str().unwrap().to_string();
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            img
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/docs/kb/img-1")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let deleted = body_json(resp).await;
+        assert_eq!(deleted["deleted"], true);
+        assert_eq!(deleted["objects_deleted"], 1);
+
+        let req = SearchRequest {
+            query: "upload caption".into(),
+            top_k: 5,
+            filter: Some(Filter::Eq(
+                "collection".into(),
+                FieldValue::Str("kb".into()),
+            )),
+            ..Default::default()
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["hits"].as_array().unwrap().len(), 0);
+
+        let resp = app
+            .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // 预计算向量旁路：chunk 携带 `vector` 时跳过嵌入直接入向量索引，纯向量检索可命中。
@@ -2087,8 +3604,119 @@ mod tests {
         assert!(v["paths"]["/v1/assets/resolve"]["post"].is_object());
         assert!(v["paths"]["/v1/asset/{citation_id}/bytes"]["get"].is_object());
         assert!(v["components"]["schemas"]["SearchRequest"].is_object());
+        assert!(
+            v["components"]["schemas"]["SearchRequest"]["properties"]["query_image_base64"]
+                .is_object()
+        );
+        assert!(
+            v["paths"]["/v1/search"]["post"]["requestBody"]["content"]["multipart/form-data"]
+                .is_object()
+        );
         // 版本来自 crate 版本，非空
         assert!(v["info"]["version"].as_str().unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn search_json_query_image_base64_decodes_and_blocks_internal_field() {
+        let req = decode_search_value(json!({
+            "query": "",
+            "mode": "vector",
+            "query_image_base64": "AQIDBA=="
+        }))
+        .unwrap();
+        assert_eq!(req.query_image, Some(vec![1, 2, 3, 4]));
+
+        let err = decode_search_value(json!({"query": "", "query_image": [1, 2]}))
+            .unwrap_err()
+            .1;
+        assert!(err.contains("query_image is internal"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn multipart_image_search_accepts_payload_above_axum_default_limit() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let boundary = "fastsearch-boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n{}\r\n",
+                r#"{"query":"","mode":"keyword","top_k":1}"#
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"q.png\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend(std::iter::repeat_n(0x42, 3 * 1024 * 1024));
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("x-api-key", "k-team-a")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn hits_json_redacts_object_media() {
+        use fastsearch_core::{AssetPointer, BBox, Citation, GlobalId, MediaRef};
+        let hit = fastsearch_engine::SearchHit {
+            id: GlobalId {
+                collection: "kb".into(),
+                doc_id: "img.png".into(),
+                chunk_id: 1,
+            },
+            score: 1.0,
+            citation: Citation {
+                collection: "kb".into(),
+                doc_id: "img.png".into(),
+                chunk_id: 1,
+                page: 1,
+                bbox: BBox {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 1.0,
+                    y1: 1.0,
+                },
+                heading_path: vec![],
+                section_id: 0,
+                time: None,
+                media: Some(MediaRef {
+                    asset: AssetPointer::Object {
+                        uri: "s3://private-bucket/secret/key.png".into(),
+                    },
+                    media_type: Some("image/png".into()),
+                    time: None,
+                    region: None,
+                    caption_source: None,
+                    thumbnail: None,
+                }),
+            },
+            bm25: None,
+            vector: Some(1.0),
+            rerank: None,
+            highlight: None,
+            merged_chunk_ids: vec![],
+        };
+        let s = serde_json::to_string(&hits_json(&[hit], None, None)).unwrap();
+        assert!(s.contains(r#""kind":"object""#));
+        assert!(!s.contains("s3://"));
+        assert!(!s.contains("private-bucket"));
     }
 
     /// 真语义混合（env-gated，需本地 Ollama）：经 server 灌入带嵌入的 passage，再用
@@ -2320,6 +3948,7 @@ mod tests {
                 thumbnail: None,
             }),
             media_bytes: None,
+            image_vector_status: None,
             tenant: Some("acme".into()),
             acl: vec!["team-a".into()],
         };

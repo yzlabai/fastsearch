@@ -179,6 +179,38 @@ impl TextIndex {
         Ok(())
     }
 
+    /// 按 `(collection, doc_id)` 取已提交行。用于删除前收集媒资引用。
+    pub fn stored_rows_by_doc(
+        &self,
+        collection: &str,
+        doc_id: &str,
+    ) -> Result<Vec<query_build::StoredRow>> {
+        let searcher = self.reader.searcher();
+        let q = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.collection, collection),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.doc_id, doc_id),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        let top = searcher.search(&q, &TopDocs::with_limit(100_000).order_by_score())?;
+        let mut out = Vec::with_capacity(top.len());
+        for (_score, addr) in top {
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            out.push(query_build::stored_row(&doc, &self.fields));
+        }
+        Ok(out)
+    }
+
     /// 提交并刷新 reader（提交后立即可见）。
     pub fn commit(&mut self) -> Result<()> {
         self.writer.commit()?;
@@ -430,6 +462,7 @@ mod tests {
             char_len: text.chars().count() as u32,
             media: None,
             media_bytes: None,
+            image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
         }

@@ -4,6 +4,7 @@ use super::*;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
@@ -32,6 +33,30 @@ fn drain_request(stream: &mut TcpStream) {
     }
 }
 
+fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => break,
+        }
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+            let cl = headers
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() - (pos + 4) >= cl {
+                break;
+            }
+        }
+    }
+    buf
+}
+
 fn write_response(stream: &mut TcpStream, status: &str, body: &str) {
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -49,6 +74,10 @@ fn parse_chunks_array_and_ndjson() {
     assert_eq!(cs.len(), 1);
     assert_eq!(cs[0].doc_id, "d.pdf");
     assert_eq!(cs[0].text, "hello");
+    let img = br#"[{"id":2,"kind":"image","text":"chart","page":1,"bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":5,"image":{"data_base64":"cG5n","media_type":"image/png"}}]"#;
+    let cs = parse_chunks(img, "img.pdf").unwrap();
+    assert_eq!(cs[0].media_bytes, Some(b"png".to_vec()));
+    assert_eq!(cs[0].kind, ChunkKind::Image);
     // NDJSON
     let nd = b"{\"id\":0,\"kind\":\"heading\",\"text\":\"H\",\"page\":1,\"bbox\":{\"x0\":0,\"y0\":0,\"x1\":1,\"y1\":1},\"char_len\":1}\n{\"id\":1,\"kind\":\"paragraph\",\"text\":\"p\",\"page\":1,\"bbox\":{\"x0\":0,\"y0\":0,\"x1\":1,\"y1\":1},\"char_len\":1}";
     assert_eq!(parse_chunks(nd, "d").unwrap().len(), 2);
@@ -76,7 +105,7 @@ fn chunk_text_markdown_headings_and_paras() {
 #[test]
 fn build_filter_always_scopes_collection() {
     // 仅 collection → 单 Eq
-    match build_filter("kb", None, None, None) {
+    match build_filter("kb", None, None, None, None) {
         Filter::Eq(f, FieldValue::Str(v)) => {
             assert_eq!(f, "collection");
             assert_eq!(v, "kb");
@@ -84,11 +113,19 @@ fn build_filter_always_scopes_collection() {
         other => panic!("expected Eq(collection), got {other:?}"),
     }
     // collection + kind + page → And 含 collection
-    match build_filter("kb", Some("table"), Some(2), None) {
+    match build_filter("kb", Some("table"), None, Some(2), None) {
         Filter::And(cl) => {
             assert_eq!(cl.len(), 3);
             assert!(
                 matches!(&cl[0], Filter::Eq(f, FieldValue::Str(v)) if f=="collection" && v=="kb")
+            );
+        }
+        other => panic!("expected And, got {other:?}"),
+    }
+    match build_filter("kb", None, Some("image"), None, None) {
+        Filter::And(cl) => {
+            assert!(
+                matches!(&cl[1], Filter::Eq(f, FieldValue::Str(v)) if f=="modality" && v=="image")
             );
         }
         other => panic!("expected And, got {other:?}"),
@@ -111,6 +148,20 @@ fn spawn_mock(body: &'static str) -> String {
     format!("http://{addr}")
 }
 
+fn spawn_capture(body: &'static str) -> (String, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let req = read_request(&mut stream);
+            let _ = tx.send(req);
+            write_response(&mut stream, "200 OK", body);
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
 #[test]
 fn cmd_search_parses_hits_from_server() {
     let url = spawn_mock(
@@ -124,6 +175,8 @@ fn cmd_search_parses_hits_from_server() {
         mode: SearchMode::Hybrid,
         top_k: 10,
         kind: None,
+        modality: None,
+        image: None,
         page_min: None,
         page_max: None,
     };
@@ -140,9 +193,38 @@ fn cmd_index_reports_indexed_count() {
         key: Some("k".into()),
         collection: "kb".into(),
         doc_id: "d.pdf".into(),
+        store_media: None,
     };
     let input = br#"[{"id":0,"kind":"paragraph","text":"a","page":1,"bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":1},{"id":1,"kind":"paragraph","text":"b","page":1,"bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":1}]"#;
     assert_eq!(cmd_index(&opts, input).unwrap(), 2);
+}
+
+#[test]
+fn cmd_upload_image_posts_multipart_to_images_endpoint() {
+    let (url, rx) = spawn_capture(r#"{"indexed":1}"#);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("img.png");
+    std::fs::write(&path, b"png-bytes").unwrap();
+    let opts = ImageUploadOpts {
+        server: Some(url),
+        key: Some("k".into()),
+        collection: "kb".into(),
+        doc_id: "img-1".into(),
+        text: Some("chart caption".into()),
+        page: 2,
+        store_media: Some(StoreMedia::Object),
+    };
+    let v = cmd_upload_image(&opts, &path).unwrap();
+    assert_eq!(v["indexed"], 1);
+    let req = String::from_utf8_lossy(&rx.recv().unwrap()).to_string();
+    assert!(req.starts_with("POST /v1/images "), "request: {req}");
+    assert!(req.contains("multipart/form-data"));
+    assert!(req.contains("name=\"collection\"\r\n\r\nkb"));
+    assert!(req.contains("name=\"doc_id\"\r\n\r\nimg-1"));
+    assert!(req.contains("name=\"text\"\r\n\r\nchart caption"));
+    assert!(req.contains("name=\"store_media\"\r\n\r\nobject"));
+    assert!(req.contains("Content-Type: image/png"));
+    assert!(req.contains("png-bytes"));
 }
 
 #[test]
@@ -209,6 +291,8 @@ fn server_error_surfaced() {
         mode: SearchMode::Keyword,
         top_k: 5,
         kind: None,
+        modality: None,
+        image: None,
         page_min: None,
         page_max: None,
     };
@@ -222,6 +306,7 @@ fn index_opts(url: String) -> IndexOpts {
         key: Some("k".into()),
         collection: "kb".into(),
         doc_id: "d".into(),
+        store_media: None,
     }
 }
 const ONE_CHUNK: &[u8] = br#"[{"id":0,"kind":"paragraph","text":"a","page":1,"bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":1}]"#;

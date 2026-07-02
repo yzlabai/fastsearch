@@ -37,6 +37,7 @@ unsafe_code = "forbid"
 # 集中管理依赖版本；crate 用 `dep.workspace = true` 继承（仿 docparse-rs）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 tantivy = "0.26"
@@ -52,7 +53,7 @@ clap = { version = "4", features = ["derive"] }
 ureq = { version = "2", features = ["json"] }
 hmac = "0.13"
 sha2 = "0.11"
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 

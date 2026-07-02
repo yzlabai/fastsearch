@@ -23,6 +23,7 @@ fastsearch-eval = { path = "../fastsearch-eval" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+base64.workspace = true
 anyhow.workspace = true
 ureq.workspace = true
 # 解析（docparse-rs 融合 Option B：摄取热路径，feature 门控，搜索热路径零依赖）。

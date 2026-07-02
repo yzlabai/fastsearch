@@ -94,6 +94,44 @@ pub enum AssetPointer {
     DocRegion { page: u32, bbox: BBox },
 }
 
+/// 对外可暴露的媒资指针。Object 只暴露种类，不暴露 uri/bucket/key/etag/sha256 等内部定位信息。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PublicAssetPointer {
+    Inline,
+    Object,
+    DocRegion { page: u32, bbox: BBox },
+}
+
+/// 对外 API/MCP/SDK 使用的媒资 DTO。由 [`MediaRef`] 脱敏得到。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublicMediaRef {
+    pub asset: PublicAssetPointer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<TimeSpan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<BBox>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<PublicAssetPointer>,
+}
+
+impl From<&AssetPointer> for PublicAssetPointer {
+    fn from(asset: &AssetPointer) -> Self {
+        match asset {
+            AssetPointer::Inline => PublicAssetPointer::Inline,
+            AssetPointer::Object { .. } => PublicAssetPointer::Object,
+            AssetPointer::DocRegion { page, bbox } => PublicAssetPointer::DocRegion {
+                page: *page,
+                bbox: *bbox,
+            },
+        }
+    }
+}
+
 /// 媒资引用（图/音/视频的渲染与取字节所需；替换原 `ImageMeta` 的超集，迁移见多模态计划 §6）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaRef {
@@ -110,6 +148,45 @@ pub struct MediaRef {
     pub thumbnail: Option<AssetPointer>,
 }
 
+impl MediaRef {
+    /// 统一媒资脱敏出口：Object 裸 uri 和缩略图 uri 都不外泄。
+    pub fn to_public(&self) -> PublicMediaRef {
+        PublicMediaRef {
+            asset: PublicAssetPointer::from(&self.asset),
+            media_type: self.media_type.clone(),
+            time: self.time,
+            region: self.region,
+            caption_source: self.caption_source.clone(),
+            thumbnail: self.thumbnail.as_ref().map(PublicAssetPointer::from),
+        }
+    }
+}
+
+/// 图片视觉向量状态。PG 是真源；派生索引和 explain 只能读/透出该状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageVectorStatus {
+    Pending,
+    Embedded,
+    TextFallback,
+    MissingBytes,
+    AssetMissing,
+    Error,
+}
+
+impl ImageVectorStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageVectorStatus::Pending => "pending",
+            ImageVectorStatus::Embedded => "embedded",
+            ImageVectorStatus::TextFallback => "text_fallback",
+            ImageVectorStatus::MissingBytes => "missing_bytes",
+            ImageVectorStatus::AssetMissing => "asset_missing",
+            ImageVectorStatus::Error => "error",
+        }
+    }
+}
+
 /// 图片 chunk 的渲染/审计元数据（非图片 chunk 为 None）。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ImageMeta {
@@ -119,6 +196,8 @@ pub struct ImageMeta {
     pub caption_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
 }
@@ -168,6 +247,9 @@ pub struct Chunk {
     /// 写侧通道：不进 JSON 线缆/不上 Citation（字节是真源内容，由媒资网关按需从 PG 取）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_bytes: Option<Vec<u8>>,
+    /// 图片向量状态（PG 真源）。非图片 chunk 通常为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_vector_status: Option<ImageVectorStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
     #[serde(default = "default_acl")]
@@ -378,6 +460,7 @@ mod tests {
             char_len: 1,
             media: None,
             media_bytes: None,
+            image_vector_status: None,
             tenant: None,
             acl: default_acl(),
         };
