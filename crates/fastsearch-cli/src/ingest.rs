@@ -135,7 +135,7 @@ pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
     }
 
     let client = crate::Client::new(opts.server.clone(), opts.key.clone());
-    crate::post_index(&client, &opts.collection, &opts.doc_id, &chunks)
+    crate::post_index(&client, &opts.collection, &opts.doc_id, None, &chunks)
 }
 
 /// docparse ChunkKind → fastsearch ChunkKind（前 6 类同构；Audio/Video 来自媒资预处理，非 PDF）。
