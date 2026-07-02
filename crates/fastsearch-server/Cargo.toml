@@ -31,6 +31,8 @@ anyhow.workspace = true
 # 资产 URL 签名（MM6-signer）：HMAC-SHA256 签短时 token，让前端 <img src> 免 Bearer 取 inline 字节。
 hmac.workspace = true
 sha2.workspace = true
+# object token nonce：16 字节 OS 随机数（避免多副本/重启后 nonce 碰撞破坏 XOR 流密码机密性）。
+getrandom.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

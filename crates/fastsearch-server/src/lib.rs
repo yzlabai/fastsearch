@@ -32,6 +32,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectTokenTarget {
+    cid: String,
+    uri: String,
+}
+
+/// Object token 密文上限（字节）：典型 token ~200B（cid+uri JSON + 17B 头）。上限留 16x 余量
+/// 防止恶意大 token 触发 B64URL 解码 / JSON 解析的内存尖峰（与速率限制互补）。
+const OBJECT_TOKEN_MAX_BYTES: usize = 4 * 1024;
+const OBJECT_TOKEN_MAX_ENCODED_BYTES: usize = b64url_unpadded_len(OBJECT_TOKEN_MAX_BYTES);
+
+const fn b64url_unpadded_len(decoded_len: usize) -> usize {
+    let full = (decoded_len / 3) * 4;
+    match decoded_len % 3 {
+        0 => full,
+        1 => full + 2,
+        _ => full + 3,
+    }
+}
+
+fn object_token_encoded_len_ok(token: &str) -> bool {
+    token.len() <= OBJECT_TOKEN_MAX_ENCODED_BYTES
+}
+
 /// 资产 URL 签名器（MM6-signer）：用 HMAC-SHA256 对 `cid|exp|ct` 签短时 token，让前端 `<img src>`
 /// **免 Bearer 头**取 inline 字节。签名即"已授权"凭证（presigned 语义）：拿到合法 URL 的前提是
 /// resolve 时过了 ACL（S3 `/v1/assets/resolve` 签发）；字节端点只验签、不再查 ACL（守不变量 #3）。
@@ -46,14 +71,17 @@ impl AssetSigner {
         AssetSigner { key, ttl_secs }
     }
 
-    fn mac_hex(&self, cid: &str, exp: u64, ct: &str) -> String {
+    fn mac_bytes(&self, msg: &[u8]) -> Vec<u8> {
         use hmac::digest::KeyInit; // new_from_slice
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC key 任意长度");
-        mac.update(format!("{cid}|{exp}|{ct}").as_bytes());
-        mac.finalize()
-            .into_bytes()
+        mac.update(msg);
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    fn mac_hex(&self, cid: &str, exp: u64, ct: &str) -> String {
+        self.mac_bytes(format!("{cid}|{exp}|{ct}").as_bytes())
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
@@ -72,6 +100,49 @@ impl AssetSigner {
         }
         ct_eq(self.mac_hex(cid, exp, ct).as_bytes(), sig.as_bytes())
     }
+
+    fn object_token_keystream(&self, nonce: &[u8; 16], len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut block = 0u64;
+        while out.len() < len {
+            let mut msg = b"object-token-stream|".to_vec();
+            msg.extend_from_slice(nonce);
+            msg.extend_from_slice(&block.to_be_bytes());
+            out.extend_from_slice(&self.mac_bytes(&msg));
+            block = block.saturating_add(1);
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn seal_object_target(&self, target: &ObjectTokenTarget) -> String {
+        let plain = serde_json::to_vec(target).expect("object token target serializes");
+        let nonce = object_token_nonce();
+        let stream = self.object_token_keystream(&nonce, plain.len());
+        let cipher: Vec<u8> = plain.iter().zip(stream).map(|(p, k)| p ^ k).collect();
+        let mut raw = Vec::with_capacity(1 + nonce.len() + cipher.len());
+        raw.push(1);
+        raw.extend_from_slice(&nonce);
+        raw.extend_from_slice(&cipher);
+        B64URL.encode(raw)
+    }
+
+    fn open_object_target(&self, token: &str) -> Option<ObjectTokenTarget> {
+        if !object_token_encoded_len_ok(token) {
+            return None;
+        }
+        let raw = B64URL.decode(token.as_bytes()).ok()?;
+        // 解码后仍复核，避免非标准/未来编码器绕过 encoded 长度上限。
+        if raw.len() < 17 || raw.len() > OBJECT_TOKEN_MAX_BYTES || raw[0] != 1 {
+            return None;
+        }
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&raw[1..17]);
+        let cipher = &raw[17..];
+        let stream = self.object_token_keystream(&nonce, cipher.len());
+        let plain: Vec<u8> = cipher.iter().zip(stream).map(|(c, k)| c ^ k).collect();
+        serde_json::from_slice(&plain).ok()
+    }
 }
 
 /// 常量时间比较（等长才可能相等；异或折叠，无早退）。
@@ -84,6 +155,21 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn object_token_nonce() -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    // OS CSPRNG：128 bit 熵 → 多副本/重启后 nonce 碰撞概率 ~2⁻¹²⁸/token，无需依赖时间/PID。
+    // getrandom 已作为 workspace dep 引入；OS 取随机失败视为异常 → 回落到时间+PID（降级但不 panic）。
+    if getrandom::getrandom(&mut nonce).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        nonce[..8].copy_from_slice(&nanos.to_be_bytes());
+        nonce[8..].copy_from_slice(&((std::process::id() as u64).to_be_bytes()));
+    }
+    nonce
 }
 
 /// 百分号编码（RFC 3986 unreserved 不编，其余 `%XX`）——cid/ct 放进 URL 路径/查询安全（doc_id 可含空格等）。
@@ -118,21 +204,25 @@ fn mint_inline_url(
     (url, exp.saturating_sub(now))
 }
 
-fn object_mac_id(uri: &str) -> String {
-    format!("object:{uri}")
+fn object_mac_id(token: &str) -> String {
+    format!("object:{token}")
 }
 
 fn mint_object_url(
     signer: &AssetSigner,
+    cid: &str,
     uri: &str,
     media_type: Option<&str>,
     now: u64,
 ) -> (String, u64) {
     let ct = media_type.unwrap_or("application/octet-stream");
-    let (exp, sig) = signer.sign(&object_mac_id(uri), ct, now);
-    let encoded = B64URL.encode(uri.as_bytes());
+    let token = signer.seal_object_target(&ObjectTokenTarget {
+        cid: cid.to_string(),
+        uri: uri.to_string(),
+    });
+    let (exp, sig) = signer.sign(&object_mac_id(&token), ct, now);
     let url = format!(
-        "/v1/object/{encoded}/bytes?exp={exp}&ct={}&sig={sig}",
+        "/v1/object/{token}/bytes?exp={exp}&ct={}&sig={sig}",
         pct(ct)
     );
     (url, exp.saturating_sub(now))
@@ -143,8 +233,14 @@ struct ServerObjectSigner {
 }
 
 impl ObjectSigner for ServerObjectSigner {
-    fn sign(&self, uri: &str, media_type: Option<&str>) -> Option<(String, u64)> {
-        Some(mint_object_url(&self.signer, uri, media_type, unix_now()))
+    fn sign(&self, cid: &str, uri: &str, media_type: Option<&str>) -> Option<(String, u64)> {
+        Some(mint_object_url(
+            &self.signer,
+            cid,
+            uri,
+            media_type,
+            unix_now(),
+        ))
     }
 }
 
@@ -839,7 +935,8 @@ fn hits_json(
                         Some(format!("{base}{path}"))
                     }
                     AssetPointer::Object { uri } => {
-                        let (path, _exp_s) = mint_object_url(sg, uri, m.media_type.as_deref(), now);
+                        let (path, _exp_s) =
+                            mint_object_url(sg, cid, uri, m.media_type.as_deref(), now);
                         Some(format!("{base}{path}"))
                     }
                     AssetPointer::DocRegion { .. } => None,
@@ -1334,18 +1431,43 @@ async fn object_bytes(
     let Some(signer) = &s.asset_signer else {
         return (StatusCode::FORBIDDEN, "asset signing not configured").into_response();
     };
-    let uri = match B64URL.decode(opaque.as_bytes()) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => return (StatusCode::FORBIDDEN, "invalid token").into_response(),
-        },
-        Err(_) => return (StatusCode::FORBIDDEN, "invalid token").into_response(),
-    };
-    if !signer.verify(&object_mac_id(&uri), q.exp, &q.ct, &q.sig, unix_now()) {
+    if !object_token_encoded_len_ok(&opaque) {
+        return (StatusCode::FORBIDDEN, "invalid token").into_response();
+    }
+    if !signer.verify(&object_mac_id(&opaque), q.exp, &q.ct, &q.sig, unix_now()) {
         return (StatusCode::FORBIDDEN, "invalid or expired token").into_response();
     }
+    let Some(target) = signer.open_object_target(&opaque) else {
+        return (StatusCode::FORBIDDEN, "invalid token").into_response();
+    };
     let engine = s.engine.lock().await;
-    match engine.fetch_object_bytes(&uri, 20 * 1024 * 1024) {
+    // `cid` 来自本机 `seal_object_target` 序列化的合法 GlobalId；解析失败属服务端不变量违反
+    // （token 被篡改但 MAC 通过 → HMAC 碰撞；或 token 版本不兼容）。返回 500 + 指标便于排查。
+    let gid = match GlobalId::parse(&target.cid) {
+        Ok(gid) => gid,
+        Err(e) => {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "fastsearch-server: sealed token cid parse failed ({e}): {:?}",
+                target.cid
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sealed token cid unparseable",
+            )
+                .into_response();
+        }
+    };
+    match engine.object_uri_for_gid(&gid) {
+        Ok(Some(current)) if current == target.uri => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        Ok(Some(_)) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+    match engine.fetch_object_bytes(&target.uri, 20 * 1024 * 1024) {
         Ok(Some(obj)) => serve_inline_bytes(&headers, q.ct, obj.bytes),
         Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
         Err(e) => {
@@ -1623,6 +1745,15 @@ fn ingest_acl_for(principal: &Principal) -> Vec<String> {
     }
 }
 
+fn apply_ingest_identity(body: &mut IndexBody, principal: &Principal) {
+    let acl = ingest_acl_for(principal);
+    for ic in &mut body.chunks {
+        ic.chunk.doc_id = body.doc_id.clone();
+        ic.chunk.tenant = principal.tenant.clone();
+        ic.chunk.acl = acl.clone();
+    }
+}
+
 fn image_has_declared_bytes(chunk: &Chunk) -> bool {
     chunk.media_bytes.is_some()
         || chunk
@@ -1663,6 +1794,7 @@ async fn index(
         s.metrics.errors.fetch_add(1, Ordering::Relaxed);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     };
+    apply_ingest_identity(&mut body, &principal);
     let namespace = object_namespace(principal.tenant.as_deref())?;
     let old_object_uris = {
         let engine = s.engine.lock().await;
@@ -1867,27 +1999,11 @@ async fn index(
     if let Some(pg_arc) = pg {
         let raw_chunks: Vec<fastsearch_core::Chunk> =
             body.chunks.iter().map(|ic| ic.chunk.clone()).collect();
-        let upsert_err = match Arc::try_unwrap(pg_arc) {
-            Ok(mut owned) => owned
-                .upsert_doc(&body.collection, &body.doc_id, &raw_chunks)
-                .await
-                .err()
-                .map(|e| format!("{e}")),
-            Err(_) => match std::env::var("DATABASE_URL") {
-                Ok(url) if !url.is_empty() => {
-                    let cfg = fastsearch_pg::PgConfig::new(url);
-                    match fastsearch_pg::PgStore::connect(cfg).await {
-                        Ok(mut owned) => owned
-                            .upsert_doc(&body.collection, &body.doc_id, &raw_chunks)
-                            .await
-                            .err()
-                            .map(|e| format!("{e}")),
-                        Err(e) => Some(format!("pg connect: {e}")),
-                    }
-                }
-                _ => Some("source_pg shared; set DATABASE_URL for write path".into()),
-            },
-        };
+        let upsert_err = pg_arc
+            .upsert_doc(&body.collection, &body.doc_id, &raw_chunks)
+            .await
+            .err()
+            .map(|e| format!("{e}"));
         if let Some(e) = upsert_err {
             s.metrics.errors.fetch_add(1, Ordering::Relaxed);
             let engine = s.engine.lock().await;
@@ -2262,6 +2378,72 @@ mod tests {
         );
     }
 
+    /// 属性测试：`object_token_nonce()` 128 bit OS 随机 → 连续 mint 10k 次不重复。
+    /// 守住"nonce 碰撞破坏 XOR 流密码机密性"不变量——如果将来有人把 nonce 改回时间+PID 构造，
+    /// 多副本/重启场景下可能复现碰撞，这个测试会先挂。
+    #[test]
+    fn object_token_nonce_no_collision_under_rapid_mint() {
+        use std::collections::HashSet;
+        const N: usize = 10_000;
+        let mut seen = HashSet::with_capacity(N);
+        for _ in 0..N {
+            let nonce = object_token_nonce();
+            assert!(
+                seen.insert(nonce),
+                "nonce 重复：多副本/重启后 XOR 流密码会泄密"
+            );
+        }
+    }
+
+    /// 属性测试：`seal_object_target` 同 target 连签两次 → token 不同（nonce 每次重掷）；
+    /// 但都能 `open_object_target` 还原出原 target。
+    #[test]
+    fn object_token_seal_is_non_deterministic_but_round_trips() {
+        let s = AssetSigner::new(b"test-key".to_vec(), 300);
+        let target = ObjectTokenTarget {
+            cid: "kb:doc/with:colon.pdf:42".into(),
+            uri: "s3://bucket/key.png".into(),
+        };
+        let t1 = s.seal_object_target(&target);
+        let t2 = s.seal_object_target(&target);
+        assert_ne!(t1, t2, "同 target 两次 seal 必须因 nonce 不同而 token 不同");
+
+        let o1 = s.open_object_target(&t1).expect("t1 可还原");
+        let o2 = s.open_object_target(&t2).expect("t2 可还原");
+        assert_eq!(o1.cid, target.cid);
+        assert_eq!(o1.uri, target.uri);
+        assert_eq!(o2.cid, target.cid);
+        assert_eq!(o2.uri, target.uri);
+    }
+
+    /// 边界：`open_object_target` 拒绝超大 token（防内存尖峰）。
+    #[test]
+    fn object_token_open_rejects_oversized_input() {
+        let s = AssetSigner::new(b"test-key".to_vec(), 300);
+        // 构造 >4KiB 的"token"：合法 base64 但超出 OBJECT_TOKEN_MAX_BYTES。
+        let big = B64URL.encode(vec![1u8; 8 * 1024]);
+        assert!(s.open_object_target(&big).is_none());
+    }
+
+    #[test]
+    fn object_token_encoded_limit_rejects_before_decode() {
+        let max = "A".repeat(OBJECT_TOKEN_MAX_ENCODED_BYTES);
+        let over = "A".repeat(OBJECT_TOKEN_MAX_ENCODED_BYTES + 1);
+        assert!(object_token_encoded_len_ok(&max));
+        assert!(!object_token_encoded_len_ok(&over));
+    }
+
+    /// 边界：`ObjectTokenTarget` 拒绝未知字段（防攻击者塞噪声绕过解析）。
+    #[test]
+    fn object_token_target_rejects_unknown_fields() {
+        let bad = r#"{"cid":"kb:d:1","uri":"s3://x","extra":"noise"}"#;
+        let r: Result<ObjectTokenTarget, _> = serde_json::from_str(bad);
+        assert!(
+            r.is_err(),
+            "带未知字段的 target 必须被 deny_unknown_fields 拒绝"
+        );
+    }
+
     fn signer_app() -> Router {
         // 无 source_pg：验签通过也取不到字节（隔离测 token 逻辑与字节面）。
         let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
@@ -2590,6 +2772,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_token_url_is_not_bound_to_issuing_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(fastsearch_engine::LocalObjectStore::new(
+            tmp.path(),
+            "assets",
+        ));
+        let bytes = b"replica readable object".to_vec();
+        let obj = store.put("kb/img.png", &bytes, "image/png").unwrap();
+
+        let make_engine = || {
+            let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+            engine.set_object_store(store.clone());
+            let mut c = chunk(1, "object image", vec!["team-a"]);
+            c.kind = ChunkKind::Image;
+            c.media = Some(MediaRef {
+                asset: AssetPointer::Object {
+                    uri: obj.uri.clone(),
+                },
+                media_type: Some("image/png".into()),
+                time: None,
+                region: None,
+                caption_source: None,
+                thumbnail: None,
+            });
+            engine.ingest("kb", &c).unwrap();
+            engine.commit().unwrap();
+            engine
+        };
+
+        let issuer = router(
+            ServerState::new(make_engine(), keys())
+                .with_asset_signer(b"k".to_vec(), 300)
+                .enable_object_url_signer()
+                .await,
+        );
+        let resp = issuer
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assets/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"ids":["kb:rep.pdf:1"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let url = body_json(resp).await["assets"][0]["url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let reader =
+            router(ServerState::new(make_engine(), keys()).with_asset_signer(b"k".to_vec(), 300));
+        let resp = reader
+            .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        assert_eq!(got, bytes);
+    }
+
+    #[tokio::test]
     async fn index_validates_object_refs_for_default_store_media() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(fastsearch_engine::LocalObjectStore::new(
@@ -2673,14 +2925,30 @@ mod tests {
         ));
         let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
         engine.set_object_store(store);
-        let app = router(ServerState::new(engine, keys()).with_asset_signer(b"k".to_vec(), 300));
+        let mut c = chunk(1, "missing object", vec!["team-a"]);
+        c.kind = ChunkKind::Image;
+        c.media = Some(MediaRef {
+            asset: AssetPointer::Object {
+                uri: "s3://assets/acme/missing.png".into(),
+            },
+            media_type: Some("image/png".into()),
+            time: None,
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        engine.ingest("kb", &c).unwrap();
+        engine.commit().unwrap();
+        let state = ServerState::new(engine, keys()).with_asset_signer(b"k".to_vec(), 300);
         let signer = AssetSigner::new(b"k".to_vec(), 300);
         let (url, _) = mint_object_url(
             &signer,
-            "s3://assets/missing.png",
+            "kb:rep.pdf:1",
+            "s3://assets/acme/missing.png",
             Some("image/png"),
             unix_now(),
         );
+        let app = router(state);
         let resp = app
             .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
             .await
@@ -2907,6 +3175,61 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["page"], 7);
         assert_eq!(hits[0]["citation_id"], "kb:d.pdf:1");
+    }
+
+    #[tokio::test]
+    async fn index_acl_and_tenant_are_injected_from_principal() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let body = r#"{"collection":"kb","doc_id":"d.pdf","chunks":[
+            {"doc_id":"client-controlled.pdf","chunk_id":1,"kind":"paragraph","text":"server injected identity","page":1,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":24,"acl":["team-b"],"tenant":"evil"}]}"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = r#"{"query":"server injected identity","top_k":5}"#;
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-b")
+                    .body(Body::from(req))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(denied).await["hits"].as_array().unwrap().len(), 0);
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(req))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(allowed).await;
+        assert_eq!(v["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hits"][0]["citation_id"], "kb:d.pdf:1");
     }
 
     #[tokio::test]
@@ -3713,10 +4036,18 @@ mod tests {
             highlight: None,
             merged_chunk_ids: vec![],
         };
-        let s = serde_json::to_string(&hits_json(&[hit], None, None)).unwrap();
+        let signer = AssetSigner::new(b"k".to_vec(), 300);
+        let s = serde_json::to_string(&hits_json(
+            &[hit],
+            Some(&signer),
+            Some("https://fastsearch.example"),
+        ))
+        .unwrap();
         assert!(s.contains(r#""kind":"object""#));
+        assert!(s.contains(r#""url":"https://fastsearch.example/v1/object/"#));
         assert!(!s.contains("s3://"));
         assert!(!s.contains("private-bucket"));
+        assert!(!s.contains("secret/key.png"));
     }
 
     /// 真语义混合（env-gated，需本地 Ollama）：经 server 灌入带嵌入的 passage，再用
@@ -3960,7 +4291,7 @@ mod tests {
 
         let mut cfg = PgConfig::new(url);
         cfg.table = "fastsearch_srv_mb_it".into();
-        let mut store = PgStore::connect(cfg).await.expect("connect");
+        let store = PgStore::connect(cfg).await.expect("connect");
         store.ensure_schema().await.expect("schema");
         c.media_bytes = Some(bytes.clone());
         store
