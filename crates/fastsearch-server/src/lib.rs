@@ -299,6 +299,10 @@ struct Bucket {
     last: std::time::Instant,
 }
 
+/// 限流桶表硬上限（DoS backstop）。正常调用方经鉴权后分桶，桶数 ≤ 配置的 API Key 数（有限），
+/// 远不及此值；此上限仅防"万一有人在鉴权前分桶或 key 空间异常大"导致 map 无界增长。
+const MAX_RATE_BUCKETS: usize = 100_000;
+
 /// 简单令牌桶限流：每个 key 一桶，容量 `capacity`、每秒回填 `refill_per_sec`。
 pub struct RateLimiter {
     capacity: f64,
@@ -311,6 +315,12 @@ impl RateLimiter {
     fn check(&self, key: &str) -> bool {
         let now = std::time::Instant::now();
         let mut map = self.buckets.lock().unwrap();
+        // 有界化 backstop（M21）：桶表触顶且来了新 key 时整表清空（摊还 O(1)，仿动态数组倍增；
+        // 清空只是把所有桶重置为满，不放松长期限流）。避免无界增长，也避免"触顶后每请求 O(n) 逐出"。
+        // 正常调用方经鉴权后分桶，桶数 ≤ 配置 key 数，远不及此上限——此路仅极端/异常下触发。
+        if map.len() >= MAX_RATE_BUCKETS && !map.contains_key(key) {
+            map.clear();
+        }
         let b = map.entry(key.to_string()).or_insert(Bucket {
             tokens: self.capacity,
             last: now,
@@ -1088,9 +1098,6 @@ async fn search(State(s): State<ServerState>, headers: HeaderMap, req: Request<B
 async fn search_request(s: ServerState, headers: HeaderMap, req: SearchRequest) -> ApiResult {
     let started = std::time::Instant::now();
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
-    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -1098,6 +1105,11 @@ async fn search_request(s: ServerState, headers: HeaderMap, req: SearchRequest) 
             "missing or invalid API key".into(),
         )
     })?;
+    // 限流在鉴权之后（M21）：仅已认证请求分桶 → 桶数 ≤ 有效 key 数（有界）；伪造 token 在鉴权处
+    // 被拒、不创建桶，避免"每个伪造 token 一个永不回收的桶"内存 DoS。
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let acl = acl_for(&principal);
 
     // 真混合：mode 需要向量、客户端未传 vector、且配了嵌入后端 → 锁外嵌入 query。
@@ -1182,9 +1194,6 @@ async fn similar(
     Json(body): Json<SimilarBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
-    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -1192,6 +1201,10 @@ async fn similar(
             "missing or invalid API key".into(),
         )
     })?;
+    // 限流在鉴权之后（M21）：见 search_request。
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let acl = acl_for(&principal);
     let gid =
         GlobalId::parse(&body.citation_id).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -1326,13 +1339,14 @@ async fn asset(
     Path(cid): Path<String>,
 ) -> Response {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
-    }
     let Some(principal) = principal_from_headers(&headers, &s.keys) else {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::UNAUTHORIZED, "missing or invalid API key").into_response();
     };
+    // 限流在鉴权之后（M21）：见 search_request。
+    if !s.allow(&rate_key(&headers)) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
     let acl = acl_for(&principal);
     let engine = s.engine.lock().await;
     let resolved = match engine.resolve_citation(&cid, Some(&acl)) {
@@ -1500,9 +1514,6 @@ async fn assets_resolve(
     Json(body): Json<ResolveBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
-    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -1510,6 +1521,10 @@ async fn assets_resolve(
             "missing or invalid API key".into(),
         )
     })?;
+    // 限流在鉴权之后（M21）：见 search_request。
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let acl = acl_for(&principal);
     let now = unix_now();
     let engine = s.engine.lock().await;
@@ -1789,9 +1804,6 @@ async fn index(
     Json(mut body): Json<IndexBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
-    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -1799,6 +1811,10 @@ async fn index(
             "missing or invalid API key".into(),
         )
     })?;
+    // 限流在鉴权之后（M21）：见 search_request。
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let err500 = |e: fastsearch_engine::EngineError| {
         s.metrics.errors.fetch_add(1, Ordering::Relaxed);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -2069,10 +2085,11 @@ async fn delete_doc(
     Path((collection, doc_id)): Path<(String, String)>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    // 限流在鉴权之后（M21）：见 search_request。
     if !s.allow(&rate_key(&headers)) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
     }
-    let principal = require_principal(&s, &headers)?;
     let acl = acl_for(&principal);
 
     let (object_uris, pg) = {
@@ -3877,6 +3894,24 @@ mod tests {
         let text =
             String::from_utf8(m.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
         assert!(text.contains("fastsearch_rate_limited_total 1"));
+    }
+
+    #[test]
+    fn rate_limiter_bucket_map_bounded_under_distinct_keys() {
+        // M21 回归：桶表有硬上限——大量不同 key（模拟伪造 token 洪水）不致 map 无界增长。
+        let rl = RateLimiter {
+            capacity: 1.0,
+            refill_per_sec: 0.0,
+            buckets: std::sync::Mutex::new(HashMap::new()),
+        };
+        for i in 0..(MAX_RATE_BUCKETS + 5_000) {
+            rl.check(&format!("forged-token-{i}"));
+        }
+        let n = rl.buckets.lock().unwrap().len();
+        assert!(
+            n <= MAX_RATE_BUCKETS,
+            "桶表应有界（防伪造 token 内存 DoS）: {n} <= {MAX_RATE_BUCKETS}"
+        );
     }
 
     #[tokio::test]
