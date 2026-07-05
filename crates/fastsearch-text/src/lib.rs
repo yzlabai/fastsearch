@@ -347,9 +347,9 @@ impl TextIndex {
         // 自定义 k1/b 生效时放宽候选窗口（重排会改变 top-k 归属，减小窗口偏差）。
         let custom_bm25 = bm25::custom_params_active(self.cfg.k1, self.cfg.b);
         let overfetch = if custom_bm25 {
-            (k * 8).max(k + 64)
+            k.saturating_mul(8).max(k.saturating_add(64))
         } else {
-            (k * 4).max(k + 16)
+            k.saturating_mul(4).max(k.saturating_add(16))
         };
         let mut top = searcher.search(&q, &TopDocs::with_limit(overfetch).order_by_score())?;
 
