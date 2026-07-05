@@ -8,7 +8,7 @@
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -916,6 +916,16 @@ async fn metrics(State(s): State<ServerState>) -> String {
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
+/// 内部错误出口：完整错误记服务端日志（排障用），只回客户端通用文案，避免向客户端泄露表名/SQL
+/// 片段/内部路径等细节（R3.5）。用于 PG/引擎等内部错误的 5xx 收口。
+fn internal_err(context: &str, detail: impl std::fmt::Display) -> (StatusCode, String) {
+    eprintln!("internal error [{context}]: {detail}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal error".to_string(),
+    )
+}
+
 fn public_media(media: &Option<fastsearch_core::MediaRef>) -> Option<PublicMediaRef> {
     media.as_ref().map(|m| m.to_public())
 }
@@ -1297,9 +1307,45 @@ fn parse_range(headers: &HeaderMap, total: u64) -> RangeSpec {
 /// 把 inline 字节按 `Range` 头组装响应：无 Range→200 全量 + `Accept-Ranges: bytes`；
 /// 单段→206 + `Content-Range`；不可满足→416 + `Content-Range: bytes */total`。两个 inline
 /// 出口（authed `asset` / token 门控 `asset_bytes`）共用，确保 Range 语义一致。
+/// media_type 是否可安全内联渲染。仅放行常见图片/音视频/PDF；**text/html、image/svg+xml（可含
+/// 脚本）、XML 等一律不内联**——media_type 客户端可控，内联渲染 HTML 会造成同源存储型 XSS（R3.5）。
+fn is_safe_inline_ct(ct: &str) -> bool {
+    let base = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/avif"
+            | "image/bmp"
+            | "audio/mpeg"
+            | "audio/mp4"
+            | "audio/ogg"
+            | "audio/wav"
+            | "audio/webm"
+            | "video/mp4"
+            | "video/webm"
+            | "video/ogg"
+            | "application/pdf"
+    )
+}
+
 fn serve_inline_bytes(headers: &HeaderMap, ct: String, bytes: Vec<u8>) -> Response {
     let total = bytes.len() as u64;
-    match parse_range(headers, total) {
+    // 非白名单类型（含客户端可伪造的 text/html、SVG）降为 octet-stream + 强制下载，不内联渲染。
+    let safe = is_safe_inline_ct(&ct);
+    let ct = if safe {
+        ct
+    } else {
+        "application/octet-stream".to_string()
+    };
+    let mut resp = match parse_range(headers, total) {
         RangeSpec::None => (
             [
                 (header::CONTENT_TYPE, ct),
@@ -1324,13 +1370,28 @@ fn serve_inline_bytes(headers: &HeaderMap, ct: String, bytes: Vec<u8>) -> Respon
             )
                 .into_response()
         }
-        RangeSpec::Unsatisfiable => (
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            [(header::CONTENT_RANGE, format!("bytes */{total}"))],
-            "range not satisfiable",
-        )
-            .into_response(),
+        RangeSpec::Unsatisfiable => {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{total}"))],
+                "range not satisfiable",
+            )
+                .into_response()
+        }
+    };
+    // 安全响应头：nosniff 阻止 MIME 嗅探；非白名单类型 attachment 强制下载（防内联 XSS）。
+    let h = resp.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if !safe {
+        h.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
     }
+    resp
 }
 
 /// 媒资 ACL 网关：`GET /v1/asset/{citation_id}` —— `principal→acl_for→resolve_citation`，
@@ -2042,7 +2103,7 @@ async fn index(
                     eprintln!("object cleanup after pg upsert failure failed: {cleanup_err}");
                 }
             }
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("pg upsert: {e}")));
+            return Err(internal_err("pg upsert", e));
         }
     }
 
@@ -2119,7 +2180,7 @@ async fn delete_doc(
     let pg_deleted = if let Some(pg) = pg {
         pg.delete_doc(&collection, &doc_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pg delete: {e}")))?
+            .map_err(|e| internal_err("pg delete", e))?
     } else {
         0
     };
@@ -2705,6 +2766,38 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "多段 Range 不支持 → 退 200 全量");
         assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_unsafe_ct_forced_download_safe_ct_inline() {
+        // R3.5：客户端可控 media_type=text/html 若内联渲染 → 同源存储型 XSS。非白名单类型应降为
+        // octet-stream + attachment + nosniff（下载不渲染）；白名单图片照常内联 + nosniff。
+        let (_st, h, _b) = resp_parts(serve_inline_bytes(
+            &HeaderMap::new(),
+            "text/html".into(),
+            b"<script>alert(1)</script>".to_vec(),
+        ))
+        .await;
+        assert_eq!(
+            h.get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream",
+            "text/html 应降为 octet-stream"
+        );
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(h.get(header::CONTENT_DISPOSITION).unwrap(), "attachment");
+
+        let (_st, h2, _b) = resp_parts(serve_inline_bytes(
+            &HeaderMap::new(),
+            "image/png".into(),
+            vec![0x89, 0x50, 0x4e, 0x47],
+        ))
+        .await;
+        assert_eq!(h2.get(header::CONTENT_TYPE).unwrap(), "image/png");
+        assert_eq!(h2.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert!(
+            h2.get(header::CONTENT_DISPOSITION).is_none(),
+            "安全图片不应强制下载（保内联 <img>）"
+        );
     }
 
     #[tokio::test]
