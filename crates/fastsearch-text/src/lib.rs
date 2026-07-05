@@ -353,8 +353,8 @@ impl TextIndex {
             let mut top = searcher.search(&q, &TopDocs::with_limit(limit).order_by_score())?;
             let window = top.len();
 
-            // 自定义 BM25 重排：用配置 k1/b 自算分覆盖 Tantivy 原生分，再按 (分降序, DocAddress 升序)
-            // 确定性重排。无可计分词的候选（纯前缀命中）保留原生分。matching 不变、仅排序变。
+            // 自定义 BM25 重排：用配置 k1/b 自算分覆盖 Tantivy 原生分。无可计分词的候选（纯前缀
+            // 命中）保留原生分。matching 不变、仅分值变；最终排序统一在下方按 (分, GlobalId) 做。
             if custom_bm25 {
                 let addrs: Vec<_> = top.iter().map(|(_, a)| *a).collect();
                 let scores = bm25::score_candidates(
@@ -372,14 +372,13 @@ impl TextIndex {
                         *score = *s;
                     }
                 }
-                top.sort_by(|(sa, aa), (sb, ab)| {
-                    sb.partial_cmp(sa)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| (aa.segment_ord, aa.doc_id).cmp(&(ab.segment_ord, ab.doc_id)))
-                });
             }
 
-            let mut hits = Vec::with_capacity(k);
+            // 构建窗口内**所有**通过后过滤的候选（不早停），再按 (分降序, GlobalId 升序) 确定性排序、
+            // 截 k。tie-break 用 GlobalId 而非 DocAddress（插入顺序）：同一 PG 真源以不同顺序重建后，
+            // 同分文档返回序稳定一致（守不变量 #4）。窗口边界仍由 Tantivy DocAddress 决定，但返回序已
+            // 由 gid 确定，engine 融合层的 gid tie-break 也不再被 text 层的顺序抖动干扰（M9）。
+            let mut hits: Vec<TextHit> = Vec::new();
             for (score, addr) in top {
                 let doc: TantivyDocument = searcher.doc(addr)?;
                 let row = stored_row(&doc, &self.fields);
@@ -431,10 +430,14 @@ impl TextIndex {
                     text,
                     highlight,
                 });
-                if hits.len() >= k {
-                    break;
-                }
             }
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            hits.truncate(k);
             Ok((hits, window))
         };
 
@@ -787,6 +790,32 @@ mod tests {
             .search("data", Some(&not_exists), None, 10, false)
             .unwrap();
         assert_eq!(got4.len(), 3);
+    }
+
+    #[test]
+    fn same_score_tie_break_stable_across_insertion_order() {
+        // M9 回归：同分文档 tie-break 用 GlobalId（而非 DocAddress/插入顺序）。同一语料以不同顺序
+        // 重建索引后，同分命中的返回序应一致（守不变量 #4）。
+        let build = |order: &[u64]| -> Vec<u64> {
+            let mut idx = ram(TokenizerKind::Default);
+            for &id in order {
+                idx.upsert(
+                    "kb",
+                    &chunk("a.pdf", id, ChunkKind::Paragraph, "data here", 1),
+                )
+                .unwrap();
+            }
+            idx.commit().unwrap();
+            idx.search("data", None, None, 3, false)
+                .unwrap()
+                .iter()
+                .map(|h| h.id.chunk_id)
+                .collect()
+        };
+        let a = build(&[1, 2, 3]);
+        let b = build(&[3, 2, 1]);
+        assert_eq!(a, b, "同分命中的顺序应与插入顺序无关（gid tie-break）");
+        assert_eq!(a, vec![1, 2, 3], "同分按 GlobalId(chunk_id) 升序");
     }
 
     #[test]
