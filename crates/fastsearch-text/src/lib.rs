@@ -772,6 +772,48 @@ mod tests {
     }
 
     #[test]
+    fn float_filter_values_preserve_superset() {
+        // H2 回归（text 端到端）：JSON 数值过滤常带小数点 → Float。Lt/Ne/Eq 对 Float 仍须正确
+        // （旧 field_as_u64 把 5.5 截成 5 → Lt 漏 page=5；旧变体严格 Ne 补集会错杀）。现翻译退
+        // AllQuery + core 精确后过滤（数值互比）保证正确。
+        use fastsearch_core::FieldValue;
+        let mut idx = ram(TokenizerKind::Default);
+        for (id, page) in [(1u64, 4u32), (2, 5), (3, 6)] {
+            idx.upsert(
+                "kb",
+                &chunk("a.pdf", id, ChunkKind::Paragraph, "data here", page),
+            )
+            .unwrap();
+        }
+        idx.commit().unwrap();
+        let pages = |f: &Filter| {
+            let mut v: Vec<u64> = idx
+                .search("data", Some(f), None, 10, false)
+                .unwrap()
+                .iter()
+                .map(|h| h.id.chunk_id)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        // Lt(page, 5.5) → page 4,5（不漏 page=5）
+        assert_eq!(
+            pages(&Filter::Lt("page".into(), FieldValue::Float(5.5))),
+            vec![1, 2]
+        );
+        // Ne(page, 6.0) → page 4,5（排除 6，不误留不误杀）
+        assert_eq!(
+            pages(&Filter::Ne("page".into(), FieldValue::Float(6.0))),
+            vec![1, 2]
+        );
+        // Eq(page, 6.0) → 仅 page=6
+        assert_eq!(
+            pages(&Filter::Eq("page".into(), FieldValue::Float(6.0))),
+            vec![3]
+        );
+    }
+
+    #[test]
     fn empty_text_and_modality_fast_field() {
         let mut idx = ram(TokenizerKind::Default);
         // 图 chunk 无 caption → text=""（媒资无文本表示）

@@ -33,7 +33,9 @@ fn u64_range(field: tantivy::schema::Field, lo: Bound<u64>, hi: Bound<u64>) -> B
 fn field_as_u64(v: &FieldValue) -> Option<u64> {
     match v {
         FieldValue::Int(i) if *i >= 0 => Some(*i as u64),
-        FieldValue::Float(f) if *f >= 0.0 => Some(*f as u64),
+        // Float 不做整数化翻译：截断会破坏 SUPERSET（`Lt(page,5.5)` 截成 `<5` 漏掉 page=5），
+        // 且非整数 Float 经补集（Ne/Not）会不精确。一律退 None → AllQuery，交由 core `Filter::eval`
+        // 精确后过滤（已修为数值互比）。仅影响 Float 值过滤的预过滤选择性，正确性由后过滤保证（H2）。
         _ => None,
     }
 }
