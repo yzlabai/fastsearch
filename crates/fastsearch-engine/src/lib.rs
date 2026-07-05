@@ -1450,13 +1450,22 @@ impl Engine {
     }
 
     /// more_like_this：以种子 chunk 的正文反查相似命中（keyword 模式），排除种子自身。
-    /// 种子不存在 → 返回空。ACL 照常强制（不可绕过）。
+    /// 种子不存在**或对调用者不可见** → 返回空。ACL 照常强制（不可绕过）。
     pub fn more_like_this(
         &self,
         gid: &GlobalId,
         top_k: usize,
         acl: Option<&AclFilter>,
     ) -> Result<Vec<SearchHit>> {
+        // 种子可见性强制（M19）：先取种子行做 ACL 校验——种子对调用者不可见（跨租户/无权）时
+        // 当作不存在返回空，绝不以其机密正文构造 MLT 查询、也不泄露其存在性。对齐 resolve_citation。
+        let seed_row = match self.text.stored_row_by_gid(gid)? {
+            Some(r) => r,
+            None => return Ok(vec![]),
+        };
+        if acl.is_some_and(|a| !a.visible(&seed_row)) {
+            return Ok(vec![]);
+        }
         let seed_text = match self.text.stored_text(gid)? {
             Some(t) => t,
             None => return Ok(vec![]),
@@ -2598,6 +2607,64 @@ mod tests {
             chunk_id: 999,
         };
         assert!(e.more_like_this(&missing, 10, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn more_like_this_seed_acl_enforced_no_cross_tenant_leak() {
+        // M19 回归：种子 chunk 对调用者不可见时 more_like_this 返回空——不以其机密正文构造查询、
+        // 不泄露存在性（否则成跨租户相似性/存在性预言机）。
+        let mut e = engine();
+        // 种子：租户 acme、标签 team-a（机密）
+        let mut seed = chunk(
+            "secret.pdf",
+            1,
+            ChunkKind::Paragraph,
+            "machine learning models",
+            1,
+        );
+        seed.tenant = Some("acme".into());
+        seed.acl = vec!["team-a".into()];
+        e.ingest("kb", &seed).unwrap();
+        // 一条 team-b 可见的相似文档（证明"若非 ACL 拦截会有命中"）
+        let mut other = chunk(
+            "pub.pdf",
+            2,
+            ChunkKind::Paragraph,
+            "learning models tuning",
+            2,
+        );
+        other.tenant = Some("acme".into());
+        other.acl = vec!["team-b".into()];
+        e.ingest("kb", &other).unwrap();
+        e.commit().unwrap();
+
+        let seed_gid = GlobalId {
+            collection: "kb".into(),
+            doc_id: "secret.pdf".into(),
+            chunk_id: 1,
+        };
+        // 调用者 B（team-b）：看不到种子 → 返回空（不泄露）
+        let acl_b = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-b".into()],
+        };
+        assert!(
+            e.more_like_this(&seed_gid, 5, Some(&acl_b))
+                .unwrap()
+                .is_empty(),
+            "种子对 B 不可见 → more_like_this 应返回空，不泄露"
+        );
+        // 调用者 A（team-a）：能看到种子 → 正常反查相似命中（对照，证明功能未坏）
+        let acl_a = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into(), "team-b".into()],
+        };
+        assert!(
+            !e.more_like_this(&seed_gid, 5, Some(&acl_a))
+                .unwrap()
+                .is_empty(),
+            "种子对 A 可见 → 应能反查相似命中"
+        );
     }
 
     #[test]
