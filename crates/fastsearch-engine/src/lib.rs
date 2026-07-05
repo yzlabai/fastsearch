@@ -1634,7 +1634,17 @@ impl Engine {
         if req.rerank.is_some() {
             let texts: Vec<String> = hits
                 .iter()
-                .map(|h| text_map.get(&h.id).cloned().unwrap_or_default())
+                .map(|h| match text_map.get(&h.id) {
+                    Some(t) => t.clone(),
+                    // 向量独有命中不在 kw_hits 的 text_map 里，回真源取 STORED 正文再打分；
+                    // 否则 rerank 拿空串 → 全候选 0 分、排序退化为 gid 序，向量排名被摧毁（H1-A）。
+                    None => self
+                        .text
+                        .stored_text(&h.id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                })
                 .collect();
             let scores = self
                 .reranker
@@ -3200,6 +3210,49 @@ mod tests {
         // chunk 2（与 query 完全重叠）应被 rerank 提前
         assert_eq!(hits[0].id.chunk_id, 2);
         assert!(hits[0].rerank.unwrap() > hits[1].rerank.unwrap());
+    }
+
+    #[test]
+    fn rerank_uses_real_text_for_vector_only_hits() {
+        // H1-A 回归：mode=Vector 命中不经 keyword 路 → text_map 无该条；rerank 必须回真源取
+        // STORED 正文打分，否则拿空串 → 全 0 分、排序退化为 gid 序，向量排名被摧毁。
+        use fastsearch_core::RerankSpec;
+        use fastsearch_sync::IndexSink;
+        let mut e = engine();
+        e.set_embedder(Box::new(HashEmbedder::new(32)));
+        let c = chunk("d.pdf", 1, ChunkKind::Paragraph, "alpha beta gamma", 1);
+        e.apply_upsert("kb", &c).unwrap();
+        e.commit().unwrap();
+
+        // Vector 模式的查询向量来自 req.vector（server 层嵌入查询文本后注入）。用同款确定性
+        // HashEmbedder 嵌同一文本 → 与索引里该 chunk 的向量 cos=1，命中它自身。
+        let qv = HashEmbedder::new(32)
+            .embed(&["alpha beta gamma".into()], EmbedKind::Query)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let req = SearchRequest {
+            query: "alpha beta gamma".into(),
+            vector: Some(qv),
+            mode: SearchMode::Vector,
+            rerank: Some(RerankSpec {
+                model: "lexical".into(),
+                top_k: 10,
+            }),
+            top_k: 5,
+            candidates: 10,
+            ..Default::default()
+        };
+        let hits = e.search(&req, None).unwrap();
+        let hit = hits
+            .iter()
+            .find(|h| h.id.chunk_id == 1)
+            .expect("chunk 应被向量召回");
+        assert_eq!(
+            hit.rerank,
+            Some(1.0),
+            "rerank 应对真源正文完全重叠打 1.0，而非空串 0.0"
+        );
     }
 
     #[test]
