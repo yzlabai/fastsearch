@@ -10,7 +10,7 @@
 //! 解码（pgoutput）与映射（行→Chunk，复用 [`fastsearch_pg::ChunkRow::to_chunk`]）是纯逻辑、
 //! 与传输解耦——故即便无 PG，解码/数组解析也有单测覆盖。
 
-use crate::pgoutput::{self, PgMessage, Relation, TupleData};
+use crate::pgoutput::{self, PgMessage, Relation, TupleData, TupleValue};
 use crate::{Change, ChangeEvent, Lsn};
 use anyhow::{Context, Result};
 use fastsearch_core::{Chunk, GlobalId};
@@ -139,16 +139,65 @@ async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<Chang
         let lsn = Lsn(parse_pg_lsn(&lsn_text)?);
         max_lsn = max_lsn.max(lsn); // 含 Begin/Commit 等非数据行：slot 推进位置
         let pg = pgoutput::parse_message(&data)?;
-        if let Some(change) = map(&mut relations, pg)? {
-            out.push(ChangeEvent { change, lsn });
+        match map(&mut relations, pg)? {
+            Some(Mapped::Ready(change)) => out.push(ChangeEvent { change, lsn }),
+            Some(Mapped::Refetch {
+                table,
+                collection,
+                doc_id,
+                chunk_id,
+            }) => {
+                // 不完整 WAL（UnchangedToast）→ 从 PG 真源重取整行（H3）。行已被删（后续 Delete 事件
+                // 会清）→ 跳过，不 push（幂等安全：重取当前真源，索引收敛到真值）。
+                if let Some((coll, chunk)) =
+                    fastsearch_pg::fetch_chunk(&client, &table, &collection, &doc_id, chunk_id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("refetch on unchanged-toast: {e}"))?
+                {
+                    out.push(ChangeEvent {
+                        change: Change::Upsert {
+                            collection: coll,
+                            chunk: Box::new(chunk),
+                        },
+                        lsn,
+                    });
+                }
+            }
+            None => {}
         }
     }
     Ok((out, max_lsn))
 }
 
-/// pgoutput 消息 → 可选 Change。Relation 入缓存；Insert/Update→Upsert，Delete→Delete；
-/// Begin/Commit/Origin/Type/Truncate → None（消化）。
-fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<Change>> {
+/// map 结果：可直接应用的 Change，或（Insert/Update 遇 UnchangedToast 不完整 WAL）需从真源重取的标记。
+enum Mapped {
+    Ready(Change),
+    /// 不完整 WAL：TOAST 大列在此变更未改、未随 WAL 带值（值为 'u'）。gid 列（小、不 TOAST）仍在，
+    /// 据此从 PG 真源重取整行（H3，堵毒丸）。`table` 为已安全引号化的限定表名。
+    Refetch {
+        table: String,
+        collection: String,
+        doc_id: String,
+        chunk_id: i64,
+    },
+}
+
+/// 元组是否含 UnchangedToast 值（'u'）——TOAST 大列在 UPDATE 里未变时 pgoutput 不带其值。
+fn tuple_has_unchanged_toast(t: &TupleData) -> bool {
+    t.values
+        .iter()
+        .any(|v| matches!(v, TupleValue::UnchangedToast))
+}
+
+/// 安全引号化限定表名 `"ns"."name"`（ns/name 取自 PG 自身的 Relation 消息，内嵌引号加倍转义）。
+fn quoted_table(rel: &Relation) -> String {
+    let q = |s: &str| s.replace('"', "\"\"");
+    format!("\"{}\".\"{}\"", q(&rel.namespace), q(&rel.name))
+}
+
+/// pgoutput 消息 → 可选 Mapped。Relation 入缓存；Insert/Update→Upsert（完整）或 Refetch（含 'u'）；
+/// Delete→Delete；Begin/Commit/Origin/Type/Truncate → None（消化）。
+fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<Mapped>> {
     match pg {
         PgMessage::Relation(r) => {
             relations.insert(r.oid, r);
@@ -161,20 +210,30 @@ fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<C
             ..
         } => {
             let rel = relation(relations, rel_oid)?;
+            if tuple_has_unchanged_toast(&tuple) {
+                // gid 列不 TOAST、必在 → 取出后交 fetch_changes 从真源重取整行（不再对 'u' 报错卡死）。
+                let m = cols(rel, &tuple);
+                return Ok(Some(Mapped::Refetch {
+                    table: quoted_table(rel),
+                    collection: get(&m, "collection")?.to_string(),
+                    doc_id: get(&m, "doc_id")?.to_string(),
+                    chunk_id: get(&m, "chunk_id")?.parse().context("chunk_id")?,
+                }));
+            }
             let (collection, chunk) = row_to_chunk(rel, &tuple)?;
-            Ok(Some(Change::Upsert {
+            Ok(Some(Mapped::Ready(Change::Upsert {
                 collection,
                 chunk: Box::new(chunk),
-            }))
+            })))
         }
         PgMessage::Delete { rel_oid, key, old } => {
             let rel = relation(relations, rel_oid)?;
             let tuple = key
                 .or(old)
                 .context("Delete without key/old tuple (need REPLICA IDENTITY)")?;
-            Ok(Some(Change::Delete {
+            Ok(Some(Mapped::Ready(Change::Delete {
                 gid: row_to_gid(rel, &tuple)?,
-            }))
+            })))
         }
         _ => Ok(None),
     }

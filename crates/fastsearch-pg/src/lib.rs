@@ -476,6 +476,27 @@ fn row_to_chunk(r: &Row) -> Result<Chunk> {
     row.to_chunk()
 }
 
+/// 按主键从真源取单个 `(collection, Chunk)`。CDC 遇 `UnchangedToast`（TOAST 大列在 UPDATE 里
+/// 未变、WAL 不带值）时，用它从 PG 真源**重取整行**再派生索引（"PG 是真源、索引派生"）。
+/// 用调用方的 `&Client`（sync 层复用其连接）；期间行已被删 → `Ok(None)`。`table` 须为安全标识符。
+pub async fn fetch_chunk(
+    client: &Client,
+    table: &str,
+    collection: &str,
+    doc_id: &str,
+    chunk_id: i64,
+) -> Result<Option<(String, Chunk)>> {
+    let q = sql::fetch_chunk_sql(table);
+    let rows = client.query(&q, &[&collection, &doc_id, &chunk_id]).await?;
+    match rows.first() {
+        Some(r) => Ok(Some((
+            r.try_get::<_, String>("collection")?,
+            row_to_chunk(r)?,
+        ))),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

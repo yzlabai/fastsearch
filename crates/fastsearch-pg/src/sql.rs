@@ -57,8 +57,13 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
         ),
         format!("CREATE INDEX IF NOT EXISTS {table}_doc ON {table} (collection, doc_id);"),
         // Publication 只发布**源真源列**（`COLUMNS`），刻意**排除引擎派生/记账列**
-        // `embedding`/`embed_model`/`updated_at`——这样 B6 写穿（`set_embedding` UPDATE 这三列）
-        // **不产生逻辑复制事件**，从根上断开"写穿→复制→再嵌入→再写穿"的 CDC 反馈环。
+        // `embedding`/`embed_model`/`updated_at`——这样 B6 写穿（`set_embedding` UPDATE 这三列）的
+        // 复制流里**不含派生列的值**，重解码不会看到它们、不据此重嵌。
+        // **（实测更正，H3/R4）**：列清单只过滤"列的值"、**不抑制"Update 事件本身"**——只改被排除列的
+        // UPDATE 仍会产生 Begin/Relation/Update/Commit（其中已发布列取当前值、或大列为 'u'）。故 CDC
+        // 写穿反馈环**不是靠"不产生事件"断开**，而是靠 `set_embedding` 的 `IS DISTINCT FROM` 幂等守卫
+        // 阻尼：值未变→0 行更新→第二轮无事件，环在一轮内收敛（不至无限）。该写穿事件对大 text 行正是
+        // 'u'(UnchangedToast) 的载体 → 依赖 H3 的"遇 'u' 从真源重取整行"才不卡死。
         // 列清单发布需 **PG 15+**（核心特性、非扩展，不破"托管 PG 可移植"不变量 #1）。
         //
         // 幂等 + **自愈但不抢占**：① 无 publication → CREATE（带列清单）；② 本表已在该 publication
@@ -327,6 +332,15 @@ pub fn fetch_doc_sql(table: &str) -> String {
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
          section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 ORDER BY chunk_id"
+    )
+}
+
+/// 按主键读取单个 chunk（CDC 遇 UnchangedToast 不完整 WAL 时重取真源用，见 fastsearch-sync）。
+pub fn fetch_chunk_sql(table: &str) -> String {
+    format!(
+        "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
+         section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
+         FROM {table} WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3"
     )
 }
 
