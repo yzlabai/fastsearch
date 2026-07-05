@@ -81,7 +81,16 @@ impl AssetSigner {
     }
 
     fn mac_hex(&self, cid: &str, exp: u64, ct: &str) -> String {
-        self.mac_bytes(format!("{cid}|{exp}|{ct}").as_bytes())
+        // 长度前缀 framing 消除分隔符歧义：cid 内嵌客户端可控的 doc_id、ct 来自客户端 media_type，
+        // 二者可含任意字符（含 `|`）。旧 `cid|exp|ct` 拼接下 (cid1,ct1) 与某个 (cid2,ct2) 可拼出逐字节
+        // 相等的消息 → 签名跨对复用。每字段前置其字节长度（8B BE），字段边界唯一可解析（M20）。
+        let mut msg = Vec::with_capacity(cid.len() + ct.len() + 24);
+        for field in [cid.as_bytes(), ct.as_bytes()] {
+            msg.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            msg.extend_from_slice(field);
+        }
+        msg.extend_from_slice(&exp.to_be_bytes());
+        self.mac_bytes(&msg)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
@@ -2375,6 +2384,23 @@ mod tests {
                 1000
             ),
             "换密钥"
+        );
+    }
+
+    #[test]
+    fn asset_signature_not_reusable_across_field_split() {
+        // M20 回归：cid/ct 客户端可控、可含 `|`。旧 `cid|exp|ct` 拼接有规范化歧义——为 (cid1,ct1)
+        // 签发的签名会对某个不同的 (cid2,exp2,ct2) 复用（拼出逐字节相等的消息）。长度前缀 framing 后
+        // 不再可复用。
+        let s = AssetSigner::new(b"secret-key".to_vec(), 500);
+        let (cid1, ct1) = ("a", "b|100|c");
+        let (exp1, sig1) = s.sign(cid1, ct1, 0);
+        assert_eq!(exp1, 500);
+        assert!(s.verify(cid1, exp1, ct1, &sig1, 0), "自身应验签通过");
+        // 旧方案：msg1 = "a|500|b|100|c"；(cid2="a|500|b", exp2=100, ct2="c") 拼出同一 msg → 会复用。
+        assert!(
+            !s.verify("a|500|b", 100, "c", &sig1, 0),
+            "跨 (cid,ct) 对复用同一签名应失败（长度前缀消歧）"
         );
     }
 
