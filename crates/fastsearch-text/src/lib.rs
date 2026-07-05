@@ -344,97 +344,115 @@ impl TextIndex {
         }
         let q = BooleanQuery::new(clauses);
 
-        // 自定义 k1/b 生效时放宽候选窗口（重排会改变 top-k 归属，减小窗口偏差）。
+        // 候选窗口：自定义 k1/b 生效时放宽（重排会改变 top-k 归属，减小窗口偏差）。
         let custom_bm25 = bm25::custom_params_active(self.cfg.k1, self.cfg.b);
-        let overfetch = if custom_bm25 {
+        let num_docs = searcher.num_docs() as usize;
+
+        // 单轮：取 `limit` 个候选 →（可选 k1/b 重排）→ 精确后过滤构建命中；返回 (命中, 本轮实际窗口大小)。
+        let run = |limit: usize| -> Result<(Vec<TextHit>, usize)> {
+            let mut top = searcher.search(&q, &TopDocs::with_limit(limit).order_by_score())?;
+            let window = top.len();
+
+            // 自定义 BM25 重排：用配置 k1/b 自算分覆盖 Tantivy 原生分，再按 (分降序, DocAddress 升序)
+            // 确定性重排。无可计分词的候选（纯前缀命中）保留原生分。matching 不变、仅排序变。
+            if custom_bm25 {
+                let addrs: Vec<_> = top.iter().map(|(_, a)| *a).collect();
+                let scores = bm25::score_candidates(
+                    &searcher,
+                    &q,
+                    self.fields.text,
+                    self.fields.heading,
+                    self.cfg.heading_boost,
+                    self.cfg.k1,
+                    self.cfg.b,
+                    &addrs,
+                )?;
+                for (score, addr) in top.iter_mut() {
+                    if let Some(s) = scores.get(addr) {
+                        *score = *s;
+                    }
+                }
+                top.sort_by(|(sa, aa), (sb, ab)| {
+                    sb.partial_cmp(sa)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| (aa.segment_ord, aa.doc_id).cmp(&(ab.segment_ord, ab.doc_id)))
+                });
+            }
+
+            let mut hits = Vec::with_capacity(k);
+            for (score, addr) in top {
+                let doc: TantivyDocument = searcher.doc(addr)?;
+                let row = stored_row(&doc, &self.fields);
+                if let Some(f) = filter {
+                    if !f.eval(&row) {
+                        continue;
+                    }
+                }
+                if let Some(a) = acl {
+                    if !a.visible(&row) {
+                        continue;
+                    }
+                }
+                let text = doc
+                    .get_first(self.fields.text)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // 高亮片段：从存储的 text 生成（命中词包 <b>）；无命中词 → None。
+                let highlight = snippet_gen.as_ref().and_then(|g| {
+                    let snip = g.snippet(&text);
+                    if snip.fragment().is_empty() {
+                        None
+                    } else {
+                        Some(snip.to_html())
+                    }
+                });
+                let citation = Citation {
+                    collection: row.collection.clone(),
+                    doc_id: row.doc_id.clone(),
+                    chunk_id: row.chunk_id,
+                    page: row.page as u32,
+                    bbox: row.bbox,
+                    heading_path: row.heading.clone(),
+                    section_id: row.section_id,
+                    // 时间区间从媒资引用透出（音视频深链）；媒资引用供答案层渲染/取字节。
+                    time: row.media.as_ref().and_then(|m| m.time),
+                    media: row.media.clone(),
+                };
+                hits.push(TextHit {
+                    id: GlobalId {
+                        collection: row.collection,
+                        doc_id: row.doc_id,
+                        chunk_id: row.chunk_id,
+                    },
+                    score,
+                    citation,
+                    kind: row.kind,
+                    text,
+                    highlight,
+                });
+                if hits.len() >= k {
+                    break;
+                }
+            }
+            Ok((hits, window))
+        };
+
+        // 自适应过取（对齐 vector/HNSW 的安全网）：不可翻译的谓词（HeadingPrefix/Exists 等）退化为
+        // AllQuery 交后过滤，高频查询下候选窗口内可能被后过滤筛到 < k，而索引里其实有足量匹配（仅排
+        // 更后）。命中不足 k 且窗口被填满（可能还有更多）就翻倍重取，直到够 k / 窗口未填满 / 覆盖全库（M3）。
+        let mut limit = if custom_bm25 {
             k.saturating_mul(8).max(k.saturating_add(64))
         } else {
             k.saturating_mul(4).max(k.saturating_add(16))
         };
-        let mut top = searcher.search(&q, &TopDocs::with_limit(overfetch).order_by_score())?;
-
-        // 自定义 BM25 重排：用配置 k1/b 自算分覆盖 Tantivy 原生分，再按 (分降序, DocAddress 升序)
-        // 确定性重排。无可计分词的候选（纯前缀命中）保留原生分。matching 不变、仅排序变。
-        if custom_bm25 {
-            let addrs: Vec<_> = top.iter().map(|(_, a)| *a).collect();
-            let scores = bm25::score_candidates(
-                &searcher,
-                &q,
-                self.fields.text,
-                self.fields.heading,
-                self.cfg.heading_boost,
-                self.cfg.k1,
-                self.cfg.b,
-                &addrs,
-            )?;
-            for (score, addr) in top.iter_mut() {
-                if let Some(s) = scores.get(addr) {
-                    *score = *s;
-                }
+        let hits = loop {
+            let (hits, window) = run(limit)?;
+            if hits.len() >= k || window < limit || limit >= num_docs {
+                break hits;
             }
-            top.sort_by(|(sa, aa), (sb, ab)| {
-                sb.partial_cmp(sa)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| (aa.segment_ord, aa.doc_id).cmp(&(ab.segment_ord, ab.doc_id)))
-            });
-        }
-
-        let mut hits = Vec::with_capacity(k);
-        for (score, addr) in top {
-            let doc: TantivyDocument = searcher.doc(addr)?;
-            let row = stored_row(&doc, &self.fields);
-            if let Some(f) = filter {
-                if !f.eval(&row) {
-                    continue;
-                }
-            }
-            if let Some(a) = acl {
-                if !a.visible(&row) {
-                    continue;
-                }
-            }
-            let text = doc
-                .get_first(self.fields.text)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            // 高亮片段：从存储的 text 生成（命中词包 <b>）；无命中词 → None。
-            let highlight = snippet_gen.as_ref().and_then(|g| {
-                let snip = g.snippet(&text);
-                if snip.fragment().is_empty() {
-                    None
-                } else {
-                    Some(snip.to_html())
-                }
-            });
-            let citation = Citation {
-                collection: row.collection.clone(),
-                doc_id: row.doc_id.clone(),
-                chunk_id: row.chunk_id,
-                page: row.page as u32,
-                bbox: row.bbox,
-                heading_path: row.heading.clone(),
-                section_id: row.section_id,
-                // 时间区间从媒资引用透出（音视频深链）；媒资引用供答案层渲染/取字节。
-                time: row.media.as_ref().and_then(|m| m.time),
-                media: row.media.clone(),
-            };
-            hits.push(TextHit {
-                id: GlobalId {
-                    collection: row.collection,
-                    doc_id: row.doc_id,
-                    chunk_id: row.chunk_id,
-                },
-                score,
-                citation,
-                kind: row.kind,
-                text,
-                highlight,
-            });
-            if hits.len() >= k {
-                break;
-            }
-        }
+            limit = limit.saturating_mul(4);
+        };
         Ok(hits)
     }
 }
@@ -769,6 +787,125 @@ mod tests {
             .search("data", Some(&not_exists), None, 10, false)
             .unwrap();
         assert_eq!(got4.len(), 3);
+    }
+
+    #[test]
+    fn over_fetch_escalates_for_low_selectivity_untranslatable_filter() {
+        // M3 回归：HeadingPrefix 不可翻译 → AllQuery，高频词 "data" 下候选窗口被高分的非匹配
+        // 文档填满，匹配文档排在窗口之外。固定过取会返回 < k（甚至 0）；自适应过取翻倍重取补足。
+        let mut idx = ram(TokenizerKind::Default);
+        let with_heading = |id: u64, text: &str, head: &str| {
+            let mut c = chunk("a.pdf", id, ChunkKind::Paragraph, text, id as u32);
+            c.heading_path = vec![head.to_string()];
+            c
+        };
+        // 60 篇高分非匹配（heading=Other，高 tf → BM25 高分，占满窗口）
+        for id in 0..60u64 {
+            idx.upsert("kb", &with_heading(id, "data data data data", "Other"))
+                .unwrap();
+        }
+        // 10 篇低分匹配（heading=Target，低 tf → 排在候选窗口之外）
+        for id in 60..70u64 {
+            idx.upsert("kb", &with_heading(id, "data", "Target"))
+                .unwrap();
+        }
+        idx.commit().unwrap();
+
+        let k = 5;
+        let f = Filter::HeadingPrefix(vec!["Target".into()]);
+        let hits = idx.search("data", Some(&f), None, k, false).unwrap();
+        assert_eq!(
+            hits.len(),
+            k,
+            "自适应过取应补足 k 个匹配（固定过取会返回 < k）"
+        );
+        assert!(
+            hits.iter().all(|h| h.id.chunk_id >= 60),
+            "命中应全为 Target 文档"
+        );
+    }
+
+    #[test]
+    fn text_side_time_filter_matches_vector_side() {
+        // M2 回归：时间过滤字段 time_start_ms/time_end_ms 此前只有 vector 侧 FieldSource 暴露，
+        // text 侧 get 返回 None → eval 恒 false → keyword 召回整支归零。补齐后从 media.time 取值。
+        use fastsearch_core::{AssetPointer, FieldValue, MediaRef, TimeSpan};
+        let mut idx = ram(TokenizerKind::Default);
+        let with_time = |id: u64, start: u64, end: u64| {
+            let mut c = chunk(
+                "a.pdf",
+                id,
+                ChunkKind::Paragraph,
+                "meeting notes",
+                id as u32,
+            );
+            c.media = Some(MediaRef {
+                asset: AssetPointer::Object {
+                    uri: "s3://b/k".into(),
+                },
+                media_type: Some("audio/mp3".into()),
+                time: Some(TimeSpan {
+                    start_ms: start,
+                    end_ms: end,
+                }),
+                region: None,
+                caption_source: None,
+                thumbnail: None,
+            });
+            c
+        };
+        idx.upsert("kb", &with_time(1, 1000, 2000)).unwrap();
+        idx.upsert("kb", &with_time(2, 5000, 6000)).unwrap();
+        // 无 time 的 chunk：time 过滤应不匹配（get→None→eval false）
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 3, ChunkKind::Paragraph, "meeting notes", 3),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        // time_start_ms >= 3000 → 仅 chunk 2
+        let hits = idx
+            .search(
+                "meeting",
+                Some(&Filter::Gte("time_start_ms".into(), FieldValue::Int(3000))),
+                None,
+                10,
+                false,
+            )
+            .unwrap();
+        let ids: Vec<u64> = hits.iter().map(|h| h.id.chunk_id).collect();
+        assert_eq!(ids, vec![2], "time 过滤应命中 chunk 2（且不再整支归零）");
+    }
+
+    #[test]
+    fn empty_and_translates_to_match_all() {
+        // M1 回归：客户端把"无过滤"序列化成 `{"and":[]}`。空 And core 语义恒真，翻译必须 match-all；
+        // 旧代码翻成空 BooleanQuery(EmptyScorer) → 整个检索归零。空 Or 恒假（两端一致，无需改）。
+        let mut idx = ram(TokenizerKind::Default);
+        for id in 1u64..=3 {
+            idx.upsert(
+                "kb",
+                &chunk("a.pdf", id, ChunkKind::Paragraph, "data here", id as u32),
+            )
+            .unwrap();
+        }
+        idx.commit().unwrap();
+        // And([]) → 全部命中
+        let all = idx
+            .search("data", Some(&Filter::And(vec![])), None, 10, false)
+            .unwrap();
+        assert_eq!(all.len(), 3, "空 And 应 match-all");
+        // Not(And([])) → 空 And 恒真、取反恒假 → 0 命中
+        let none = idx
+            .search(
+                "data",
+                Some(&Filter::Not(Box::new(Filter::And(vec![])))),
+                None,
+                10,
+                false,
+            )
+            .unwrap();
+        assert_eq!(none.len(), 0, "Not(空 And) 应匹配 0");
     }
 
     #[test]

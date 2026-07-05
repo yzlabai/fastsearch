@@ -44,6 +44,11 @@ fn field_as_u64(v: &FieldValue) -> Option<u64> {
 pub fn translate(filter: &Filter, f: &Fields) -> Box<dyn Query> {
     match filter {
         Filter::And(subs) => {
+            // 空 And = 恒真（core `Filter::eval` 语义），必须 match-all；Tantivy 空 `BooleanQuery`
+            // 是 `EmptyScorer`（匹配 0），作 Must 会让整个检索归零，违反"不可翻译→match-all"（M1）。
+            if subs.is_empty() {
+                return Box::new(AllQuery);
+            }
             let clauses = subs
                 .iter()
                 .map(|s| (Occur::Must, translate(s, f)))
@@ -174,6 +179,10 @@ fn exact_translate(filter: &Filter, f: &Fields) -> Option<Box<dyn Query>> {
             exact_range(field, val, f, |v| (Bound::Unbounded, Bound::Included(v)))
         }
         Filter::And(subs) => {
+            // 空 And 恒真 → 精确翻译 = AllQuery（使 `Not(And([]))` 的补集正确匹配 0）（M1）。
+            if subs.is_empty() {
+                return Some(Box::new(AllQuery));
+            }
             let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(subs.len());
             for s in subs {
                 clauses.push((Occur::Must, exact_translate(s, f)?));
@@ -241,6 +250,18 @@ impl FieldSource for StoredRow {
             "tenant" => self.tenant.clone().map(FieldValue::Str),
             "page" => Some(FieldValue::Int(self.page as i64)),
             "section_id" => Some(FieldValue::Int(self.section_id as i64)),
+            // 时间来自 media.time（STORED），与 vector 侧 `VecMeta::get` 同构——否则时间过滤
+            // 在 text 侧恒 None → eval 恒 false → keyword 召回整支归零（M1/不变量 #5：两端同步）。
+            "time_start_ms" => self
+                .media
+                .as_ref()
+                .and_then(|m| m.time)
+                .map(|t| FieldValue::Int(t.start_ms as i64)),
+            "time_end_ms" => self
+                .media
+                .as_ref()
+                .and_then(|m| m.time)
+                .map(|t| FieldValue::Int(t.end_ms as i64)),
             _ => None,
         }
     }
