@@ -126,6 +126,11 @@ async fn main() -> anyhow::Result<()> {
     // 打开数据目录下的派生索引（落盘恢复）：text + vector.bin + checkpoint.json。
     let (mut engine, start_lsn) = Engine::open_with(&data, cfg, backend)?;
 
+    // 嵌入后端配置（FASTSEARCH_EMBEDDER=ollama|openai；默认 hash→不嵌入）。**提前读取**：PG 表的
+    // `embedding halfvec(dim)` 列维度须与 embedder 输出维度一致（M18），故建 PgConfig 前先拿到 dim。
+    let ecfg = fastsearch_embed::EmbedderConfig::from_env();
+    let embed_dim = ecfg.dim;
+
     // pgvector 直查档（B6）：向量召回改在 PG 跑 ANN（需 DATABASE_URL）。引擎侧向量后端仍建
     // （Brute，空置不用）。注意：embedding 须已在 PG（外部嵌入管线写入；引擎写穿为下一迭代）。
     if matches!(
@@ -134,7 +139,10 @@ async fn main() -> anyhow::Result<()> {
     ) {
         match std::env::var("DATABASE_URL") {
             Ok(url) => {
-                let pg = fastsearch_pg::PgStore::connect(fastsearch_pg::PgConfig::new(url)).await?;
+                let pg = fastsearch_pg::PgStore::connect(
+                    fastsearch_pg::PgConfig::new(url).with_vector_dim(embed_dim),
+                )
+                .await?;
                 engine.set_pg_vector(std::sync::Arc::new(pg));
                 eprintln!("vector backend: pgvector 直查（ANN 在 PG，需 embedding 已入 PG）");
             }
@@ -145,7 +153,11 @@ async fn main() -> anyhow::Result<()> {
     // 媒资真源（MM6-inline）：媒资网关 `/v1/asset` 的 Inline 路径从 PG `media_bytes` 按需取字节。
     // 与向量后端无关——只要有 PG 真源（DATABASE_URL）即开启（字节是真源、引擎派生层不持）。
     if let Ok(url) = std::env::var("DATABASE_URL") {
-        match fastsearch_pg::PgStore::connect(fastsearch_pg::PgConfig::new(url.clone())).await {
+        match fastsearch_pg::PgStore::connect(
+            fastsearch_pg::PgConfig::new(url.clone()).with_vector_dim(embed_dim),
+        )
+        .await
+        {
             Ok(pg) => {
                 // 幂等建表 + vector 扩展 + publication（并发 boot 安全：advisory lock 串行化）
                 if let Err(e) = pg.ensure_schema().await {
@@ -195,8 +207,6 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("object store on: local S3-compatible directory");
     }
 
-    // 嵌入后端配置（FASTSEARCH_EMBEDDER=ollama|openai；默认 hash→不嵌入）。
-    let ecfg = fastsearch_embed::EmbedderConfig::from_env();
     let embed_on = matches!(ecfg.kind, fastsearch_embed::EmbedderKind::Http(_));
     if embed_on {
         // CDC 落地路径用引擎自身的 embedder 嵌入 passage。
@@ -229,9 +239,10 @@ async fn main() -> anyhow::Result<()> {
                 if start_lsn == fastsearch_sync::Lsn(0) {
                     match created {
                         Some(consistent) => {
-                            let store =
-                                fastsearch_pg::PgStore::connect(fastsearch_pg::PgConfig::new(url))
-                                    .await?;
+                            let store = fastsearch_pg::PgStore::connect(
+                                fastsearch_pg::PgConfig::new(url).with_vector_dim(embed_dim),
+                            )
+                            .await?;
                             let rows = store.fetch_all_chunks().await?;
                             if !rows.is_empty() {
                                 let n = engine.bootstrap_snapshot(&rows, &data, consistent)?;

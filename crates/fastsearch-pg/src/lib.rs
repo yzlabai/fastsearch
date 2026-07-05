@@ -35,6 +35,13 @@ impl PgConfig {
             vector_type: VectorType::HalfVec,
         }
     }
+
+    /// 覆盖向量维度（`embedding` 列类型 `halfvec(dim)`）。**须与运行时 embedder 输出维度一致**，
+    /// 否则 `set_embedding` 写穿每行都因 pgvector 维度不符报错、embedding 列永空（M18）。
+    pub fn with_vector_dim(mut self, dim: usize) -> Self {
+        self.vector_dim = dim;
+        self
+    }
 }
 
 /// `ensure_schema` 的事务级 advisory lock key（固定常量，全副本同值才能互斥）。任意 i64；
@@ -271,7 +278,8 @@ impl PgStore {
             return Ok(vec![]);
         }
         let limit = k.saturating_mul(over_fetch.max(1)).max(k);
-        let (sql, sparams) = pgvector_search_sql(&self.cfg.table, limit, acl, filter);
+        let (sql, sparams) =
+            pgvector_search_sql(&self.cfg.table, self.cfg.vector_type, limit, acl, filter);
         // filter-aware：iterative scan + 提高 ef_search（会话级，对本直查连接生效）。
         let client = self.client.lock().await;
         client
@@ -501,6 +509,19 @@ pub async fn fetch_chunk(
 mod tests {
     use super::*;
     use fastsearch_core::{BBox, ChunkKind};
+
+    #[test]
+    fn pg_config_with_vector_dim_threads_into_ddl() {
+        // M18：维度须能从 embedder 联动进 `embedding halfvec(dim)` 列，防硬编码 384 与真实模型维度
+        // 不符（否则 set_embedding 逐行维度不匹配、embedding 列永空）。
+        let cfg = PgConfig::new("postgres://x").with_vector_dim(768);
+        assert_eq!(cfg.vector_dim, 768);
+        let ddl = sql::ddl(&cfg.table, cfg.vector_type, cfg.vector_dim).join("\n");
+        assert!(
+            ddl.contains("embedding halfvec(768)"),
+            "列维度应联动: {ddl}"
+        );
+    }
 
     fn sample(doc: &str, id: u64) -> Chunk {
         Chunk {
@@ -841,7 +862,7 @@ mod tests {
             .client
             .lock()
             .await
-            .batch_execute(&sql::ann_index_sql("fastsearch_vec_it"))
+            .batch_execute(&sql::ann_index_sql("fastsearch_vec_it", VectorType::Vector))
             .await
             .ok();
 
