@@ -78,13 +78,20 @@ def test_hit_to_llama_node():
 
 
 class _FakeClient:
-    """记录 search 调用参数的假 client。"""
+    """记录 search 调用参数的假 client。
+
+    **镜像真实 `FastsearchClient.search` 的签名（无 `**kw` 兜底）**：若 retriever 透传了真实
+    client 不接受的参数会立即 TypeError，测试即能抓住——这正是 H6 的教训（旧 stub 用 `**kw`
+    吞掉 `highlight`，遮蔽了真实 client 缺该参数导致 `retriever.invoke()` 必崩的 bug）。
+    """
 
     def __init__(self, hits):
         self.hits = hits
         self.calls = []
 
-    def search(self, collection, query, *, mode, top_k, filter, **kw):
+    def search(
+        self, collection, query, *, mode="hybrid", top_k=20, filter=None, vector=None, highlight=False
+    ):
         self.calls.append(
             {
                 "collection": collection,
@@ -92,7 +99,8 @@ class _FakeClient:
                 "mode": mode,
                 "top_k": top_k,
                 "filter": filter,
-                "kw": kw,
+                "vector": vector,
+                "highlight": highlight,
             }
         )
         return self.hits
@@ -105,6 +113,8 @@ def test_retriever_invoke_and_param_passthrough():
     )
     docs = r.invoke("毛利率")
     assert len(docs) == 2
+    # H6 回归：真实 client 签名下 invoke 不再 TypeError，且 highlight 命中进 page_content
+    assert docs[0].page_content == "本季度<b>毛利率</b>提升至 42%"
     # get_relevant_documents 是 invoke 的别名，结果一致
     assert r.get_relevant_documents("毛利率")[0].metadata["citation_id"] == "kb:rep.pdf:3"
     # 透传：collection/mode/top_k/filter/highlight 原样进入 client.search
@@ -113,7 +123,28 @@ def test_retriever_invoke_and_param_passthrough():
     assert call["mode"] == "hybrid"
     assert call["top_k"] == 8
     assert call["filter"] == {"kind": "table"}
-    assert call["kw"]["highlight"] is True
+    assert call["highlight"] is True
+
+
+def test_retriever_kwargs_bind_real_client_signature():
+    """H6 直接回归（不依赖 live server）：retriever 透传给 client.search 的参数必须能绑定
+    **真实** FastsearchClient.search 的签名。旧代码 highlight 无法绑定 → `sig.bind(...)`
+    抛 TypeError，即 `retriever.invoke()` 用真实 client 必崩。"""
+    import inspect
+
+    from fastsearch_client import FastsearchClient
+
+    sig = inspect.signature(FastsearchClient.search)
+    # 模拟 get_relevant_documents 的调用实参（self, collection, query, **kw）
+    sig.bind(
+        None,  # self
+        "kb",  # collection
+        "毛利率",  # query
+        mode="hybrid",
+        top_k=8,
+        filter=None,
+        highlight=True,
+    )  # 不抛 TypeError 即通过
 
 
 def main():
@@ -122,6 +153,7 @@ def main():
         test_hits_to_documents,
         test_hit_to_llama_node,
         test_retriever_invoke_and_param_passthrough,
+        test_retriever_kwargs_bind_real_client_signature,
     ]
     for t in tests:
         t()

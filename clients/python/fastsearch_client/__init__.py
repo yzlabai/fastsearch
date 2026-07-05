@@ -80,9 +80,11 @@ class FastsearchClient:
         top_k: int = 20,
         filter: Optional[dict] = None,
         vector: Optional[list[float]] = None,
+        highlight: bool = False,
     ) -> list[dict]:
         """检索。返回命中列表，每条含 citation_id/score/page/bbox/heading_path/...
 
+        `highlight=True` 让服务端回高亮片段（进入命中的 `highlight` 字段，供 RAG 取片段）。
         注：当前 collection 由服务端单一引擎承载；保留参数以对齐多集合演进。
         """
         body: dict = {"query": query, "mode": mode, "top_k": top_k}
@@ -90,6 +92,8 @@ class FastsearchClient:
             body["filter"] = filter
         if vector is not None:
             body["vector"] = vector
+        if highlight:
+            body["highlight"] = True
         out = self._post("/v1/search", body)
         return out.get("hits", [])
 
