@@ -118,14 +118,20 @@ pub async fn advance_slot(cfg: &ReplicationConfig, lsn: Lsn) -> Result<()> {
     Ok(())
 }
 
+/// 单批最多解码的变更数（`upto_nchanges`）。PG 会在到达此数后于**事务边界**停止（不会切断事务，
+/// 故崩溃安全水位仍落在完整事务上）。防积压后首次拉取把全部待处理变更一次性载入内存（M16）；
+/// 未消费的余量下一拍继续（slot 不推进则重取，peek/get 皆安全）。
+const MAX_CHANGES_PER_BATCH: i64 = 10_000;
+
 /// 用逻辑解码函数 `func`（get 或 peek）取变更并解码 + 映射成有序 `ChangeEvent`。
-/// `func` 为受控字面量（非用户输入）；slot/publication 单引号转义。
+/// `func` 为受控字面量（非用户输入）；slot/publication 单引号转义；批量上限为常量内插。
 async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<ChangeEvent>, Lsn)> {
     let client = connect(&cfg.url).await?;
     let sql = format!(
         "SELECT lsn::text, data FROM {func}(\
-         '{slot}', NULL, NULL, 'proto_version', '1', 'publication_names', '{pubn}')",
+         '{slot}', NULL, {limit}, 'proto_version', '1', 'publication_names', '{pubn}')",
         slot = esc(&cfg.slot),
+        limit = MAX_CHANGES_PER_BATCH,
         pubn = esc(&cfg.publication),
     );
     let rows = client.query(&sql, &[]).await.context(func.to_string())?;

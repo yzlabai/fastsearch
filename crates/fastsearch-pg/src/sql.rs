@@ -279,6 +279,10 @@ pub fn ann_index_sql(table: &str) -> String {
 }
 
 /// 列顺序（写入 + 读取共用）。
+/// Publication 列清单（发布到逻辑复制流的源列）。**刻意不含 `media_bytes`**（M16）：inline 媒资
+/// 字节（可达 20MB/张）是 PG 真源、网关按需 `fetch_media_bytes` 直查，复制流只搬指针（`media` JSON）。
+/// 若把 bytea 放进列清单，字节会整个走 WAL 逻辑解码进内存（积压时 OOM、带宽白放大），与"CDC 不搬
+/// inline 字节"（MM2c-bytes §4.2）矛盾。派生索引本就不持字节（sync `row_to_chunk` 置 `media_bytes: None`）。
 pub const COLUMNS: &[&str] = &[
     "collection",
     "doc_id",
@@ -292,7 +296,6 @@ pub const COLUMNS: &[&str] = &[
     "char_len",
     "modality",
     "media",
-    "media_bytes",
     "image_vector_status",
     "time_start_ms",
     "time_end_ms",
