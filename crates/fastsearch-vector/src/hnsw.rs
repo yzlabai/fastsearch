@@ -253,8 +253,15 @@ impl HnswVectorIndex {
         let snap: HnswSnapshot = serde_json::from_slice(&bytes)?;
         let mut idx = Self::new(snap.params);
         for e in snap.entries {
+            let mut meta = e.meta;
+            // M4：旧快照无 modality 字段 → serde default 为 ""。由 kind 回填（同 MemVectorIndex::load）。
+            if meta.modality.is_empty() {
+                meta.modality = fastsearch_core::Modality::of_kind_str(&meta.kind)
+                    .as_str()
+                    .to_string();
+            }
             // 已是归一化向量；upsert 会再次归一化（幂等：归一化向量再归一化不变）。
-            idx.upsert(e.gid, e.vector, e.meta)?;
+            idx.upsert(e.gid, e.vector, meta)?;
         }
         Ok(idx)
     }

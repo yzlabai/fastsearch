@@ -430,13 +430,21 @@ impl MemVectorIndex {
             // 由存储的归一化向量重建（code/l1 不落盘，省盘且与 upsert 一致）。
             let code = binary::pack_signs(&e.vector);
             let l1 = binary::l1_norm(&e.vector);
+            let mut meta = e.meta;
+            // M4：旧快照无 modality 字段 → serde default 为 ""，`Eq("modality","text")` 全不匹配。
+            // 由 kind 回填（与 text 侧动态派生同口径），使旧快照 load 后 modality 过滤仍正确。
+            if meta.modality.is_empty() {
+                meta.modality = fastsearch_core::Modality::of_kind_str(&meta.kind)
+                    .as_str()
+                    .to_string();
+            }
             entries.insert(
                 e.gid,
                 Entry {
                     vector: e.vector,
                     code,
                     l1,
-                    meta: e.meta,
+                    meta,
                 },
             );
         }
@@ -622,6 +630,30 @@ mod tests {
             time: None,
             media: None,
         }
+    }
+
+    #[test]
+    fn legacy_snapshot_empty_modality_backfilled_from_kind() {
+        // M4 回归：旧快照 modality 缺省为 ""（serde default），load 应由 kind 回填（paragraph→text），
+        // 否则 Eq("modality","text") 对旧数据全不匹配。
+        use fastsearch_core::{FieldValue, Filter};
+        let mut legacy = meta("a.pdf", 1, "paragraph", 1, vec!["public"]);
+        legacy.modality = String::new(); // 模拟旧快照无 modality 字段
+        let mut v = MemVectorIndex::new();
+        v.upsert(gid("a.pdf", 1), vec![1.0, 0.0], legacy).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vec.bin");
+        v.save(&path).unwrap();
+        let loaded = MemVectorIndex::load(&path).unwrap();
+
+        let q = vec![1.0, 0.0];
+        let f = Filter::Eq("modality".into(), FieldValue::Str("text".into()));
+        assert_eq!(
+            loaded.search(&q, 10, Some(&f), None).unwrap().len(),
+            1,
+            "回填后 modality=text 过滤应命中旧快照条目"
+        );
     }
 
     #[test]
