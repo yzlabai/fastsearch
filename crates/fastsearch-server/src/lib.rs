@@ -376,8 +376,13 @@ pub struct ServerState {
     /// **集合注册表**（咨询性、内存态、可重建）：记录集合期望的 `dim`/`distance`，供 ingest 维度
     /// 校验 + introspection。**不是真源、不跨副本共享**（多副本各自一份）；向量后端是**服务端级**
     /// 选择（`FASTSEARCH_VECTOR_BACKEND` env），不在此处按集合实例化。见 [docs/benchmark-strategy.md]。
-    collections: Arc<Mutex<HashMap<String, CollectionSpec>>>,
+    // 键含所有者 tenant：集合注册表按租户隔离，跨租户不可覆盖/读取/枚举（M22）。tenant=None
+    // （无租户/管理 key）自成一个作用域。单租户部署（所有 key 同 tenant/无 tenant）行为不变。
+    collections: Arc<Mutex<CollectionRegistry>>,
 }
+
+/// 集合注册表：`(所有者 tenant, 集合名) → 配置`。按租户隔离（M22）。
+type CollectionRegistry = HashMap<(Option<String>, String), CollectionSpec>;
 
 /// 集合的咨询性配置（注册表项）。`dim` 设了则 ingest 校验预计算向量维度一致；`distance` 仅记录。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1891,7 +1896,7 @@ async fn index(
         .collections
         .lock()
         .await
-        .get(&body.collection)
+        .get(&(principal.tenant.clone(), body.collection.clone()))
         .and_then(|c| c.dim)
     {
         for ic in &body.chunks {
@@ -2183,7 +2188,7 @@ async fn create_collection(
     Json(body): Json<CreateCollectionBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    require_principal(&s, &headers)?;
+    let principal = require_principal(&s, &headers)?;
     if body.name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".into()));
     }
@@ -2191,10 +2196,11 @@ async fn create_collection(
         dim: body.dim,
         distance: body.distance.clone(),
     };
+    // 按 (owner_tenant, name) 分桶：不同租户的同名集合互不覆盖（M22）。
     s.collections
         .lock()
         .await
-        .insert(body.name.clone(), spec.clone());
+        .insert((principal.tenant.clone(), body.name.clone()), spec.clone());
     let info = server_vector_info(&s).await;
     Ok(Json(json!({
         "name": body.name,
@@ -2211,8 +2217,14 @@ async fn get_collection(
     Path(name): Path<String>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    require_principal(&s, &headers)?;
-    let spec = s.collections.lock().await.get(&name).cloned();
+    let principal = require_principal(&s, &headers)?;
+    // 只查本租户名下的集合：他租户的同名集合视为未注册（404，不暴露存在性）（M22）。
+    let spec = s
+        .collections
+        .lock()
+        .await
+        .get(&(principal.tenant.clone(), name.clone()))
+        .cloned();
     let Some(spec) = spec else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -2231,8 +2243,16 @@ async fn get_collection(
 /// 列出已注册集合名 + 服务端实际向量配置。
 async fn list_collections(State(s): State<ServerState>, headers: HeaderMap) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    require_principal(&s, &headers)?;
-    let mut names: Vec<String> = s.collections.lock().await.keys().cloned().collect();
+    let principal = require_principal(&s, &headers)?;
+    // 只列本租户名下的集合，不枚举他租户的名字（M22）。
+    let mut names: Vec<String> = s
+        .collections
+        .lock()
+        .await
+        .iter()
+        .filter(|((t, _), _)| t == &principal.tenant)
+        .map(|((_, n), _)| n.clone())
+        .collect();
     names.sort();
     let info = server_vector_info(&s).await;
     Ok(Json(json!({ "collections": names, "server": info })))
@@ -3731,6 +3751,91 @@ mod tests {
             .unwrap();
         let v = body_json(resp).await;
         assert_eq!(v["collections"], json!(["kb"]));
+    }
+
+    // M22：集合注册表按租户隔离——他租户不可覆盖/读取/枚举本租户的集合。
+    #[tokio::test]
+    async fn collections_tenant_isolated() {
+        let mut ks = HashMap::new();
+        ks.insert(
+            "key-a".to_string(),
+            Principal {
+                tenant: Some("tenant-a".into()),
+                tags: vec![],
+            },
+        );
+        ks.insert(
+            "key-b".to_string(),
+            Principal {
+                tenant: Some("tenant-b".into()),
+                tags: vec![],
+            },
+        );
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, ks));
+        let post = |key: &'static str, body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/collections")
+                .header("content-type", "application/json")
+                .header("x-api-key", key)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let get = |key: &'static str, uri: &'static str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap()
+        };
+        // A 注册 kb dim=3；B 注册同名 kb dim=8 —— 不应覆盖 A 的
+        assert_eq!(
+            app.clone()
+                .oneshot(post("key-a", r#"{"name":"kb","dim":3}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(post("key-b", r#"{"name":"kb","dim":8}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // A 读回仍是自己的 dim=3（未被 B 覆盖）
+        let ra = app
+            .clone()
+            .oneshot(get("key-a", "/v1/collections/kb"))
+            .await
+            .unwrap();
+        assert_eq!(body_json(ra).await["dim"], 3, "A 的集合维度不应被 B 覆盖");
+        // B 读回自己的 dim=8
+        let rb = app
+            .clone()
+            .oneshot(get("key-b", "/v1/collections/kb"))
+            .await
+            .unwrap();
+        assert_eq!(body_json(rb).await["dim"], 8, "B 读到自己的集合");
+        // B 注册独有集合后，A 的列表不应枚举到它
+        app.clone()
+            .oneshot(post("key-b", r#"{"name":"b-only","dim":5}"#))
+            .await
+            .unwrap();
+        let rl = app
+            .clone()
+            .oneshot(get("key-a", "/v1/collections"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(rl).await["collections"],
+            json!(["kb"]),
+            "A 只应看到自己的集合，不枚举 B 的 b-only"
+        );
     }
 
     // 注册 dim 后，ingest 携带不等维预计算向量 → 400（benchmark 误配早失败）。
