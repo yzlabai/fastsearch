@@ -1,7 +1,6 @@
 # 构建产物（本地 target/ 可达数十 GB）——绝不进 build context。
-target/
+# `**/target/` 已覆盖根 target/ 与 vendor/docparse/target/ 等各级。
 **/target/
-vendor/docparse/target/
 
 # 依赖/构建缓存
 **/node_modules/

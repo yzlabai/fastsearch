@@ -220,6 +220,16 @@ impl VecMeta {
             media: self.media.clone(),
         }
     }
+
+    /// 旧快照 `modality` 缺省为 ""（serde default）→ 由 `kind` 回填（与 text 侧动态派生同口径）。
+    /// `MemVectorIndex::load` / `HnswVectorIndex::load` 都在重建条目时调用（M4，避免两处重复）。
+    pub(crate) fn backfill_modality(&mut self) {
+        if self.modality.is_empty() {
+            self.modality = fastsearch_core::Modality::of_kind_str(&self.kind)
+                .as_str()
+                .to_string();
+        }
+    }
 }
 
 impl FieldSource for VecMeta {
@@ -431,13 +441,7 @@ impl MemVectorIndex {
             let code = binary::pack_signs(&e.vector);
             let l1 = binary::l1_norm(&e.vector);
             let mut meta = e.meta;
-            // M4：旧快照无 modality 字段 → serde default 为 ""，`Eq("modality","text")` 全不匹配。
-            // 由 kind 回填（与 text 侧动态派生同口径），使旧快照 load 后 modality 过滤仍正确。
-            if meta.modality.is_empty() {
-                meta.modality = fastsearch_core::Modality::of_kind_str(&meta.kind)
-                    .as_str()
-                    .to_string();
-            }
+            meta.backfill_modality(); // M4：旧快照 modality 缺省 "" → 由 kind 回填。
             entries.insert(
                 e.gid,
                 Entry {
