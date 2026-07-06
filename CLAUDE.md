@@ -65,10 +65,10 @@ docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(
 |---|---|---|
 | `core` | 纯逻辑：文档模型 / 查询·过滤 AST / 融合(RRF·归一化·加权) / 引用 / **ACL** | 无后端依赖；`Filter::eval`、`AclFilter::visible`、`fuse` 是确定性的（同分按 `GlobalId` tie-break） |
 | `text` | Tantivy BM25 + 分词(jieba/default) + 过滤 + 高亮 | 见下"预过滤策略"；`text` 字段 STORED 供高亮/rerank |
-| `vector` | 向量后端 **trait** + `MemVectorIndex`(暴力余弦) | **filter-aware 真预过滤**（打分前过滤，超 pgvector 后过滤坑）；HNSW/量化待迭代 |
+| `vector` | 向量后端 **trait** + `MemVectorIndex`(暴力余弦) + HNSW + 二值/RaBitQ 量化 | **filter-aware 真预过滤**（打分前过滤，超 pgvector 后过滤坑）；HNSW 图内 filtered-traversal + 墓碑压实 + 暴力精确安全网(H5) 已落地，见 [spec 15](docs/specs/15-vector.md) |
 | `embed` / `rerank` | `Embedder` / `Reranker` trait + 确定性基线 + 可配置 HTTP 嵌入后端 | HashEmbedder/LexicalOverlap 非语义，仅离线/CI/fallback；**真语义嵌入经 `HttpEmbedder`（Ollama / OpenAI 兼容）接入，不做进程内模型推理**；rerank：RAG 主路径默认不上神经 rerank（答案层 LLM 兜底），可选 LTR 供无-LLM 入口 |
 | `pg` | Postgres 真源：DDL + Chunk↔行映射 + doc 级替换写路径 | DDL 在 `sql.rs`，**只用 pgvector + 逻辑复制**；集成测试 env-gated |
-| `sync` | CDC apply 编排：幂等 + LSN 水位续传 + 替换语义 | `IndexSink` trait；pgoutput 线缆层待迭代（v1 只做正确性核心） |
+| `sync` | CDC apply 编排：幂等 + LSN 水位续传 + 替换语义 | `IndexSink` trait；pgoutput 解码器已落地（UnchangedToast→真源重取 H3、批量上限 M16）；仅 `START_REPLICATION` 流式为后续（现走轮询式 `pg_logical_slot_get`，正确、崩溃安全） |
 | `engine` | 整合 text+vector+rerank+sync sink → 端到端排序管线 | `run()` 是管线主体；`search`/`search_with_facets`；实现 `sync::IndexSink`（适配器，避免 text 反依赖 sync） |
 | `eval` | 相关性评测：nDCG/recall/MRR + `assert_no_regression`(CI 门禁) | 纯函数 |
 | `server` | REST(axum) + API-Key 认证 + **ACL 服务端注入不可绕过** + /metrics | `principal_from_headers`→`acl_for`→`engine.search(req, Some(acl))`；客户端无法传/绕过 ACL |
