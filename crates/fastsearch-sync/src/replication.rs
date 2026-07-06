@@ -136,25 +136,37 @@ async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<Chang
     );
     let rows = client.query(&sql, &[]).await.context(func.to_string())?;
 
-    let mut relations: HashMap<u32, Relation> = HashMap::new();
-    let mut out = Vec::new();
+    // 先收 (lsn, bytes) 并算 slot 高水位（含 Begin/Commit 等非数据行）。LSN 解析保持严格：
+    // 坏 LSN 是协议级错误（PG 几乎不可能返回），应显式失败而非静默跳过。
     let mut max_lsn = Lsn(0);
+    let mut items: Vec<(Lsn, Vec<u8>)> = Vec::with_capacity(rows.len());
     for row in &rows {
         let lsn_text: String = row.get(0);
-        let data: Vec<u8> = row.get(1);
         let lsn = Lsn(parse_pg_lsn(&lsn_text)?);
-        max_lsn = max_lsn.max(lsn); // 含 Begin/Commit 等非数据行：slot 推进位置
-        let pg = pgoutput::parse_message(&data)?;
-        match map(&mut relations, pg)? {
-            Some(Mapped::Ready(change)) => out.push(ChangeEvent { change, lsn }),
-            Some(Mapped::Refetch {
+        max_lsn = max_lsn.max(lsn);
+        items.push((lsn, row.get(1)));
+    }
+
+    // 逐条解码 + 映射，对**确定性毒丸**（parse/map 失败）容错跳过（R4.1b，见 `decode_batch_lenient`）。
+    let (mapped, dead) = decode_batch_lenient(&items);
+    if dead > 0 {
+        eprintln!("cdc: 本批共跳过 {dead} 条毒丸变更（slot 仍推进，避免单条卡死整个 CDC）");
+    }
+
+    let mut out = Vec::with_capacity(mapped.len());
+    for (lsn, m) in mapped {
+        match m {
+            Mapped::Ready(change) => out.push(ChangeEvent { change, lsn }),
+            Mapped::Refetch {
                 table,
                 collection,
                 doc_id,
                 chunk_id,
-            }) => {
+            } => {
                 // 不完整 WAL（UnchangedToast）→ 从 PG 真源重取整行（H3）。行已被删（后续 Delete 事件
                 // 会清）→ 跳过，不 push（幂等安全：重取当前真源，索引收敛到真值）。
+                // refetch 错误**不跳过而是传播**：可能是瞬时（连接抖动），传播使整批重试（peek 未
+                // advance slot，不丢数据）；确定性毒丸只在 decode/map 阶段（那里同字节必同错、重试无益）。
                 if let Some((coll, chunk)) =
                     fastsearch_pg::fetch_chunk(&client, &table, &collection, &doc_id, chunk_id)
                         .await
@@ -169,10 +181,33 @@ async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<Chang
                     });
                 }
             }
-            None => {}
         }
     }
     Ok((out, max_lsn))
+}
+
+/// 逐条解码（parse）+ 映射（map），对**确定性毒丸容错**：单条 parse/map 失败（同字节必同错、
+/// 重试无益）→ 计入死信、跳过，不阻塞整批、不 poison CDC（R4.1b）。返回 (映射结果, 死信数)；
+/// Refetch 标记留调用方用 PG 解析。跳过一条 = 该 chunk 的派生索引可能漂移，靠"从真源重建"自愈
+/// （PG 是真源、索引派生可重建，不变量 #2）。**不含 refetch**——那是 PG I/O、可能瞬时，见调用处。
+fn decode_batch_lenient(items: &[(Lsn, Vec<u8>)]) -> (Vec<(Lsn, Mapped)>, usize) {
+    let mut relations: HashMap<u32, Relation> = HashMap::new();
+    let mut out = Vec::new();
+    let mut dead = 0usize;
+    for (lsn, data) in items {
+        match pgoutput::parse_message(data).and_then(|pg| map(&mut relations, pg)) {
+            Ok(Some(m)) => out.push((*lsn, m)),
+            Ok(None) => {}
+            Err(e) => {
+                dead += 1;
+                eprintln!(
+                    "cdc: 跳过毒丸变更 @ {lsn:?}: {e}（确定性解码/映射失败，该变更未应用；\
+                     派生索引可能漂移，持续出现请从真源重建索引）"
+                );
+            }
+        }
+    }
+    (out, dead)
 }
 
 /// map 结果：可直接应用的 Change，或（Insert/Update 遇 UnchangedToast 不完整 WAL）需从真源重取的标记。
@@ -406,5 +441,29 @@ mod tests {
     #[test]
     fn esc_quotes() {
         assert_eq!(esc("a'b"), "a''b");
+    }
+
+    #[test]
+    fn decode_batch_skips_deterministic_poison() {
+        // R4.1b：单条确定性解码/映射失败（毒丸）应被跳过并计入死信，不阻塞整批、不 poison CDC。
+        // 合法 Begin：'B' + final_lsn(u64) + commit_ts(i64) + xid(u32) → map 为 None（非毒丸、非变更）。
+        let mut begin = vec![b'B'];
+        begin.extend_from_slice(&0x1234u64.to_be_bytes());
+        begin.extend_from_slice(&700i64.to_be_bytes());
+        begin.extend_from_slice(&42u32.to_be_bytes());
+        // 截断的 Begin（只有 tag，读 u64 越界）→ parse 错 → 毒丸。
+        let truncated = vec![b'B'];
+
+        let items = vec![
+            (Lsn(1), begin),
+            (Lsn(2), truncated.clone()),
+            (Lsn(3), truncated),
+        ];
+        let (out, dead) = decode_batch_lenient(&items);
+        assert_eq!(dead, 2, "两条毒丸应计入死信并跳过");
+        assert!(
+            out.is_empty(),
+            "合法 Begin→None、毒丸被跳过 → 无 Mapped 结果"
+        );
     }
 }
