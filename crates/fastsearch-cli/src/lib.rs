@@ -26,10 +26,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Client {
     base: String,
     key: String,
+    agent: ureq::Agent,
 }
 
 impl Client {
     /// 解析连接配置：显式 > env（`FASTSEARCH_SERVER`/`FASTSEARCH_KEY`）> 默认 localhost:8642。
+    /// 请求超时（连接/读/写）默认 30s，`FASTSEARCH_TIMEOUT_SECS` 可覆盖——否则 server 接受连接后
+    /// 挂起会让 CLI 永久阻塞（ureq 默认无读超时）（M26）。
     pub fn new(server: Option<String>, key: Option<String>) -> Self {
         let base = server
             .or_else(|| std::env::var("FASTSEARCH_SERVER").ok())
@@ -37,16 +40,27 @@ impl Client {
         let key = key
             .or_else(|| std::env::var("FASTSEARCH_KEY").ok())
             .unwrap_or_default();
+        let timeout_secs: u64 = std::env::var("FASTSEARCH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(30);
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build();
         Client {
             base: base.trim_end_matches('/').to_string(),
             key,
+            agent,
         }
     }
 
     /// 底层 POST：返回**类型化错误**，让 `post_retry` 精确区分"状态码拒绝"（不重试）vs
     /// "传输失败"（可重试）——不靠脆弱的错误字符串匹配。
     fn post_raw<B: Serialize>(&self, url: &str, body: &B) -> std::result::Result<Value, PostError> {
-        match ureq::post(url)
+        match self
+            .agent
+            .post(url)
             .set("authorization", &format!("Bearer {}", self.key))
             .send_json(body)
         {
@@ -67,7 +81,9 @@ impl Client {
 
     fn post_multipart(&self, path: &str, boundary: &str, body: Vec<u8>) -> Result<Value> {
         let url = format!("{}{}", self.base, path);
-        match ureq::post(&url)
+        match self
+            .agent
+            .post(&url)
             .set("authorization", &format!("Bearer {}", self.key))
             .set(
                 "content-type",
