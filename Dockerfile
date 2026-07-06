@@ -5,11 +5,12 @@
 # ---- 构建阶段 ----
 FROM rust:1.88-slim AS builder
 WORKDIR /build
-# 先拷 manifest 预热依赖缓存（源码改动不必重编依赖）。
+# 注：当前**无独立依赖预热层**——manifest 与源码一起 COPY，任何源码改动都会重编依赖。
+# 若需依赖缓存加速，改用 cargo-chef（recipe.json 层）或 dummy-src 预构建（下一迭代）。
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY vendor ./vendor
-# 仅构建 server 二进制（release，lto=thin）。
+# 仅构建 server 二进制（release，lto=thin）。.dockerignore 已排除 target/ 等，避免巨大 build context。
 RUN cargo build --release -p fastsearch-server --bin fastsearch-server
 
 # ---- 运行时阶段 ----
