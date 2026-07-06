@@ -92,11 +92,6 @@ impl Filter {
             }
         }
     }
-
-    /// 把强制 ACL 过滤 AND 进当前过滤（服务端注入用，客户端不可绕过）。
-    pub fn and_acl(self, acl_filter: Filter) -> Filter {
-        Filter::And(vec![acl_filter, self])
-    }
 }
 
 fn cmp(row: &dyn FieldSource, field: &str, v: &FieldValue) -> Option<std::cmp::Ordering> {

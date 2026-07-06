@@ -907,6 +907,19 @@ mod tests {
     }
 
     #[test]
+    fn search_k_zero_returns_empty() {
+        // 低危回归：k=0 应返回空（M9 的 build-all→truncate(k) 已结构性修正；旧代码先 push 后判长度返 1）。
+        let mut idx = ram(TokenizerKind::Default);
+        idx.upsert(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "data here", 1),
+        )
+        .unwrap();
+        idx.commit().unwrap();
+        assert!(idx.search("data", None, None, 0, false).unwrap().is_empty());
+    }
+
+    #[test]
     fn empty_and_translates_to_match_all() {
         // M1 回归：客户端把"无过滤"序列化成 `{"and":[]}`。空 And core 语义恒真，翻译必须 match-all；
         // 旧代码翻成空 BooleanQuery(EmptyScorer) → 整个检索归零。空 Or 恒假（两端一致，无需改）。

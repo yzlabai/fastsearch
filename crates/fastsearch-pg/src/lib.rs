@@ -223,6 +223,8 @@ impl PgStore {
         embedding: &[f32],
         model: &str,
     ) -> Result<u64> {
+        // 非有限值（NaN/inf，如嵌入服务异常返回）会被 pgvector 以晦涩错误拒收——提前给清晰错误。
+        ensure_finite(embedding)?;
         let sql = format!(
             "UPDATE {} SET embedding = $1::text::vector, embed_model = $5, updated_at = now() \
              WHERE collection = $2 AND doc_id = $3 AND chunk_id = $4 \
@@ -277,6 +279,7 @@ impl PgStore {
         if k == 0 {
             return Ok(vec![]);
         }
+        ensure_finite(query)?; // NaN/inf 查询向量提前拦下（清晰错误，避免 pgvector 晦涩拒收）。
         let limit = k.saturating_mul(over_fetch.max(1)).max(k);
         let (sql, sparams) =
             pgvector_search_sql(&self.cfg.table, self.cfg.vector_type, limit, acl, filter);
@@ -352,6 +355,16 @@ fn validate_identifier(name: &str) -> Result<()> {
 
 /// f32 向量 → pgvector 文本字面 `[v1,v2,...]`（配合 SQL 内 `$1::text::vector`：先 text 再 vector，
 /// 避免 tokio-postgres 把 `$1` 推断成 vector 类型而拒收 String，同 jsonb 写入的处理）。
+/// 校验向量全为有限值（无 NaN/inf）。非有限值会被 pgvector 文本解析拒收（晦涩错误）——提前拦下。
+fn ensure_finite(v: &[f32]) -> Result<()> {
+    if let Some(i) = v.iter().position(|x| !x.is_finite()) {
+        return Err(PgError::Mapping(format!(
+            "embedding 含非有限值（NaN/inf）于第 {i} 维；嵌入服务返回异常向量"
+        )));
+    }
+    Ok(())
+}
+
 fn format_vector(v: &[f32]) -> String {
     let mut s = String::from("[");
     for (i, x) in v.iter().enumerate() {
@@ -509,6 +522,13 @@ pub async fn fetch_chunk(
 mod tests {
     use super::*;
     use fastsearch_core::{BBox, ChunkKind};
+
+    #[test]
+    fn ensure_finite_rejects_nan_inf() {
+        assert!(ensure_finite(&[1.0, 0.5, -0.3]).is_ok());
+        assert!(ensure_finite(&[1.0, f32::NAN, 0.0]).is_err());
+        assert!(ensure_finite(&[f32::INFINITY, 0.0]).is_err());
+    }
 
     #[test]
     fn pg_config_with_vector_dim_threads_into_ddl() {
