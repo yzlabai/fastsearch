@@ -147,6 +147,28 @@ def test_retriever_kwargs_bind_real_client_signature():
     )  # 不抛 TypeError 即通过
 
 
+def test_search_injects_collection_filter():
+    """M23：真实 client.search 把 collection 作用域注入为 Eq 过滤，与用户 filter `and` 合并。"""
+    from fastsearch_client import FastsearchClient
+
+    c = FastsearchClient("http://x", api_key="dev")
+    captured = []
+
+    def fake_post(path, body):
+        captured.append(body)
+        return {"hits": []}
+
+    c._post = fake_post
+    # 无用户 filter → 单 Eq(collection)
+    c.search("kb", "q")
+    assert captured[-1]["filter"] == {"eq": ["collection", "kb"]}
+    # 有用户 filter → and 合并
+    c.search("kb", "q", filter={"eq": ["kind", "table"]})
+    assert captured[-1]["filter"] == {
+        "and": [{"eq": ["collection", "kb"]}, {"eq": ["kind", "table"]}]
+    }
+
+
 def main():
     tests = [
         test_hit_to_document,
@@ -154,6 +176,7 @@ def main():
         test_hit_to_llama_node,
         test_retriever_invoke_and_param_passthrough,
         test_retriever_kwargs_bind_real_client_signature,
+        test_search_injects_collection_filter,
     ]
     for t in tests:
         t()

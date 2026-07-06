@@ -120,10 +120,21 @@ test("search maps camelCase options to snake_case body", async () => {
     auto_merge: true,
     search_after: "cur-1",
     highlight: true,
-    filter: { eq: ["kind", "table"] },
+    // M23：collection 作用域强制注入，与用户 filter `and` 合并。
+    filter: { and: [{ eq: ["collection", "kb"] }, { eq: ["kind", "table"] }] },
     facets: ["doc_id"],
   });
   assert.equal(res.hits.length, 1);
+});
+
+test("search injects collection filter when no user filter", async () => {
+  // M23：无用户 filter 时 body.filter 应为单 Eq(collection)。
+  const { fetch, calls } = stub(() => ({ json: { hits: [], facets: {} } }));
+  const c = new FastsearchClient({ baseUrl: "http://x", apiKey: "dev", fetch });
+  await c.search("kb", "q", { topK: 3 });
+  assert.deepEqual((calls[0]!.body as Record<string, unknown>).filter, {
+    eq: ["collection", "kb"],
+  });
 });
 
 test("search maps queryImage and embedder", async () => {
@@ -259,12 +270,13 @@ test("makeSearchTool exposes both tool schemas and runs", async () => {
   assert.deepEqual(tool.anthropic.input_schema.required, ["query"]);
 
   const result = await tool.run({ query: "毛利率" });
-  // 默认 highlight=true、topK 取 defaultTopK。
+  // 默认 highlight=true、topK 取 defaultTopK；collection 作用域过滤注入（M23）。
   assert.deepEqual(calls[0]!.body, {
     query: "毛利率",
     mode: "hybrid",
     top_k: 3,
     highlight: true,
+    filter: { eq: ["collection", "kb"] },
   });
   assert.equal(result.hits.length, 1);
   assert.match(result.content, /\[1\]/);
