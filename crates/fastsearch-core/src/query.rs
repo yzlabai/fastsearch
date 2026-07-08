@@ -118,11 +118,27 @@ impl Default for SearchRequest {
     }
 }
 
+/// `top_k` 上界：防客户端可控的巨值经 `Vec::with_capacity` 触发 OOM abort（不可 unwind →
+/// 打崩整个多租户服务）。远超任何真实检索需求。
+pub const MAX_TOP_K: usize = 10_000;
+/// `candidates`（over-fetch 候选窗口）上界：直达后端 `Vec::with_capacity`，必须收口。
+pub const MAX_CANDIDATES: usize = 100_000;
+
 impl SearchRequest {
     /// 契约校验：非法组合返回 [`CoreError::InvalidRequest`]。
     pub fn validate(&self) -> Result<()> {
         if self.top_k == 0 {
             return Err(CoreError::InvalidRequest("top_k must be > 0".into()));
+        }
+        if self.top_k > MAX_TOP_K {
+            return Err(CoreError::InvalidRequest(format!(
+                "top_k must be <= {MAX_TOP_K}"
+            )));
+        }
+        if self.candidates > MAX_CANDIDATES {
+            return Err(CoreError::InvalidRequest(format!(
+                "candidates must be <= {MAX_CANDIDATES}"
+            )));
         }
         if self.candidates < self.top_k {
             return Err(CoreError::InvalidRequest(
@@ -206,6 +222,28 @@ mod tests {
             ..Default::default()
         };
         assert!(bad_rank.validate().is_err());
+
+        // H4 回归：巨值 candidates/top_k 直达后端 `Vec::with_capacity` → OOM abort 打崩服务。
+        // validate 必须在此收口，拒绝而非放行。
+        let huge_cand = SearchRequest {
+            top_k: 1,
+            candidates: 100_000_000_000,
+            ..Default::default()
+        };
+        assert!(huge_cand.validate().is_err());
+        let huge_topk = SearchRequest {
+            top_k: 100_000_000_000,
+            candidates: 100_000_000_000,
+            ..Default::default()
+        };
+        assert!(huge_topk.validate().is_err());
+        // 边界：恰好上限应通过
+        let at_max = SearchRequest {
+            top_k: MAX_TOP_K,
+            candidates: MAX_CANDIDATES,
+            ..Default::default()
+        };
+        assert!(at_max.validate().is_ok());
     }
 
     #[test]

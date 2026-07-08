@@ -80,16 +80,22 @@ class FastsearchClient:
         top_k: int = 20,
         filter: Optional[dict] = None,
         vector: Optional[list[float]] = None,
+        highlight: bool = False,
     ) -> list[dict]:
         """检索。返回命中列表，每条含 citation_id/score/page/bbox/heading_path/...
 
-        注：当前 collection 由服务端单一引擎承载；保留参数以对齐多集合演进。
+        `highlight=True` 让服务端回高亮片段（进入命中的 `highlight` 字段，供 RAG 取片段）。
+        `collection` 作用域**强制注入**为过滤子句（与 CLI 一致），多集合 server 上只返回本集合命中；
+        与用户 `filter` 用 `and` 合并。ACL 由服务端按 API Key 强制，与此无关。
         """
         body: dict = {"query": query, "mode": mode, "top_k": top_k}
-        if filter is not None:
-            body["filter"] = filter
+        # collection 作用域：注入 Eq(collection) 过滤，与用户 filter `and` 合并（M23）。
+        coll_filter = {"eq": ["collection", collection]}
+        body["filter"] = {"and": [coll_filter, filter]} if filter is not None else coll_filter
         if vector is not None:
             body["vector"] = vector
+        if highlight:
+            body["highlight"] = True
         out = self._post("/v1/search", body)
         return out.get("hits", [])
 

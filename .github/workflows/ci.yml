@@ -60,7 +60,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: assert hot-path crates pull zero docparse
         run: |
-          for c in fastsearch-server fastsearch-engine fastsearch-core fastsearch-text fastsearch-vector; do
+          # 含 mcp（第四张脸检索入口，依赖 engine）与 cli 默认档（CLAUDE.md：默认构建零 docparse，
+          # 仅 --features parse 才拉入）。
+          for c in fastsearch-server fastsearch-engine fastsearch-core fastsearch-text fastsearch-vector fastsearch-mcp fastsearch-cli; do
             if cargo tree -p "$c" -e normal | grep -qi docparse; then
               echo "FAIL: $c 拉入了 docparse（搜索热路径必须零 docparse）" >&2
               cargo tree -p "$c" -e normal | grep -i docparse >&2
@@ -68,6 +70,36 @@ jobs:
             fi
             echo "ok: $c 无 docparse"
           done
+
+  # SDK 冒烟：TS（node --test，stub fetch 零网络）+ Python（stdlib，零依赖）。此前 clients/ 完全无
+  # CI（正是 H6 的 LangChain Retriever 真客户端崩溃盲区来源）。
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: TS SDK tests
+        working-directory: clients/typescript
+        run: |
+          npm ci || npm install
+          npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python SDK tests
+        working-directory: clients/python
+        run: python3 test_integrations.py
+
+  # Docker 镜像构建校验（此前发布制品从未被 CI 构建过）。验证 Dockerfile + .dockerignore：
+  # build context 不含 target/（.dockerignore 生效），多阶段构建成功。
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build (server image)
+        run: docker build -t fastsearch-server:ci .
 
   # 解析分档（轻量，无 ONNX）：`parse` feature 对 vendored docparse 编译 + 单测绿。
   # parse-ocr/parse-tables（重 ONNX）需模型目录，CI 仅编译校验、运行测试 env-gated 跳过。

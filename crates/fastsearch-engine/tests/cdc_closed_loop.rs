@@ -428,3 +428,91 @@ async fn cdc_embed_hybrid_full_loop() {
 
     drop_slot(&rcfg).await.expect("drop_slot");
 }
+
+/// H3 回归（env-gated：需 PG）：TOAST 大列在 UPDATE 里未变 → pgoutput 发 'u'(UnchangedToast)。
+/// 旧代码把 'u' 当 missing/null → `row_to_chunk` 报错 → 整批失败 → slot 永不 advance（毒丸卡死）。
+/// 修复后 map 检测 'u' → 从 PG 真源**重取整行**，pull_changes 不再报错，大 text 不丢。
+#[tokio::test]
+async fn cdc_unchanged_toast_update_does_not_stall() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_unchanged_toast_update_does_not_stall: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_toast_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+    };
+    reset(&url, slot).await;
+
+    let store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("ensure_schema");
+
+    // 直连：把 text 列存储改 EXTERNAL（强制大值出行外存、不压缩）→ 未改 text 的 UPDATE 必发 'u'。
+    let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connect");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    client
+        .batch_execute("ALTER TABLE fastsearch_chunks ALTER COLUMN text SET STORAGE EXTERNAL")
+        .await
+        .expect("set storage external");
+
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+
+    // 大 text（>8KB，出行外存 TOAST），含检索词 "toasted"。
+    let big = format!("toasted marker {}", "abcdefgh".repeat(1500));
+    store
+        .upsert_doc("kb", "big.pdf", &[chunk("big.pdf", 1, &big)])
+        .await
+        .expect("upsert big");
+    let ev1 = pull_changes(&rcfg).await.expect("pull insert");
+    assert!(!ev1.is_empty(), "insert 应产生事件");
+
+    // 原地 UPDATE 只改小列 tenant（不动大 text）→ pgoutput 对 text 发 'u'（UnchangedToast）。
+    client
+        .execute(
+            "UPDATE fastsearch_chunks SET tenant='acme' \
+             WHERE collection='kb' AND doc_id='big.pdf' AND chunk_id=1",
+            &[],
+        )
+        .await
+        .expect("update small col");
+
+    // 关键：pull_changes 不再因 'u' 报错（毒丸），而是从真源重取整行 → 一条有效 Upsert。
+    let ev2 = pull_changes(&rcfg)
+        .await
+        .expect("pull_changes 不应因 UnchangedToast 卡死(毒丸)");
+    assert_eq!(
+        ev2.len(),
+        1,
+        "UnchangedToast UPDATE 应重取为 1 条 upsert, got {ev2:?}"
+    );
+
+    // 应用后：大 text 仍可检索（重取保住了 text，未丢）。
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+    let mut applier = Applier::new(Lsn(0));
+    applier
+        .apply_batch(&mut engine, &ev1)
+        .expect("apply insert");
+    applier
+        .apply_batch(&mut engine, &ev2)
+        .expect("apply update");
+    let req = SearchRequest {
+        query: "toasted".into(),
+        mode: SearchMode::Keyword,
+        top_k: 5,
+        ..Default::default()
+    };
+    let hits = engine.search(&req, None).expect("search");
+    assert_eq!(hits.len(), 1, "大 text 应仍可检索（重取保住了 text）");
+    assert_eq!(hits[0].id.chunk_id, 1);
+
+    drop_slot(&rcfg).await.expect("drop_slot");
+}

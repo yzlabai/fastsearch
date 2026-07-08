@@ -73,13 +73,18 @@ impl Filter {
             Filter::And(fs) => fs.iter().all(|f| f.eval(row)),
             Filter::Or(fs) => fs.iter().any(|f| f.eval(row)),
             Filter::Not(f) => !f.eval(row),
-            Filter::Eq(k, v) => row.get(k).as_ref() == Some(v),
-            Filter::Ne(k, v) => row.get(k).as_ref() != Some(v),
+            // Eq/Ne/In 数值跨类型互比（`Int(6)==Float(6.0)`），与 Gt/Lt 一致；缺失字段/
+            // 类型不匹配一律不相等。Eq 与 Ne 都要求字段存在（缺失 → 两者皆 false，符合
+            // 本模块"缺失 → false"契约），避免 `Ne` 对缺失字段误判 true。
+            Filter::Eq(k, v) => row.get(k).is_some_and(|got| val_eq(&got, v)),
+            Filter::Ne(k, v) => row.get(k).is_some_and(|got| !val_eq(&got, v)),
             Filter::Gt(k, v) => matches!(cmp(row, k, v), Some(Greater)),
             Filter::Gte(k, v) => matches!(cmp(row, k, v), Some(Greater | Equal)),
             Filter::Lt(k, v) => matches!(cmp(row, k, v), Some(Less)),
             Filter::Lte(k, v) => matches!(cmp(row, k, v), Some(Less | Equal)),
-            Filter::In(k, vs) => row.get(k).is_some_and(|val| vs.contains(&val)),
+            Filter::In(k, vs) => row
+                .get(k)
+                .is_some_and(|got| vs.iter().any(|v| val_eq(&got, v))),
             Filter::Exists(k) => row.get(k).is_some(),
             Filter::HeadingPrefix(prefix) => {
                 let hp = row.heading_path();
@@ -87,15 +92,20 @@ impl Filter {
             }
         }
     }
-
-    /// 把强制 ACL 过滤 AND 进当前过滤（服务端注入用，客户端不可绕过）。
-    pub fn and_acl(self, acl_filter: Filter) -> Filter {
-        Filter::And(vec![acl_filter, self])
-    }
 }
 
 fn cmp(row: &dyn FieldSource, field: &str, v: &FieldValue) -> Option<std::cmp::Ordering> {
     row.get(field).and_then(|got| got.partial_cmp_val(v))
+}
+
+/// 标量相等：数值（Int/Float）跨类型按数值比（`Int(6)==Float(6.0)`），与范围比较一致；
+/// 字符串/布尔按值精确比；一数值一非数值的类型不匹配 → 不相等。
+fn val_eq(a: &FieldValue, b: &FieldValue) -> bool {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a == b,
+        _ => false,
+    }
 }
 
 /// "调用者可见性"判定：tenant 匹配 **且**（acl 含 `public` 或与授权标签有交集）。
@@ -175,6 +185,36 @@ mod tests {
         assert!(!Filter::Eq("kind".into(), FieldValue::Int(3)).eval(&row));
         // 字段缺失 → false
         assert!(!Filter::Eq("missing".into(), FieldValue::Int(1)).eval(&row));
+    }
+
+    #[test]
+    fn eq_ne_in_numeric_cross_type() {
+        // H2 回归：JSON 把整数带小数点解析成 Float（`10.0`），Eq/Ne/In 必须与 Int 数值互比，
+        // 否则 `Eq(page,10.0)` 恒 false 且 `Ne(page,6.0)` 恒 true（旧变体严格比较的坑）。
+        let row = Row::new().with("page", FieldValue::Int(6));
+        assert!(Filter::Eq("page".into(), FieldValue::Float(6.0)).eval(&row));
+        assert!(Filter::Eq("page".into(), FieldValue::Int(6)).eval(&row));
+        assert!(!Filter::Eq("page".into(), FieldValue::Float(6.5)).eval(&row)); // 非整数不匹配整数页
+        assert!(!Filter::Ne("page".into(), FieldValue::Float(6.0)).eval(&row)); // 6==6.0 → Ne false
+        assert!(Filter::Ne("page".into(), FieldValue::Float(6.5)).eval(&row)); // 6≠6.5 → Ne true
+        assert!(Filter::In(
+            "page".into(),
+            vec![FieldValue::Float(6.0), FieldValue::Int(9)]
+        )
+        .eval(&row));
+        // Eq ≡ (Gte ∧ Lte)：修复后三者对同一 Float 值一致
+        let eq = Filter::Eq("page".into(), FieldValue::Float(6.0)).eval(&row);
+        let ge_le = Filter::Gte("page".into(), FieldValue::Float(6.0)).eval(&row)
+            && Filter::Lte("page".into(), FieldValue::Float(6.0)).eval(&row);
+        assert_eq!(eq, ge_le);
+    }
+
+    #[test]
+    fn eq_and_ne_on_missing_field_both_false() {
+        // 契约：字段缺失 → Eq 与 Ne 均 false（SQL NULL 语义），Ne 不再对缺失字段误判 true。
+        let row = Row::new().with("kind", FieldValue::Str("table".into()));
+        assert!(!Filter::Eq("missing".into(), FieldValue::Int(1)).eval(&row));
+        assert!(!Filter::Ne("missing".into(), FieldValue::Int(1)).eval(&row));
     }
 
     #[test]

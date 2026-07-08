@@ -10,7 +10,7 @@
 //! 解码（pgoutput）与映射（行→Chunk，复用 [`fastsearch_pg::ChunkRow::to_chunk`]）是纯逻辑、
 //! 与传输解耦——故即便无 PG，解码/数组解析也有单测覆盖。
 
-use crate::pgoutput::{self, PgMessage, Relation, TupleData};
+use crate::pgoutput::{self, PgMessage, Relation, TupleData, TupleValue};
 use crate::{Change, ChangeEvent, Lsn};
 use anyhow::{Context, Result};
 use fastsearch_core::{Chunk, GlobalId};
@@ -118,37 +118,127 @@ pub async fn advance_slot(cfg: &ReplicationConfig, lsn: Lsn) -> Result<()> {
     Ok(())
 }
 
+/// 单批最多解码的变更数（`upto_nchanges`）。PG 会在到达此数后于**事务边界**停止（不会切断事务，
+/// 故崩溃安全水位仍落在完整事务上）。防积压后首次拉取把全部待处理变更一次性载入内存（M16）；
+/// 未消费的余量下一拍继续（slot 不推进则重取，peek/get 皆安全）。
+const MAX_CHANGES_PER_BATCH: i64 = 10_000;
+
 /// 用逻辑解码函数 `func`（get 或 peek）取变更并解码 + 映射成有序 `ChangeEvent`。
-/// `func` 为受控字面量（非用户输入）；slot/publication 单引号转义。
+/// `func` 为受控字面量（非用户输入）；slot/publication 单引号转义；批量上限为常量内插。
 async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<ChangeEvent>, Lsn)> {
     let client = connect(&cfg.url).await?;
     let sql = format!(
         "SELECT lsn::text, data FROM {func}(\
-         '{slot}', NULL, NULL, 'proto_version', '1', 'publication_names', '{pubn}')",
+         '{slot}', NULL, {limit}, 'proto_version', '1', 'publication_names', '{pubn}')",
         slot = esc(&cfg.slot),
+        limit = MAX_CHANGES_PER_BATCH,
         pubn = esc(&cfg.publication),
     );
     let rows = client.query(&sql, &[]).await.context(func.to_string())?;
 
-    let mut relations: HashMap<u32, Relation> = HashMap::new();
-    let mut out = Vec::new();
+    // 先收 (lsn, bytes) 并算 slot 高水位（含 Begin/Commit 等非数据行）。LSN 解析保持严格：
+    // 坏 LSN 是协议级错误（PG 几乎不可能返回），应显式失败而非静默跳过。
     let mut max_lsn = Lsn(0);
+    let mut items: Vec<(Lsn, Vec<u8>)> = Vec::with_capacity(rows.len());
     for row in &rows {
         let lsn_text: String = row.get(0);
-        let data: Vec<u8> = row.get(1);
         let lsn = Lsn(parse_pg_lsn(&lsn_text)?);
-        max_lsn = max_lsn.max(lsn); // 含 Begin/Commit 等非数据行：slot 推进位置
-        let pg = pgoutput::parse_message(&data)?;
-        if let Some(change) = map(&mut relations, pg)? {
-            out.push(ChangeEvent { change, lsn });
+        max_lsn = max_lsn.max(lsn);
+        items.push((lsn, row.get(1)));
+    }
+
+    // 逐条解码 + 映射，对**确定性毒丸**（parse/map 失败）容错跳过（R4.1b，见 `decode_batch_lenient`）。
+    let (mapped, dead) = decode_batch_lenient(&items);
+    if dead > 0 {
+        eprintln!("cdc: 本批共跳过 {dead} 条毒丸变更（slot 仍推进，避免单条卡死整个 CDC）");
+    }
+
+    let mut out = Vec::with_capacity(mapped.len());
+    for (lsn, m) in mapped {
+        match m {
+            Mapped::Ready(change) => out.push(ChangeEvent { change, lsn }),
+            Mapped::Refetch {
+                table,
+                collection,
+                doc_id,
+                chunk_id,
+            } => {
+                // 不完整 WAL（UnchangedToast）→ 从 PG 真源重取整行（H3）。行已被删（后续 Delete 事件
+                // 会清）→ 跳过，不 push（幂等安全：重取当前真源，索引收敛到真值）。
+                // refetch 错误**不跳过而是传播**：可能是瞬时（连接抖动），传播使整批重试（peek 未
+                // advance slot，不丢数据）；确定性毒丸只在 decode/map 阶段（那里同字节必同错、重试无益）。
+                if let Some((coll, chunk)) =
+                    fastsearch_pg::fetch_chunk(&client, &table, &collection, &doc_id, chunk_id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("refetch on unchanged-toast: {e}"))?
+                {
+                    out.push(ChangeEvent {
+                        change: Change::Upsert {
+                            collection: coll,
+                            chunk: Box::new(chunk),
+                        },
+                        lsn,
+                    });
+                }
+            }
         }
     }
     Ok((out, max_lsn))
 }
 
-/// pgoutput 消息 → 可选 Change。Relation 入缓存；Insert/Update→Upsert，Delete→Delete；
-/// Begin/Commit/Origin/Type/Truncate → None（消化）。
-fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<Change>> {
+/// 逐条解码（parse）+ 映射（map），对**确定性毒丸容错**：单条 parse/map 失败（同字节必同错、
+/// 重试无益）→ 计入死信、跳过，不阻塞整批、不 poison CDC（R4.1b）。返回 (映射结果, 死信数)；
+/// Refetch 标记留调用方用 PG 解析。跳过一条 = 该 chunk 的派生索引可能漂移，靠"从真源重建"自愈
+/// （PG 是真源、索引派生可重建，不变量 #2）。**不含 refetch**——那是 PG I/O、可能瞬时，见调用处。
+fn decode_batch_lenient(items: &[(Lsn, Vec<u8>)]) -> (Vec<(Lsn, Mapped)>, usize) {
+    let mut relations: HashMap<u32, Relation> = HashMap::new();
+    let mut out = Vec::new();
+    let mut dead = 0usize;
+    for (lsn, data) in items {
+        match pgoutput::parse_message(data).and_then(|pg| map(&mut relations, pg)) {
+            Ok(Some(m)) => out.push((*lsn, m)),
+            Ok(None) => {}
+            Err(e) => {
+                dead += 1;
+                eprintln!(
+                    "cdc: 跳过毒丸变更 @ {lsn:?}: {e}（确定性解码/映射失败，该变更未应用；\
+                     派生索引可能漂移，持续出现请从真源重建索引）"
+                );
+            }
+        }
+    }
+    (out, dead)
+}
+
+/// map 结果：可直接应用的 Change，或（Insert/Update 遇 UnchangedToast 不完整 WAL）需从真源重取的标记。
+enum Mapped {
+    Ready(Change),
+    /// 不完整 WAL：TOAST 大列在此变更未改、未随 WAL 带值（值为 'u'）。gid 列（小、不 TOAST）仍在，
+    /// 据此从 PG 真源重取整行（H3，堵毒丸）。`table` 为已安全引号化的限定表名。
+    Refetch {
+        table: String,
+        collection: String,
+        doc_id: String,
+        chunk_id: i64,
+    },
+}
+
+/// 元组是否含 UnchangedToast 值（'u'）——TOAST 大列在 UPDATE 里未变时 pgoutput 不带其值。
+fn tuple_has_unchanged_toast(t: &TupleData) -> bool {
+    t.values
+        .iter()
+        .any(|v| matches!(v, TupleValue::UnchangedToast))
+}
+
+/// 安全引号化限定表名 `"ns"."name"`（ns/name 取自 PG 自身的 Relation 消息，内嵌引号加倍转义）。
+fn quoted_table(rel: &Relation) -> String {
+    let q = |s: &str| s.replace('"', "\"\"");
+    format!("\"{}\".\"{}\"", q(&rel.namespace), q(&rel.name))
+}
+
+/// pgoutput 消息 → 可选 Mapped。Relation 入缓存；Insert/Update→Upsert（完整）或 Refetch（含 'u'）；
+/// Delete→Delete；Begin/Commit/Origin/Type/Truncate → None（消化）。
+fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<Mapped>> {
     match pg {
         PgMessage::Relation(r) => {
             relations.insert(r.oid, r);
@@ -161,20 +251,30 @@ fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<C
             ..
         } => {
             let rel = relation(relations, rel_oid)?;
+            if tuple_has_unchanged_toast(&tuple) {
+                // gid 列不 TOAST、必在 → 取出后交 fetch_changes 从真源重取整行（不再对 'u' 报错卡死）。
+                let m = cols(rel, &tuple);
+                return Ok(Some(Mapped::Refetch {
+                    table: quoted_table(rel),
+                    collection: get(&m, "collection")?.to_string(),
+                    doc_id: get(&m, "doc_id")?.to_string(),
+                    chunk_id: get(&m, "chunk_id")?.parse().context("chunk_id")?,
+                }));
+            }
             let (collection, chunk) = row_to_chunk(rel, &tuple)?;
-            Ok(Some(Change::Upsert {
+            Ok(Some(Mapped::Ready(Change::Upsert {
                 collection,
                 chunk: Box::new(chunk),
-            }))
+            })))
         }
         PgMessage::Delete { rel_oid, key, old } => {
             let rel = relation(relations, rel_oid)?;
             let tuple = key
                 .or(old)
                 .context("Delete without key/old tuple (need REPLICA IDENTITY)")?;
-            Ok(Some(Change::Delete {
+            Ok(Some(Mapped::Ready(Change::Delete {
                 gid: row_to_gid(rel, &tuple)?,
-            }))
+            })))
         }
         _ => Ok(None),
     }
@@ -341,5 +441,29 @@ mod tests {
     #[test]
     fn esc_quotes() {
         assert_eq!(esc("a'b"), "a''b");
+    }
+
+    #[test]
+    fn decode_batch_skips_deterministic_poison() {
+        // R4.1b：单条确定性解码/映射失败（毒丸）应被跳过并计入死信，不阻塞整批、不 poison CDC。
+        // 合法 Begin：'B' + final_lsn(u64) + commit_ts(i64) + xid(u32) → map 为 None（非毒丸、非变更）。
+        let mut begin = vec![b'B'];
+        begin.extend_from_slice(&0x1234u64.to_be_bytes());
+        begin.extend_from_slice(&700i64.to_be_bytes());
+        begin.extend_from_slice(&42u32.to_be_bytes());
+        // 截断的 Begin（只有 tag，读 u64 越界）→ parse 错 → 毒丸。
+        let truncated = vec![b'B'];
+
+        let items = vec![
+            (Lsn(1), begin),
+            (Lsn(2), truncated.clone()),
+            (Lsn(3), truncated),
+        ];
+        let (out, dead) = decode_batch_lenient(&items);
+        assert_eq!(dead, 2, "两条毒丸应计入死信并跳过");
+        assert!(
+            out.is_empty(),
+            "合法 Begin→None、毒丸被跳过 → 无 Mapped 结果"
+        );
     }
 }

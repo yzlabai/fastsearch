@@ -21,13 +21,18 @@ docparse chunks / 文本文件 → Postgres(真源: chunk+元数据+ACL+pgvector
    四张脸：CLI · 库 · REST · MCP
 ```
 
-## 五分钟上手（本机零依赖）
+## 五分钟上手
+
+CLI 是 server 的**纯 REST 客户端**（类比 Typesense/Qdrant/Algolia 的 CLI）。先起 server，CLI 再连它——喂一个文件夹即上传 chunk，随后拿到完整混合检索。
 
 ```bash
-cargo build -p fastsearch-cli --bin fastsearch
+cargo build -p fastsearch-server -p fastsearch-cli
+# 1) 起 server（真源 / 索引 / 嵌入 / 落盘都在这）
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" ./target/debug/fastsearch-server &   # REST :8642
+# 2) CLI 作客户端（--server/--key，或 env FASTSEARCH_SERVER/FASTSEARCH_KEY）
 # 喂一个资料文件夹（递归 .md/.txt，markdown 标题成面包屑），随后检索
-./target/debug/fastsearch index-dir --data ./idx --collection kb  ./我的资料
-./target/debug/fastsearch search    --data ./idx --collection kb --query "毛利率" --json
+./target/debug/fastsearch index-dir --server http://localhost:8642 --key dev --collection kb ./我的资料
+./target/debug/fastsearch search    --server http://localhost:8642 --key dev --collection kb --query "毛利率" --json
 ```
 
 接 docparse / PDF / REST / MCP / Python 的用法见 [Agent 使用指南](docs/在Agent中使用fastsearch.md)。

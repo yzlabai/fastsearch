@@ -17,6 +17,15 @@ impl VectorType {
             VectorType::HalfVec => "halfvec",
         }
     }
+
+    /// HNSW cosine opclass。**必须与列类型一致**：halfvec 列建 hnsw 用 `halfvec_cosine_ops`，
+    /// 否则 `CREATE INDEX` 报错、直查退化为顺序扫描（M17）。
+    fn cosine_opclass(self) -> &'static str {
+        match self {
+            VectorType::Vector => "vector_cosine_ops",
+            VectorType::HalfVec => "halfvec_cosine_ops",
+        }
+    }
 }
 
 /// 逻辑复制 publication 名（固定）。
@@ -56,9 +65,17 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
             dim = vector_dim
         ),
         format!("CREATE INDEX IF NOT EXISTS {table}_doc ON {table} (collection, doc_id);"),
+        // embedding HNSW ANN 索引（直查档，opclass 随列类型）——否则直查全程顺序扫描（M17）。
+        // embedding 列全 NULL（非直查部署）时索引为空、几乎零代价；直查填充后即生效。
+        format!("{};", ann_index_sql(table, vector_type)),
         // Publication 只发布**源真源列**（`COLUMNS`），刻意**排除引擎派生/记账列**
-        // `embedding`/`embed_model`/`updated_at`——这样 B6 写穿（`set_embedding` UPDATE 这三列）
-        // **不产生逻辑复制事件**，从根上断开"写穿→复制→再嵌入→再写穿"的 CDC 反馈环。
+        // `embedding`/`embed_model`/`updated_at`——这样 B6 写穿（`set_embedding` UPDATE 这三列）的
+        // 复制流里**不含派生列的值**，重解码不会看到它们、不据此重嵌。
+        // **（实测更正，H3/R4）**：列清单只过滤"列的值"、**不抑制"Update 事件本身"**——只改被排除列的
+        // UPDATE 仍会产生 Begin/Relation/Update/Commit（其中已发布列取当前值、或大列为 'u'）。故 CDC
+        // 写穿反馈环**不是靠"不产生事件"断开**，而是靠 `set_embedding` 的 `IS DISTINCT FROM` 幂等守卫
+        // 阻尼：值未变→0 行更新→第二轮无事件，环在一轮内收敛（不至无限）。该写穿事件对大 text 行正是
+        // 'u'(UnchangedToast) 的载体 → 依赖 H3 的"遇 'u' 从真源重取整行"才不卡死。
         // 列清单发布需 **PG 15+**（核心特性、非扩展，不破"托管 PG 可移植"不变量 #1）。
         //
         // 幂等 + **自愈但不抢占**：① 无 publication → CREATE（带列清单）；② 本表已在该 publication
@@ -239,6 +256,7 @@ fn acl_clause(acl: &AclFilter, b: &mut WhereBuilder) -> String {
 /// 返回 (SQL, params)。SUPERSET WHERE + 调用方 over-fetch + Rust 精确后过滤（守 #5）。
 pub fn pgvector_search_sql(
     table: &str,
+    vector_type: VectorType,
     limit: usize,
     acl: Option<&AclFilter>,
     filter: Option<&Filter>,
@@ -254,26 +272,34 @@ pub fn pgvector_search_sql(
     if let Some(f) = filter {
         wheres.push(b.build(f));
     }
+    // 查询向量 cast 必须与 embedding 列类型一致（halfvec 列用 `::halfvec`，否则 `<=>` 类型不符）（M17）。
+    let vtype = vector_type.sql();
     // heading_path/media 供不可翻译子句（HeadingPrefix）+ 时间后过滤（media.time 权威）；bbox/media 供组装 Citation。
     let sql = format!(
         "SELECT collection, doc_id, chunk_id, kind, modality, page, section_id, tenant, acl, \
-         heading_path, bbox::text, media::text, 1 - (embedding <=> $1::text::vector) AS score \
+         heading_path, bbox::text, media::text, 1 - (embedding <=> $1::text::{vtype}) AS score \
          FROM {table} WHERE {} \
-         ORDER BY embedding <=> $1::text::vector LIMIT {limit}",
+         ORDER BY embedding <=> $1::text::{vtype} LIMIT {limit}",
         wheres.join(" AND ")
     );
     (sql, b.params)
 }
 
-/// embedding 上的 HNSW ANN 索引（cosine）——直查档需要；幂等。
-pub fn ann_index_sql(table: &str) -> String {
+/// embedding 上的 HNSW ANN 索引（cosine）——直查档需要；幂等。opclass 随列类型（halfvec 用
+/// `halfvec_cosine_ops`）。由 `ddl` 建（否则直查全程顺序扫描）。
+pub fn ann_index_sql(table: &str, vector_type: VectorType) -> String {
     format!(
         "CREATE INDEX IF NOT EXISTS {table}_emb_hnsw ON {table} \
-         USING hnsw (embedding vector_cosine_ops)"
+         USING hnsw (embedding {opclass})",
+        opclass = vector_type.cosine_opclass()
     )
 }
 
 /// 列顺序（写入 + 读取共用）。
+/// Publication 列清单（发布到逻辑复制流的源列）。**刻意不含 `media_bytes`**（M16）：inline 媒资
+/// 字节（可达 20MB/张）是 PG 真源、网关按需 `fetch_media_bytes` 直查，复制流只搬指针（`media` JSON）。
+/// 若把 bytea 放进列清单，字节会整个走 WAL 逻辑解码进内存（积压时 OOM、带宽白放大），与"CDC 不搬
+/// inline 字节"（MM2c-bytes §4.2）矛盾。派生索引本就不持字节（sync `row_to_chunk` 置 `media_bytes: None`）。
 pub const COLUMNS: &[&str] = &[
     "collection",
     "doc_id",
@@ -287,7 +313,6 @@ pub const COLUMNS: &[&str] = &[
     "char_len",
     "modality",
     "media",
-    "media_bytes",
     "image_vector_status",
     "time_start_ms",
     "time_end_ms",
@@ -327,6 +352,15 @@ pub fn fetch_doc_sql(table: &str) -> String {
         "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
          section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 ORDER BY chunk_id"
+    )
+}
+
+/// 按主键读取单个 chunk（CDC 遇 UnchangedToast 不完整 WAL 时重取真源用，见 fastsearch-sync）。
+pub fn fetch_chunk_sql(table: &str) -> String {
+    format!(
+        "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
+         section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
+         FROM {table} WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3"
     )
 }
 
@@ -603,7 +637,8 @@ mod tests {
             Filter::Eq("modality".into(), FieldValue::Str("image".into())),
             Filter::Gte("page".into(), FieldValue::Int(5)),
         ]);
-        let (sql, params) = pgvector_search_sql("t", 80, Some(&acl), Some(&filter));
+        let (sql, params) =
+            pgvector_search_sql("t", VectorType::Vector, 80, Some(&acl), Some(&filter));
         // 查询向量是 $1；ACL 先入参（$2 tenant, $3 tags），filter 后（$4 modality, $5 page）。
         assert!(sql.contains("embedding <=> $1::text::vector"));
         assert!(sql.contains("tenant = $2"));
@@ -631,7 +666,7 @@ mod tests {
             Filter::Eq("page".into(), FieldValue::Str("oops".into())),     // 类型不符
             Filter::Gt("kind".into(), FieldValue::Str("a".into())),        // 文本大小比较
         ]);
-        let (sql, params) = pgvector_search_sql("t", 10, None, Some(&f));
+        let (sql, params) = pgvector_search_sql("t", VectorType::Vector, 10, None, Some(&f));
         assert!(params.is_empty(), "全不可翻译 → 无参数");
         // 子句全为 TRUE：AND(TRUE,TRUE,TRUE,TRUE)
         assert!(sql.contains("(TRUE AND TRUE AND TRUE AND TRUE)"));
@@ -648,14 +683,32 @@ mod tests {
                 FieldValue::Str("image".into()),
             ],
         );
-        let (sql, params) = pgvector_search_sql("t", 5, None, Some(&f));
+        let (sql, params) = pgvector_search_sql("t", VectorType::Vector, 5, None, Some(&f));
         assert!(sql.contains("kind IN ($2, $3)"));
         assert_eq!(params.len(), 2);
         // 无过滤 + 无 ACL：仅 embedding 守门。
-        let (sql2, p2) = pgvector_search_sql("t", 5, None, None);
+        let (sql2, p2) = pgvector_search_sql("t", VectorType::Vector, 5, None, None);
         assert!(sql2.contains("WHERE embedding IS NOT NULL ORDER BY"));
         assert!(p2.is_empty());
-        assert!(ann_index_sql("t").contains("USING hnsw (embedding vector_cosine_ops)"));
+        assert!(ann_index_sql("t", VectorType::Vector)
+            .contains("USING hnsw (embedding vector_cosine_ops)"));
+    }
+
+    #[test]
+    fn halfvec_opclass_and_cast_and_ddl() {
+        // M17：halfvec 列（默认档）的 ANN 索引 opclass 与查询 cast 必须是 halfvec 版本，否则建索引
+        // 报错/直查退化为顺序扫描。且 ddl 应把 ANN 索引建出来（此前 ann_index_sql 从不被调用）。
+        assert!(ann_index_sql("t", VectorType::HalfVec).contains("halfvec_cosine_ops"));
+        let (sql, _) = pgvector_search_sql("t", VectorType::HalfVec, 5, None, None);
+        assert!(
+            sql.contains("$1::text::halfvec"),
+            "halfvec 列查询 cast 应为 ::halfvec: {sql}"
+        );
+        let ddl_stmts = ddl("c", VectorType::HalfVec, 384).join("\n");
+        assert!(
+            ddl_stmts.contains("halfvec_cosine_ops"),
+            "默认 ddl 应建 halfvec opclass 的 ANN 索引"
+        );
     }
 
     #[test]
@@ -665,7 +718,7 @@ mod tests {
             Filter::Gte("time_start_ms".into(), FieldValue::Int(1000)),
             Filter::Lte("time_end_ms".into(), FieldValue::Int(9000)),
         ]);
-        let (sql, params) = pgvector_search_sql("t", 20, None, Some(&f));
+        let (sql, params) = pgvector_search_sql("t", VectorType::Vector, 20, None, Some(&f));
         // 超集守 #5：时间列下推须 `OR col IS NULL`（列 NULL 而 media.time 有值的遗留行不被排除，
         // 交后过滤读权威 media.time 精确判定）。
         assert!(sql.contains("(time_start_ms >= $2 OR time_start_ms IS NULL)"));

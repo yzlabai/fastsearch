@@ -152,7 +152,8 @@ export class FastsearchClient {
   /**
    * 混合检索。返回命中列表（带 page+bbox 引用）+ 分面。
    *
-   * `collection` 当前由服务端单一引擎承载，保留参数以对齐多集合演进。
+   * `collection` 作用域**强制注入**为过滤子句（与 CLI 一致），多集合 server 上只返回本集合命中；
+   * 与用户 `filter` 用 `and` 合并。ACL 由服务端按 API Key 强制，与此无关。
    * Agent 取上下文时建议 `{ highlight: true }`，让正文片段进入 `Hit.highlight`。
    */
   async search(
@@ -160,14 +161,16 @@ export class FastsearchClient {
     query: string,
     opts: SearchOptions = {},
   ): Promise<SearchResponse> {
-    void collection;
     const body: Record<string, unknown> = {
       query,
       mode: opts.mode ?? "hybrid",
       top_k: opts.topK ?? 20,
     };
     if (opts.fusion !== undefined) body.fusion = opts.fusion;
-    if (opts.filter !== undefined) body.filter = opts.filter;
+    // collection 作用域：注入 Eq(collection) 过滤，与用户 filter `and` 合并（M23）。
+    const collFilter = { eq: ["collection", collection] };
+    body.filter =
+      opts.filter !== undefined ? { and: [collFilter, opts.filter] } : collFilter;
     if (opts.vector !== undefined) body.vector = opts.vector;
     if (opts.queryImage !== undefined) body.query_image = opts.queryImage;
     if (opts.embedder !== undefined) body.embedder = opts.embedder;

@@ -253,8 +253,10 @@ impl HnswVectorIndex {
         let snap: HnswSnapshot = serde_json::from_slice(&bytes)?;
         let mut idx = Self::new(snap.params);
         for e in snap.entries {
-            // 已是归一化向量；upsert 会再次归一化（幂等：归一化向量再归一化不变）。
-            idx.upsert(e.gid, e.vector, e.meta)?;
+            let mut meta = e.meta;
+            meta.backfill_modality(); // M4：旧快照 modality 缺省 "" → 由 kind 回填（同 MemVectorIndex::load）。
+                                      // 已是归一化向量；upsert 会再次归一化（幂等：归一化向量再归一化不变）。
+            idx.upsert(e.gid, e.vector, meta)?;
         }
         Ok(idx)
     }
@@ -380,19 +382,29 @@ impl HnswVectorIndex {
         }
         // over-fetch：向 HNSW 多要候选，抵消后过滤 + u8 量化损耗（全精度重排兜底）。
         let qcode = quantize_u8(&q);
-        let total = self.gid_to_id.len();
+        // 升级上限用**图节点总数**（含墓碑），而非活条目数：墓碑聚簇在近邻处时，要取回足够多
+        // 图节点才能筛出 k 个活条目（H5）。
+        let graph_total = self.entries.len();
         let ef_base = ef_override.unwrap_or(self.params.ef_search);
         // **图内 filtered-traversal**（hnsw_rs `search_filter`）：有 filter/acl 时把 filter+ACL
         // 谓词下推进图遍历——`hnsw_filter(d_id)` 在遍历期即裁掉不合规节点，结果堆只收合规候选，
         // 强选择性下命中更密（无需"搜一大批再筛"），且遍历仍穿过被裁节点保连通性、不掉召回（守 #5）。
-        // 谓词同时滤掉墓碑（`entries[id]=None`）。无 filter/acl 走纯 `search`（零谓词开销）。
-        // **自适应过取仍作安全网**：过滤后不足 k 就翻倍 `want` 重搜，上限=全集（最坏退化全扫）。
-        // 确定：同输入 → 同遍历 → 同升级路径 → 同结果。
-        let needs_escalation = filter.is_some() || acl.is_some();
+        // 谓词同时滤掉墓碑（`entries[id]=None`）。
+        //
+        // 分支选择只看 filter/acl：无 filter/acl 时走纯 `search`（零谓词开销）＋后过滤剔墓碑。
+        // **不要**因"有墓碑"就改走 `search_filter`——查询恰好落在被删的相似簇里时，谓词会拒掉
+        // 遍历落点附近的全部节点，导致 filtered-traversal 被"困"在簇内、返回 0（实测）。纯 `search`
+        // 照常返回含墓碑的近邻，交给下方后过滤剔除、再靠自适应过取补足（H5）。
+        //
+        // **自适应过取（安全网）**：过滤后不足 k 就翻倍 `want` 重搜，上限=图节点总数（最坏退化全扫）。
+        // 触发条件含"有墓碑"：删除一整簇相似向量后其墓碑占满 `k×over_fetch` 候选窗口，不升级则
+        // 命中被墓碑吃光可返回 0（全局压实阈值挡不住局部聚簇）。确定：同输入 → 同遍历 → 同结果。
+        let use_predicate = filter.is_some() || acl.is_some();
+        let needs_escalation = use_predicate || self.dead_count() > 0;
         let mut want = k.saturating_mul(self.params.over_fetch).max(k);
         let mut scored: Vec<Scored> = loop {
             let ef = ef_base.max(want);
-            let neighbours = if needs_escalation {
+            let neighbours = if use_predicate {
                 // 谓词：内部 DataId（=entries 下标）→ 活条目且过 filter+ACL 才保留。
                 let pred = |id: &usize| -> bool {
                     self.entries
@@ -420,11 +432,22 @@ impl HnswVectorIndex {
                     score: dot(&q, &e.vector) as f64,
                 })
                 .collect();
-            if !needs_escalation || s.len() >= k || want >= total {
+            if !needs_escalation || s.len() >= k || want >= graph_total {
                 break s;
             }
-            want = want.saturating_mul(4).min(total); // 升级过取，封顶全集
+            want = want.saturating_mul(4).min(graph_total); // 升级过取，封顶图节点总数
         };
+
+        // 精确安全网：HNSW 返回不足 k 时回退暴力全扫（exact）。近似遍历在病态图上可能欠交付——
+        // 尤其查询落在一大簇被删的近乎相同向量里时，greedy 遍历会被"困"在墓碑 clique 内、连
+        // 升级到全图也逃不出去（H5）。brute_search 线扫活条目、同口径 filter/ACL，给出真 top-k。
+        // 仅在欠交付时触发（正常查询命中够 k 不进此路），代价可控。
+        if scored.len() < k {
+            let exact = self.brute_search(&q, k, filter, acl);
+            if exact.len() > scored.len() {
+                return Ok(exact);
+            }
+        }
 
         scored.sort_by(|a, b| {
             b.score
@@ -538,6 +561,40 @@ mod tests {
         // 阈值留余量（HNSW 建图非确定，每次略有波动；50 查询平均后稳定 ≥0.9）。
         let recall = hits as f64 / (k * queries) as f64;
         assert!(recall >= 0.9, "recall@{k} = {recall} < 0.9");
+    }
+
+    #[test]
+    fn no_filter_tombstone_cluster_still_returns_k() {
+        // H5 回归：删除一整簇相似向量后，其墓碑仍在图中且聚簇在查询近邻处，会占满 k×over_fetch
+        // 候选窗口。无 filter/acl 时旧代码 needs_escalation=false → 首轮即 break → 命中被墓碑吃光
+        // 返回 0。修复后 dead_count>0 也触发自适应过取/谓词滤墓碑，取够 k 个活条目。
+        let dim = 16;
+        let mut hnsw = HnswVectorIndex::new(HnswParams::default());
+        // 背景活条目 1500 条（> BRUTE_FALLBACK_MAX=1000 → 真走 HNSW），随机方向。
+        for i in 0..1500u64 {
+            hnsw.upsert(gid("bg", i), vec_for(i, dim), meta("bg", i, vec!["public"]))
+                .unwrap();
+        }
+        // 查询近邻簇：600 条都贴近 q，插入后全部删除 → 查询近邻处一片墓碑。
+        let q = vec_for(999_999, dim);
+        for j in 0..600u64 {
+            let mut v = q.clone();
+            v[(j as usize) % dim] += 0.001; // 微扰，保持贴近 q 但各不相同
+            hnsw.upsert(gid("cluster", j), v, meta("cluster", j, vec!["public"]))
+                .unwrap();
+        }
+        for j in 0..600u64 {
+            hnsw.delete(&gid("cluster", j)).unwrap();
+        }
+        assert!(hnsw.dead_count() >= 600, "簇墓碑应存在（未被自动压实）");
+        assert_eq!(hnsw.len(), 1500, "活条目=背景 1500");
+        // 无 filter/acl，query 落在墓碑簇附近，k=10。
+        let got = hnsw.search(&q, 10, None, None).unwrap();
+        assert!(
+            got.len() >= 10,
+            "墓碑簇不应吃光结果，应过取到活条目：got {}",
+            got.len()
+        );
     }
 
     // 逐查询 ef_search 覆盖被真正接受：① None 等同默认 search（路径不变）；

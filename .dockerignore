@@ -1,0 +1,27 @@
+# 构建产物（本地 target/ 可达数十 GB）——绝不进 build context。
+# `**/target/` 已覆盖根 target/ 与 vendor/docparse/target/ 等各级。
+**/target/
+
+# 依赖/构建缓存
+**/node_modules/
+**/dist/
+**/.testbuild/
+**/__pycache__/
+**/*.pyc
+
+# VCS / 编辑器 / 临时
+.git/
+.gitignore
+tmp/
+**/.env
+**/.DS_Store
+
+# 数据/索引落盘目录（不该进镜像）
+data/
+idx/
+
+# 文档/示例（构建 server 二进制不需要）
+docs/
+example/
+benchmarks/
+*.md

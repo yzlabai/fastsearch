@@ -59,6 +59,11 @@ pub struct EmbedderConfig {
     pub passage_prefix: String,
     /// 请求超时秒数。
     pub timeout_secs: u64,
+    /// 单请求最多嵌入多少条输入（M12）。大 doc 一次全发会触发 413 / 提供方条数上限（OpenAI 2048）/
+    /// 超时；超此数则拆多次请求、结果拼接。
+    pub max_batch: usize,
+    /// 传输/5xx/429 失败的重试次数（M12）；每次指数退避。0=不重试。
+    pub retries: u32,
     /// 是否启用 HTTP 图片输入。开启后 `caps.image=true`。
     pub image: bool,
     /// 文本和图片是否同空间。文搜图/图搜文的向量召回必须显式开启。
@@ -79,6 +84,8 @@ impl EmbedderConfig {
             query_prefix: String::new(),
             passage_prefix: String::new(),
             timeout_secs: 30,
+            max_batch: 64,
+            retries: 2,
             image: false,
             cross_modal: false,
             image_input_format: ImageInputFormat::DataUrl,
@@ -92,6 +99,8 @@ impl EmbedderConfig {
     /// - `FASTSEARCH_EMBED_QUERY_PREFIX` / `FASTSEARCH_EMBED_PASSAGE_PREFIX`
     /// - `FASTSEARCH_EMBED_IMAGE` / `FASTSEARCH_EMBED_CROSS_MODAL`
     /// - `FASTSEARCH_EMBED_IMAGE_INPUT_FORMAT` = `data_url` | `base64_object` | `openai_content`
+    /// - `FASTSEARCH_EMBED_TIMEOUT_SECS`（默认 30）/ `FASTSEARCH_EMBED_MAX_BATCH`（默认 64，单请求条数上限）
+    ///   / `FASTSEARCH_EMBED_RETRIES`（默认 2，transient 重试次数）（M12）
     pub fn from_env() -> Self {
         let var = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
         let bool_var =
@@ -117,7 +126,16 @@ impl EmbedderConfig {
             api_key: var("FASTSEARCH_EMBED_API_KEY"),
             query_prefix: var("FASTSEARCH_EMBED_QUERY_PREFIX").unwrap_or_default(),
             passage_prefix: var("FASTSEARCH_EMBED_PASSAGE_PREFIX").unwrap_or_default(),
-            timeout_secs: 30,
+            timeout_secs: var("FASTSEARCH_EMBED_TIMEOUT_SECS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+            max_batch: var("FASTSEARCH_EMBED_MAX_BATCH")
+                .and_then(|s| s.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(64),
+            retries: var("FASTSEARCH_EMBED_RETRIES")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
             image: bool_var("FASTSEARCH_EMBED_IMAGE"),
             cross_modal: bool_var("FASTSEARCH_EMBED_CROSS_MODAL"),
             image_input_format: match var("FASTSEARCH_EMBED_IMAGE_INPUT_FORMAT").as_deref() {
@@ -214,23 +232,40 @@ impl HttpEmbedder {
 
     fn send_embedding_body(&self, body: &str) -> Result<String> {
         let url = self.endpoint();
-        let mut req = self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/json");
-        if let Some(k) = &self.cfg.api_key {
-            req = req.set("Authorization", &format!("Bearer {k}"));
-        }
-        match req.send_string(body) {
-            Ok(resp) => resp.into_string().context("read embedding response"),
-            Err(ureq::Error::Status(code, resp)) => {
-                let detail = resp.into_string().unwrap_or_default();
-                bail!(
-                    "embedding endpoint {url} returned {code}: {}",
-                    truncate(&detail, 300)
-                );
+        let mut attempt = 0u32;
+        loop {
+            let mut req = self
+                .agent
+                .post(&url)
+                .set("Content-Type", "application/json");
+            if let Some(k) = &self.cfg.api_key {
+                req = req.set("Authorization", &format!("Bearer {k}"));
             }
-            Err(e) => Err(e).with_context(|| format!("POST {url}")),
+            match req.send_string(body) {
+                Ok(resp) => return resp.into_string().context("read embedding response"),
+                Err(e) => {
+                    // transient（429/5xx/传输错误）才重试；4xx（如 400/413）是确定性错误、立即失败（M12）。
+                    let retriable = match &e {
+                        ureq::Error::Status(code, _) => *code == 429 || (500..600).contains(code),
+                        ureq::Error::Transport(_) => true,
+                    };
+                    if retriable && attempt < self.cfg.retries {
+                        std::thread::sleep(Duration::from_millis(100u64 << attempt)); // 指数退避
+                        attempt += 1;
+                        continue;
+                    }
+                    return match e {
+                        ureq::Error::Status(code, resp) => {
+                            let detail = resp.into_string().unwrap_or_default();
+                            bail!(
+                                "embedding endpoint {url} returned {code}: {}",
+                                truncate(&detail, 300)
+                            );
+                        }
+                        e => Err(e).with_context(|| format!("POST {url}")),
+                    };
+                }
+            }
         }
     }
 
@@ -281,23 +316,33 @@ impl Embedder for HttpEmbedder {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let inputs = self.inputs(texts, kind);
-        let body = serde_json::to_string(&self.request_body(&inputs))?;
-        let text = self.send_embedding_body(&body)?;
-        self.parse_response(&text, texts.len())
+        // 按 max_batch 拆多次请求（大 doc 一次全发会 413/超条数上限/超时），结果按序拼接（M12）。
+        let mut out = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(self.cfg.max_batch) {
+            let inputs = self.inputs(batch, kind);
+            let body = serde_json::to_string(&self.request_body(&inputs))?;
+            let text = self.send_embedding_body(&body)?;
+            out.extend(self.parse_response(&text, batch.len())?);
+        }
+        Ok(out)
     }
 
     fn embed_multi(&self, inputs: &[EmbedInput], kind: EmbedKind) -> Result<Vec<Vec<f32>>> {
         if inputs.is_empty() {
             return Ok(vec![]);
         }
-        let vals = inputs
-            .iter()
-            .map(|i| self.input_value(i, kind))
-            .collect::<Result<Vec<_>>>()?;
-        let body = serde_json::to_string(&self.request_body_values(vals))?;
-        let text = self.send_embedding_body(&body)?;
-        self.parse_response(&text, inputs.len())
+        // 按 max_batch 拆多次请求（含 base64 图片时 body 更易超限），结果按序拼接（M12）。
+        let mut out = Vec::with_capacity(inputs.len());
+        for batch in inputs.chunks(self.cfg.max_batch) {
+            let vals = batch
+                .iter()
+                .map(|i| self.input_value(i, kind))
+                .collect::<Result<Vec<_>>>()?;
+            let body = serde_json::to_string(&self.request_body_values(vals))?;
+            let text = self.send_embedding_body(&body)?;
+            out.extend(self.parse_response(&text, batch.len())?);
+        }
+        Ok(out)
     }
 }
 
@@ -379,6 +424,8 @@ mod tests {
             query_prefix: "query: ".into(),
             passage_prefix: "passage: ".into(),
             timeout_secs: 5,
+            max_batch: 64,
+            retries: 0,
             image: false,
             cross_modal: false,
             image_input_format: ImageInputFormat::DataUrl,
@@ -532,5 +579,120 @@ mod tests {
             rel > unrel,
             "related ({rel}) should beat unrelated ({unrel})"
         );
+    }
+
+    /// 极简 mock 嵌入服务：前 `fail_first` 个请求回 503（测重试），其余按请求体的 input 条数回
+    /// 等量 Ollama 向量。返回 (base_url, 请求计数)。
+    fn mock_embed_server(
+        dim: usize,
+        fail_first: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c2 = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = match stream {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                // 读到 header 结束 + Content-Length 个 body 字节（localhost 小请求，稳妥读全）。
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let (mut headers_end, mut want) = (None, 0usize);
+                loop {
+                    let n = match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    if headers_end.is_none() {
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            headers_end = Some(p + 4);
+                            let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                            want = head
+                                .split("content-length:")
+                                .nth(1)
+                                .and_then(|s| s.split("\r\n").next())
+                                .and_then(|s| s.trim().parse().ok())
+                                .unwrap_or(0);
+                        }
+                    }
+                    if let Some(h) = headers_end {
+                        if buf.len() >= h + want {
+                            break;
+                        }
+                    }
+                }
+                let idx = c2.fetch_add(1, Ordering::SeqCst);
+                if idx < fail_first {
+                    let _ = s.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\n\r\nerr",
+                    );
+                    continue;
+                }
+                let body = headers_end
+                    .map(|h| String::from_utf8_lossy(&buf[h..]).to_string())
+                    .unwrap_or_default();
+                let v: Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+                let n_in = v["input"].as_array().map(|a| a.len()).unwrap_or(0);
+                let embs: Vec<Vec<f32>> = (0..n_in).map(|_| vec![0.1f32; dim]).collect();
+                let rb = serde_json::json!({ "embeddings": embs }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    rb.len(),
+                    rb
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    #[test]
+    fn embed_splits_into_batches() {
+        // M12：max_batch=2 时 5 条输入应拆成 3 次请求（2+2+1），结果按序拼接为 5 条。
+        use std::sync::atomic::Ordering;
+        let (url, count) = mock_embed_server(4, 0);
+        let mut cfg = http_cfg(HttpProtocol::Ollama, 4);
+        cfg.url = url;
+        cfg.max_batch = 2;
+        let e = HttpEmbedder::new(cfg);
+        let texts: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
+        let out = e.embed(&texts, EmbedKind::Passage).unwrap();
+        assert_eq!(out.len(), 5, "5 条输入应返回 5 个向量");
+        assert!(out.iter().all(|v| v.len() == 4));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "5 条 / max_batch=2 → 3 次请求"
+        );
+    }
+
+    #[test]
+    fn embed_retries_transient_5xx() {
+        // M12：前一个请求 503（transient），retries=2 应重试并最终成功。
+        let (url, _count) = mock_embed_server(4, 1);
+        let mut cfg = http_cfg(HttpProtocol::Ollama, 4);
+        cfg.url = url;
+        cfg.retries = 2;
+        let e = HttpEmbedder::new(cfg);
+        let out = e.embed(&["hi".into()], EmbedKind::Passage).unwrap();
+        assert_eq!(out.len(), 1, "重试后应成功拿到 1 个向量");
+    }
+
+    #[test]
+    fn embed_no_retry_gives_up_on_5xx() {
+        // 对照：retries=0 时 503 立即失败（不无限重试）。
+        let (url, _count) = mock_embed_server(4, 1);
+        let mut cfg = http_cfg(HttpProtocol::Ollama, 4);
+        cfg.url = url;
+        cfg.retries = 0;
+        let e = HttpEmbedder::new(cfg);
+        assert!(e.embed(&["hi".into()], EmbedKind::Passage).is_err());
     }
 }

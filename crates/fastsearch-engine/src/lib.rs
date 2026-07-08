@@ -1149,6 +1149,13 @@ impl Engine {
                 "query_image 需要支持图像的嵌入后端（caps.image=false）".into(),
             ));
         }
+        if !emb.caps().cross_modal {
+            // 非跨模态后端：写入侧模态路由（apply_upsert）从不把图向量放入共享（文本）索引，
+            // 故查询图嵌成的图域向量只会与文本向量做无意义余弦。拒绝而非静默返回垃圾命中（M8）。
+            return Err(EngineError::Vector(
+                "query_image 需要跨模态嵌入后端（caps.cross_modal=false：图向量不与索引里的文本向量同空间）".into(),
+            ));
+        }
         let v = emb
             .embed_multi(&[EmbedInput::Image(bytes.clone())], EmbedKind::Query)
             .map_err(|e| EngineError::Vector(e.to_string()))?
@@ -1443,13 +1450,22 @@ impl Engine {
     }
 
     /// more_like_this：以种子 chunk 的正文反查相似命中（keyword 模式），排除种子自身。
-    /// 种子不存在 → 返回空。ACL 照常强制（不可绕过）。
+    /// 种子不存在**或对调用者不可见** → 返回空。ACL 照常强制（不可绕过）。
     pub fn more_like_this(
         &self,
         gid: &GlobalId,
         top_k: usize,
         acl: Option<&AclFilter>,
     ) -> Result<Vec<SearchHit>> {
+        // 种子可见性强制（M19）：先取种子行做 ACL 校验——种子对调用者不可见（跨租户/无权）时
+        // 当作不存在返回空，绝不以其机密正文构造 MLT 查询、也不泄露其存在性。对齐 resolve_citation。
+        let seed_row = match self.text.stored_row_by_gid(gid)? {
+            Some(r) => r,
+            None => return Ok(vec![]),
+        };
+        if acl.is_some_and(|a| !a.visible(&seed_row)) {
+            return Ok(vec![]);
+        }
         let seed_text = match self.text.stored_text(gid)? {
             Some(t) => t,
             None => return Ok(vec![]),
@@ -1492,7 +1508,6 @@ impl Engine {
             ));
         }
 
-        let want_kw = matches!(req.mode, SearchMode::Keyword | SearchMode::Hybrid);
         // 查询向量：显式 `req.vector` 优先；否则若带 `query_image` 且后端支持图像 → 嵌图
         // （**以图搜图**，MM9）。写入侧要求 `caps.cross_modal=true` 才把图片向量放入共享索引，
         // 因此真实图文/图图向量检索都依赖同空间多模态后端。
@@ -1500,6 +1515,11 @@ impl Engine {
             Some(v) => Some(v.clone()),
             None => self.embed_query_image(req)?,
         };
+        // keyword 召回：空 query 在 text 侧退化成 match-all。当有向量查询（以图搜图/显式向量）且 query
+        // 为空时跳过 keyword，避免 match-all 前 `candidates` 条无关文档污染融合排名——Hybrid 是 serde
+        // 默认模式，客户端只发 query_image 不显式 mode=Vector 也会中招（M7）。
+        let image_only = req.query.trim().is_empty() && query_vec.is_some();
+        let want_kw = matches!(req.mode, SearchMode::Keyword | SearchMode::Hybrid) && !image_only;
         let want_vec =
             matches!(req.mode, SearchMode::Vector | SearchMode::Hybrid) && query_vec.is_some();
 
@@ -1631,10 +1651,23 @@ impl Engine {
 
         // rerank：宽召回后重排（req.rerank 存在时）。对候选文本打分、按 rerank 分降序、
         // 同分按 gid，再截 top_k。rerank 分写入命中（透明）；原 bm25/vector/fused 保留。
-        if req.rerank.is_some() {
+        if let Some(spec) = &req.rerank {
+            // rerank 窗口：只对融合分最高的 `rerank.top_k` 个候选重排（hits 此时已是融合序），其余
+            // 低分候选丢弃——重排后也进不了最终 top_k。接真 cross-encoder 时这限住延迟/费用（M5）。
+            hits.truncate(spec.top_k);
             let texts: Vec<String> = hits
                 .iter()
-                .map(|h| text_map.get(&h.id).cloned().unwrap_or_default())
+                .map(|h| match text_map.get(&h.id) {
+                    Some(t) => t.clone(),
+                    // 向量独有命中不在 kw_hits 的 text_map 里，回真源取 STORED 正文再打分；
+                    // 否则 rerank 拿空串 → 全候选 0 分、排序退化为 gid 序，向量排名被摧毁（H1-A）。
+                    None => self
+                        .text
+                        .stored_text(&h.id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                })
                 .collect();
             let scores = self
                 .reranker
@@ -1706,15 +1739,16 @@ fn compute_facets(fields: &[String], hits: &[TextHit]) -> Facets {
 /// 输入须已按最终排名排序（代表 = 组内首个出现者）；输出保序、确定性。
 fn auto_merge(hits: Vec<SearchHit>) -> Vec<SearchHit> {
     let mut out: Vec<SearchHit> = Vec::with_capacity(hits.len());
-    // (doc_id, section_id) → out 中代表命中的下标。
-    let mut rep: HashMap<(String, u64), usize> = HashMap::new();
+    // (collection, doc_id, section_id) → out 中代表命中的下标。section_id 是 doc 内编号，键必须含
+    // collection+doc_id，否则跨 collection/跨 doc 的同号 section 会被错误归并成一条（M6）。
+    let mut rep: HashMap<(String, String, u64), usize> = HashMap::new();
     for h in hits {
         let sec = h.citation.section_id;
         if sec == 0 {
             out.push(h); // 无段，不参与归并
             continue;
         }
-        let key = (h.id.doc_id.clone(), sec);
+        let key = (h.id.collection.clone(), h.id.doc_id.clone(), sec);
         match rep.get(&key) {
             Some(&idx) => {
                 // 已有代表：把本命中并入（记录 chunk_id），丢弃本命中。
@@ -1757,9 +1791,15 @@ fn collapse_groups(hits: Vec<SearchHit>, field: &str, max_per_group: usize) -> V
     let mut out: Vec<SearchHit> = Vec::with_capacity(hits.len());
     let mut counts: HashMap<String, usize> = HashMap::new();
     for h in hits {
+        // 分组键含 collection：doc_id 全局唯一需带 collection；section_id 是 doc 内编号，需带
+        // collection+doc_id，否则不同文档的同号 section 互相挤占名额、静默丢命中（M6）。
+        // 用 NUL 分隔（collection/doc_id 不含 NUL，无歧义）。
         let key = match field {
-            "doc_id" => h.id.doc_id.clone(),
-            _ => h.citation.section_id.to_string(),
+            "doc_id" => format!("{}\u{0}{}", h.id.collection, h.id.doc_id),
+            _ => format!(
+                "{}\u{0}{}\u{0}{}",
+                h.id.collection, h.id.doc_id, h.citation.section_id
+            ),
         };
         let n = counts.entry(key).or_insert(0);
         if *n < max_per_group {
@@ -2036,21 +2076,21 @@ mod tests {
         e.apply_upsert("kb", &c).unwrap();
         e.commit().unwrap();
 
-        let hits = e
-            .search(
-                &SearchRequest {
-                    mode: SearchMode::Vector,
-                    query_image: c.media_bytes.clone(),
-                    top_k: 10,
-                    candidates: 10,
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap();
+        // M8：非跨模态后端的 query_image 直接报错（图向量不与索引里的文本向量同空间），
+        // 而非静默返回可能的垃圾/空命中——旧行为恰好因"库里无图向量"返回空、遮蔽了洞。
+        let err = e.search(
+            &SearchRequest {
+                mode: SearchMode::Vector,
+                query_image: c.media_bytes.clone(),
+                top_k: 10,
+                candidates: 10,
+                ..Default::default()
+            },
+            None,
+        );
         assert!(
-            hits.is_empty(),
-            "non-cross-modal image vectors must not share the text vector index"
+            err.is_err(),
+            "non-cross-modal query_image 应报错，不与文本向量索引混比"
         );
     }
 
@@ -2567,6 +2607,64 @@ mod tests {
             chunk_id: 999,
         };
         assert!(e.more_like_this(&missing, 10, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn more_like_this_seed_acl_enforced_no_cross_tenant_leak() {
+        // M19 回归：种子 chunk 对调用者不可见时 more_like_this 返回空——不以其机密正文构造查询、
+        // 不泄露存在性（否则成跨租户相似性/存在性预言机）。
+        let mut e = engine();
+        // 种子：租户 acme、标签 team-a（机密）
+        let mut seed = chunk(
+            "secret.pdf",
+            1,
+            ChunkKind::Paragraph,
+            "machine learning models",
+            1,
+        );
+        seed.tenant = Some("acme".into());
+        seed.acl = vec!["team-a".into()];
+        e.ingest("kb", &seed).unwrap();
+        // 一条 team-b 可见的相似文档（证明"若非 ACL 拦截会有命中"）
+        let mut other = chunk(
+            "pub.pdf",
+            2,
+            ChunkKind::Paragraph,
+            "learning models tuning",
+            2,
+        );
+        other.tenant = Some("acme".into());
+        other.acl = vec!["team-b".into()];
+        e.ingest("kb", &other).unwrap();
+        e.commit().unwrap();
+
+        let seed_gid = GlobalId {
+            collection: "kb".into(),
+            doc_id: "secret.pdf".into(),
+            chunk_id: 1,
+        };
+        // 调用者 B（team-b）：看不到种子 → 返回空（不泄露）
+        let acl_b = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-b".into()],
+        };
+        assert!(
+            e.more_like_this(&seed_gid, 5, Some(&acl_b))
+                .unwrap()
+                .is_empty(),
+            "种子对 B 不可见 → more_like_this 应返回空，不泄露"
+        );
+        // 调用者 A（team-a）：能看到种子 → 正常反查相似命中（对照，证明功能未坏）
+        let acl_a = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into(), "team-b".into()],
+        };
+        assert!(
+            !e.more_like_this(&seed_gid, 5, Some(&acl_a))
+                .unwrap()
+                .is_empty(),
+            "种子对 A 可见 → 应能反查相似命中"
+        );
     }
 
     #[test]
@@ -3200,6 +3298,146 @@ mod tests {
         // chunk 2（与 query 完全重叠）应被 rerank 提前
         assert_eq!(hits[0].id.chunk_id, 2);
         assert!(hits[0].rerank.unwrap() > hits[1].rerank.unwrap());
+    }
+
+    #[test]
+    fn rerank_uses_real_text_for_vector_only_hits() {
+        // H1-A 回归：mode=Vector 命中不经 keyword 路 → text_map 无该条；rerank 必须回真源取
+        // STORED 正文打分，否则拿空串 → 全 0 分、排序退化为 gid 序，向量排名被摧毁。
+        use fastsearch_core::RerankSpec;
+        use fastsearch_sync::IndexSink;
+        let mut e = engine();
+        e.set_embedder(Box::new(HashEmbedder::new(32)));
+        let c = chunk("d.pdf", 1, ChunkKind::Paragraph, "alpha beta gamma", 1);
+        e.apply_upsert("kb", &c).unwrap();
+        e.commit().unwrap();
+
+        // Vector 模式的查询向量来自 req.vector（server 层嵌入查询文本后注入）。用同款确定性
+        // HashEmbedder 嵌同一文本 → 与索引里该 chunk 的向量 cos=1，命中它自身。
+        let qv = HashEmbedder::new(32)
+            .embed(&["alpha beta gamma".into()], EmbedKind::Query)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let req = SearchRequest {
+            query: "alpha beta gamma".into(),
+            vector: Some(qv),
+            mode: SearchMode::Vector,
+            rerank: Some(RerankSpec {
+                model: "lexical".into(),
+                top_k: 10,
+            }),
+            top_k: 5,
+            candidates: 10,
+            ..Default::default()
+        };
+        let hits = e.search(&req, None).unwrap();
+        let hit = hits
+            .iter()
+            .find(|h| h.id.chunk_id == 1)
+            .expect("chunk 应被向量召回");
+        assert_eq!(
+            hit.rerank,
+            Some(1.0),
+            "rerank 应对真源正文完全重叠打 1.0，而非空串 0.0"
+        );
+    }
+
+    #[test]
+    fn rerank_top_k_caps_window() {
+        // M5 回归：rerank.top_k 限住重排窗口（融合分最高的 N 个），其余候选丢弃。此前该值无处读取，
+        // rerank 窗口=整个候选集。
+        use fastsearch_core::RerankSpec;
+        let mut e = engine();
+        for id in 1..=5u64 {
+            e.ingest(
+                "kb",
+                &chunk("a.pdf", id, ChunkKind::Paragraph, "data here", id as u32),
+            )
+            .unwrap();
+        }
+        e.commit().unwrap();
+        let mut r = req("data");
+        r.top_k = 10;
+        r.rerank = Some(RerankSpec {
+            model: "lexical".into(),
+            top_k: 2,
+        });
+        let hits = e.search(&r, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "rerank 窗口应截到 rerank.top_k=2（而非全部 5 条）"
+        );
+    }
+
+    #[test]
+    fn collapse_by_section_id_scoped_per_doc() {
+        // M6 回归：section_id 是 doc 内编号，collapse{field:section_id} 分组键必须含 collection+doc_id，
+        // 否则不同文档的同号 section 互相挤占名额、静默丢命中。
+        use fastsearch_core::Collapse;
+        let mut e = engine();
+        e.ingest("kb", &chunk_sec("a.pdf", 1, "data here", 1))
+            .unwrap();
+        e.ingest("kb", &chunk_sec("b.pdf", 2, "data here", 1))
+            .unwrap(); // 不同 doc、同 section 号
+        e.commit().unwrap();
+        let mut r = req("data");
+        r.collapse = Some(Collapse {
+            field: "section_id".into(),
+            max_per_group: 1,
+        });
+        let hits = e.search(&r, None).unwrap();
+        assert_eq!(hits.len(), 2, "不同文档的同号 section 不应互相挤占名额");
+    }
+
+    #[test]
+    fn image_query_empty_text_hybrid_equals_vector() {
+        // M7 回归：mode=Hybrid（serde 默认）+ query_image + 空 query 时，keyword 路退化成 match-all
+        // 污染融合。修复后空-query 图像检索跳过 keyword，Hybrid 结果应与显式 mode=Vector 完全一致。
+        use fastsearch_sync::IndexSink;
+        let mut e = engine();
+        e.set_embedder(Box::new(CrossModalHashEmbedder::new(32)));
+        let mk = |id: u64, bytes: Vec<u8>| {
+            let mut c = chunk("d.pdf", id, ChunkKind::Image, "", id as u32);
+            c.media_bytes = Some(bytes);
+            c
+        };
+        let a = vec![0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4, 5];
+        let bytes = [
+            (1u64, a.clone()),
+            (2, vec![0xFF, 0xD8, 9, 8, 7, 6, 5]),
+            (3, vec![0x47, 0x49, 0x46, 3, 1, 4, 1, 5]),
+            (4, vec![0x42, 0x4D, 2, 7, 1, 8, 2, 8]),
+            (5, vec![0x00, 0x01, 6, 1, 8, 0, 3, 3]),
+            (6, vec![0x7F, 0x45, 4, 6, 6, 9, 2, 0]),
+        ];
+        for (id, b) in bytes {
+            e.apply_upsert("kb", &mk(id, b)).unwrap();
+        }
+        e.commit().unwrap();
+        let ids = |mode| -> Vec<u64> {
+            e.search(
+                &SearchRequest {
+                    mode,
+                    query_image: Some(a.clone()),
+                    top_k: 3,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .iter()
+            .map(|h| h.id.chunk_id)
+            .collect()
+        };
+        let hybrid = ids(SearchMode::Hybrid);
+        let vector = ids(SearchMode::Vector);
+        assert_eq!(
+            hybrid, vector,
+            "空-query 图像检索的 Hybrid 应与 Vector 一致（无 match-all 污染）"
+        );
+        assert_eq!(hybrid.first(), Some(&1), "查询图=a → 命中 a 自身");
     }
 
     #[test]

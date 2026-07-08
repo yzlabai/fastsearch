@@ -8,7 +8,7 @@
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -81,7 +81,16 @@ impl AssetSigner {
     }
 
     fn mac_hex(&self, cid: &str, exp: u64, ct: &str) -> String {
-        self.mac_bytes(format!("{cid}|{exp}|{ct}").as_bytes())
+        // 长度前缀 framing 消除分隔符歧义：cid 内嵌客户端可控的 doc_id、ct 来自客户端 media_type，
+        // 二者可含任意字符（含 `|`）。旧 `cid|exp|ct` 拼接下 (cid1,ct1) 与某个 (cid2,ct2) 可拼出逐字节
+        // 相等的消息 → 签名跨对复用。每字段前置其字节长度（8B BE），字段边界唯一可解析（M20）。
+        let mut msg = Vec::with_capacity(cid.len() + ct.len() + 24);
+        for field in [cid.as_bytes(), ct.as_bytes()] {
+            msg.extend_from_slice(&(field.len() as u64).to_be_bytes());
+            msg.extend_from_slice(field);
+        }
+        msg.extend_from_slice(&exp.to_be_bytes());
+        self.mac_bytes(&msg)
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect()
@@ -290,6 +299,10 @@ struct Bucket {
     last: std::time::Instant,
 }
 
+/// 限流桶表硬上限（DoS backstop）。正常调用方经鉴权后分桶，桶数 ≤ 配置的 API Key 数（有限），
+/// 远不及此值；此上限仅防"万一有人在鉴权前分桶或 key 空间异常大"导致 map 无界增长。
+const MAX_RATE_BUCKETS: usize = 100_000;
+
 /// 简单令牌桶限流：每个 key 一桶，容量 `capacity`、每秒回填 `refill_per_sec`。
 pub struct RateLimiter {
     capacity: f64,
@@ -302,6 +315,12 @@ impl RateLimiter {
     fn check(&self, key: &str) -> bool {
         let now = std::time::Instant::now();
         let mut map = self.buckets.lock().unwrap();
+        // 有界化 backstop（M21）：桶表触顶且来了新 key 时整表清空（摊还 O(1)，仿动态数组倍增；
+        // 清空只是把所有桶重置为满，不放松长期限流）。避免无界增长，也避免"触顶后每请求 O(n) 逐出"。
+        // 正常调用方经鉴权后分桶，桶数 ≤ 配置 key 数，远不及此上限——此路仅极端/异常下触发。
+        if map.len() >= MAX_RATE_BUCKETS && !map.contains_key(key) {
+            map.clear();
+        }
         let b = map.entry(key.to_string()).or_insert(Bucket {
             tokens: self.capacity,
             last: now,
@@ -357,8 +376,13 @@ pub struct ServerState {
     /// **集合注册表**（咨询性、内存态、可重建）：记录集合期望的 `dim`/`distance`，供 ingest 维度
     /// 校验 + introspection。**不是真源、不跨副本共享**（多副本各自一份）；向量后端是**服务端级**
     /// 选择（`FASTSEARCH_VECTOR_BACKEND` env），不在此处按集合实例化。见 [docs/benchmark-strategy.md]。
-    collections: Arc<Mutex<HashMap<String, CollectionSpec>>>,
+    // 键含所有者 tenant：集合注册表按租户隔离，跨租户不可覆盖/读取/枚举（M22）。tenant=None
+    // （无租户/管理 key）自成一个作用域。单租户部署（所有 key 同 tenant/无 tenant）行为不变。
+    collections: Arc<Mutex<CollectionRegistry>>,
 }
+
+/// 集合注册表：`(所有者 tenant, 集合名) → 配置`。按租户隔离（M22）。
+type CollectionRegistry = HashMap<(Option<String>, String), CollectionSpec>;
 
 /// 集合的咨询性配置（注册表项）。`dim` 设了则 ingest 校验预计算向量维度一致；`distance` 仅记录。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -892,6 +916,16 @@ async fn metrics(State(s): State<ServerState>) -> String {
 
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
+/// 内部错误出口：完整错误记服务端日志（排障用），只回客户端通用文案，避免向客户端泄露表名/SQL
+/// 片段/内部路径等细节（R3.5）。用于 PG/引擎等内部错误的 5xx 收口。
+fn internal_err(context: &str, detail: impl std::fmt::Display) -> (StatusCode, String) {
+    eprintln!("internal error [{context}]: {detail}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal error".to_string(),
+    )
+}
+
 fn public_media(media: &Option<fastsearch_core::MediaRef>) -> Option<PublicMediaRef> {
     media.as_ref().map(|m| m.to_public())
 }
@@ -1079,9 +1113,6 @@ async fn search(State(s): State<ServerState>, headers: HeaderMap, req: Request<B
 async fn search_request(s: ServerState, headers: HeaderMap, req: SearchRequest) -> ApiResult {
     let started = std::time::Instant::now();
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
-    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -1089,6 +1120,11 @@ async fn search_request(s: ServerState, headers: HeaderMap, req: SearchRequest) 
             "missing or invalid API key".into(),
         )
     })?;
+    // 限流在鉴权之后（M21）：仅已认证请求分桶 → 桶数 ≤ 有效 key 数（有界）；伪造 token 在鉴权处
+    // 被拒、不创建桶，避免"每个伪造 token 一个永不回收的桶"内存 DoS。
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let acl = acl_for(&principal);
 
     // 真混合：mode 需要向量、客户端未传 vector、且配了嵌入后端 → 锁外嵌入 query。
@@ -1173,9 +1209,6 @@ async fn similar(
     Json(body): Json<SimilarBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
-    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -1183,6 +1216,10 @@ async fn similar(
             "missing or invalid API key".into(),
         )
     })?;
+    // 限流在鉴权之后（M21）：见 search_request。
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let acl = acl_for(&principal);
     let gid =
         GlobalId::parse(&body.citation_id).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -1270,9 +1307,45 @@ fn parse_range(headers: &HeaderMap, total: u64) -> RangeSpec {
 /// 把 inline 字节按 `Range` 头组装响应：无 Range→200 全量 + `Accept-Ranges: bytes`；
 /// 单段→206 + `Content-Range`；不可满足→416 + `Content-Range: bytes */total`。两个 inline
 /// 出口（authed `asset` / token 门控 `asset_bytes`）共用，确保 Range 语义一致。
+/// media_type 是否可安全内联渲染。仅放行常见图片/音视频/PDF；**text/html、image/svg+xml（可含
+/// 脚本）、XML 等一律不内联**——media_type 客户端可控，内联渲染 HTML 会造成同源存储型 XSS（R3.5）。
+fn is_safe_inline_ct(ct: &str) -> bool {
+    let base = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/avif"
+            | "image/bmp"
+            | "audio/mpeg"
+            | "audio/mp4"
+            | "audio/ogg"
+            | "audio/wav"
+            | "audio/webm"
+            | "video/mp4"
+            | "video/webm"
+            | "video/ogg"
+            | "application/pdf"
+    )
+}
+
 fn serve_inline_bytes(headers: &HeaderMap, ct: String, bytes: Vec<u8>) -> Response {
     let total = bytes.len() as u64;
-    match parse_range(headers, total) {
+    // 非白名单类型（含客户端可伪造的 text/html、SVG）降为 octet-stream + 强制下载，不内联渲染。
+    let safe = is_safe_inline_ct(&ct);
+    let ct = if safe {
+        ct
+    } else {
+        "application/octet-stream".to_string()
+    };
+    let mut resp = match parse_range(headers, total) {
         RangeSpec::None => (
             [
                 (header::CONTENT_TYPE, ct),
@@ -1297,13 +1370,28 @@ fn serve_inline_bytes(headers: &HeaderMap, ct: String, bytes: Vec<u8>) -> Respon
             )
                 .into_response()
         }
-        RangeSpec::Unsatisfiable => (
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            [(header::CONTENT_RANGE, format!("bytes */{total}"))],
-            "range not satisfiable",
-        )
-            .into_response(),
+        RangeSpec::Unsatisfiable => {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{total}"))],
+                "range not satisfiable",
+            )
+                .into_response()
+        }
+    };
+    // 安全响应头：nosniff 阻止 MIME 嗅探；非白名单类型 attachment 强制下载（防内联 XSS）。
+    let h = resp.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if !safe {
+        h.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
     }
+    resp
 }
 
 /// 媒资 ACL 网关：`GET /v1/asset/{citation_id}` —— `principal→acl_for→resolve_citation`，
@@ -1317,13 +1405,14 @@ async fn asset(
     Path(cid): Path<String>,
 ) -> Response {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
-    }
     let Some(principal) = principal_from_headers(&headers, &s.keys) else {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         return (StatusCode::UNAUTHORIZED, "missing or invalid API key").into_response();
     };
+    // 限流在鉴权之后（M21）：见 search_request。
+    if !s.allow(&rate_key(&headers)) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
     let acl = acl_for(&principal);
     let engine = s.engine.lock().await;
     let resolved = match engine.resolve_citation(&cid, Some(&acl)) {
@@ -1491,9 +1580,6 @@ async fn assets_resolve(
     Json(body): Json<ResolveBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
-    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -1501,6 +1587,10 @@ async fn assets_resolve(
             "missing or invalid API key".into(),
         )
     })?;
+    // 限流在鉴权之后（M21）：见 search_request。
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let acl = acl_for(&principal);
     let now = unix_now();
     let engine = s.engine.lock().await;
@@ -1780,9 +1870,6 @@ async fn index(
     Json(mut body): Json<IndexBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    if !s.allow(&rate_key(&headers)) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
-    }
     let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
         s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
         (
@@ -1790,6 +1877,10 @@ async fn index(
             "missing or invalid API key".into(),
         )
     })?;
+    // 限流在鉴权之后（M21）：见 search_request。
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
     let err500 = |e: fastsearch_engine::EngineError| {
         s.metrics.errors.fetch_add(1, Ordering::Relaxed);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -1866,7 +1957,7 @@ async fn index(
         .collections
         .lock()
         .await
-        .get(&body.collection)
+        .get(&(principal.tenant.clone(), body.collection.clone()))
         .and_then(|c| c.dim)
     {
         for ic in &body.chunks {
@@ -2012,7 +2103,7 @@ async fn index(
                     eprintln!("object cleanup after pg upsert failure failed: {cleanup_err}");
                 }
             }
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("pg upsert: {e}")));
+            return Err(internal_err("pg upsert", e));
         }
     }
 
@@ -2060,10 +2151,11 @@ async fn delete_doc(
     Path((collection, doc_id)): Path<(String, String)>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    // 限流在鉴权之后（M21）：见 search_request。
     if !s.allow(&rate_key(&headers)) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
     }
-    let principal = require_principal(&s, &headers)?;
     let acl = acl_for(&principal);
 
     let (object_uris, pg) = {
@@ -2088,7 +2180,7 @@ async fn delete_doc(
     let pg_deleted = if let Some(pg) = pg {
         pg.delete_doc(&collection, &doc_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pg delete: {e}")))?
+            .map_err(|e| internal_err("pg delete", e))?
     } else {
         0
     };
@@ -2157,7 +2249,7 @@ async fn create_collection(
     Json(body): Json<CreateCollectionBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    require_principal(&s, &headers)?;
+    let principal = require_principal(&s, &headers)?;
     if body.name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".into()));
     }
@@ -2165,10 +2257,11 @@ async fn create_collection(
         dim: body.dim,
         distance: body.distance.clone(),
     };
+    // 按 (owner_tenant, name) 分桶：不同租户的同名集合互不覆盖（M22）。
     s.collections
         .lock()
         .await
-        .insert(body.name.clone(), spec.clone());
+        .insert((principal.tenant.clone(), body.name.clone()), spec.clone());
     let info = server_vector_info(&s).await;
     Ok(Json(json!({
         "name": body.name,
@@ -2185,8 +2278,14 @@ async fn get_collection(
     Path(name): Path<String>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    require_principal(&s, &headers)?;
-    let spec = s.collections.lock().await.get(&name).cloned();
+    let principal = require_principal(&s, &headers)?;
+    // 只查本租户名下的集合：他租户的同名集合视为未注册（404，不暴露存在性）（M22）。
+    let spec = s
+        .collections
+        .lock()
+        .await
+        .get(&(principal.tenant.clone(), name.clone()))
+        .cloned();
     let Some(spec) = spec else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -2205,8 +2304,16 @@ async fn get_collection(
 /// 列出已注册集合名 + 服务端实际向量配置。
 async fn list_collections(State(s): State<ServerState>, headers: HeaderMap) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    require_principal(&s, &headers)?;
-    let mut names: Vec<String> = s.collections.lock().await.keys().cloned().collect();
+    let principal = require_principal(&s, &headers)?;
+    // 只列本租户名下的集合，不枚举他租户的名字（M22）。
+    let mut names: Vec<String> = s
+        .collections
+        .lock()
+        .await
+        .iter()
+        .filter(|((t, _), _)| t == &principal.tenant)
+        .map(|((_, n), _)| n.clone())
+        .collect();
     names.sort();
     let info = server_vector_info(&s).await;
     Ok(Json(json!({ "collections": names, "server": info })))
@@ -2375,6 +2482,23 @@ mod tests {
                 1000
             ),
             "换密钥"
+        );
+    }
+
+    #[test]
+    fn asset_signature_not_reusable_across_field_split() {
+        // M20 回归：cid/ct 客户端可控、可含 `|`。旧 `cid|exp|ct` 拼接有规范化歧义——为 (cid1,ct1)
+        // 签发的签名会对某个不同的 (cid2,exp2,ct2) 复用（拼出逐字节相等的消息）。长度前缀 framing 后
+        // 不再可复用。
+        let s = AssetSigner::new(b"secret-key".to_vec(), 500);
+        let (cid1, ct1) = ("a", "b|100|c");
+        let (exp1, sig1) = s.sign(cid1, ct1, 0);
+        assert_eq!(exp1, 500);
+        assert!(s.verify(cid1, exp1, ct1, &sig1, 0), "自身应验签通过");
+        // 旧方案：msg1 = "a|500|b|100|c"；(cid2="a|500|b", exp2=100, ct2="c") 拼出同一 msg → 会复用。
+        assert!(
+            !s.verify("a|500|b", 100, "c", &sig1, 0),
+            "跨 (cid,ct) 对复用同一签名应失败（长度前缀消歧）"
         );
     }
 
@@ -2642,6 +2766,38 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "多段 Range 不支持 → 退 200 全量");
         assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn inline_bytes_unsafe_ct_forced_download_safe_ct_inline() {
+        // R3.5：客户端可控 media_type=text/html 若内联渲染 → 同源存储型 XSS。非白名单类型应降为
+        // octet-stream + attachment + nosniff（下载不渲染）；白名单图片照常内联 + nosniff。
+        let (_st, h, _b) = resp_parts(serve_inline_bytes(
+            &HeaderMap::new(),
+            "text/html".into(),
+            b"<script>alert(1)</script>".to_vec(),
+        ))
+        .await;
+        assert_eq!(
+            h.get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream",
+            "text/html 应降为 octet-stream"
+        );
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(h.get(header::CONTENT_DISPOSITION).unwrap(), "attachment");
+
+        let (_st, h2, _b) = resp_parts(serve_inline_bytes(
+            &HeaderMap::new(),
+            "image/png".into(),
+            vec![0x89, 0x50, 0x4e, 0x47],
+        ))
+        .await;
+        assert_eq!(h2.get(header::CONTENT_TYPE).unwrap(), "image/png");
+        assert_eq!(h2.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert!(
+            h2.get(header::CONTENT_DISPOSITION).is_none(),
+            "安全图片不应强制下载（保内联 <img>）"
+        );
     }
 
     #[tokio::test]
@@ -3690,6 +3846,91 @@ mod tests {
         assert_eq!(v["collections"], json!(["kb"]));
     }
 
+    // M22：集合注册表按租户隔离——他租户不可覆盖/读取/枚举本租户的集合。
+    #[tokio::test]
+    async fn collections_tenant_isolated() {
+        let mut ks = HashMap::new();
+        ks.insert(
+            "key-a".to_string(),
+            Principal {
+                tenant: Some("tenant-a".into()),
+                tags: vec![],
+            },
+        );
+        ks.insert(
+            "key-b".to_string(),
+            Principal {
+                tenant: Some("tenant-b".into()),
+                tags: vec![],
+            },
+        );
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, ks));
+        let post = |key: &'static str, body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/collections")
+                .header("content-type", "application/json")
+                .header("x-api-key", key)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let get = |key: &'static str, uri: &'static str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap()
+        };
+        // A 注册 kb dim=3；B 注册同名 kb dim=8 —— 不应覆盖 A 的
+        assert_eq!(
+            app.clone()
+                .oneshot(post("key-a", r#"{"name":"kb","dim":3}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(post("key-b", r#"{"name":"kb","dim":8}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // A 读回仍是自己的 dim=3（未被 B 覆盖）
+        let ra = app
+            .clone()
+            .oneshot(get("key-a", "/v1/collections/kb"))
+            .await
+            .unwrap();
+        assert_eq!(body_json(ra).await["dim"], 3, "A 的集合维度不应被 B 覆盖");
+        // B 读回自己的 dim=8
+        let rb = app
+            .clone()
+            .oneshot(get("key-b", "/v1/collections/kb"))
+            .await
+            .unwrap();
+        assert_eq!(body_json(rb).await["dim"], 8, "B 读到自己的集合");
+        // B 注册独有集合后，A 的列表不应枚举到它
+        app.clone()
+            .oneshot(post("key-b", r#"{"name":"b-only","dim":5}"#))
+            .await
+            .unwrap();
+        let rl = app
+            .clone()
+            .oneshot(get("key-a", "/v1/collections"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(rl).await["collections"],
+            json!(["kb"]),
+            "A 只应看到自己的集合，不枚举 B 的 b-only"
+        );
+    }
+
     // 注册 dim 后，ingest 携带不等维预计算向量 → 400（benchmark 误配早失败）。
     #[tokio::test]
     async fn index_dim_mismatch_rejected() {
@@ -3851,6 +4092,24 @@ mod tests {
         let text =
             String::from_utf8(m.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
         assert!(text.contains("fastsearch_rate_limited_total 1"));
+    }
+
+    #[test]
+    fn rate_limiter_bucket_map_bounded_under_distinct_keys() {
+        // M21 回归：桶表有硬上限——大量不同 key（模拟伪造 token 洪水）不致 map 无界增长。
+        let rl = RateLimiter {
+            capacity: 1.0,
+            refill_per_sec: 0.0,
+            buckets: std::sync::Mutex::new(HashMap::new()),
+        };
+        for i in 0..(MAX_RATE_BUCKETS + 5_000) {
+            rl.check(&format!("forged-token-{i}"));
+        }
+        let n = rl.buckets.lock().unwrap().len();
+        assert!(
+            n <= MAX_RATE_BUCKETS,
+            "桶表应有界（防伪造 token 内存 DoS）: {n} <= {MAX_RATE_BUCKETS}"
+        );
     }
 
     #[tokio::test]
