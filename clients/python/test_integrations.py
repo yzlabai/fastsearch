@@ -169,6 +169,216 @@ def test_search_injects_collection_filter():
     }
 
 
+# ---- M24：SDK 补齐（与 TS client 对齐的方法面，零网络 stub） -------------------
+
+
+def _stub_client(responses=None):
+    """真实 client + 录制型 `_post` stub（沿用 test_search_injects_collection_filter 模式）。"""
+    from fastsearch_client import FastsearchClient
+
+    c = FastsearchClient("http://x", api_key="dev")
+    calls = []
+
+    def fake_post(path, body):
+        calls.append({"path": path, "body": body})
+        if callable(responses):
+            return responses(path, body)
+        return responses if responses is not None else {"hits": []}
+
+    c._post = fake_post
+    return c, calls
+
+
+def test_search_full_options_body():
+    """新增检索参数逐一映射进请求体（snake_case，与 server 契约一致）。"""
+    c, calls = _stub_client()
+    c.search(
+        "kb",
+        "毛利率",
+        mode="hybrid",
+        top_k=5,
+        fusion={"rrf": {"k": 60}},
+        embedder="bge",
+        candidates=100,
+        rerank=True,
+        auto_merge=True,
+        collapse="doc_id",
+        search_after="cur-1",
+        highlight=True,
+        facets=["doc_id"],
+        explain=True,
+    )
+    body = calls[-1]["body"]
+    assert body["top_k"] == 5
+    assert body["fusion"] == {"rrf": {"k": 60}}
+    assert body["embedder"] == "bge"
+    assert body["candidates"] == 100
+    assert body["rerank"] is True
+    assert body["auto_merge"] is True
+    assert body["collapse"] == "doc_id"
+    assert body["search_after"] == "cur-1"
+    assert body["highlight"] is True
+    assert body["facets"] == ["doc_id"]
+    assert body["explain"] is True
+    # 未显式给的可选参数不进请求体（服务端走默认）
+    c.search("kb", "q")
+    assert "rerank" not in calls[-1]["body"]
+    assert "search_after" not in calls[-1]["body"]
+
+
+def test_search_with_facets():
+    c, calls = _stub_client({"hits": SAMPLE_HITS, "facets": {"doc_id": {"rep.pdf": 2}}})
+    out = c.search_with_facets("kb", "毛利率", top_k=8, facets=["doc_id"])
+    assert out["hits"] == SAMPLE_HITS
+    assert out["facets"] == {"doc_id": {"rep.pdf": 2}}
+    assert calls[-1]["body"]["facets"] == ["doc_id"]
+    # collection 作用域注入同 search（M23）
+    assert calls[-1]["body"]["filter"] == {"eq": ["collection", "kb"]}
+
+
+def test_paginate_follows_cursor_and_stops():
+    """paginate：按末条 cursor 续取；不足一页停；游标未推进停（防死循环）。"""
+
+    def hit(cid, cursor):
+        return {"citation_id": cid, "cursor": cursor}
+
+    pages = {
+        None: [hit("kb:d:1", "c1"), hit("kb:d:2", "c2")],
+        "c2": [hit("kb:d:3", "c3"), hit("kb:d:4", "c4")],
+        "c4": [hit("kb:d:5", "c5")],  # 不足一页 → 最后一页
+    }
+
+    def respond(path, body):
+        return {"hits": pages[body.get("search_after")]}
+
+    c, calls = _stub_client(respond)
+    got = list(c.paginate("kb", "q", top_k=2))
+    assert [len(p) for p in got] == [2, 2, 1]
+    assert [call["body"].get("search_after") for call in calls] == [None, "c2", "c4"]
+
+    # 游标未推进：第二页末条 cursor 与当前相同 → 停在两页，不无限循环
+    def respond_stuck(path, body):
+        return {"hits": [hit("kb:d:1", "cX"), hit("kb:d:2", "cX")]}
+
+    c2, _ = _stub_client(respond_stuck)
+    got2 = list(c2.paginate("kb", "q", top_k=2, max_pages=10))
+    assert len(got2) == 2
+
+    # max_pages 截断
+    c3, _ = _stub_client(respond_stuck)
+    assert len(list(c3.paginate("kb", "q", top_k=2, max_pages=1))) == 1
+
+
+def test_similar_posts_citation_id():
+    c, calls = _stub_client({"hits": SAMPLE_HITS})
+    hits = c.similar("kb:rep.pdf:3", top_k=4)
+    assert len(hits) == 2
+    assert calls[-1]["path"] == "/v1/similar"
+    assert calls[-1]["body"] == {"citation_id": "kb:rep.pdf:3", "top_k": 4}
+
+
+def test_resolve_assets_posts_ids():
+    c, calls = _stub_client({"assets": [{"citation_id": "kb:rep.pdf:3", "url": "http://x/u"}]})
+    assets = c.resolve_assets(["kb:rep.pdf:3", "kb:rep.pdf:9"])
+    assert assets[0]["url"] == "http://x/u"
+    assert calls[-1]["path"] == "/v1/assets/resolve"
+    assert calls[-1]["body"] == {"ids": ["kb:rep.pdf:3", "kb:rep.pdf:9"]}
+
+
+def test_delete_doc_issues_delete_with_slash_doc_id():
+    """DELETE /v1/docs/{collection}/{doc_id}：doc_id 可含 `/`（server 通配段），不转义斜杠。"""
+    from fastsearch_client import FastsearchClient
+
+    c = FastsearchClient("http://x", api_key="dev")
+    captured = {}
+
+    def fake_request(method, path, body=None, **kw):
+        captured.update({"method": method, "path": path})
+        return {"deleted": True, "pg_deleted": 3}
+
+    c._request = fake_request
+    out = c.delete_doc("kb", "sub/d.md")
+    assert out["deleted"] is True and out["pg_deleted"] == 3
+    assert captured["method"] == "DELETE"
+    assert captured["path"] == "/v1/docs/kb/sub/d.md"
+
+
+def test_fetch_asset_bytes_variants():
+    """inline 字节 → (bytes, ct)；JSON（DocRender）→ None；404 → None；其余错误上抛。"""
+    from fastsearch_client import FastsearchClient, FastsearchError
+
+    def client_with(raw_result=None, error=None):
+        c = FastsearchClient("http://x", api_key="dev")
+
+        def fake_request(method, path, body=None, raw=False, **kw):
+            assert method == "GET" and raw
+            # citation_id 整体 percent-encode（含 `:`）
+            assert path == "/v1/asset/kb%3Arep.pdf%3A3"
+            if error is not None:
+                raise error
+            return raw_result
+
+        c._request = fake_request
+        return c
+
+    got = client_with((b"\x89PNG", "image/png")).fetch_asset_bytes("kb:rep.pdf:3")
+    assert got == (b"\x89PNG", "image/png")
+    assert client_with((b"{}", "application/json")).fetch_asset_bytes("kb:rep.pdf:3") is None
+    err404 = FastsearchError("HTTP 404: not found", 404, "not found")
+    assert client_with(error=err404).fetch_asset_bytes("kb:rep.pdf:3") is None
+    err500 = FastsearchError("HTTP 500: boom", 500, "boom")
+    try:
+        client_with(error=err500).fetch_asset_bytes("kb:rep.pdf:3")
+        raise AssertionError("500 应上抛")
+    except FastsearchError as e:
+        assert e.status == 500
+
+
+def test_request_retries_transient_then_succeeds():
+    """retries>0：网络错先退避重试，成功即返回；默认 retries=0 保持原一击即抛。"""
+    import io
+    import urllib.error
+    import urllib.request
+
+    from fastsearch_client import FastsearchClient, FastsearchError
+
+    attempts = []
+
+    class FakeResp(io.BytesIO):
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    real_urlopen = urllib.request.urlopen
+
+    def flaky_urlopen(req, timeout=None):
+        attempts.append(req.full_url)
+        if len(attempts) == 1:
+            raise urllib.error.URLError("connection refused")
+        return FakeResp(b'{"hits": []}')
+
+    urllib.request.urlopen = flaky_urlopen
+    try:
+        c = FastsearchClient("http://x", api_key="dev", retries=2)
+        assert c.search("kb", "q") == []
+        assert len(attempts) == 2  # 失败 1 次 + 成功 1 次
+        # retries=0（默认）：不重试，直接抛
+        attempts.clear()
+        c0 = FastsearchClient("http://x", api_key="dev")
+        try:
+            c0.search("kb", "q")
+            raise AssertionError("应抛 FastsearchError")
+        except FastsearchError:
+            pass
+        assert len(attempts) == 1
+    finally:
+        urllib.request.urlopen = real_urlopen
+
+
 def main():
     tests = [
         test_hit_to_document,
@@ -177,6 +387,14 @@ def main():
         test_retriever_invoke_and_param_passthrough,
         test_retriever_kwargs_bind_real_client_signature,
         test_search_injects_collection_filter,
+        test_search_full_options_body,
+        test_search_with_facets,
+        test_paginate_follows_cursor_and_stops,
+        test_similar_posts_citation_id,
+        test_resolve_assets_posts_ids,
+        test_delete_doc_issues_delete_with_slash_doc_id,
+        test_fetch_asset_bytes_variants,
+        test_request_retries_transient_then_succeeds,
     ]
     for t in tests:
         t()

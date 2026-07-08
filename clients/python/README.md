@@ -13,8 +13,19 @@ chunks = json.loads(subprocess.check_output(["docparse", "report.pdf", "-f", "ch
 c.index("kb", "report.pdf", chunks)
 
 # 检索（带 page+bbox 引用溯源）
-for h in c.search("kb", "毛利率为什么下降", top_k=10):
+for h in c.search("kb", "毛利率为什么下降", top_k=10, highlight=True):
     print(h["citation_id"], "p", h["page"], h["bbox"])
+
+# 分面计数 / 相似检索 / 深分页 / 资产解析 / 删除（与 TS SDK 同一 API 面）
+out = c.search_with_facets("kb", "毛利率", facets=["doc_id"])   # {"hits": [...], "facets": {...}}
+more = c.similar("kb:report.pdf:3", top_k=5)                    # more_like_this
+for page in c.paginate("kb", "毛利率", top_k=50, max_pages=10): # cursor 深分页逐页扫读
+    ...
+assets = c.resolve_assets(["kb:report.pdf:3"])                  # citation_id → 短时 URL / 跳原文
+c.delete_doc("kb", "report.pdf")                                # 真源 PG + 派生索引一起删
+
+# 可选：瞬态错误自动重试（429/5xx/网络，指数退避；默认 0 不重试）
+c = FastsearchClient("http://127.0.0.1:8642", api_key="dev", retries=2)
 ```
 
 ## LangChain / LlamaIndex

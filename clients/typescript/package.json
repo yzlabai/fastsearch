@@ -1,6 +1,6 @@
 {
   "name": "fastsearch-client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Zero-dependency TypeScript SDK for the fastsearch REST API — hybrid search over docparse chunks, with first-class helpers for LLM agent development (tool definitions, RAG context, retrievers).",
   "license": "Apache-2.0",
   "type": "module",

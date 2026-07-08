@@ -210,6 +210,22 @@ test("similar posts citation_id and top_k", async () => {
   assert.equal(hits.length, 1);
 });
 
+// ---- deleteDoc ------------------------------------------------------------
+
+test("deleteDoc issues DELETE and keeps doc_id slashes", async () => {
+  const { fetch, calls } = stub(() => ({
+    json: { deleted: true, pg_deleted: 3, objects_deleted: 0, object_errors: [] },
+  }));
+  const c = new FastsearchClient({ baseUrl: "http://x", apiKey: "dev", fetch });
+  const out = await c.deleteDoc("kb", "sub/d.md");
+  assert.equal(calls[0]!.method, "DELETE");
+  // doc_id 含 `/` 保留为路径段（server 通配段），collection 整体编码
+  assert.equal(calls[0]!.url, "http://x/v1/docs/kb/sub/d.md");
+  assert.equal(calls[0]!.headers["x-api-key"], "dev");
+  assert.equal(out.deleted, true);
+  assert.equal(out.pg_deleted, 3);
+});
+
 // ---- paginate / 资产 ------------------------------------------------------
 
 test("paginate stops when the last hit lacks a cursor (no infinite loop)", async () => {

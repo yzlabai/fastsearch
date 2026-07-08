@@ -75,7 +75,7 @@ export class FastsearchClient {
   // ---- HTTP 内核：超时 + 取消 + 可选重试 ----------------------------------
 
   private async request(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "DELETE",
     path: string,
     body?: unknown,
     opts: { signal?: AbortSignal; timeoutMs?: number } = {},
@@ -315,6 +315,36 @@ export class FastsearchClient {
       { signal: opts.signal, timeoutMs: opts.timeoutMs },
     );
     return out.indexed ?? 0;
+  }
+
+  /**
+   * 删除一个 doc（真源 PG + 派生索引 + 关联对象）。
+   * ACL 强制：不可见/不存在抛 404 FastsearchError（不暴露存在性）。
+   */
+  async deleteDoc(
+    collection: string,
+    docId: string,
+    opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<{
+    deleted: boolean;
+    pg_deleted?: number;
+    objects_deleted?: number;
+    object_errors?: string[];
+  }> {
+    // doc_id 可含 `/`（server 通配段）：按段编码、保留斜杠。
+    const docPath = docId.split("/").map(encodeURIComponent).join("/");
+    const resp = await this.request(
+      "DELETE",
+      `/v1/docs/${encodeURIComponent(collection)}/${docPath}`,
+      undefined,
+      opts,
+    );
+    return (await resp.json()) as {
+      deleted: boolean;
+      pg_deleted?: number;
+      objects_deleted?: number;
+      object_errors?: string[];
+    };
   }
 
   // ---- 健康/契约 ---------------------------------------------------------
