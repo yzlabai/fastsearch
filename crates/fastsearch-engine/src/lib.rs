@@ -18,7 +18,9 @@ use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
 use fastsearch_sync::replication::{advance_slot, peek_with_lsn, ReplicationConfig};
 use fastsearch_sync::{Applier, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
-pub use fastsearch_vector::{HnswParams, VectorBackendKind, DEFAULT_BINARY_OVERSAMPLE};
+pub use fastsearch_vector::{
+    HnswParams, VectorBackendKind, DEFAULT_BINARY_OVERSAMPLE, DEFAULT_QUANT_BITS,
+};
 use fastsearch_vector::{VecMeta, VectorBackend, VectorStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -971,6 +973,10 @@ impl Engine {
             "brute_binary_rotated" => {
                 VectorBackendKind::BruteBinaryRotated(fastsearch_vector::DEFAULT_BINARY_OVERSAMPLE)
             }
+            // bits 由 turbo 快照自描述（首启缺文件时才用默认）；同 hnsw params 取自快照策略。
+            "turboquant" => VectorBackendKind::TurboQuant {
+                bits: fastsearch_vector::DEFAULT_QUANT_BITS,
+            },
             _ => default_backend,
         };
         let vector = VectorStore::load(kind, &vector_path(data_dir))
@@ -3269,6 +3275,46 @@ mod tests {
         let mut r = req("");
         r.mode = SearchMode::Vector;
         r.vector = Some(vec![1.0, 0.0]);
+        assert_eq!(e2.search(&r, None).unwrap()[0].id.chunk_id, 1);
+    }
+
+    /// TurboQuant 后端化：首启 `TurboQuant{bits:4}` → 检查点记 `turboquant` → 重开（默认 `Brute`）
+    /// 仍恢复量化档（bits 由 turbo 快照自描述、load 重建旋转矩阵）；检索可用。
+    #[test]
+    fn persist_reopen_restores_turboquant_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut e, _) = Engine::open_with(
+            dir.path(),
+            TextIndexConfig::default(),
+            VectorBackendKind::TurboQuant { bits: 4 },
+        )
+        .unwrap();
+        assert_eq!(e.vector.kind_str(), "turboquant");
+        e.ingest_vector(
+            "kb",
+            &chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha", 1),
+            vec![1.0, 0.0, 0.0, 0.0],
+        )
+        .unwrap();
+        e.persist(dir.path(), Lsn(11)).unwrap();
+        drop(e);
+
+        // 重开**用默认 Brute**：检查点记的 turboquant 覆盖默认 → 仍量化档。
+        let (e2, lsn) = Engine::open_with(
+            dir.path(),
+            TextIndexConfig::default(),
+            VectorBackendKind::Brute,
+        )
+        .unwrap();
+        assert_eq!(lsn, Lsn(11));
+        assert_eq!(
+            e2.vector.kind_str(),
+            "turboquant",
+            "检查点应恢复量化档（覆盖默认 brute）"
+        );
+        let mut r = req("");
+        r.mode = SearchMode::Vector;
+        r.vector = Some(vec![1.0, 0.0, 0.0, 0.0]);
         assert_eq!(e2.search(&r, None).unwrap()[0].id.chunk_id, 1);
     }
 

@@ -1,8 +1,8 @@
 # spec · fastsearch-vector
 
 > 模块 #5，依赖：fastsearch-core。阶段 P2。上游：[产品设计 §3.3](../plans/2026-06-24-产品设计文档.md)、需求 F10–F13。
-> 状态：**已完成 v2.1**（暴力 + HNSW/u8 量化 + pgvector 直查三档）。VecMeta 另含多模态
-> `modality/time/media`（MM1/MM4）。
+> 状态：**已完成 v2.2**（暴力 + HNSW/u8 量化 + pgvector 直查 + **TurboQuant 压缩主索引**四档）。
+> VecMeta 另含多模态 `modality/time/media`（MM1/MM4）。
 
 ## 1. 目的与范围
 
@@ -12,8 +12,10 @@
 - `MemVectorIndex`：内存暴力余弦（精确、filter-aware）——正确、可测、无需模型；适合中小集合，也作正确性基线。
 - **真预过滤**：过滤/ACL 在打分前/打分中施加（非后过滤），这正是超越 pgvector 后过滤召回崩的点。
 
-三个后端档（同 `VectorBackend` trait）：`MemVectorIndex`（暴力，默认确定）、`HnswVectorIndex`
-（HNSW+u8 量化，A9，大规模近似）、**pgvector 直查**（ANN 在 PG 跑，B6，经 `fastsearch-pg::PgStore::vector_search`）。
+四个后端档（同 `VectorBackend` trait）：`MemVectorIndex`（暴力，默认确定）、`HnswVectorIndex`
+（HNSW+u8 量化，A9，大规模近似）、**pgvector 直查**（ANN 在 PG 跑，B6，经 `fastsearch-pg::PgStore::vector_search`）、
+**`TurboVectorIndex`**（TurboQuant 2–4bit 压缩主索引，只存码不存 f32、内存 ↓8~16×、**无训练 + 完全确定**，
+借鉴 turbovec，见 [plan](../plans/2026-07-21-向量量化压缩主索引-TurboQuant借鉴.md)）。
 
 **不做**：嵌入计算（embed 模块）；旋转档 engine 接线 / filtered-traversal（下一迭代；二值粗筛 + RaBitQ 估计器 + 随机旋转**已落地**于 vector crate，见 §6）；CDC 自动写穿 PG embedding（**已落地**，见 §6 已知限制 + [pg spec](12-pg.md)）；**多向量 MaxSim（ColPali，M2/MM11）`gated`**——只在引擎派生层、不入 PG 真源（不变量 #1），待多模态模型与规模信封。当前后端全是**单向量**（文本嵌入产出；视觉/跨模态向量属 M1 gated，本 crate 不感知模态、只存 `VecMeta.modality` 供过滤下推）。
 
@@ -81,3 +83,4 @@ pub struct VecMeta { pub kind, doc_id, collection, tenant, page, section_id, hea
 - HNSW 大 N 的 p95 与暴力交叉点实测（见 [容量/SLO](../governance/2026-06-26-容量与SLO.md)）；查询分平面量化恢复二值粗筛 popcount 级速度。
 - ✅ pgvector 直查的 **CDC 自动写穿已落地**（2026-06-27，B6 续作）：engine `apply_upsert` 在配了 `set_pg_vector` 时把嵌入写回 PG `embedding` 列（`PgStore::set_embedding`，block_in_place 桥），而非引擎派生索引——直查读 PG、写也归 PG，闭环。**CDC 反馈环**经"列清单 publication 排除派生列（`embedding`/`embed_model`/`updated_at`）+ `set_embedding` 幂等守卫（0 行不复制）"双防线断开。Docker pgvector 验证（见 [pg spec §7](12-pg.md)、devlog）。
 - 向量经 CDC 落地路径自动嵌入（`engine.set_embedder` + `apply_upsert`）或 `ingest_vector` 灌入。
+- ✅ **TurboQuant 压缩主索引已落地**（2026-07-21，借鉴 [turbovec](https://github.com/RyanCodrai/turbovec) / Google TurboQuant，arXiv 2504.19874）：新后端 `TurboVectorIndex`（`turbo.rs`）**只存 2–4bit 量化码 + 每向量一个 f32 修正标量**（`⌈d·bits/8⌉` 字节/条 + 4B），f32 根本不存 → 内存 **↓8~16×**（vs 现有档全 f32 主存）。量化核 `quant.rs`：**Gaussian Lloyd-Max codebook**（旋转后坐标高维→N(0,1)，解析求最优量化点，MSE 逐位对齐经典 Max 表 {2b:0.1175,3b:0.03454,4b:0.009497}——**不引 statrs/BLAS**，用初等高斯 pdf/cdf 闭式 + 复用现成 `binary::Rotation`）+ **长度重归一化**（`corr=1/⟨u_rot,x̂_rot⟩`，无偏内积估计、零查询成本，是现有 1-bit `‖x‖₁` 校正的多-bit 正统版）+ per-query LUT 标量打分（turbovec SIMD 核的**标量等价**，守 `unsafe_code=forbid`）。**无训练**（守 #2）、**完全确定**（旋转固定种子 + 解析 codebook + `GlobalId` tie-break，守 #4——相对 HNSW 非确定的关键卖点）、**filter-aware 真预过滤**（守 #5）。持久化：带 magic/version 的自描述格式（`bits` 存盘、旋转不落盘由种子重建）+ DoS 护栏（NaN/Inf、`MAX_DIM`）。接线 `VectorBackendKind::TurboQuant{bits}` + `VectorStore::Turbo` + engine `open_with` 检查点恢复（`"turboquant"`）+ server `FASTSEARCH_VECTOR_BACKEND=turboquant`（`FASTSEARCH_QUANT_BITS` 调档，默认 4）。**实测**（纯量化分、无 f32 重排、合成聚簇 d=1024）：4-bit exact recall@10≈**0.87** / 候选@100≥**0.98**；2-bit 是候选生成器（exact 低、候选@100≥0.90，需重排）。+14 单测（quant 6：MSE/对称/位打包往返/无偏/召回门禁/确定性；turbo 8：排序/预过滤/ACL/覆盖删除/维度·空·零/确定/持久化往返 bits 自描述/缺文件）+ engine `persist_reopen_restores_turboquant_backend` 回环 + server 实跑 boot（`vector_backend:"turboquant"`）。**默认仍暴力精确、零回归**；TurboQuant 全程 opt-in。**下一迭代**：TQ+ 每坐标校准（+1.4pp，需流式首批 fit 适配）；SIMD 核（Tier 3 gated，需产品决策为量化子模块局部解禁 unsafe）；PG 真源 f32 落 mmap sidecar 供少数候选精排（比 turbovec 更省内存）。
