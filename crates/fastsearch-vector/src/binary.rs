@@ -59,6 +59,11 @@ fn next_unit(s: &mut u64) -> f64 {
     ((*s >> 11) as f64 / (1u64 << 53) as f64).max(f64::MIN_POSITIVE)
 }
 
+/// 物化 d×d 旋转矩阵的维度上限（守 DoS：不可信快照声明巨维会触发 `4·d²` 分配 + O(d³) 建矩阵）。
+/// 8192 覆盖一切真实稠密嵌入模型（已知最大 4096）+2× 余量；`d>此` 标量旋转本就不可用。
+/// 决策见 [governance](../../docs/governance/2026-07-21-向量旋转维度上限与DoS.md)；根治靠 FHT（下一迭代）。
+pub(crate) const MAX_ROTATION_DIM: usize = 8192;
+
 /// RaBitQ 随机正交旋转：量化前对向量做一次**数据无关**的正交变换，把信息/量化误差摊匀到各维，
 /// 使符号码（`sign`）更均匀有信息、估计器趋近**无偏**——对各向异性（能量集中在少数维）数据增益尤大。
 /// 由**固定种子 + 维度**确定生成（多副本/重开一致，无需持久化矩阵；正交变换不改内积，故精排仍用原向量）。
@@ -68,7 +73,12 @@ pub(crate) struct Rotation {
 }
 
 impl Rotation {
-    pub(crate) fn new(dim: usize, seed: u64) -> Self {
+    /// 建 d×d 旋转矩阵。`dim∈[1, MAX_ROTATION_DIM]`，越界（含 0）→ `Err`——这是**唯一分配点**，
+    /// 两个旋转档（turbo / BruteBinaryRotated）都经此，DoS 闸在此一处、不可绕过。
+    pub(crate) fn new(dim: usize, seed: u64) -> anyhow::Result<Self> {
+        if dim == 0 || dim > MAX_ROTATION_DIM {
+            anyhow::bail!("旋转维度 {dim} 越界（须 1..={MAX_ROTATION_DIM}）");
+        }
         let mut s = seed | 1;
         // 高斯随机矩阵（Box–Muller）。
         let mut mat = vec![0f32; dim * dim];
@@ -99,7 +109,7 @@ impl Rotation {
                 }
             }
         }
-        Rotation { dim, mat }
+        Ok(Rotation { dim, mat })
     }
 
     /// 旋转向量：`(M·v)[i] = ⟨row_i, v⟩`。`v.len()` 须等于 `dim`。
@@ -117,6 +127,18 @@ impl Rotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DoS 闸：`Rotation::new` 唯一分配点拒 dim==0 / >MAX（Err 在建矩阵前立即返回，不触发巨分配）。
+    /// 只测越界快路径 + 小维正常；**不**实建 8192² 矩阵（O(d³)、268MB，太慢）。
+    #[test]
+    fn rotation_dim_guard() {
+        assert!(Rotation::new(0, 1).is_err(), "dim=0 应拒");
+        assert!(
+            Rotation::new(MAX_ROTATION_DIM + 1, 1).is_err(),
+            "dim>MAX 应拒（不分配巨矩阵）"
+        );
+        assert!(Rotation::new(16, 1).is_ok(), "小维正常");
+    }
 
     #[test]
     fn pack_signs_basics() {

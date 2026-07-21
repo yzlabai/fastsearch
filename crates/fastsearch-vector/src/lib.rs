@@ -141,7 +141,7 @@ impl VectorStore {
             VectorBackendKind::BruteBinaryRotated(m) => {
                 let mut idx = MemVectorIndex::load(path)?;
                 idx.set_binary_prefilter(Some(m));
-                idx.set_rabitq_rotation(true); // 重建旋转矩阵 + 旋转空间重算 code/l1
+                idx.set_rabitq_rotation(true)?; // 重建旋转矩阵 + 旋转空间重算 code/l1（dim 越界 → Err）
                 VectorStore::Brute(idx)
             }
             VectorBackendKind::Hnsw(_) => VectorStore::Hnsw(Box::new(HnswVectorIndex::load(path)?)),
@@ -366,12 +366,14 @@ impl MemVectorIndex {
     }
 
     /// dim 已知且开了旋转但矩阵未建 → 惰性构建（固定种子，确定）。
-    fn ensure_rotation(&mut self) {
+    /// dim>`MAX_ROTATION_DIM` → `Err`（`Rotation::new` 唯一分配点守 DoS）。
+    fn ensure_rotation(&mut self) -> anyhow::Result<()> {
         if self.rabitq_rotation && self.rotation.is_none() {
             if let Some(d) = self.dim {
-                self.rotation = Some(binary::Rotation::new(d, RABITQ_ROTATION_SEED));
+                self.rotation = Some(binary::Rotation::new(d, RABITQ_ROTATION_SEED)?);
             }
         }
+        Ok(())
     }
 
     /// 当前二值粗筛 oversample（`None`=精确暴力档）。
@@ -385,12 +387,12 @@ impl MemVectorIndex {
     }
 
     /// 开/关 RaBitQ 随机旋转并**在新空间重算所有 code/l1**（供 load 后翻档；同 `set_binary_prefilter`
-    /// 的"策略不落盘、调用方设"模式）。开启时按固定种子重建旋转矩阵。
-    pub fn set_rabitq_rotation(&mut self, enabled: bool) {
+    /// 的"策略不落盘、调用方设"模式）。开启时按固定种子重建旋转矩阵；dim>`MAX_ROTATION_DIM` → `Err`。
+    pub fn set_rabitq_rotation(&mut self, enabled: bool) -> anyhow::Result<()> {
         self.rabitq_rotation = enabled;
         self.rotation = None;
         if enabled {
-            self.ensure_rotation();
+            self.ensure_rotation()?;
         }
         let rot = self.rotation.take(); // 取出避免与 entries 可变借用冲突
         for e in self.entries.values_mut() {
@@ -399,6 +401,7 @@ impl MemVectorIndex {
             e.l1 = binary::l1_norm(coded.as_deref().unwrap_or(&e.vector));
         }
         self.rotation = rot;
+        Ok(())
     }
 
     /// 取某 gid 的引用（命中组装用）。
@@ -537,7 +540,7 @@ impl VectorBackend for MemVectorIndex {
             _ => {}
         }
         let normalized = normalize(&vector);
-        self.ensure_rotation();
+        self.ensure_rotation()?;
         // 二值码在（可选）旋转空间打：code/l1 由旋转后向量派生；原向量仍存供精排（正交不改内积）。
         let coded = self.rotation.as_ref().map(|r| r.apply(&normalized));
         let code = binary::pack_signs(coded.as_deref().unwrap_or(&normalized));
@@ -1057,6 +1060,23 @@ mod tests {
             .unwrap();
         }
         idx
+    }
+
+    /// DoS 闸（§governance）：旋转粗筛档（BruteBinaryRotated）upsert 维度 >MAX_ROTATION_DIM(8192)
+    /// → 拒（经 `Rotation::new` 兜底闸——补此前只 turbo 有闸、旋转档漏防的问题）。
+    #[test]
+    fn rotated_upsert_rejects_oversized_dim() {
+        let mut idx = MemVectorIndex::with_binary_prefilter_rotated(8);
+        let big = vec![0.1f32; binary::MAX_ROTATION_DIM + 1];
+        assert!(
+            idx.upsert(
+                gid("d", 1),
+                big,
+                meta("d", 1, "paragraph", 1, vec!["public"])
+            )
+            .is_err(),
+            "旋转档超维 upsert 应拒"
+        );
     }
 
     /// 旋转在**各向异性**数据上提升粗筛召回：旋转档 recall ≥ 非旋转档（两档精排同、仅候选选择不同）。

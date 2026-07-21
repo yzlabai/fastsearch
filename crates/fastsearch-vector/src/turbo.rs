@@ -26,8 +26,10 @@ pub const DEFAULT_QUANT_BITS: u8 = 4;
 /// 旋转矩阵固定种子（数据无关、定常 → 多副本/重开生成同一矩阵，无需持久化）。
 const TURBO_ROTATION_SEED: u64 = 0x5475_7262_6f51_5631; // "TurboQV1"
 
-/// 维度上限（防不可信快照声明巨维触发 d×d 旋转矩阵内存爆炸；借 turbovec `MAX_DIM`）。
-const MAX_DIM: usize = 65536;
+/// 维度上限（防不可信快照声明巨维触发 d×d 旋转矩阵内存爆炸）。= 旋转矩阵唯一分配点的共享上限
+/// `binary::MAX_ROTATION_DIM`（8192）；turbo 侧显式早检给清晰错误，`Rotation::new` 的 Result 作兜底。
+/// 决策见 [governance](../../docs/governance/2026-07-21-向量旋转维度上限与DoS.md)。
+const MAX_DIM: usize = crate::binary::MAX_ROTATION_DIM;
 
 /// 落盘格式 magic + 版本（带版本起步，便于将来平滑升级；借 turbovec io.rs）。
 const TURBO_MAGIC: &str = "fastsearch-turbo";
@@ -67,13 +69,14 @@ impl TurboVectorIndex {
         self.bits
     }
 
-    /// dim 已知且矩阵未建 → 惰性构建（固定种子，确定）。
-    fn ensure_rotation(&mut self) {
+    /// dim 已知且矩阵未建 → 惰性构建（固定种子，确定）。dim>`MAX_ROTATION_DIM` → `Err`（DoS 闸）。
+    fn ensure_rotation(&mut self) -> anyhow::Result<()> {
         if self.rotation.is_none() {
             if let Some(d) = self.dim {
-                self.rotation = Some(Rotation::new(d, TURBO_ROTATION_SEED));
+                self.rotation = Some(Rotation::new(d, TURBO_ROTATION_SEED)?);
             }
         }
+        Ok(())
     }
 
     pub fn citation(&self, gid: &GlobalId) -> Option<Citation> {
@@ -150,7 +153,7 @@ impl TurboVectorIndex {
         }
         let mut idx = TurboVectorIndex::new(snap.bits);
         idx.dim = snap.dim;
-        idx.ensure_rotation();
+        idx.ensure_rotation()?;
         let expect_len = snap.dim.map(|d| packed_len(d, snap.bits));
         for e in snap.entries {
             if let Some(el) = expect_len {
@@ -192,7 +195,7 @@ impl VectorBackend for TurboVectorIndex {
             _ => {}
         }
         let normalized = normalize(&vector); // 零/NaN → 全零（不 panic）
-        self.ensure_rotation();
+        self.ensure_rotation()?;
         // 旋转后编码（旋转把坐标摊成近高斯，量化更准）；正交不改内积。
         let u_rot = self
             .rotation
@@ -545,6 +548,35 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("corr"), "应因 corr 非有限拒之: {err}");
+    }
+
+    /// DoS 闸（§governance）：`upsert` 维度 >MAX_DIM(8192) → 拒（建 d×d 旋转前）。
+    #[test]
+    fn upsert_rejects_oversized_dim() {
+        let mut idx = TurboVectorIndex::new(4);
+        let big = vec![0.1f32; MAX_DIM + 1];
+        assert!(
+            idx.upsert(gid("a", 1), big, meta("text", &[])).is_err(),
+            "超维 upsert 应拒"
+        );
+    }
+
+    /// DoS 闸：**小文件声明巨维**（dim=50000、空条目）→ load 在建 16GB 旋转矩阵**前**就拒。
+    #[test]
+    fn load_rejects_oversized_dim() {
+        let snap = TurboSnapshot {
+            magic: TURBO_MAGIC.to_string(),
+            version: TURBO_FORMAT_VERSION,
+            dim: Some(50_000),
+            bits: 4,
+            entries: vec![],
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), serde_json::to_vec(&snap).unwrap()).unwrap();
+        assert!(
+            TurboVectorIndex::load(tmp.path(), 4).is_err(),
+            "小文件声明巨维应拒（不触发巨分配）"
+        );
     }
 
     /// 畸形快照：有条目但 dim 缺失 → load 拒之。

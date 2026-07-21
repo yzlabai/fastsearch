@@ -73,10 +73,15 @@
   不会因未校验 dim 触发巨额分配；corr 守卫覆盖每条目 NaN/±Inf；`packed.len()` 校验不受 dim 守卫影响。
 - 6 新测均非空测；`load_rejects_poisoned_corr` 确证 `1e39`→f32 Inf 触达守卫并**特定**因 corr 报错。
 
-**遗留（非本次增量、首轮已记）**：`MAX_DIM=65536` 仍允许 ~17GB 的 d×d 旋转矩阵分配——根治靠结构化
-旋转（FHT，O(d·log d)、无 d×d 矩阵），属"下一迭代"；当前真实嵌入维（≤~4096）远低于此，风险仅在
-不可信超大 dim 快照（load 侧已挡越界，但 65536 仍偏松）。**建议下一迭代把 `MAX_DIM` 收到 ~8192**
-（覆盖所有真实模型、把最坏分配从 17GB 压到 256MB）。
+**遗留（非本次增量、首轮已记）→ 已处理**：`MAX_DIM=65536` 偏松（+旋转粗筛档同一 DoS 面无闸）。
+经[决策记录](../governance/2026-07-21-向量旋转维度上限与DoS.md)研究分析后落地：
+- **上限 65536→8192**（`binary::MAX_ROTATION_DIM`），覆盖所有真实嵌入模型（≤4096）+2× 余量，
+  最坏 d×d 分配 17GB→**268MB**；
+- **闸移到唯一分配点** `Rotation::new`（改返 `Result`），turbo + **BruteBinaryRotated**（此前漏防）
+  都经此、不可绕过；`Rotation::new`/`ensure_rotation`/`set_rabitq_rotation` 链改 `Result` 传播；
+- +4 测（`rotation_dim_guard` / turbo upsert+load 超维拒 / 旋转档 upsert 超维拒），**vector 57→61**、
+  workspace **303→307** 绿。
+- 根治仍是结构化旋转（FHT，O(d·log d)、无 d×d 矩阵）—— 见决策记录 §6，"下一迭代"。
 
 ## 下一步
 
