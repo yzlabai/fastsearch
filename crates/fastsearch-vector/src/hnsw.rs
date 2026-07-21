@@ -26,7 +26,7 @@
 //! load 重建图）+ 小集合回退暴力 + 接 engine + **图内 filtered-traversal**（hnsw_rs
 //! `search_filter` 谓词下推）+ **自适应过取（强过滤召回兜底）** + **墓碑自动压实**。
 
-use crate::{dot, normalize, tmp_path, VecMeta, VectorBackend};
+use crate::{dot, normalize, VecMeta, VectorBackend};
 use fastsearch_core::{AclFilter, Citation, Filter, GlobalId, Scored};
 use hnsw_rs::prelude::{DistL2, FilterT, Hnsw};
 use serde::{Deserialize, Serialize};
@@ -232,16 +232,7 @@ impl HnswVectorIndex {
                 })
                 .collect(),
         };
-        let bytes = serde_json::to_vec(&snap)?;
-        let tmp = tmp_path(path);
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        crate::atomic_write(path, &serde_json::to_vec(&snap)?)
     }
 
     /// 从快照加载并**重建图**（逐条 re-insert）。文件不存在 → 空索引（默认参数）。

@@ -16,7 +16,10 @@ use std::path::Path;
 
 mod binary;
 mod hnsw;
+mod quant;
+mod turbo;
 pub use hnsw::{HnswParams, HnswVectorIndex};
+pub use turbo::{TurboVectorIndex, DEFAULT_QUANT_BITS};
 
 /// 二值量化粗筛档的默认 oversample（重开检查点时用；与 HNSW 参数同策略——格式入检查点、
 /// 调参取默认）。粗筛候选数 = `k·oversample`。
@@ -35,6 +38,9 @@ pub enum VectorBackendKind {
     BruteBinaryRotated(usize),
     /// HNSW 近似（大规模 opt-in；近似召回 + 非确定，见 [`HnswVectorIndex`]）。
     Hnsw(HnswParams),
+    /// **TurboQuant 压缩主索引**（只存 2–4bit 码，内存 ↓8~16×；无训练、**完全确定**、
+    /// 近似召回，见 [`TurboVectorIndex`]）。`u8` = 位宽 bits∈{2,3,4}。
+    TurboQuant { bits: u8 },
 }
 
 /// 后端门面：让 engine 用单一类型持有"暴力 / HNSW"二选一，统一 upsert/search/持久化等。
@@ -42,6 +48,7 @@ pub enum VectorBackendKind {
 pub enum VectorStore {
     Brute(MemVectorIndex),
     Hnsw(Box<HnswVectorIndex>),
+    Turbo(Box<TurboVectorIndex>),
 }
 
 impl VectorStore {
@@ -55,6 +62,9 @@ impl VectorStore {
                 VectorStore::Brute(MemVectorIndex::with_binary_prefilter_rotated(m))
             }
             VectorBackendKind::Hnsw(p) => VectorStore::Hnsw(Box::new(HnswVectorIndex::new(p))),
+            VectorBackendKind::TurboQuant { bits } => {
+                VectorStore::Turbo(Box::new(TurboVectorIndex::new(bits)))
+            }
         }
     }
 
@@ -70,6 +80,7 @@ impl VectorStore {
             VectorStore::Brute(m) if m.binary_oversample().is_some() => "brute_binary",
             VectorStore::Brute(_) => "brute",
             VectorStore::Hnsw(_) => "hnsw",
+            VectorStore::Turbo(_) => "turboquant",
         }
     }
 
@@ -77,6 +88,7 @@ impl VectorStore {
         match self {
             VectorStore::Brute(m) => m.citation(gid),
             VectorStore::Hnsw(h) => h.citation(gid),
+            VectorStore::Turbo(t) => t.citation(gid),
         }
     }
 
@@ -84,6 +96,7 @@ impl VectorStore {
         match self {
             VectorStore::Brute(m) => m.dim(),
             VectorStore::Hnsw(h) => h.dim(),
+            VectorStore::Turbo(t) => t.dim(),
         }
     }
 
@@ -91,6 +104,7 @@ impl VectorStore {
         match self {
             VectorStore::Brute(m) => m.len(),
             VectorStore::Hnsw(h) => h.len(),
+            VectorStore::Turbo(t) => t.len(),
         }
     }
 
@@ -102,6 +116,7 @@ impl VectorStore {
         match self {
             VectorStore::Brute(m) => m.clear(),
             VectorStore::Hnsw(h) => h.clear(),
+            VectorStore::Turbo(t) => t.clear(),
         }
     }
 
@@ -109,6 +124,7 @@ impl VectorStore {
         match self {
             VectorStore::Brute(m) => m.save(path),
             VectorStore::Hnsw(h) => h.save(path),
+            VectorStore::Turbo(t) => t.save(path),
         }
     }
 
@@ -129,6 +145,10 @@ impl VectorStore {
                 VectorStore::Brute(idx)
             }
             VectorBackendKind::Hnsw(_) => VectorStore::Hnsw(Box::new(HnswVectorIndex::load(path)?)),
+            // bits 由文件自描述（存盘时定的位宽决定码解码）；kind 的 bits 仅当文件缺失（首启）时用。
+            VectorBackendKind::TurboQuant { bits } => {
+                VectorStore::Turbo(Box::new(TurboVectorIndex::load(path, bits)?))
+            }
         })
     }
 }
@@ -138,18 +158,21 @@ impl VectorBackend for VectorStore {
         match self {
             VectorStore::Brute(m) => m.upsert(gid, vector, meta),
             VectorStore::Hnsw(h) => h.upsert(gid, vector, meta),
+            VectorStore::Turbo(t) => t.upsert(gid, vector, meta),
         }
     }
     fn delete(&mut self, gid: &GlobalId) -> anyhow::Result<()> {
         match self {
             VectorStore::Brute(m) => m.delete(gid),
             VectorStore::Hnsw(h) => h.delete(gid),
+            VectorStore::Turbo(t) => t.delete(gid),
         }
     }
     fn delete_doc(&mut self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
         match self {
             VectorStore::Brute(m) => m.delete_doc(collection, doc_id),
             VectorStore::Hnsw(h) => h.delete_doc(collection, doc_id),
+            VectorStore::Turbo(t) => t.delete_doc(collection, doc_id),
         }
     }
     fn search(
@@ -162,6 +185,7 @@ impl VectorBackend for VectorStore {
         match self {
             VectorStore::Brute(m) => m.search(query, k, filter, acl),
             VectorStore::Hnsw(h) => h.search(query, k, filter, acl),
+            VectorStore::Turbo(t) => t.search(query, k, filter, acl),
         }
     }
     fn search_with_ef(
@@ -173,9 +197,10 @@ impl VectorBackend for VectorStore {
         ef_search: Option<usize>,
     ) -> anyhow::Result<Vec<Scored>> {
         match self {
-            // 暴力档精确，ef 无意义 → 忽略覆盖。
+            // 暴力/量化档精确或 ef 无关 → 忽略覆盖。
             VectorStore::Brute(m) => m.search(query, k, filter, acl),
             VectorStore::Hnsw(h) => h.search_with_ef(query, k, filter, acl, ef_search),
+            VectorStore::Turbo(t) => t.search(query, k, filter, acl),
         }
     }
 }
@@ -416,16 +441,7 @@ impl MemVectorIndex {
                 })
                 .collect(),
         };
-        let bytes = serde_json::to_vec(&snap)?;
-        let tmp = tmp_path(path);
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?; // 落盘后再 rename，保证 rename 后内容已持久
-        }
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        atomic_write(path, &serde_json::to_vec(&snap)?)
     }
 
     /// 从快照加载（文件不存在 → 返回空索引，便于首启）。
@@ -469,6 +485,20 @@ pub(crate) fn tmp_path(path: &Path) -> std::path::PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
     std::path::PathBuf::from(s)
+}
+
+/// 原子落盘字节：写临时文件 → fsync（落盘后再 rename，保证 rename 后内容已持久）→ rename（原子，
+/// 防写一半崩坏）。三档后端（Mem/Hnsw/Turbo）的 `save` 共用，避免重复。
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let tmp = tmp_path(path);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// 落盘快照 DTO（`HashMap<GlobalId,_>` 的 JSON key 须为字符串，故 entries 用 Vec 对）。
@@ -1119,6 +1149,43 @@ mod tests {
             assert_eq!(x.id, y.id);
             assert!((x.score - y.score).abs() < 1e-9);
         }
+    }
+
+    /// 后端化：`VectorStore` 的 `TurboQuant` 档——`kind_str="turboquant"`、落盘（只存码）按
+    /// 量化档重载（bits 由文件自描述）、重载后结果一致。
+    #[test]
+    fn vectorstore_turbo_roundtrip() {
+        let mut s = VectorStore::new(VectorBackendKind::TurboQuant { bits: 4 });
+        assert_eq!(s.kind_str(), "turboquant");
+        for i in 0..40u64 {
+            s.upsert(
+                gid("d", i),
+                pseudo_vec(i, 48),
+                meta("d", i, "paragraph", i as u32, vec!["public"]),
+            )
+            .unwrap();
+        }
+        let q = pseudo_vec(777, 48);
+        let before: Vec<u64> = s
+            .search(&q, 6, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vector.bin");
+        s.save(&path).unwrap();
+        // 重载用默认 bits（DEFAULT_QUANT_BITS），文件自描述实际 bits。
+        let reloaded = VectorStore::load(VectorBackendKind::TurboQuant { bits: 4 }, &path).unwrap();
+        assert_eq!(reloaded.kind_str(), "turboquant", "重载应保持量化档");
+        let after: Vec<u64> = reloaded
+            .search(&q, 6, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+        assert_eq!(before, after, "落盘往返结果应一致");
     }
 
     /// 后端化：`VectorStore` 的 `BruteBinary` 档——`kind_str="brute_binary"`、落盘按粗筛档重载、

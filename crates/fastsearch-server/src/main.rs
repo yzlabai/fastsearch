@@ -13,7 +13,8 @@
 //! - `FASTSEARCH_OBJECT_BUCKET`：本地对象存储默认 bucket（默认 `fastsearch-assets`）。
 //! - `FASTSEARCH_S3_MAX_IMAGE_BYTES`：对象读写最大字节数（默认 20MiB）。
 //! - `FASTSEARCH_EMBEDDER` = `hash`|`ollama`|`openai`（+ `FASTSEARCH_EMBED_*`）：真语义嵌入后端。
-//! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`brute_binary`|`brute_binary_rotated`|`hnsw`|`pgvector`：向量后端。hnsw=引擎侧近似
+//! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`brute_binary`|`brute_binary_rotated`|`turboquant`|`hnsw`|`pgvector`：向量后端。
+//!   `turboquant`=压缩主索引（只存 2–4bit 码、内存 ↓8~16×、确定，位宽由 `FASTSEARCH_QUANT_BITS` 调，默认 4）；hnsw=引擎侧近似
 //!   ANN（大规模、近似+非确定，仅首启生效）；pgvector=直查档（ANN 在 PG 跑，需 `DATABASE_URL` +
 //!   embedding 已入 PG，引擎写穿为下一迭代）。
 //! - `FASTSEARCH_CDC=1`（+ `DATABASE_URL`，可选 `FASTSEARCH_CDC_SLOT`/`_PUBLICATION`/`_INTERVAL_MS`）：
@@ -120,6 +121,14 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 fastsearch_engine::VectorBackendKind::BruteBinary(m)
             }
+        }
+        // TurboQuant 压缩主索引（只存 2–4bit 码，内存 ↓8~16×、确定；位宽由 FASTSEARCH_QUANT_BITS 调，默认 4）。
+        Ok("turboquant") => {
+            let bits = std::env::var("FASTSEARCH_QUANT_BITS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(fastsearch_engine::DEFAULT_QUANT_BITS);
+            fastsearch_engine::VectorBackendKind::TurboQuant { bits }
         }
         _ => fastsearch_engine::VectorBackendKind::Brute,
     };
