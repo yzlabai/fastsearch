@@ -61,6 +61,23 @@
 **迭代后收口三绿**：fmt + clippy `-D warnings` + `cargo test --workspace` **303 passed / 0 failed**
 （vector 51→**57**，+6 测）。
 
+## 复审（迭代增量，合并后）
+
+首轮双轴审查跑在**原始实现**上；迭代增量（`atomic_write` 重构跨 Mem/Hnsw/Turbo 三档 `save`、
+`load` 的 corr/dim 守卫、6 新测）是审查**之后**加的、未独立过审 → 补一轮聚焦复审专验"行为保持 +
+正确性"。**结论：无回归、无缺口、无空测**：
+
+- `atomic_write`（lib.rs）与三档旧内联块逐字节等价（`tmp→create→write_all→sync_all→rename`，
+  同序、错误经 `?` 传播）；`tmp_path` import 移除干净（仅留仍用处）。
+- `load` 守卫正确且**顺序安全**：dim 范围检查（`>MAX_DIM`）在 `ensure_rotation()` 建 d×d 矩阵**之前**，
+  不会因未校验 dim 触发巨额分配；corr 守卫覆盖每条目 NaN/±Inf；`packed.len()` 校验不受 dim 守卫影响。
+- 6 新测均非空测；`load_rejects_poisoned_corr` 确证 `1e39`→f32 Inf 触达守卫并**特定**因 corr 报错。
+
+**遗留（非本次增量、首轮已记）**：`MAX_DIM=65536` 仍允许 ~17GB 的 d×d 旋转矩阵分配——根治靠结构化
+旋转（FHT，O(d·log d)、无 d×d 矩阵），属"下一迭代"；当前真实嵌入维（≤~4096）远低于此，风险仅在
+不可信超大 dim 快照（load 侧已挡越界，但 65536 仍偏松）。**建议下一迭代把 `MAX_DIM` 收到 ~8192**
+（覆盖所有真实模型、把最坏分配从 17GB 压到 256MB）。
+
 ## 下一步
 
 - **TQ+ 每坐标校准**（+1.4pp @1）：需解决流式 CDC 首批 ≥1000 有代表性样本的 fit 时机（首版退化为无校准的基础 TurboQuant）。
