@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 mod binary;
+#[cfg(test)] // Step 1 单独验证 FHT 原语；Step 2 接后端后转无条件 `mod fht;`
+mod fht;
 mod hnsw;
 mod quant;
 mod turbo;
@@ -536,7 +538,18 @@ impl VectorBackend for MemVectorIndex {
             Some(d) if d != vector.len() => {
                 anyhow::bail!("dimension mismatch: index dim {d}, got {}", vector.len())
             }
-            None => self.dim = Some(vector.len()),
+            None => {
+                // 旋转档：先校验维度上限，**再**赋 dim——避免超维首 upsert 把 dim 毒化成越界值
+                // （否则后续合法 upsert 全撞维度不匹配）。同 turbo 的"先验证后赋值"（review 跟进）。
+                if self.rabitq_rotation && vector.len() > binary::MAX_ROTATION_DIM {
+                    anyhow::bail!(
+                        "旋转档维度 {} 越界（须 ≤{}）",
+                        vector.len(),
+                        binary::MAX_ROTATION_DIM
+                    );
+                }
+                self.dim = Some(vector.len());
+            }
             _ => {}
         }
         let normalized = normalize(&vector);
@@ -1064,6 +1077,7 @@ mod tests {
 
     /// DoS 闸（§governance）：旋转粗筛档（BruteBinaryRotated）upsert 维度 >MAX_ROTATION_DIM(8192)
     /// → 拒（经 `Rotation::new` 兜底闸——补此前只 turbo 有闸、旋转档漏防的问题）。
+    /// 且**拒绝发生在赋 dim 之前**（不毒化）：超维被拒后合法维度仍能建库（review 跟进）。
     #[test]
     fn rotated_upsert_rejects_oversized_dim() {
         let mut idx = MemVectorIndex::with_binary_prefilter_rotated(8);
@@ -1077,6 +1091,15 @@ mod tests {
             .is_err(),
             "旋转档超维 upsert 应拒"
         );
+        assert_eq!(idx.dim(), None, "拒绝不应毒化 dim");
+        // 后续合法维度仍能建库（若 dim 被毒化成 8193，这里会撞维度不匹配）。
+        idx.upsert(
+            gid("d", 2),
+            pseudo_vec(2, 48),
+            meta("d", 2, "paragraph", 1, vec!["public"]),
+        )
+        .unwrap();
+        assert_eq!(idx.dim(), Some(48));
     }
 
     /// 旋转在**各向异性**数据上提升粗筛召回：旋转档 recall ≥ 非旋转档（两档精排同、仅候选选择不同）。
