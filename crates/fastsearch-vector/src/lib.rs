@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 mod binary;
-#[cfg(test)] // Step 1 单独验证 FHT 原语；Step 2 接后端后转无条件 `mod fht;`
 mod fht;
 mod hnsw;
 mod quant;

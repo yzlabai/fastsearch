@@ -12,7 +12,7 @@
 //!
 //! 设计见 [plan](../../docs/plans/2026-07-21-向量量化压缩主索引-TurboQuant借鉴.md)。
 
-use crate::binary::Rotation;
+use crate::fht::StructuredRotation;
 use crate::quant::{packed_len, Codebook};
 use crate::{normalize, VecMeta, VectorBackend};
 use fastsearch_core::{AclFilter, Citation, Filter, GlobalId, Scored};
@@ -23,17 +23,18 @@ use std::path::Path;
 /// TurboQuant 后端的默认量化位宽（4-bit：近乎可直接排序，8× 压缩）。
 pub const DEFAULT_QUANT_BITS: u8 = 4;
 
-/// 旋转矩阵固定种子（数据无关、定常 → 多副本/重开生成同一矩阵，无需持久化）。
+/// 旋转固定种子（数据无关、定常 → 多副本/重开生成同一变换，无需持久化）。
 const TURBO_ROTATION_SEED: u64 = 0x5475_7262_6f51_5631; // "TurboQV1"
 
-/// 维度上限（防不可信快照声明巨维触发 d×d 旋转矩阵内存爆炸）。= 旋转矩阵唯一分配点的共享上限
-/// `binary::MAX_ROTATION_DIM`（8192）；turbo 侧显式早检给清晰错误，`Rotation::new` 的 Result 作兜底。
-/// 决策见 [governance](../../docs/governance/2026-07-21-向量旋转维度上限与DoS.md)。
+/// 维度上限（sanity 界；真实嵌入 ≤4096 远低于此）。**FHT 旋转存 O(d)/apply O(d·log d)、无 d×d 矩阵**，
+/// 故不再是 DoS 关键（物化档时代才是）——保留作合理上界。见
+/// [governance](../../docs/governance/2026-07-21-向量旋转维度上限与DoS.md) / [FHT plan](../../docs/plans/2026-07-22-FHT结构化旋转.md)。
 const MAX_DIM: usize = crate::binary::MAX_ROTATION_DIM;
 
-/// 落盘格式 magic + 版本（带版本起步，便于将来平滑升级；借 turbovec io.rs）。
+/// 落盘格式 magic + 版本。**v2**（2026-07-22，FHT）：码在 **FHT 旋转空间**（维度 `D=next_pow2(d)`）；
+/// v1（物化 d×d 旋转、码在 d 空间）不兼容 → 拒之（turbo 新档，无生产 v1 数据）。
 const TURBO_MAGIC: &str = "fastsearch-turbo";
-const TURBO_FORMAT_VERSION: u32 = 1;
+const TURBO_FORMAT_VERSION: u32 = 2;
 
 struct TurboEntry {
     packed: Vec<u8>, // 位打包量化码（`⌈dim·bits/8⌉` 字节）
@@ -46,8 +47,9 @@ pub struct TurboVectorIndex {
     dim: Option<usize>,
     bits: u8,
     codebook: Codebook,
-    /// 惰性构建的旋转矩阵（首次 upsert dim 已知时建；固定种子、确定、不落盘）。
-    rotation: Option<Rotation>,
+    /// 惰性构建的 **FHT 结构化旋转**（首次 upsert dim 已知时建；固定种子、确定、不落盘；
+    /// 存 O(d)、apply O(d·log d)、无 d×d 矩阵）。输出维度 `D=next_pow2(d)`——码/打分按 D。
+    rotation: Option<StructuredRotation>,
     entries: HashMap<GlobalId, TurboEntry>,
 }
 
@@ -69,14 +71,14 @@ impl TurboVectorIndex {
         self.bits
     }
 
-    /// dim 已知且矩阵未建 → 惰性构建（固定种子，确定）。dim>`MAX_ROTATION_DIM` → `Err`（DoS 闸）。
-    fn ensure_rotation(&mut self) -> anyhow::Result<()> {
+    /// dim 已知且旋转未建 → 惰性构建 FHT 旋转（固定种子，确定；O(d) 存储、无 d×d 矩阵、无 panic）。
+    /// 维度上限由 `upsert`/`load` 的显式 `MAX_DIM` 早检守（FHT 无巨分配，故此处不再返 Result）。
+    fn ensure_rotation(&mut self) {
         if self.rotation.is_none() {
             if let Some(d) = self.dim {
-                self.rotation = Some(Rotation::new(d, TURBO_ROTATION_SEED)?);
+                self.rotation = Some(StructuredRotation::new(d, TURBO_ROTATION_SEED));
             }
         }
-        Ok(())
     }
 
     pub fn citation(&self, gid: &GlobalId) -> Option<Citation> {
@@ -153,8 +155,12 @@ impl TurboVectorIndex {
         }
         let mut idx = TurboVectorIndex::new(snap.bits);
         idx.dim = snap.dim;
-        idx.ensure_rotation()?;
-        let expect_len = snap.dim.map(|d| packed_len(d, snap.bits));
+        idx.ensure_rotation();
+        // 码在 FHT 旋转空间 → 期望码长按 D=next_pow2(dim)（取自已建旋转的 out_dim）。
+        let expect_len = idx
+            .rotation
+            .as_ref()
+            .map(|r| packed_len(r.out_dim(), snap.bits));
         for e in snap.entries {
             if let Some(el) = expect_len {
                 if e.packed.len() != el {
@@ -195,8 +201,8 @@ impl VectorBackend for TurboVectorIndex {
             _ => {}
         }
         let normalized = normalize(&vector); // 零/NaN → 全零（不 panic）
-        self.ensure_rotation()?;
-        // 旋转后编码（旋转把坐标摊成近高斯，量化更准）；正交不改内积。
+        self.ensure_rotation();
+        // FHT 旋转后编码（把坐标摊成近高斯，量化更准；正交不改内积）。u_rot 长 D=next_pow2(d)。
         let u_rot = self
             .rotation
             .as_ref()
@@ -234,6 +240,7 @@ impl VectorBackend for TurboVectorIndex {
         let q = normalize(query);
         let q_rot = self.rotation.as_ref().map(|r| r.apply(&q)).unwrap_or(q);
         let lut = self.codebook.query_lut(&q_rot);
+        let out_d = q_rot.len(); // FHT 空间维度 D（码宽/打分按此，非原始 d）
 
         // 真预过滤：先 filter + ACL 筛候选，再码上打分（守不变量 #5）。
         let mut scored: Vec<Scored> = self
@@ -243,7 +250,7 @@ impl VectorBackend for TurboVectorIndex {
             .filter(|(_, e)| acl.is_none_or(|a| a.visible(&e.meta)))
             .map(|(gid, e)| Scored {
                 id: gid.clone(),
-                score: self.codebook.score(&lut, &e.packed, d, e.corr) as f64,
+                score: self.codebook.score(&lut, &e.packed, out_d, e.corr) as f64,
             })
             .collect();
 
@@ -597,5 +604,56 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), serde_json::to_vec(&snap).unwrap()).unwrap();
         assert!(TurboVectorIndex::load(tmp.path(), 4).is_err());
+    }
+
+    /// 生成聚簇合成数据（有真实近邻结构）：`k` 簇心，每条 = normalize(心 + σ·噪声)。
+    fn clustered(rng: &mut Rng, n: usize, d: usize, k: usize, sigma: f32) -> Vec<Vec<f32>> {
+        let centers: Vec<Vec<f32>> = (0..k).map(|_| normalize(&rng.vec(d))).collect();
+        (0..n)
+            .map(|i| {
+                let c = &centers[i % k];
+                normalize(&(0..d).map(|j| c[j] + sigma * rng.g()).collect::<Vec<_>>())
+            })
+            .collect()
+    }
+
+    fn exact_topk(q: &[f32], db: &[Vec<f32>], k: usize) -> Vec<usize> {
+        let mut s: Vec<(f32, usize)> = db
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (crate::dot(&normalize(q), &normalize(v)), i))
+            .collect();
+        s.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        s.into_iter().take(k).map(|(_, i)| i).collect()
+    }
+
+    /// **FHT 端到端召回门禁**（Step 2 关键验证）：TurboVectorIndex（现用 FHT 旋转）纯量化分 top-10
+    /// vs 精确暴力 ground-truth。用**非 2 幂维 d=1000**（→ D=1024，走填充路径）。达到与物化档
+    /// 同量级（对齐 quant §8.5 的 4-bit exact@10≈0.85），即证 FHT 旋转召回不劣、可无条件替换物化。
+    #[test]
+    fn recall_vs_exact_fht() {
+        let (d, n) = (1000usize, 1500usize);
+        let mut rng = Rng(0xFECA);
+        let db = clustered(&mut rng, n, d, 30, 0.32);
+        let queries = clustered(&mut rng, 40, d, 30, 0.32);
+        let mut idx = TurboVectorIndex::new(4);
+        for (i, v) in db.iter().enumerate() {
+            idx.upsert(gid("d", i as u64), v.clone(), meta("text", &[]))
+                .unwrap();
+        }
+        let mut recall = 0f32;
+        for q in &queries {
+            let truth = exact_topk(q, &db, 10);
+            let got: std::collections::HashSet<usize> = idx
+                .search(q, 10, None, None)
+                .unwrap()
+                .iter()
+                .map(|s| s.id.chunk_id as usize)
+                .collect();
+            recall += truth.iter().filter(|i| got.contains(i)).count() as f32 / 10.0;
+        }
+        recall /= queries.len() as f32;
+        // 实测 ≈0.885（与物化档 ~0.87 同量级/略优）→ FHT 召回不劣，无条件替换物化成立。
+        assert!(recall >= 0.82, "FHT turbo 4-bit exact@10={recall} < 0.82");
     }
 }

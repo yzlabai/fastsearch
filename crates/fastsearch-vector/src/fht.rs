@@ -18,8 +18,7 @@ const ROUNDS: usize = 3;
 
 /// 结构化随机正交旋转。存 `ROUNDS×D` 个 ±1（O(d)）；`apply` O(d·log d)、无 d×d 矩阵。
 pub(crate) struct StructuredRotation {
-    dim: usize,     // 原始 d
-    padded: usize,  // D = next_pow2(d)
+    padded: usize,  // D = next_pow2(d)；apply 输出维度、下游码宽/标准化按此
     signs: Vec<i8>, // ROUNDS×D 个 ±1（行主序 round*D + i）
 }
 
@@ -68,12 +67,7 @@ impl StructuredRotation {
         let signs: Vec<i8> = (0..ROUNDS * padded)
             .map(|_| if next_bit(&mut s) { 1i8 } else { -1i8 })
             .collect();
-        StructuredRotation { dim, padded, signs }
-    }
-
-    /// 原始（逻辑）维度 d——供上层校验入库向量维度（Step 2 集成用）。
-    pub(crate) fn in_dim(&self) -> usize {
-        self.dim
+        StructuredRotation { padded, signs }
     }
 
     /// 变换后维度 `D=next_pow2(dim)`（下游码宽/标准化按此）。
@@ -218,11 +212,10 @@ mod tests {
         assert!((dot(&r, &r).sqrt() - 1.0).abs() < 1e-2, "保范数");
     }
 
-    /// 非 2 幂维 → out_dim = next_pow2；in_dim 保留原始 d。
+    /// 非 2 幂维 → out_dim = next_pow2（下游码宽按 D）。
     #[test]
     fn out_dim_pads_to_pow2() {
-        let r = StructuredRotation::new(768, 0);
-        assert_eq!((r.in_dim(), r.out_dim()), (768, 1024));
+        assert_eq!(StructuredRotation::new(768, 0).out_dim(), 1024);
         assert_eq!(StructuredRotation::new(1536, 0).out_dim(), 2048);
         assert_eq!(StructuredRotation::new(1024, 0).out_dim(), 1024);
         assert_eq!(StructuredRotation::new(3072, 0).out_dim(), 4096);
