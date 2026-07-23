@@ -1,6 +1,6 @@
 # TurboQuant f32 精排 sidecar（磁盘）· 设计与开发计划
 
-> 状态：**Step 1 已落地**（核心 + 双文件持久化，实测召回恢复）｜日期：2026-07-22｜上游：
+> 状态：**Step 1+2 已落地**（核心 + 引擎/server 接线）｜日期：2026-07-22｜上游：
 > [TQ+ 评估决策 §5](../governance/2026-07-22-TQ+校准评估-不做.md)（点名此为更高价值项）、
 > [TurboQuant plan](2026-07-21-向量量化压缩主索引-TurboQuant借鉴.md)、[15-vector spec](../specs/15-vector.md)。
 > **代码是真源**。
@@ -70,9 +70,13 @@ struct RerankSidecar {
    格式 v3。**实测**：4-bit rerank exact@10 **1.000** vs 纯量化 0.885；2-bit rerank ≫ 纯 2-bit（>+10pt）。
    +5 测（召回恢复/2-bit 受益/双文件往返逐位一致/delete 复用 slot 无脏读+文件不增长/默认关）。
    **未接引擎**（同 TurboQuant/FHT 分阶段）。
-2. 接引擎/server：`VectorBackendKind::TurboQuant{bits, rerank_oversample}` + `VectorStore` 传 sidecar 路径 +
-   engine `open_with` + server env（`FASTSEARCH_TURBO_RERANK`）。
-3.（可选）sidecar 压实（去洞）+ mmap opt（若剖析需要，需 unsafe 决策）。
+2. ✅ **接引擎/server**：`VectorBackendKind::TurboQuant{bits, rerank_oversample}`；`VectorStore::load` 首启且
+   rerank>0 → `with_rerank(sidecar_path(path))`（`new`/内存态纯量化——sidecar 需磁盘）；`kind_str` 加
+   `"turboquant_rerank"`（观测 + 检查点，rerank 值由 v3 快照自描述，重开取默认 `DEFAULT_RERANK_OVERSAMPLE`）；
+   engine `open_with` 映射 `turboquant`/`turboquant_rerank`；server env `FASTSEARCH_TURBO_RERANK=<oversample>`。
+   engine 回环测试 `persist_reopen_restores_turboquant_rerank`（首启→精排档→持久化→重开恢复→检索正确）；
+   server 实跑 boot（rerank env 解析、listening）。
+3.（可选）sidecar 压实（去洞）+ mmap/`read_at` opt（若剖析需要，需 unsafe 决策）。
 
 ## 8. 测试计划（Step 1）
 

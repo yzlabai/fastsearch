@@ -26,6 +26,9 @@ use std::sync::Mutex;
 /// TurboQuant 后端的默认量化位宽（4-bit：近乎可直接排序，8× 压缩）。
 pub const DEFAULT_QUANT_BITS: u8 = 4;
 
+/// f32 精排 sidecar 的默认 oversample（重开检查点时用；同 HNSW/二值档参数策略——档入检查点、参数取默认）。
+pub const DEFAULT_RERANK_OVERSAMPLE: usize = 8;
+
 /// 旋转固定种子（数据无关、定常 → 多副本/重开生成同一变换，无需持久化）。
 const TURBO_ROTATION_SEED: u64 = 0x5475_7262_6f51_5631; // "TurboQV1"
 
@@ -55,7 +58,7 @@ struct RerankSidecar {
 }
 
 /// 码快照路径 → sidecar 兄弟路径（`vector.bin` → `vector.bin.f32`）。
-fn sidecar_path(snapshot: &Path) -> PathBuf {
+pub(crate) fn sidecar_path(snapshot: &Path) -> PathBuf {
     let mut s = snapshot.as_os_str().to_owned();
     s.push(".f32");
     PathBuf::from(s)

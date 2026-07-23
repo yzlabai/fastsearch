@@ -20,6 +20,7 @@ use fastsearch_sync::{Applier, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
 pub use fastsearch_vector::{
     HnswParams, VectorBackendKind, DEFAULT_BINARY_OVERSAMPLE, DEFAULT_QUANT_BITS,
+    DEFAULT_RERANK_OVERSAMPLE,
 };
 use fastsearch_vector::{VecMeta, VectorBackend, VectorStore};
 use serde::{Deserialize, Serialize};
@@ -973,9 +974,14 @@ impl Engine {
             "brute_binary_rotated" => {
                 VectorBackendKind::BruteBinaryRotated(fastsearch_vector::DEFAULT_BINARY_OVERSAMPLE)
             }
-            // bits 由 turbo 快照自描述（首启缺文件时才用默认）；同 hnsw params 取自快照策略。
+            // bits/rerank 由 turbo v3 快照自描述（首启缺文件时才用默认）；同 hnsw params 取自快照策略。
             "turboquant" => VectorBackendKind::TurboQuant {
                 bits: fastsearch_vector::DEFAULT_QUANT_BITS,
+                rerank_oversample: 0,
+            },
+            "turboquant_rerank" => VectorBackendKind::TurboQuant {
+                bits: fastsearch_vector::DEFAULT_QUANT_BITS,
+                rerank_oversample: fastsearch_vector::DEFAULT_RERANK_OVERSAMPLE,
             },
             _ => default_backend,
         };
@@ -3286,7 +3292,10 @@ mod tests {
         let (mut e, _) = Engine::open_with(
             dir.path(),
             TextIndexConfig::default(),
-            VectorBackendKind::TurboQuant { bits: 4 },
+            VectorBackendKind::TurboQuant {
+                bits: 4,
+                rerank_oversample: 0,
+            },
         )
         .unwrap();
         assert_eq!(e.vector.kind_str(), "turboquant");
@@ -3311,6 +3320,53 @@ mod tests {
             e2.vector.kind_str(),
             "turboquant",
             "检查点应恢复量化档（覆盖默认 brute）"
+        );
+        let mut r = req("");
+        r.mode = SearchMode::Vector;
+        r.vector = Some(vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(e2.search(&r, None).unwrap()[0].id.chunk_id, 1);
+    }
+
+    /// TurboQuant **f32 精排 sidecar** 端到端接线：首启带 rerank → `kind_str="turboquant_rerank"`、
+    /// 检索命中；persist + 重开（默认 brute）→ 检查点 + v3 快照恢复 rerank 档、结果不变。
+    #[test]
+    fn persist_reopen_restores_turboquant_rerank() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut e, _) = Engine::open_with(
+            dir.path(),
+            TextIndexConfig::default(),
+            VectorBackendKind::TurboQuant {
+                bits: 4,
+                rerank_oversample: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(e.vector.kind_str(), "turboquant_rerank", "首启应开精排档");
+        for (i, v) in [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+            .into_iter()
+            .enumerate()
+        {
+            e.ingest_vector(
+                "kb",
+                &chunk("a.pdf", i as u64 + 1, ChunkKind::Paragraph, "x", 1),
+                v.to_vec(),
+            )
+            .unwrap();
+        }
+        e.persist(dir.path(), Lsn(7)).unwrap();
+        drop(e);
+
+        let (e2, lsn) = Engine::open_with(
+            dir.path(),
+            TextIndexConfig::default(),
+            VectorBackendKind::Brute,
+        )
+        .unwrap();
+        assert_eq!(lsn, Lsn(7));
+        assert_eq!(
+            e2.vector.kind_str(),
+            "turboquant_rerank",
+            "检查点 + v3 快照应恢复精排档（覆盖默认 brute）"
         );
         let mut r = req("");
         r.mode = SearchMode::Vector;

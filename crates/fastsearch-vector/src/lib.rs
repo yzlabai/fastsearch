@@ -20,7 +20,7 @@ mod hnsw;
 mod quant;
 mod turbo;
 pub use hnsw::{HnswParams, HnswVectorIndex};
-pub use turbo::{TurboVectorIndex, DEFAULT_QUANT_BITS};
+pub use turbo::{TurboVectorIndex, DEFAULT_QUANT_BITS, DEFAULT_RERANK_OVERSAMPLE};
 
 /// 二值量化粗筛档的默认 oversample（重开检查点时用；与 HNSW 参数同策略——格式入检查点、
 /// 调参取默认）。粗筛候选数 = `k·oversample`。
@@ -39,9 +39,10 @@ pub enum VectorBackendKind {
     BruteBinaryRotated(usize),
     /// HNSW 近似（大规模 opt-in；近似召回 + 非确定，见 [`HnswVectorIndex`]）。
     Hnsw(HnswParams),
-    /// **TurboQuant 压缩主索引**（只存 2–4bit 码，内存 ↓8~16×；无训练、**完全确定**、
-    /// 近似召回，见 [`TurboVectorIndex`]）。`u8` = 位宽 bits∈{2,3,4}。
-    TurboQuant { bits: u8 },
+    /// **TurboQuant 压缩主索引**（只存 2–4bit 码，内存 ↓8~16×；无训练、**完全确定**）。
+    /// `bits`∈{2,3,4}；`rerank_oversample`>0 开 **f32 精排 sidecar**（磁盘 f32、码粗筛→读盘精排、
+    /// 召回近精确、RAM 仍只码），0=纯量化档。见 [`TurboVectorIndex`]。
+    TurboQuant { bits: u8, rerank_oversample: usize },
 }
 
 /// 后端门面：让 engine 用单一类型持有"暴力 / HNSW"二选一，统一 upsert/search/持久化等。
@@ -63,7 +64,8 @@ impl VectorStore {
                 VectorStore::Brute(MemVectorIndex::with_binary_prefilter_rotated(m))
             }
             VectorBackendKind::Hnsw(p) => VectorStore::Hnsw(Box::new(HnswVectorIndex::new(p))),
-            VectorBackendKind::TurboQuant { bits } => {
+            // 内存态（无 data_dir）→ 纯量化：f32 精排 sidecar 需磁盘落点，仅经 `load`（持久化引擎）启用。
+            VectorBackendKind::TurboQuant { bits, .. } => {
                 VectorStore::Turbo(Box::new(TurboVectorIndex::new(bits)))
             }
         }
@@ -81,6 +83,7 @@ impl VectorStore {
             VectorStore::Brute(m) if m.binary_oversample().is_some() => "brute_binary",
             VectorStore::Brute(_) => "brute",
             VectorStore::Hnsw(_) => "hnsw",
+            VectorStore::Turbo(t) if t.rerank_oversample() > 0 => "turboquant_rerank",
             VectorStore::Turbo(_) => "turboquant",
         }
     }
@@ -146,9 +149,24 @@ impl VectorStore {
                 VectorStore::Brute(idx)
             }
             VectorBackendKind::Hnsw(_) => VectorStore::Hnsw(Box::new(HnswVectorIndex::load(path)?)),
-            // bits 由文件自描述（存盘时定的位宽决定码解码）；kind 的 bits 仅当文件缺失（首启）时用。
-            VectorBackendKind::TurboQuant { bits } => {
-                VectorStore::Turbo(Box::new(TurboVectorIndex::load(path, bits)?))
+            // bits/rerank 由 v3 快照自描述；kind 的 bits/rerank_oversample 仅当文件缺失（首启）时用：
+            // 首启且 rerank>0 → 建带 sidecar（兄弟路径 `path.f32`）的 rerank 档。
+            VectorBackendKind::TurboQuant {
+                bits,
+                rerank_oversample,
+            } => {
+                let idx = if path.exists() {
+                    TurboVectorIndex::load(path, bits)? // 快照自描述 bits + rerank
+                } else if rerank_oversample > 0 {
+                    TurboVectorIndex::with_rerank(
+                        bits,
+                        rerank_oversample,
+                        turbo::sidecar_path(path),
+                    )
+                } else {
+                    TurboVectorIndex::new(bits)
+                };
+                VectorStore::Turbo(Box::new(idx))
             }
         })
     }
@@ -1192,7 +1210,10 @@ mod tests {
     /// 量化档重载（bits 由文件自描述）、重载后结果一致。
     #[test]
     fn vectorstore_turbo_roundtrip() {
-        let mut s = VectorStore::new(VectorBackendKind::TurboQuant { bits: 4 });
+        let mut s = VectorStore::new(VectorBackendKind::TurboQuant {
+            bits: 4,
+            rerank_oversample: 0,
+        });
         assert_eq!(s.kind_str(), "turboquant");
         for i in 0..40u64 {
             s.upsert(
@@ -1214,7 +1235,14 @@ mod tests {
         let path = dir.path().join("vector.bin");
         s.save(&path).unwrap();
         // 重载用默认 bits（DEFAULT_QUANT_BITS），文件自描述实际 bits。
-        let reloaded = VectorStore::load(VectorBackendKind::TurboQuant { bits: 4 }, &path).unwrap();
+        let reloaded = VectorStore::load(
+            VectorBackendKind::TurboQuant {
+                bits: 4,
+                rerank_oversample: 0,
+            },
+            &path,
+        )
+        .unwrap();
         assert_eq!(reloaded.kind_str(), "turboquant", "重载应保持量化档");
         let after: Vec<u64> = reloaded
             .search(&q, 6, None, None)

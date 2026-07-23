@@ -14,7 +14,8 @@
 //! - `FASTSEARCH_S3_MAX_IMAGE_BYTES`：对象读写最大字节数（默认 20MiB）。
 //! - `FASTSEARCH_EMBEDDER` = `hash`|`ollama`|`openai`（+ `FASTSEARCH_EMBED_*`）：真语义嵌入后端。
 //! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`brute_binary`|`brute_binary_rotated`|`turboquant`|`hnsw`|`pgvector`：向量后端。
-//!   `turboquant`=压缩主索引（只存 2–4bit 码、内存 ↓8~16×、确定，位宽由 `FASTSEARCH_QUANT_BITS` 调，默认 4）；hnsw=引擎侧近似
+//!   `turboquant`=压缩主索引（只存 2–4bit 码、内存 ↓8~16×、确定，位宽由 `FASTSEARCH_QUANT_BITS` 调，默认 4；
+//!   `FASTSEARCH_TURBO_RERANK=<oversample>` 开 f32 精排 sidecar → 召回近精确、RAM 仍只码）；hnsw=引擎侧近似
 //!   ANN（大规模、近似+非确定，仅首启生效）；pgvector=直查档（ANN 在 PG 跑，需 `DATABASE_URL` +
 //!   embedding 已入 PG，引擎写穿为下一迭代）。
 //! - `FASTSEARCH_CDC=1`（+ `DATABASE_URL`，可选 `FASTSEARCH_CDC_SLOT`/`_PUBLICATION`/`_INTERVAL_MS`）：
@@ -123,12 +124,20 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         // TurboQuant 压缩主索引（只存 2–4bit 码，内存 ↓8~16×、确定；位宽由 FASTSEARCH_QUANT_BITS 调，默认 4）。
+        // FASTSEARCH_TURBO_RERANK=<oversample> 开 f32 精排 sidecar（磁盘 f32 精排，召回近精确、RAM 仍只码）。
         Ok("turboquant") => {
             let bits = std::env::var("FASTSEARCH_QUANT_BITS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(fastsearch_engine::DEFAULT_QUANT_BITS);
-            fastsearch_engine::VectorBackendKind::TurboQuant { bits }
+            let rerank_oversample = std::env::var("FASTSEARCH_TURBO_RERANK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            fastsearch_engine::VectorBackendKind::TurboQuant {
+                bits,
+                rerank_oversample,
+            }
         }
         _ => fastsearch_engine::VectorBackendKind::Brute,
     };
