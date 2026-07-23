@@ -1,4 +1,4 @@
-//! FHT 结构化随机旋转（替代物化 d×d `binary::Rotation`）。
+//! FHT 结构化随机旋转（**唯一**旋转实现，已退役物化 d×d 矩阵）。
 //!
 //! 把数据无关正交旋转从**物化 d×d 矩阵**（存 O(d²)、建 O(d³)、apply O(d²)）换成
 //! **随机化 Walsh-Hadamard**（存 O(d)、apply **O(d·log d)**、零建矩阵）：对输入零填充到
@@ -15,6 +15,12 @@
 
 /// 归一化 WHT 轮数（多轮更接近各向同性；O(D log D) 常数 ×ROUNDS）。
 const ROUNDS: usize = 3;
+
+/// 旋转维度 sanity 上限（两个旋转档 turbo/BruteBinaryRotated 共用）。**FHT 存 O(d)/apply O(d·log d)、
+/// 无 d×d 矩阵**，故这不再是 DoS 关键（物化 d×d 时代才是）——纯防 `next_pow2` 溢出 / 病态巨维输入。
+/// 8192 覆盖一切真实稠密嵌入（已知最大 4096）+2× 余量；真需更大改此常量即可（FHT 下代价线性）。
+/// 沿革见 [governance](../../docs/governance/2026-07-21-向量旋转维度上限与DoS.md)。
+pub(crate) const MAX_DIM: usize = 8192;
 
 /// 结构化随机正交旋转。存 `ROUNDS×D` 个 ±1（O(d)）；`apply` O(d·log d)、无 d×d 矩阵。
 pub(crate) struct StructuredRotation {

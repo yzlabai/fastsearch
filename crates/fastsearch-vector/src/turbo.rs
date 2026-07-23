@@ -26,10 +26,9 @@ pub const DEFAULT_QUANT_BITS: u8 = 4;
 /// 旋转固定种子（数据无关、定常 → 多副本/重开生成同一变换，无需持久化）。
 const TURBO_ROTATION_SEED: u64 = 0x5475_7262_6f51_5631; // "TurboQV1"
 
-/// 维度上限（sanity 界；真实嵌入 ≤4096 远低于此）。**FHT 旋转存 O(d)/apply O(d·log d)、无 d×d 矩阵**，
-/// 故不再是 DoS 关键（物化档时代才是）——保留作合理上界。见
-/// [governance](../../docs/governance/2026-07-21-向量旋转维度上限与DoS.md) / [FHT plan](../../docs/plans/2026-07-22-FHT结构化旋转.md)。
-const MAX_DIM: usize = crate::binary::MAX_ROTATION_DIM;
+/// 维度上限（sanity 界；真实嵌入 ≤4096 远低于此）。两个旋转档共用 `fht::MAX_DIM`——FHT 存 O(d)/
+/// apply O(d·log d)、无 d×d 矩阵，故非 DoS 关键（纯防 `next_pow2` 溢出/病态巨维）。见 [FHT plan](../../docs/plans/2026-07-22-FHT结构化旋转.md)。
+const MAX_DIM: usize = crate::fht::MAX_DIM;
 
 /// 落盘格式 magic + 版本。**v2**（2026-07-22，FHT）：码在 **FHT 旋转空间**（维度 `D=next_pow2(d)`）；
 /// v1（物化 d×d 旋转、码在 d 空间）不兼容 → 拒之（turbo 新档，无生产 v1 数据）。

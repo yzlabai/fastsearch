@@ -6,7 +6,7 @@
 //! 因分布已知，可**解析**（非数据训练）求 Lloyd-Max 最优量化点（[`Codebook`]）。本实现用高维高斯
 //! 极限：Gaussian Lloyd-Max 的 MSE 恰为经典 Max(1960) 量化表值 {2b:0.1175, 3b:0.03454, 4b:0.009497}，
 //! 与 turbovec 的精确 Beta codebook 在高维收敛到同一表——但**不引 statrs**（用初等高斯 pdf/cdf 闭式，
-//! 见 [`gaussian_lloyd_max`]）。旋转由 [`crate::binary::Rotation`] 复用（不引 BLAS）。低维（d<~256）
+//! 见 [`gaussian_lloyd_max`]）。旋转由 [`crate::fht::StructuredRotation`] 提供（FHT，O(d·log d)、无 BLAS）。低维（d<~256）
 //! 略逊，由 TQ+ 校准（下一迭代）补；目标负载是高维文本嵌入，极佳。
 //!
 //! ## 长度重归一化（无偏、零查询成本）

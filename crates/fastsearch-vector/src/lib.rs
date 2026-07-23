@@ -142,7 +142,7 @@ impl VectorStore {
             VectorBackendKind::BruteBinaryRotated(m) => {
                 let mut idx = MemVectorIndex::load(path)?;
                 idx.set_binary_prefilter(Some(m));
-                idx.set_rabitq_rotation(true)?; // 重建旋转矩阵 + 旋转空间重算 code/l1（dim 越界 → Err）
+                idx.set_rabitq_rotation(true); // 重建 FHT 旋转 + 旋转空间重算 code/l1
                 VectorStore::Brute(idx)
             }
             VectorBackendKind::Hnsw(_) => VectorStore::Hnsw(Box::new(HnswVectorIndex::load(path)?)),
@@ -330,11 +330,12 @@ pub struct MemVectorIndex {
     /// 二值粗筛是否在 **RaBitQ 随机旋转空间**打分（意图标志；dim 已知后惰性建矩阵）。
     /// 旋转把量化误差摊匀 → 估计器趋无偏、对各向异性数据增益更大。正交变换不改内积，精排仍用原向量。
     rabitq_rotation: bool,
-    /// 惰性构建的旋转矩阵（`rabitq_rotation` 且 dim 已知时建；search 只读）。
-    rotation: Option<binary::Rotation>,
+    /// 惰性构建的 **FHT 结构化旋转**（`rabitq_rotation` 且 dim 已知时建；search 只读；O(d) 存储、
+    /// apply O(d·log d)）。输出维度 `D=next_pow2(d)` → code/l1 在 D 空间（正交保内积，精排仍用原 d 向量）。
+    rotation: Option<fht::StructuredRotation>,
 }
 
-/// RaBitQ 旋转的固定种子（数据无关、定常 → 多副本/重开生成同一矩阵，无需持久化）。
+/// RaBitQ 旋转的固定种子（数据无关、定常 → 多副本/重开生成同一变换，无需持久化）。
 const RABITQ_ROTATION_SEED: u64 = 0x5261_4269_7451_5631; // "RaBitQV1"
 
 impl MemVectorIndex {
@@ -366,15 +367,14 @@ impl MemVectorIndex {
         self.binary_oversample = oversample.map(|m| m.max(1));
     }
 
-    /// dim 已知且开了旋转但矩阵未建 → 惰性构建（固定种子，确定）。
-    /// dim>`MAX_ROTATION_DIM` → `Err`（`Rotation::new` 唯一分配点守 DoS）。
-    fn ensure_rotation(&mut self) -> anyhow::Result<()> {
+    /// dim 已知且开了旋转但未建 → 惰性构建 FHT 旋转（固定种子，确定；O(d) 存储、无 d×d 矩阵、无 panic）。
+    /// 维度上限由 `upsert` 的显式 `fht::MAX_DIM` 早检守（FHT 无巨分配，故此处不返 Result）。
+    fn ensure_rotation(&mut self) {
         if self.rabitq_rotation && self.rotation.is_none() {
             if let Some(d) = self.dim {
-                self.rotation = Some(binary::Rotation::new(d, RABITQ_ROTATION_SEED)?);
+                self.rotation = Some(fht::StructuredRotation::new(d, RABITQ_ROTATION_SEED));
             }
         }
-        Ok(())
     }
 
     /// 当前二值粗筛 oversample（`None`=精确暴力档）。
@@ -388,12 +388,12 @@ impl MemVectorIndex {
     }
 
     /// 开/关 RaBitQ 随机旋转并**在新空间重算所有 code/l1**（供 load 后翻档；同 `set_binary_prefilter`
-    /// 的"策略不落盘、调用方设"模式）。开启时按固定种子重建旋转矩阵；dim>`MAX_ROTATION_DIM` → `Err`。
-    pub fn set_rabitq_rotation(&mut self, enabled: bool) -> anyhow::Result<()> {
+    /// 的"策略不落盘、调用方设"模式）。开启时按固定种子重建 FHT 旋转（code/l1 转 D 空间）。
+    pub fn set_rabitq_rotation(&mut self, enabled: bool) {
         self.rabitq_rotation = enabled;
         self.rotation = None;
         if enabled {
-            self.ensure_rotation()?;
+            self.ensure_rotation();
         }
         let rot = self.rotation.take(); // 取出避免与 entries 可变借用冲突
         for e in self.entries.values_mut() {
@@ -402,7 +402,6 @@ impl MemVectorIndex {
             e.l1 = binary::l1_norm(coded.as_deref().unwrap_or(&e.vector));
         }
         self.rotation = rot;
-        Ok(())
     }
 
     /// 取某 gid 的引用（命中组装用）。
@@ -540,19 +539,15 @@ impl VectorBackend for MemVectorIndex {
             None => {
                 // 旋转档：先校验维度上限，**再**赋 dim——避免超维首 upsert 把 dim 毒化成越界值
                 // （否则后续合法 upsert 全撞维度不匹配）。同 turbo 的"先验证后赋值"（review 跟进）。
-                if self.rabitq_rotation && vector.len() > binary::MAX_ROTATION_DIM {
-                    anyhow::bail!(
-                        "旋转档维度 {} 越界（须 ≤{}）",
-                        vector.len(),
-                        binary::MAX_ROTATION_DIM
-                    );
+                if self.rabitq_rotation && vector.len() > fht::MAX_DIM {
+                    anyhow::bail!("旋转档维度 {} 越界（须 ≤{}）", vector.len(), fht::MAX_DIM);
                 }
                 self.dim = Some(vector.len());
             }
             _ => {}
         }
         let normalized = normalize(&vector);
-        self.ensure_rotation()?;
+        self.ensure_rotation();
         // 二值码在（可选）旋转空间打：code/l1 由旋转后向量派生；原向量仍存供精排（正交不改内积）。
         let coded = self.rotation.as_ref().map(|r| r.apply(&normalized));
         let code = binary::pack_signs(coded.as_deref().unwrap_or(&normalized));
@@ -1080,7 +1075,7 @@ mod tests {
     #[test]
     fn rotated_upsert_rejects_oversized_dim() {
         let mut idx = MemVectorIndex::with_binary_prefilter_rotated(8);
-        let big = vec![0.1f32; binary::MAX_ROTATION_DIM + 1];
+        let big = vec![0.1f32; fht::MAX_DIM + 1];
         assert!(
             idx.upsert(
                 gid("d", 1),

@@ -10,8 +10,8 @@
 //! 比对称 Hamming（只数符号一致维、丢掉 `q` 的幅度）更接近真实余弦：两条同符号的库向量 Hamming
 //! 必打平，估计器仍能按 `q` 的幅度把它们分开 → 同 oversample 下召回更高（单测 `..._beats_hamming` 佐证）。
 //!
-//! 无偏性需**随机旋转**把量化误差摊匀：见下方 [`Rotation`]（数据无关正交变换，量化前施加），
-//! 经 `MemVectorIndex::with_binary_prefilter_rotated` / `set_rabitq_rotation` 启用，并由 engine
+//! 无偏性需**随机旋转**把量化误差摊匀：见 [`crate::fht::StructuredRotation`]（FHT 结构化正交变换，
+//! 量化前施加）经 `MemVectorIndex::with_binary_prefilter_rotated` / `set_rabitq_rotation` 启用，并由 engine
 //! `open_with` 据 checkpoint 翻档接线。未旋转档（默认二值）估计器已严格优于 Hamming；旋转档
 //! 对各向异性数据进一步增益（单测 `rabitq_rotation_helps_anisotropic` 佐证）。重排 +
 //! `GlobalId` tie-break 保持确定。
@@ -51,94 +51,9 @@ pub(crate) fn rabitq_estimate(q: &[f32], code: &[u64], l1: f32) -> f32 {
     s / l1
 }
 
-/// 固定种子的 xorshift64 → (0,1] 均匀数（确定、无 RNG 依赖；多副本/重开一致）。
-fn next_unit(s: &mut u64) -> f64 {
-    *s ^= *s << 13;
-    *s ^= *s >> 7;
-    *s ^= *s << 17;
-    ((*s >> 11) as f64 / (1u64 << 53) as f64).max(f64::MIN_POSITIVE)
-}
-
-/// 物化 d×d 旋转矩阵的维度上限（守 DoS：不可信快照声明巨维会触发 `4·d²` 分配 + O(d³) 建矩阵）。
-/// 8192 覆盖一切真实稠密嵌入模型（已知最大 4096）+2× 余量；`d>此` 标量旋转本就不可用。
-/// 决策见 [governance](../../docs/governance/2026-07-21-向量旋转维度上限与DoS.md)；根治靠 FHT（下一迭代）。
-pub(crate) const MAX_ROTATION_DIM: usize = 8192;
-
-/// RaBitQ 随机正交旋转：量化前对向量做一次**数据无关**的正交变换，把信息/量化误差摊匀到各维，
-/// 使符号码（`sign`）更均匀有信息、估计器趋近**无偏**——对各向异性（能量集中在少数维）数据增益尤大。
-/// 由**固定种子 + 维度**确定生成（多副本/重开一致，无需持久化矩阵；正交变换不改内积，故精排仍用原向量）。
-pub(crate) struct Rotation {
-    dim: usize,
-    mat: Vec<f32>, // d×d 行主序，行单位正交（高斯随机 + 改进 Gram-Schmidt）
-}
-
-impl Rotation {
-    /// 建 d×d 旋转矩阵。`dim∈[1, MAX_ROTATION_DIM]`，越界（含 0）→ `Err`——这是**唯一分配点**，
-    /// 两个旋转档（turbo / BruteBinaryRotated）都经此，DoS 闸在此一处、不可绕过。
-    pub(crate) fn new(dim: usize, seed: u64) -> anyhow::Result<Self> {
-        if dim == 0 || dim > MAX_ROTATION_DIM {
-            anyhow::bail!("旋转维度 {dim} 越界（须 1..={MAX_ROTATION_DIM}）");
-        }
-        let mut s = seed | 1;
-        // 高斯随机矩阵（Box–Muller）。
-        let mut mat = vec![0f32; dim * dim];
-        for x in mat.iter_mut() {
-            let u1 = next_unit(&mut s);
-            let u2 = next_unit(&mut s);
-            *x = ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32;
-        }
-        // 改进 Gram-Schmidt：逐行减去对前行的投影 + 归一化 → 行单位正交。
-        for i in 0..dim {
-            for j in 0..i {
-                let mut d = 0f32;
-                for c in 0..dim {
-                    d += mat[i * dim + c] * mat[j * dim + c];
-                }
-                for c in 0..dim {
-                    mat[i * dim + c] -= d * mat[j * dim + c];
-                }
-            }
-            let mut n = 0f32;
-            for c in 0..dim {
-                n += mat[i * dim + c] * mat[i * dim + c];
-            }
-            let n = n.sqrt();
-            if n > f32::EPSILON {
-                for c in 0..dim {
-                    mat[i * dim + c] /= n;
-                }
-            }
-        }
-        Ok(Rotation { dim, mat })
-    }
-
-    /// 旋转向量：`(M·v)[i] = ⟨row_i, v⟩`。`v.len()` 须等于 `dim`。
-    pub(crate) fn apply(&self, v: &[f32]) -> Vec<f32> {
-        let d = self.dim;
-        (0..d)
-            .map(|i| {
-                let row = &self.mat[i * d..(i + 1) * d];
-                row.iter().zip(v).map(|(a, b)| a * b).sum()
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// DoS 闸：`Rotation::new` 唯一分配点拒 dim==0 / >MAX（Err 在建矩阵前立即返回，不触发巨分配）。
-    /// 只测越界快路径 + 小维正常；**不**实建 8192² 矩阵（O(d³)、268MB，太慢）。
-    #[test]
-    fn rotation_dim_guard() {
-        assert!(Rotation::new(0, 1).is_err(), "dim=0 应拒");
-        assert!(
-            Rotation::new(MAX_ROTATION_DIM + 1, 1).is_err(),
-            "dim>MAX 应拒（不分配巨矩阵）"
-        );
-        assert!(Rotation::new(16, 1).is_ok(), "小维正常");
-    }
 
     #[test]
     fn pack_signs_basics() {
