@@ -81,14 +81,15 @@ impl RerankSidecar {
         })
     }
 
-    /// 打开既有 sidecar（load，不截断）。`next_slot` 由调用方按 entries 重建。
-    fn open(path: &Path, dim: usize, next_slot: u32) -> anyhow::Result<Self> {
+    /// 打开既有 sidecar（load，不截断）。`next_slot`/`free` 由调用方按 entries 重建
+    /// （`free`=`[0,next_slot)` 里未被任何 entry 占的洞——**修复 reload 后洞不复用的泄漏**）。
+    fn open(path: &Path, dim: usize, next_slot: u32, free: Vec<u32>) -> anyhow::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Ok(RerankSidecar {
             file: Mutex::new(file),
             dim,
             next_slot,
-            free: Vec::new(),
+            free,
         })
     }
 
@@ -199,8 +200,17 @@ impl TurboVectorIndex {
         }
     }
 
-    /// rerank 开、dim 已知、sidecar 未建 → 惰性建 sidecar 文件（stride=dim·4）。`next_slot` 由既有 entries
-    /// 重建（load 后首次 upsert；新索引则 0）。
+    /// 由既有 entries 重建 sidecar 的 `(next_slot, free)`：`next=max(slot)+1`、
+    /// `free=[0,next) 里未被占的洞`（供 open/ensure 复用，避免 reload 后洞泄漏）。
+    fn slot_state(&self) -> (u32, Vec<u32>) {
+        let used: std::collections::HashSet<u32> = self.entries.values().map(|e| e.slot).collect();
+        let next = used.iter().map(|s| s + 1).max().unwrap_or(0);
+        let free = (0..next).filter(|s| !used.contains(s)).collect();
+        (next, free)
+    }
+
+    /// rerank 开、dim 已知、sidecar 未建 → 惰性建 sidecar 文件（stride=dim·4）。既有 entries 时
+    /// 重建 `(next_slot, free)`（load 后首次 upsert 复用洞；新索引则空）。
     fn ensure_sidecar(&mut self) -> anyhow::Result<()> {
         if self.rerank_oversample == 0 || self.rerank.is_some() {
             return Ok(());
@@ -208,12 +218,53 @@ impl TurboVectorIndex {
         let (Some(d), Some(path)) = (self.dim, self.rerank_path.clone()) else {
             return Ok(());
         };
-        let next = self.entries.values().map(|e| e.slot + 1).max().unwrap_or(0);
+        let (next, free) = self.slot_state();
         self.rerank = Some(if path.exists() {
-            RerankSidecar::open(&path, d, next)?
+            RerankSidecar::open(&path, d, next, free)?
         } else {
             RerankSidecar::create(&path, d)?
         });
+        Ok(())
+    }
+
+    /// **压实 sidecar**：把活条目的 f32 重写成紧凑连续 slot（0..live），去除 delete/覆盖遗留的洞 →
+    /// 文件从 `max-ever-live·stride` 缩到 `live·stride`。原子（写临时→rename→重开）。供长跑永久删除后回收
+    /// 磁盘（churn 型删增由 `free` 复用已控增长；本方法处理**永久缩量**）。无 rerank/空则 no-op。
+    pub fn compact(&mut self) -> anyhow::Result<()> {
+        let (Some(d), Some(path)) = (self.dim, self.rerank_path.clone()) else {
+            return Ok(());
+        };
+        if self.rerank.is_none() {
+            return Ok(());
+        }
+        // 收集活条目（gid, 旧 slot），读旧 f32，写紧凑临时文件。
+        let mapping: Vec<(GlobalId, u32)> = self
+            .entries
+            .iter()
+            .map(|(g, e)| (g.clone(), e.slot))
+            .collect();
+        let old_slots: Vec<u32> = mapping.iter().map(|(_, s)| *s).collect();
+        let f32s = self.rerank.as_ref().unwrap().read_batch(&old_slots)?;
+        let tmp = crate::tmp_path(&path);
+        let compact = RerankSidecar::create(&tmp, d)?;
+        for (i, v) in f32s.iter().enumerate() {
+            compact.write(i as u32, v)?;
+        }
+        compact.fsync()?;
+        drop(compact); // 关临时文件句柄再 rename
+        std::fs::rename(&tmp, &path)?;
+        // 重指 entry.slot 为紧凑序，重开 sidecar（next=live、free 空）。
+        for (i, (gid, _)) in mapping.iter().enumerate() {
+            if let Some(e) = self.entries.get_mut(gid) {
+                e.slot = i as u32;
+            }
+        }
+        self.rerank = Some(RerankSidecar::open(
+            &path,
+            d,
+            mapping.len() as u32,
+            Vec::new(),
+        )?);
         Ok(())
     }
 
@@ -332,9 +383,9 @@ impl TurboVectorIndex {
             let scp = sidecar_path(path);
             idx.rerank_path = Some(scp.clone());
             if let Some(d) = snap.dim {
-                let next = idx.entries.values().map(|e| e.slot + 1).max().unwrap_or(0);
                 if scp.exists() {
-                    idx.rerank = Some(RerankSidecar::open(&scp, d, next)?);
+                    let (next, free) = idx.slot_state(); // 重建 free：复用洞，修 reload 泄漏
+                    idx.rerank = Some(RerankSidecar::open(&scp, d, next, free)?);
                 } else {
                     anyhow::bail!("turbo rerank 档缺 sidecar 文件: {}", scp.display());
                 }
@@ -1023,5 +1074,91 @@ mod tests {
     fn default_no_rerank() {
         let idx = TurboVectorIndex::new(4);
         assert_eq!(idx.rerank_oversample(), 0);
+    }
+
+    /// §Step3：**reload 复用洞**——删后 save→load，重建 `free` → 新 upsert 复用洞、文件不增长
+    /// （修 reload 后 free 清空导致的 churn 泄漏）。
+    #[test]
+    fn rerank_reload_reclaims_holes() {
+        let d = 64;
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("vector.bin");
+        let scp = sidecar_path(&snap);
+        let mut idx = TurboVectorIndex::with_rerank(4, 4, scp.clone());
+        let mut rng = Rng(0x33);
+        for i in 0..10 {
+            idx.upsert(gid("a", i), rng.vec(d), meta("text", &[]))
+                .unwrap();
+        }
+        for i in 0..4 {
+            idx.delete(&gid("a", i)).unwrap(); // 4 洞
+        }
+        idx.save(&snap).unwrap();
+
+        let mut re = TurboVectorIndex::load(&snap, 4).unwrap();
+        assert_eq!(re.len(), 6);
+        for i in 100..104 {
+            re.upsert(gid("a", i), rng.vec(d), meta("text", &[]))
+                .unwrap(); // 复用 4 洞
+        }
+        re.save(&snap).unwrap();
+        let size = std::fs::metadata(&scp).unwrap().len();
+        assert_eq!(
+            size,
+            10 * d as u64 * 4,
+            "reload 应复用洞、文件不增长（10 slot 而非 14）"
+        );
+        assert_eq!(re.len(), 10);
+    }
+
+    /// §Step3：**compact 缩量**——永久删除半数后 `compact` 把文件从 12 缩到 6 活 slot，检索语义不变
+    /// （无脏读、活向量仍在、删的不出现）。
+    #[test]
+    fn rerank_compact_shrinks() {
+        let d = 32;
+        let dir = tempfile::tempdir().unwrap();
+        let scp = dir.path().join("v.f32");
+        let mut idx = TurboVectorIndex::with_rerank(4, 8, scp.clone());
+        let mut rng = Rng(0x44);
+        let vecs: Vec<_> = (0..12).map(|_| rng.vec(d)).collect();
+        for (i, v) in vecs.iter().enumerate() {
+            idx.upsert(gid("a", i as u64), v.clone(), meta("text", &[]))
+                .unwrap();
+        }
+        for i in (0..12).step_by(2) {
+            idx.delete(&gid("a", i)).unwrap(); // 永久删偶数 id（6 个）
+        }
+        idx.save(&dir.path().join("vector.bin")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&scp).unwrap().len(),
+            12 * d as u64 * 4,
+            "删后仍 12 slot（洞未回收）"
+        );
+        let live_q = vecs[5].clone();
+        let before: Vec<u64> = idx
+            .search(&live_q, 3, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+
+        idx.compact().unwrap();
+        assert_eq!(
+            std::fs::metadata(&scp).unwrap().len(),
+            6 * d as u64 * 4,
+            "compact 缩到 6 活 slot"
+        );
+        assert_eq!(idx.len(), 6);
+        let after: Vec<u64> = idx
+            .search(&live_q, 3, None, None)
+            .unwrap()
+            .iter()
+            .map(|s| s.id.chunk_id)
+            .collect();
+        assert_eq!(before, after, "compact 前后检索一致（无脏读）");
+        assert!(
+            !after.contains(&0) && !after.contains(&2),
+            "已删偶数 id 不应出现"
+        );
     }
 }
