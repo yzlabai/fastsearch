@@ -228,6 +228,8 @@ fn to_core(dc: DocparseChunk, doc_id: &str) -> Chunk {
         image_vector_status: None,
         tenant: None,
         acl: vec!["public".to_string()],
+        metadata: Default::default(),
+        searchable: true,
     }
 }
 
@@ -310,6 +312,8 @@ fn mk_text_chunk(
         image_vector_status: None,
         tenant: None,
         acl: vec!["public".to_string()],
+        metadata: Default::default(),
+        searchable: true,
     };
     *id += 1;
     c

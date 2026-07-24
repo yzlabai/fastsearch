@@ -163,6 +163,8 @@ mod tests {
             image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
+            metadata: Default::default(),
+            searchable: true,
         })
     }
 

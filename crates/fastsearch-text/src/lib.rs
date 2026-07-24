@@ -14,7 +14,7 @@ pub use error::{Result, TextError};
 pub use query_build::StoredRow;
 pub use schema::{TextIndexConfig, TokenizerKind};
 
-use fastsearch_core::{AclFilter, Chunk, ChunkKind, Citation, Filter, GlobalId};
+use fastsearch_core::{AclFilter, Chunk, ChunkKind, Citation, Filter, GlobalId, Metadata};
 use query_build::{acl_query, stored_row, translate};
 use schema::{build_schema, Fields};
 use tantivy::collector::TopDocs;
@@ -34,6 +34,8 @@ pub struct TextHit {
     pub kind: String,
     /// 命中正文（用于 rerank / 上层展示）。
     pub text: String,
+    /// 调用方透传 metadata（不参与检索或过滤）。
+    pub metadata: Metadata,
     /// 高亮片段（HTML，命中词包 `<b>`）；未请求高亮或无命中词时为 None。
     pub highlight: Option<String>,
 }
@@ -85,7 +87,17 @@ impl TextIndex {
         let (schema, fields) = build_schema(cfg.tokenizer);
         let mmap = tantivy::directory::MmapDirectory::open(dir)
             .map_err(|e| TextError::QueryParse(format!("open dir: {e}")))?;
-        let index = Index::open_or_create(mmap, schema)?;
+        let index = Index::open_or_create(mmap, schema).map_err(|error| match error {
+            tantivy::TantivyError::IncompatibleIndex(reason) => {
+                TextError::SchemaMismatch(format!("{reason:?}"))
+            }
+            tantivy::TantivyError::SchemaError(reason)
+                if reason.contains("schema does not match") =>
+            {
+                TextError::SchemaMismatch(reason)
+            }
+            other => TextError::Tantivy(other),
+        })?;
         Self::finish(index, fields, cfg)
     }
 
@@ -104,6 +116,7 @@ impl TextIndex {
 
     /// upsert：同 gid 覆盖（先按 gid 删，再加）。
     pub fn upsert(&mut self, collection: &str, chunk: &Chunk) -> Result<()> {
+        chunk.validate_metadata()?;
         let gid = chunk.global_id(collection).to_citation_id();
         self.writer
             .delete_term(Term::from_field_text(self.fields.gid, &gid));
@@ -130,6 +143,7 @@ impl TextIndex {
         if let Some(m) = &chunk.media {
             doc.add_text(f.media, serde_json::to_string(m)?);
         }
+        doc.add_text(f.metadata, serde_json::to_string(&chunk.metadata)?);
         self.writer.add_document(doc)?;
         Ok(())
     }
@@ -428,6 +442,7 @@ impl TextIndex {
                     citation,
                     kind: row.kind,
                     text,
+                    metadata: row.metadata,
                     highlight,
                 });
             }
@@ -486,6 +501,8 @@ mod tests {
             image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
+            metadata: Metadata::new(),
+            searchable: true,
         }
     }
 
@@ -500,11 +517,11 @@ mod tests {
     #[test]
     fn index_search_returns_citation() {
         let mut idx = ram(TokenizerKind::Default);
-        idx.upsert(
-            "kb",
-            &chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha beta gamma", 5),
-        )
-        .unwrap();
+        let mut first = chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha beta gamma", 5);
+        first
+            .metadata
+            .insert("source".into(), serde_json::json!("fixture"));
+        idx.upsert("kb", &first).unwrap();
         idx.upsert(
             "kb",
             &chunk("a.pdf", 2, ChunkKind::Paragraph, "beta delta", 6),
@@ -517,6 +534,31 @@ mod tests {
         assert_eq!(hits[0].citation.page, 5);
         assert_eq!(hits[0].citation.bbox.x1, 3.0);
         assert_eq!(hits[0].citation.heading_path, vec!["第3章", "财务"]);
+        assert_eq!(hits[0].metadata["source"], "fixture");
+        assert_eq!(
+            idx.stored_row_by_gid(&hits[0].id)
+                .unwrap()
+                .unwrap()
+                .metadata["source"],
+            "fixture"
+        );
+    }
+
+    #[test]
+    fn persisted_schema_mismatch_requires_an_explicit_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old_schema = tantivy::schema::Schema::builder();
+        old_schema.add_text_field("gid", tantivy::schema::STRING | tantivy::schema::STORED);
+        Index::create_in_dir(dir.path(), old_schema.build()).unwrap();
+
+        let error = TextIndex::open_or_create(dir.path(), TextIndexConfig::default())
+            .err()
+            .expect("old schema must be rejected");
+        assert!(
+            matches!(error, TextError::SchemaMismatch(_)),
+            "unexpected error: {error}"
+        );
+        assert!(error.to_string().contains("rebuild the derived index"));
     }
 
     #[test]

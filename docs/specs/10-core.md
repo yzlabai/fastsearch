@@ -36,10 +36,13 @@ pub struct Chunk {
     pub media_bytes: Option<Vec<u8>>, // inline 媒资字节（小裁图，AssetPointer::Inline 时有值；落 PG bytea 真源，MM2c-bytes）。transient 写侧通道：serde skip、不进 JSON 线缆/不上 Citation
     pub tenant: Option<String>,
     pub acl: Vec<String>,         // 默认 ["public"]
+    pub metadata: Metadata,       // 不透明 JSON object；默认 {}
+    pub searchable: bool,         // 默认 true；false=持久化但不进入检索
 }
 ```
 - `GlobalId`：`(collection, doc_id, chunk_id)` 的稳定标识；`fn global_id(&self, collection) -> GlobalId`。
 - `ChunkKind`：serde 用 snake_case（与 docparse 一致：heading/paragraph/table/code/list_item/image/**audio/video**）。`Audio`/`Video` 为多模态新增（MM1）。
+- `Metadata = serde_json::Map<String, Value>`：FastSearch 仅校验、存储和返回，不索引、不解释、不参与 ACL 或过滤。单 chunk 上限为 64 KiB、256 个键、16 层 JSON 容器嵌套。
 
 ### 2.1b 多模态：模态 + 媒资引用（MM1）
 
@@ -90,6 +93,8 @@ pub struct SearchRequest {
     pub collapse: Option<Collapse>,    // 分组折叠（None=不折叠）
     pub search_after: Option<String>,  // 深分页游标（不透明 token，取自上页末条 cursor()）
     pub highlight: bool,
+    pub include_text: bool,             // 默认 false；按需返回完整正文
+    pub include_metadata: bool,         // 默认 false；按需返回 metadata
     pub facets: Vec<String>,           // 请求分面的字段（当前支持 kind / doc_id）
     pub explain: bool,
 }
@@ -164,6 +169,8 @@ pub enum CoreError { InvalidRequest(String), InvalidCitation(String), InvalidFil
 - **确定性**：fuse 排序稳定、tie-break 确定；filter 求值无副作用。
 - **健壮**：类型不匹配/字段缺失返回 false 或 None，不 panic。
 - **serde**：Chunk/SearchRequest/Filter 全可 (de)serialize；枚举 snake_case；与 docparse chunk 字段名一致（kind/page/bbox/heading_path/section_id/char_len）。
+- **兼容默认值**：旧 JSON 缺少 `metadata`/`searchable`/`include_*` 时分别按 `{}`/`true`/`false` 解码。
+- **资源边界**：所有写入口在产生持久化或索引副作用前调用 `Chunk::validate_metadata()`。
 
 ## 4. 依赖
 
@@ -200,3 +207,4 @@ pub enum CoreError { InvalidRequest(String), InvalidCitation(String), InvalidFil
 - 2026-06-24 v1：首版，数据模型 + 查询/过滤 AST + 融合 + 引用 + 错误，单测覆盖 §5。
 - 2026-06-27 回写多模态（MM1，代码已实现）：`ChunkKind` 加 `Audio`/`Video` + `ChunkKind::modality()`；新增 `Modality`/`TimeSpan`/`AssetPointer`/`MediaRef`（§2.1b）；`Chunk.image_meta`→`media`（MM2b，`ImageMeta` 降级为迁移用 `to_media`）；`text` 语义放宽为"可空串的可检索文本表示"；`Citation` 加 `time`/`media`（§2.5）。设计见 [多模态功能设计与开发计划](../plans/2026-06-25-多模态功能设计与开发计划.md)；单测覆盖 modality 派生/serde/citation 回环。
 - 2026-06-28 回写 spec 漂移（代码已实现，spec 落后）：`Chunk` 加 `media_bytes`（MM2c-bytes，inline 字节，serde skip）；`SearchRequest` 加 `query_image`（MM9 以图搜图）、`collapse`（分组折叠）、`search_after`（深分页游标）、`facets`（请求分面字段）；补 `RerankSpec`/`Collapse` 类型定义（§2.2）。均为补文档、无代码改动。
+- 2026-07-23 通用 chunk 协议：`Chunk` 新增不透明 `metadata` 与 `searchable`；`SearchRequest` 新增 opt-in `include_text`/`include_metadata`。字段均有向后兼容默认值，metadata 受统一资源边界约束。

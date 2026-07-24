@@ -214,6 +214,8 @@ pub fn from_docparse_chunk(
         image_vector_status: None,
         tenant,
         acl,
+        metadata: Default::default(),
+        searchable: true,
     }
 }
 

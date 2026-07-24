@@ -8,7 +8,9 @@
 
 REST 服务（四张脸之一）+ 安全 + 基础可观测。
 
-- 端点：`GET /healthz` `/readyz` `/metrics` `/openapi.json`；`POST /v1/search`（含 `search_after` 深分页，命中带 `cursor`）；`POST /v1/similar`（按 citation_id more_like_this）；`GET /v1/asset/{cid}`（媒资 ACL 网关，authed）；`GET /v1/asset/{cid}/bytes?exp&ct&sig`（**token 门控** inline 字节，免 Bearer，MM6-signer）；`POST /v1/index`。
+- 端点：健康/契约、search/similar/index/assets，以及通用管理端点
+  `POST /v1/chunks/batch-get|batch-upsert|batch-delete`、`GET /v1/chunks`、
+  `DELETE /v1/collections/{name}`。
 - **认证（F43）**：API Key（`Authorization: Bearer <k>` 或 `X-API-Key`）→ Principal{tenant, tags}；缺/错 → 401。
 - **逐文档 ACL（F44，安全核心）**：Principal → `AclFilter`，**服务端注入**给 engine.search/resolve_citation；**客户端无法在请求里传 ACL/越权**（含 /v1/asset：越权/不存在均 404，不泄漏存在性）。
 - 可观测（F50）：counters + 延迟直方图 `/metrics`（Prometheus 文本）；限流（令牌桶 429）；审计（可插拔 sink）。
@@ -29,8 +31,13 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 ```
 
 请求/响应：
-- `POST /v1/search` body = `SearchRequest`（core，serde）。注意：**body 里若带 ACL 字段会被忽略**——ACL 只来自认证身份。响应 = `{hits:[{citation_id,score,page,bbox,heading_path,doc_id,chunk_id,bm25,vector}]}`。
-- `POST /v1/index` body = `{collection, doc_id, chunks:[Chunk]}` → ingest+commit，返回 `{indexed:n}`。
+- `POST /v1/search` body = `SearchRequest`（core，serde）。注意：**body 里若带 ACL 字段会被忽略**——ACL 只来自认证身份。`include_text`/`include_metadata` 默认 false；开启后命中分别附带完整 `text`/不透明 `metadata`，未开启时字段直接省略。
+- `POST /v1/index` body = `{collection, doc_id, chunks:[Chunk]}` → ingest+commit，返回 `{indexed:n}`。Chunk 支持默认 `{}` 的 `metadata` 和默认 true 的 `searchable`；metadata 在副作用前校验。
+- chunk 管理端点以现有 `GlobalId=(collection,doc_id,chunk_id)` 寻址；batch 上限 1000。
+  Batch get 保持请求顺序并用 `chunk:null` 合并不可见/不存在；batch delete 同理返回
+  `deleted:false`；文档列表按 `chunk_id` 游标分页（默认 100、上限 500）。
+- chunk/collection 管理依赖 PostgreSQL 真源；未配置时返回 503。管理读取移除 inline 字节，
+  Object 媒资只暴露种类，不暴露 URI/bucket/key。
 - 401（无/错 key）、400（坏 body）、200（成功）。
 
 ## 3. 行为规约
@@ -38,6 +45,11 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - **认证强制**：除 `/healthz`/`/readyz`/`/metrics` 外都要求合法 key。
 - **ACL 注入**：search 一律以 `acl_for(principal)` 调 engine.search（Some），客户端不可绕过；越权 chunk 不出现在结果。
 - **健壮**：坏 JSON→400、不 panic；engine 错误→500 + 简短信息。
+- **真源约束**：REST 收到 `searchable=false` 时必须已配置 PostgreSQL source store，否则返回 400；避免把“需持久化但不可检索”的 row 静默丢失。普通 `searchable=true` 兼容既有无 PG 模式。
+- **身份覆盖**：batch upsert 与 doc index 一样，由 Principal 强制覆盖 tenant/acl；跨 tenant
+  GlobalId 冲突返回 409，不允许覆盖。
+- **删除幂等**：chunk 删除、collection 删除重复调用均返回 200；collection 删除按 tenant owner
+  scope 清真源，再按 PG 返回的实际 GlobalId/对象列表清派生状态。
 - 确定性、无敏感信息泄漏到错误体。
 
 ## 4. 依赖
@@ -52,6 +64,10 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 4. `/v1/index` 写入后 `/v1/search` 能查到、带引用。
 5. 坏 body → 400。
 6. principal_from_headers / acl_for 纯函数单测。
+7. 无 PostgreSQL 时所有管理端点返回 503。
+8. 真实 PostgreSQL 路由级生命周期覆盖顺序、metadata/searchable、ACL、跨 tenant 409、分页、
+   context-only 不召回、chunk/collection 重复删除及其他 tenant 保留。
+9. 管理读取不暴露 `media_bytes` 或 Object 原始定位信息。
 
 ## 6. 验收标准与状态
 
@@ -73,5 +89,12 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   `/v1/asset` 的 **Inline 路径从 PG `media_bytes` 真源吐字节**（+Content-Type）。**server HTTP E2E** `asset_inline_bytes_e2e`
   （Docker 真机：授权 200+image/png+真源字节 / 越权 404 / 无 key 401）。**Object 无签名器→404 不泄露裸 key**（MM6-secure）。
   真签名 URL（S3 presign）/ **对象存储档 Range**（交对象存储）随 S4 presign（gated）；**inline 档 Range 已落地**（见 v1.9）。
+- [x] v2.0（2026-07-23，通用 chunk 协议）：REST/OpenAPI 暴露 `metadata`、`searchable`、`include_text`、`include_metadata`；响应按 opt-in 省略完整 payload。新增 metadata 限制、无 PG 拒绝 `searchable=false`、真实 PG 持久化但不可检索的测试。
+- [x] v2.1（2026-07-23，通用管理 API）：完成 batch get/upsert/delete、文档内分页和幂等
+  collection 删除；OpenAPI 同步全部 schema/path。真实 pgvector route test 证明 ACL/tenant/分页/
+  幂等语义，Object 定位和 inline 字节经统一管理 DTO 脱敏。
+- [x] v2.2（2026-07-23，实例级向量维度）：`FASTSEARCH_EMBED_DIM` 同时约束服务端
+  collection 注册；`dim=0` 或与实例维度不一致时在写入前返回 400，`server.vector_dim`
+  可用于契约自检。单元测试覆盖维度拒绝，真实 Compose smoke 覆盖 1024 接受/768 拒绝。
 
 **已知限制 / 下一迭代：** RBAC 细粒度策略引擎、TLS（交网关）、并发优化（当前 Mutex 串行；后续 RwLock/副本，见 [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。MCP 工具面已独立实现（`fastsearch-mcp`）。

@@ -161,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
                     fastsearch_pg::PgConfig::new(url).with_vector_dim(embed_dim),
                 )
                 .await?;
+                pg.ensure_schema().await?;
                 engine.set_pg_vector(std::sync::Arc::new(pg));
                 eprintln!("vector backend: pgvector 直查（ANN 在 PG，需 embedding 已入 PG）");
             }
@@ -285,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let mut state = ServerState::new(engine, keys);
+    let mut state = ServerState::new(engine, keys).with_vector_dim(embed_dim);
 
     // 限流：FASTSEARCH_RATE_LIMIT="capacity,refill_per_sec"
     if let Ok(spec) = std::env::var("FASTSEARCH_RATE_LIMIT") {

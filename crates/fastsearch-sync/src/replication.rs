@@ -311,6 +311,18 @@ fn row_to_chunk(rel: &Relation, tuple: &TupleData) -> Result<(String, Chunk)> {
         chunk_id: get(&m, "chunk_id")?.parse().context("chunk_id")?,
         kind: get(&m, "kind")?.to_string(),
         text: get(&m, "text")?.to_string(),
+        metadata: m
+            .get("metadata")
+            .copied()
+            .flatten()
+            .unwrap_or("{}")
+            .to_string(),
+        searchable: m
+            .get("searchable")
+            .copied()
+            .flatten()
+            .map(|value| matches!(value, "t" | "true" | "1"))
+            .unwrap_or(true),
         page: get(&m, "page")?.parse().context("page")?,
         bbox: get(&m, "bbox")?.to_string(),
         heading_path: parse_pg_array(get(&m, "heading_path")?),

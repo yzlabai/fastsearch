@@ -44,6 +44,8 @@ fn chunk(doc: &str, id: u64, text: &str) -> Chunk {
         image_vector_status: None,
         tenant: None,
         acl: vec!["public".into()],
+        metadata: Default::default(),
+        searchable: true,
     }
 }
 
@@ -96,10 +98,16 @@ async fn cdc_closed_loop_pg_to_search() {
     ensure_slot(&rcfg).await.expect("ensure_slot");
 
     // 3) 写 PG（真源）：doc 级替换写 3 个 chunk。
+    let mut revenue = chunk("rep.pdf", 2, "revenue grew by eighteen percent");
+    revenue
+        .metadata
+        .insert("source".into(), serde_json::json!("ledger"));
+    let mut hidden = chunk("rep.pdf", 3, "chip research investment increased");
+    hidden.searchable = false;
     let chunks = vec![
         chunk("rep.pdf", 1, "gross margin improved this year"),
-        chunk("rep.pdf", 2, "revenue grew by eighteen percent"),
-        chunk("rep.pdf", 3, "chip research investment increased"),
+        revenue,
+        hidden,
     ];
     let n = store
         .upsert_doc("kb", "rep.pdf", &chunks)
@@ -125,6 +133,7 @@ async fn cdc_closed_loop_pg_to_search() {
         query: "revenue".into(),
         mode: SearchMode::Keyword,
         top_k: 5,
+        include_metadata: true,
         ..Default::default()
     };
     let hits = engine.search(&req, None).expect("search");
@@ -133,15 +142,16 @@ async fn cdc_closed_loop_pg_to_search() {
     assert_eq!(hits[0].id.chunk_id, 2);
     assert_eq!(hits[0].citation.page, 2);
     assert_eq!(hits[0].citation.heading_path, vec!["chapter", "sec"]);
+    assert_eq!(hits[0].metadata.as_ref().unwrap()["source"], "ledger");
 
-    // 另一个词验证多 chunk 都进了索引
+    // searchable=false 的真源行会经过 CDC，但不会进入派生检索索引。
     let req2 = SearchRequest {
         query: "chip".into(),
         mode: SearchMode::Keyword,
         top_k: 5,
         ..Default::default()
     };
-    assert_eq!(engine.search(&req2, None).unwrap()[0].id.chunk_id, 3);
+    assert!(engine.search(&req2, None).unwrap().is_empty());
 
     // 7) 清理 slot（避免 WAL 滞留）。
     drop_slot(&rcfg).await.expect("drop_slot");

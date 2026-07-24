@@ -205,6 +205,8 @@ def test_search_full_options_body():
         collapse="doc_id",
         search_after="cur-1",
         highlight=True,
+        include_text=True,
+        include_metadata=True,
         facets=["doc_id"],
         explain=True,
     )
@@ -218,12 +220,16 @@ def test_search_full_options_body():
     assert body["collapse"] == "doc_id"
     assert body["search_after"] == "cur-1"
     assert body["highlight"] is True
+    assert body["include_text"] is True
+    assert body["include_metadata"] is True
     assert body["facets"] == ["doc_id"]
     assert body["explain"] is True
     # 未显式给的可选参数不进请求体（服务端走默认）
     c.search("kb", "q")
     assert "rerank" not in calls[-1]["body"]
     assert "search_after" not in calls[-1]["body"]
+    assert "include_text" not in calls[-1]["body"]
+    assert "include_metadata" not in calls[-1]["body"]
 
 
 def test_search_with_facets():
@@ -301,6 +307,76 @@ def test_delete_doc_issues_delete_with_slash_doc_id():
     assert out["deleted"] is True and out["pg_deleted"] == 3
     assert captured["method"] == "DELETE"
     assert captured["path"] == "/v1/docs/kb/sub/d.md"
+
+
+def test_chunk_and_collection_management_methods():
+    """管理方法保持 GlobalId 结构、分页查询参数与幂等删除响应。"""
+    from fastsearch_client import FastsearchClient
+
+    ids = [
+        {"collection": "kb/a", "doc_id": "doc one", "chunk_id": 2},
+        {"collection": "kb/a", "doc_id": "missing", "chunk_id": 9},
+    ]
+    item = {
+        "collection": "kb/a",
+        "chunk": {
+            "doc_id": "doc one",
+            "chunk_id": 2,
+            "kind": "paragraph",
+            "text": "hello",
+            "page": 1,
+            "bbox": {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+            "char_len": 5,
+            "metadata": {"source": "caller"},
+            "searchable": False,
+        },
+    }
+    c = FastsearchClient("http://x", api_key="dev")
+    calls = []
+
+    def fake_request(method, path, body=None, **kw):
+        calls.append({"method": method, "path": path, "body": body})
+        if path == "/v1/chunks/batch-get":
+            return {
+                "results": [
+                    {"id": ids[0], "chunk": item["chunk"]},
+                    {"id": ids[1], "chunk": None},
+                ]
+            }
+        if path == "/v1/chunks/batch-upsert":
+            return {"upserted": 1}
+        if path == "/v1/chunks/batch-delete":
+            return {
+                "results": [
+                    {"id": ids[0], "deleted": True},
+                    {"id": ids[1], "deleted": False},
+                ],
+                "objects_deleted": 0,
+                "object_errors": [],
+            }
+        if path.startswith("/v1/chunks?"):
+            return {"chunks": [item["chunk"]], "next_after": 2}
+        return {
+            "deleted_chunks": 1,
+            "registered_removed": True,
+            "objects_deleted": 0,
+            "object_errors": [],
+        }
+
+    c._request = fake_request
+    assert [r["id"] for r in c.batch_get_chunks(ids)] == ids
+    assert c.batch_upsert_chunks([item]) == 1
+    assert [r["deleted"] for r in c.batch_delete_chunks(ids)["results"]] == [True, False]
+    assert c.list_document_chunks("kb/a", "doc one", after=1, limit=20)["next_after"] == 2
+    assert c.delete_collection("kb/a")["deleted_chunks"] == 1
+    assert calls[0]["body"] == {"ids": ids}
+    assert calls[1]["body"] == {"items": [item]}
+    assert calls[2]["body"] == {"ids": ids}
+    assert calls[3]["path"] == (
+        "/v1/chunks?collection=kb%2Fa&doc_id=doc+one&after=1&limit=20"
+    )
+    assert calls[4]["method"] == "DELETE"
+    assert calls[4]["path"] == "/v1/collections/kb%2Fa"
 
 
 def test_fetch_asset_bytes_variants():
@@ -393,6 +469,7 @@ def main():
         test_similar_posts_citation_id,
         test_resolve_assets_posts_ids,
         test_delete_doc_issues_delete_with_slash_doc_id,
+        test_chunk_and_collection_management_methods,
         test_fetch_asset_bytes_variants,
         test_request_retries_transient_then_succeeds,
     ]

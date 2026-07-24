@@ -45,6 +45,41 @@ pub trait FieldSource {
     fn acl(&self) -> &[String];
 }
 
+impl FieldSource for crate::model::Chunk {
+    fn get(&self, field: &str) -> Option<FieldValue> {
+        let kind = match self.kind {
+            crate::model::ChunkKind::Heading => "heading",
+            crate::model::ChunkKind::Paragraph => "paragraph",
+            crate::model::ChunkKind::Table => "table",
+            crate::model::ChunkKind::Code => "code",
+            crate::model::ChunkKind::ListItem => "list_item",
+            crate::model::ChunkKind::Image => "image",
+            crate::model::ChunkKind::Audio => "audio",
+            crate::model::ChunkKind::Video => "video",
+        };
+        match field {
+            "doc_id" => Some(FieldValue::Str(self.doc_id.clone())),
+            "chunk_id" => i64::try_from(self.chunk_id).ok().map(FieldValue::Int),
+            "kind" => Some(FieldValue::Str(kind.into())),
+            "modality" => Some(FieldValue::Str(self.kind.modality().as_str().into())),
+            "page" => Some(FieldValue::Int(self.page.into())),
+            "section_id" => i64::try_from(self.section_id).ok().map(FieldValue::Int),
+            "char_len" => Some(FieldValue::Int(self.char_len.into())),
+            "tenant" => self.tenant.clone().map(FieldValue::Str),
+            "searchable" => Some(FieldValue::Bool(self.searchable)),
+            _ => None,
+        }
+    }
+
+    fn heading_path(&self) -> &[String] {
+        &self.heading_path
+    }
+
+    fn acl(&self) -> &[String] {
+        &self.acl
+    }
+}
+
 /// 过滤表达式（可嵌套布尔）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

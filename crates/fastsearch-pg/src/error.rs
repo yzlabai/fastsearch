@@ -12,6 +12,8 @@ pub enum PgError {
     Mapping(String),
     #[error("config error: {0}")]
     Config(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("core error: {0}")]
     Core(#[from] fastsearch_core::CoreError),
 }

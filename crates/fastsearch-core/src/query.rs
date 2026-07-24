@@ -80,6 +80,12 @@ pub struct SearchRequest {
     pub search_after: Option<String>,
     #[serde(default)]
     pub highlight: bool,
+    /// 在每条命中中附带完整 chunk 正文。默认关闭，避免放大响应。
+    #[serde(default)]
+    pub include_text: bool,
+    /// 在每条命中中附带调用方透传 metadata。默认关闭。
+    #[serde(default)]
+    pub include_metadata: bool,
     /// 请求分面的字段（当前支持 `kind` / `doc_id`）。
     #[serde(default)]
     pub facets: Vec<String>,
@@ -112,6 +118,8 @@ impl Default for SearchRequest {
             collapse: None,
             search_after: None,
             highlight: false,
+            include_text: false,
+            include_metadata: false,
             facets: Vec::new(),
             explain: false,
         }

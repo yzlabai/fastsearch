@@ -6,6 +6,17 @@
 
 use crate::error::{CoreError, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// 调用方透传的 chunk 元数据。FastSearch 只存储和返回，不解释、不索引、不参与过滤。
+pub type Metadata = Map<String, Value>;
+
+/// 单个 chunk 元数据的最大 JSON 编码大小。
+pub const MAX_METADATA_BYTES: usize = 64 * 1024;
+/// 单个 chunk 元数据对象允许的最大总键数（含嵌套对象）。
+pub const MAX_METADATA_KEYS: usize = 256;
+/// 单个 chunk 元数据允许的最大 JSON 容器嵌套深度。
+pub const MAX_METADATA_DEPTH: usize = 16;
 
 /// 轴对齐包围盒（PDF 用户空间，原点左下）。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -254,6 +265,12 @@ pub struct Chunk {
     pub tenant: Option<String>,
     #[serde(default = "default_acl")]
     pub acl: Vec<String>,
+    /// 调用方透传元数据。仅存储/返回，不建立索引，也不参与 FastSearch 业务语义。
+    #[serde(default)]
+    pub metadata: Metadata,
+    /// 是否进入全文/向量检索。`false` 的 chunk 仍保存在真源，供管理 API 按主键读取。
+    #[serde(default = "default_searchable")]
+    pub searchable: bool,
 }
 
 impl Chunk {
@@ -264,6 +281,48 @@ impl Chunk {
             doc_id: self.doc_id.clone(),
             chunk_id: self.chunk_id,
         }
+    }
+
+    /// 校验透传元数据的资源边界。FastSearch 不解释字段，只限制大小与结构复杂度。
+    pub fn validate_metadata(&self) -> Result<()> {
+        let encoded = serde_json::to_vec(&self.metadata)
+            .map_err(|e| CoreError::InvalidRequest(format!("metadata is not valid JSON: {e}")))?;
+        if encoded.len() > MAX_METADATA_BYTES {
+            return Err(CoreError::InvalidRequest(format!(
+                "metadata must be <= {MAX_METADATA_BYTES} bytes"
+            )));
+        }
+
+        let (keys, depth) = metadata_shape(&Value::Object(self.metadata.clone()), 0);
+        if keys > MAX_METADATA_KEYS {
+            return Err(CoreError::InvalidRequest(format!(
+                "metadata must contain <= {MAX_METADATA_KEYS} keys"
+            )));
+        }
+        if depth > MAX_METADATA_DEPTH {
+            return Err(CoreError::InvalidRequest(format!(
+                "metadata depth must be <= {MAX_METADATA_DEPTH}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn default_searchable() -> bool {
+    true
+}
+
+fn metadata_shape(value: &Value, depth: usize) -> (usize, usize) {
+    match value {
+        Value::Object(map) => map.iter().fold((map.len(), depth + 1), |acc, (_, value)| {
+            let child = metadata_shape(value, depth + 1);
+            (acc.0 + child.0, acc.1.max(child.1))
+        }),
+        Value::Array(values) => values.iter().fold((0, depth + 1), |acc, value| {
+            let child = metadata_shape(value, depth + 1);
+            (acc.0 + child.0, acc.1.max(child.1))
+        }),
+        _ => (0, depth),
     }
 }
 
@@ -463,6 +522,8 @@ mod tests {
             image_vector_status: None,
             tenant: None,
             acl: default_acl(),
+            metadata: Metadata::new(),
+            searchable: true,
         };
         let gid = c.global_id("kb");
         let cid = gid.to_citation_id();
@@ -489,5 +550,37 @@ mod tests {
         assert!(GlobalId::parse("only:one").is_err()); // 缺第三段
         assert!(GlobalId::parse("kb:doc:notanumber").is_err());
         assert!(GlobalId::parse(":doc:1").is_err()); // 空 collection
+    }
+
+    #[test]
+    fn chunk_metadata_and_searchable_have_compatible_defaults() {
+        let json = r#"{"doc_id":"a.pdf","chunk_id":1,"kind":"paragraph","text":"hi",
+            "page":1,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":2}"#;
+        let c: Chunk = serde_json::from_str(json).unwrap();
+        assert!(c.metadata.is_empty());
+        assert!(c.searchable);
+        assert!(c.validate_metadata().is_ok());
+    }
+
+    #[test]
+    fn chunk_metadata_limits_are_enforced() {
+        let mut c: Chunk = serde_json::from_str(
+            r#"{"doc_id":"a.pdf","chunk_id":1,"kind":"paragraph","text":"hi",
+            "page":1,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":2}"#,
+        )
+        .unwrap();
+        c.metadata.insert(
+            "large".into(),
+            Value::String("x".repeat(MAX_METADATA_BYTES)),
+        );
+        assert!(c.validate_metadata().is_err());
+
+        c.metadata.clear();
+        let mut nested = Value::Null;
+        for _ in 0..=MAX_METADATA_DEPTH {
+            nested = Value::Array(vec![nested]);
+        }
+        c.metadata.insert("nested".into(), nested);
+        assert!(c.validate_metadata().is_err());
     }
 }

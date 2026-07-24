@@ -38,7 +38,14 @@ impl TextIndex {
     pub fn commit(&mut self) -> Result<()>;
     pub fn search(&self, query: &str, filter: Option<&Filter>, k: usize) -> Result<Vec<TextHit>>;
 }
-pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
+pub struct TextHit {
+    pub id: GlobalId,
+    pub score: f32,
+    pub citation: Citation,
+    pub text: String,
+    pub metadata: Metadata,
+    ...
+}
 ```
 
 - `global_id` 在索引内以字符串 `collection:doc_id:chunk_id`（= citation_id）作主键字段（STRING, indexed+stored），便于 upsert（先 delete_term 再 add）与删除。
@@ -62,6 +69,7 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 | `acl` | STRING(多值) | FAST（ACL） |
 | `heading_path` | STORED(JSON/多值) | 组装 citation |
 | `bbox` | STORED(JSON) | 组装 citation |
+| `metadata` | STORED(JSON) | 调用方不透明数据；只往返，不索引/过滤 |
 
 - BM25：用 `tantivy::query::QueryParser` over [text, heading]，heading 加 boost；Similarity 用 Tantivy BM25，k1/b 通过 schema 的 `TextFieldIndexing` + 自定义 `Bm25` 参数（Tantivy 0.26 支持设定）。若版本不支持直接设 k1/b，则记录为已知限制并在 spec 标注，后续迭代用自定义 Weight。
 
@@ -80,6 +88,7 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 - **delete_by_doc**：删除 `(collection,doc_id)` 全部 chunk（对应 doc_id 级替换）。
 - **健壮**：查询解析失败返回空结果或显式错误，不 panic；commit 失败上报。
 - **确定性**：同分 tie-break 按 gid（与 core fuse 一致），保证可复现。
+- **派生索引兼容**：加入 stored metadata 会改变 Tantivy schema。旧目录不会被自动删除；打开时返回明确 `SchemaMismatch`，有 PG 真源的部署应从真源重建派生索引。
 
 ## 6. 依赖
 
@@ -112,3 +121,4 @@ pub struct TextHit { pub id: GlobalId, pub score: f32, pub citation: Citation }
 - 2026-06-24 v1（完成）：schema + BM25 + jieba + 过滤 + ACL 强制 + upsert/delete + 确定性。10 测试绿。
 - 2026-06-25：`Ne`/`Not` 索引侧精确补集翻译（`exact_translate`/`complement`），+1 端到端测试（Ne/Not/Not(And)/Not(Exists 退化）。
 - 2026-06-25：**查询能力补全**——短语 `"a b"` 与邻近 `"a b"~N` 经 Tantivy parser 已支持（加回归测试确认）；新增**末词前缀** `term*`（search-as-you-type）：`build_text_query` 识别末词 `*`、用 `RegexQuery` 在 text 字段前缀匹配（前词照常 parse、Should 合并），含引号时不启用。+1 测试（短语/slop/前缀/多词前缀/无匹配）。
+- 2026-07-23 通用 chunk 协议：schema 增加 stored-only `metadata`，`TextHit` 回传正文和 metadata 供 engine 按请求裁剪；不增加 metadata 查询能力。旧派生索引必须显式重建，测试覆盖不兼容错误。

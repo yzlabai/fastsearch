@@ -6,6 +6,10 @@ use thiserror::Error;
 pub enum TextError {
     #[error("tantivy error: {0}")]
     Tantivy(#[from] tantivy::TantivyError),
+    #[error(
+        "text index schema is incompatible with this fastsearch version; rebuild the derived index from the source store: {0}"
+    )]
+    SchemaMismatch(String),
     #[error("query parse error: {0}")]
     QueryParse(String),
     #[error("json error: {0}")]
