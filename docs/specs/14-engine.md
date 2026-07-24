@@ -19,12 +19,21 @@
 
 ```rust
 pub struct Engine { /* TextIndex（+later VectorBackend） */ }
-pub struct SearchHit { pub id: GlobalId, pub score: f64, pub citation: Citation,
-                       pub bm25: Option<f32>, pub vector: Option<f64> }
+pub struct SearchHit {
+    pub id: GlobalId,
+    pub score: f64,
+    pub citation: Citation,
+    pub bm25: Option<f32>,
+    pub vector: Option<f64>,
+    pub text: Option<String>,
+    pub metadata: Option<Metadata>,
+    ...
+}
 
 impl Engine {
     pub fn create_in_ram(cfg: TextIndexConfig) -> Result<Self>;
     pub fn ingest(&mut self, collection: &str, chunk: &Chunk) -> Result<()>; // upsert+不提交
+    pub fn remove_many(&mut self, ids: &[GlobalId]) -> Result<()>;
     pub fn commit(&mut self) -> Result<()>;
     pub fn search(&self, req: &SearchRequest, acl: Option<&AclFilter>) -> Result<Vec<SearchHit>>;
 }
@@ -39,8 +48,11 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
    - mode=Keyword：text.search(query, filter, acl, candidates) → bm25 候选。
    - mode=Vector/Hybrid：vector 后端未接入前**回退到 keyword**（返回结果但标注 vector=None；spec 记为已知限制，P2 补真混合）。
 4. **融合**：keyword 单路时直接按 bm25 降序；hybrid 时用 core::fuse（待 vector）。
-5. **组装**：取 top_k，产出 SearchHit（citation 来自 text 命中）。
+5. **组装**：取 top_k，产出 SearchHit（citation 来自 text 命中）；完整正文和 metadata 仅在 `include_text`/`include_metadata` 为 true 时附带。
 6. 确定性：同库同请求结果一致（继承 text/core 的 tie-break）。
+7. `searchable=false` 的 upsert/CDC 事件从全文和向量索引删除该 gid；PG 真源行不受影响。
+8. text-only chunk upsert 必须删除同 GlobalId 的旧向量，防止 chunk 级更新留下过期向量；批量删除在
+   单次 commit 前同步移除全文与向量派生项。
 
 ## 4. 测试用例
 
@@ -84,6 +96,9 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 - [x] v2.4（MM5，M0 路由，2026-06-27）：CDC `apply_upsert` 嵌入按"可检索文本表示"（`chunk.text`，含 caption/转录）；
   **无文本媒资（`text==""`）跳过向量嵌入/写入**（否则空串塌成退化向量污染 ANN），幂等覆盖时删旧向量。
   无文本媒资仍在 BM25 + modality fast field。单测 `mm5_textless_media_skips_vector`。真 CDC 端到端音视频召回需 PG（`待运行验证`）；M1 图像向量路由 `gated`。
+- [x] v2.7（2026-07-23，通用 chunk 协议）：`SearchHit` opt-in 返回完整正文/metadata，keyword/vector-only/hybrid 语义一致；`searchable=false` 在直接 ingest 与 CDC 更新时从全文/向量派生索引移除。派生 schema checkpoint 升至 v2，旧版本明确要求从真源重建而不会自动删除目录。
+- [x] v2.8（2026-07-23，chunk 生命周期）：新增 `remove_many` 供 server 在一个提交周期清理任意
+  GlobalId；普通 text-only upsert 同步删除旧向量，覆盖 chunk 级向量转文本回归。
 
 **已知限制 / 下一迭代：**
 - ✅ auto-merging（v1.3）、rerank 钩子、CDC 自动 embedding（v1.6）、search_after（v2.1）、单集合重建（v2.2）均已实现。

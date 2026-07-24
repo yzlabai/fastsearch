@@ -117,6 +117,8 @@ class FastsearchClient:
         auto_merge: Optional[bool] = None,
         collapse: Optional[str] = None,
         search_after: Optional[str] = None,
+        include_text: bool = False,
+        include_metadata: bool = False,
         facets: Optional[list[str]] = None,
         explain: bool = False,
     ) -> dict:
@@ -142,6 +144,10 @@ class FastsearchClient:
             body["collapse"] = collapse
         if search_after is not None:
             body["search_after"] = search_after
+        if include_text:
+            body["include_text"] = True
+        if include_metadata:
+            body["include_metadata"] = True
         if highlight:
             body["highlight"] = True
         if facets is not None:
@@ -168,6 +174,8 @@ class FastsearchClient:
         auto_merge: Optional[bool] = None,
         collapse: Optional[str] = None,
         search_after: Optional[str] = None,
+        include_text: bool = False,
+        include_metadata: bool = False,
         facets: Optional[list[str]] = None,
         explain: bool = False,
     ) -> list[dict]:
@@ -194,6 +202,8 @@ class FastsearchClient:
             auto_merge=auto_merge,
             collapse=collapse,
             search_after=search_after,
+            include_text=include_text,
+            include_metadata=include_metadata,
             facets=facets,
             explain=explain,
         )
@@ -314,6 +324,50 @@ class FastsearchClient:
             + "/"
             + urllib.parse.quote(doc_id, safe="/")  # doc_id 可含 `/`（server 通配段）
         )
+        return self._request("DELETE", path)
+
+    # ---- chunk / collection 管理 ---------------------------------------------
+
+    def batch_get_chunks(self, ids: list[dict]) -> list[dict]:
+        """按 GlobalId 批量读取，保持输入顺序。
+
+        不存在或当前身份不可见的项都返回 ``{"id": ..., "chunk": None}``。
+        """
+        out = self._post("/v1/chunks/batch-get", {"ids": ids})
+        return out.get("results", [])
+
+    def batch_upsert_chunks(self, items: list[dict]) -> int:
+        """事务性批量 upsert 通用 chunks，返回写入数。
+
+        服务端从 API Key 注入 tenant/acl；调用方负责预先切分正文。
+        """
+        out = self._post("/v1/chunks/batch-upsert", {"items": items})
+        return int(out.get("upserted", 0))
+
+    def batch_delete_chunks(self, ids: list[dict]) -> dict:
+        """按 GlobalId 批量幂等删除；不可见与不存在均报告 ``deleted=False``。"""
+        return self._post("/v1/chunks/batch-delete", {"ids": ids})
+
+    def list_document_chunks(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        after: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> dict:
+        """按 chunk_id 升序分页读取一个文档的可见 chunks。"""
+        query = {"collection": collection, "doc_id": doc_id}
+        if after is not None:
+            query["after"] = str(after)
+        if limit is not None:
+            query["limit"] = str(limit)
+        path = "/v1/chunks?" + urllib.parse.urlencode(query)
+        return self._request("GET", path)
+
+    def delete_collection(self, name: str) -> dict:
+        """幂等删除当前 API Key 所属 tenant scope 内的 collection。"""
+        path = "/v1/collections/" + urllib.parse.quote(name, safe="")
         return self._request("DELETE", path)
 
     # ---- 健康 / 契约 ----------------------------------------------------------

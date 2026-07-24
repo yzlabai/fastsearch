@@ -11,7 +11,7 @@
 
 use fastsearch_core::{
     fuse, AclFilter, AssetPointer, BBox, Chunk, ChunkKind, Citation, FieldValue, Filter, GlobalId,
-    Scored, SearchMode, SearchRequest, TimeSpan,
+    Metadata, Scored, SearchMode, SearchRequest, TimeSpan,
 };
 use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
@@ -50,6 +50,8 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 fn vector_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("vector.bin")
 }
+
+const DERIVED_SCHEMA_VERSION: u32 = 2;
 
 /// pgvector 直查档的过取系数（PG 取 `candidates × 此值` 候选再精确后过滤，抵消损耗）。
 const PG_VECTOR_OVER_FETCH: usize = 4;
@@ -170,6 +172,10 @@ pub struct SearchHit {
     pub rerank: Option<f64>,
     /// 高亮片段（HTML）；仅 keyword 命中且 req.highlight 时有值。
     pub highlight: Option<String>,
+    /// 完整 chunk 正文；仅 `include_text=true` 时有值。
+    pub text: Option<String>,
+    /// 调用方透传 metadata；仅 `include_metadata=true` 时有值。
+    pub metadata: Option<Metadata>,
     /// auto-merge 时被并入本代表命中的同 section 兄弟 chunk_id（升序）；未归并为空。
     /// 答案层可据此解析整段的全部引用。
     pub merged_chunk_ids: Vec<u64>,
@@ -962,8 +968,14 @@ impl Engine {
         let text_dir = data_dir.join("text");
         std::fs::create_dir_all(&text_dir)
             .map_err(|e| EngineError::Persist(format!("create data dir: {e}")))?;
-        let text = TextIndex::open_or_create(&text_dir, cfg)?;
         let cp = Checkpoint::load(data_dir)?;
+        if cp.schema_version != 0 && cp.schema_version != DERIVED_SCHEMA_VERSION {
+            return Err(EngineError::Persist(format!(
+                "derived index schema version {} is incompatible with version {}; rebuild the derived indexes from the source store",
+                cp.schema_version, DERIVED_SCHEMA_VERSION
+            )));
+        }
+        let text = TextIndex::open_or_create(&text_dir, cfg)?;
         // 已有检查点 → 沿用其后端（hnsw params 取自快照本身）；无检查点（首启）→ 用传入默认。
         let kind = match cp.vector_backend.as_str() {
             "hnsw" => VectorBackendKind::Hnsw(fastsearch_vector::HnswParams::default()),
@@ -1017,7 +1029,7 @@ impl Engine {
             .save(&vector_path(data_dir))
             .map_err(|e| EngineError::Vector(e.to_string()))?;
         Checkpoint {
-            schema_version: 1,
+            schema_version: DERIVED_SCHEMA_VERSION,
             applied_lsn: applied_lsn.0,
             vector_dim: self.vector.dim(),
             vector_backend: self.vector.kind_str().to_string(),
@@ -1343,7 +1355,14 @@ impl Engine {
 
     /// 灌入一个 chunk（仅全文，不提交）。
     pub fn ingest(&mut self, collection: &str, chunk: &Chunk) -> Result<()> {
+        chunk.validate_metadata()?;
+        if !chunk.searchable {
+            return self.remove(&chunk.global_id(collection));
+        }
         self.text.upsert(collection, chunk)?;
+        self.vector
+            .delete(&chunk.global_id(collection))
+            .map_err(|e| EngineError::Vector(e.to_string()))?;
         Ok(())
     }
 
@@ -1354,6 +1373,10 @@ impl Engine {
         chunk: &Chunk,
         vector: Vec<f32>,
     ) -> Result<()> {
+        chunk.validate_metadata()?;
+        if !chunk.searchable {
+            return self.remove(&chunk.global_id(collection));
+        }
         self.text.upsert(collection, chunk)?;
         self.vector
             .upsert(
@@ -1371,6 +1394,14 @@ impl Engine {
         self.vector
             .delete(gid)
             .map_err(|e| EngineError::Vector(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 批量删除已由真源确认的 GID（不提交）。调用方可在全部删除后只 commit 一次。
+    pub fn remove_many(&mut self, ids: &[GlobalId]) -> Result<()> {
+        for id in ids {
+            self.remove(id)?;
+        }
         Ok(())
     }
 
@@ -1592,10 +1623,12 @@ impl Engine {
         let mut citation: HashMap<GlobalId, Citation> = HashMap::new();
         let mut highlight: HashMap<GlobalId, String> = HashMap::new();
         let mut text_map: HashMap<GlobalId, String> = HashMap::new();
+        let mut metadata_map: HashMap<GlobalId, Metadata> = HashMap::new();
         for h in &kw_hits {
             kw_score.insert(h.id.clone(), h.score);
             citation.insert(h.id.clone(), h.citation.clone());
             text_map.insert(h.id.clone(), h.text.clone());
+            metadata_map.insert(h.id.clone(), h.metadata.clone());
             if let Some(hl) = &h.highlight {
                 highlight.insert(h.id.clone(), hl.clone());
             }
@@ -1649,6 +1682,25 @@ impl Engine {
                     vector: vec_score.get(&s.id).copied(),
                     rerank: None,
                     highlight: highlight.get(&s.id).cloned(),
+                    text: if req.include_text {
+                        text_map
+                            .get(&s.id)
+                            .cloned()
+                            .or_else(|| self.text.stored_text(&s.id).ok().flatten())
+                    } else {
+                        None
+                    },
+                    metadata: if req.include_metadata {
+                        metadata_map.get(&s.id).cloned().or_else(|| {
+                            self.text
+                                .stored_row_by_gid(&s.id)
+                                .ok()
+                                .flatten()
+                                .map(|row| row.metadata)
+                        })
+                    } else {
+                        None
+                    },
                     merged_chunk_ids: Vec::new(),
                 })
             })
@@ -1825,6 +1877,18 @@ fn collapse_groups(hits: Vec<SearchHit>, field: &str, max_per_group: usize) -> V
 /// CDC 落地：sync 的变更应用到 text 索引。放在 engine 而非 text，避免 text 反依赖 sync。
 impl fastsearch_sync::IndexSink for Engine {
     fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()> {
+        chunk.validate_metadata()?;
+        if !chunk.searchable {
+            let gid = chunk.global_id(collection);
+            self.text.delete_by_global_id(&gid)?;
+            if let Some(pg) = &self.vector_pg {
+                block_on_pg(pg.clear_embedding(collection, &chunk.doc_id, chunk.chunk_id))
+                    .map_err(|e| anyhow::anyhow!("pg clear_embedding: {e}"))?;
+            } else {
+                self.vector.delete(&gid)?;
+            }
+            return Ok(());
+        }
         self.text.upsert(collection, chunk)?;
         // 配了嵌入后端则同步写向量索引（CDC 主循环：复制→解码→嵌入→派生向量）。
         // **模态路由（MM5/MM10）**：① 图片 chunk 且后端支持图像、有 inline 字节、且
@@ -2007,6 +2071,8 @@ mod tests {
             image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
+            metadata: Default::default(),
+            searchable: true,
         }
     }
 
@@ -2998,6 +3064,72 @@ mod tests {
     }
 
     #[test]
+    fn searchable_false_removes_chunk_from_text_and_vector_indexes() {
+        let mut e = engine();
+        let mut c = chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha beta", 5);
+        e.ingest_vector("kb", &c, vec![1.0, 0.0]).unwrap();
+        e.commit().unwrap();
+        assert_eq!(e.search(&req("alpha"), None).unwrap().len(), 1);
+
+        c.searchable = false;
+        e.ingest_vector("kb", &c, vec![1.0, 0.0]).unwrap();
+        e.commit().unwrap();
+        assert!(e.search(&req("alpha"), None).unwrap().is_empty());
+        let vector_req = SearchRequest {
+            query: String::new(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            ..Default::default()
+        };
+        assert!(e.search(&vector_req, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_only_upsert_removes_a_stale_vector() {
+        let mut e = engine();
+        let c = chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha beta", 5);
+        e.ingest_vector("kb", &c, vec![1.0, 0.0]).unwrap();
+        e.commit().unwrap();
+
+        e.ingest("kb", &c).unwrap();
+        e.commit().unwrap();
+        let vector_req = SearchRequest {
+            query: String::new(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            ..Default::default()
+        };
+        assert!(e.search(&vector_req, None).unwrap().is_empty());
+        assert_eq!(e.search(&req("alpha"), None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_text_and_metadata_are_opt_in_for_keyword_and_vector_hits() {
+        let mut e = engine();
+        let mut c = chunk("a.pdf", 1, ChunkKind::Paragraph, "alpha beta", 5);
+        c.metadata
+            .insert("source".into(), serde_json::json!("external"));
+        e.ingest_vector("kb", &c, vec![1.0, 0.0]).unwrap();
+        e.commit().unwrap();
+
+        let default_hit = &e.search(&req("alpha"), None).unwrap()[0];
+        assert!(default_hit.text.is_none());
+        assert!(default_hit.metadata.is_none());
+
+        let vector_req = SearchRequest {
+            query: String::new(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            include_text: true,
+            include_metadata: true,
+            ..Default::default()
+        };
+        let hit = &e.search(&vector_req, None).unwrap()[0];
+        assert_eq!(hit.text.as_deref(), Some("alpha beta"));
+        assert_eq!(hit.metadata.as_ref().unwrap()["source"], "external");
+    }
+
+    #[test]
     fn highlight_when_requested() {
         let mut e = engine();
         e.ingest(
@@ -3203,6 +3335,27 @@ mod tests {
         // 文本也在（keyword 路）
         let kw = e2.search(&req("beta"), None).unwrap();
         assert_eq!(kw[0].id.chunk_id, 2);
+    }
+
+    #[test]
+    fn open_rejects_an_old_derived_schema_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        Checkpoint {
+            schema_version: 1,
+            applied_lsn: 42,
+            vector_dim: None,
+            vector_backend: "brute".into(),
+        }
+        .save(dir.path())
+        .unwrap();
+
+        let error = Engine::open(dir.path(), TextIndexConfig::default())
+            .err()
+            .expect("old schema must be rejected");
+        assert!(
+            error.to_string().contains("rebuild the derived indexes"),
+            "unexpected error: {error}"
+        );
     }
 
     /// 二值粗筛后端化：首启用 `BruteBinary` → 检查点记 `brute_binary` → 重开（即便默认 `Brute`）

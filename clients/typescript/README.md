@@ -139,6 +139,14 @@ const similar = await client.similar("kb:report.pdf:3", { topK: 5 });
 // 把引用解析成可直接渲染的短时 URL / 跳原文（前端 <img src>）
 const assets = await client.resolveAssets(hits.map((h) => h.citation_id));
 
+// 通用 chunk 管理（输入必须已完成切分）
+const ids = [{ collection: "kb", doc_id: "report.pdf", chunk_id: 3 }];
+const rows = await client.batchGetChunks(ids);
+await client.batchUpsertChunks([{ collection: "kb", chunk: chunks[0] }]);
+const page = await client.listDocumentChunks("kb", "report.pdf", { limit: 100 });
+await client.batchDeleteChunks(ids);
+await client.deleteCollection("kb");
+
 // 健康探针
 if (!(await client.health())) throw new Error("server down");
 ```

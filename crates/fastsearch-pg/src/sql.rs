@@ -43,6 +43,8 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              chunk_id bigint NOT NULL,\n\
              kind text NOT NULL,\n\
              text text NOT NULL,\n\
+             metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,\n\
+             searchable boolean NOT NULL DEFAULT true,\n\
              page integer NOT NULL,\n\
              bbox jsonb NOT NULL,\n\
              heading_path text[] NOT NULL DEFAULT '{{}}',\n\
@@ -64,6 +66,12 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
             vectype = vector_type.sql(),
             dim = vector_dim
         ),
+        format!(
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb;"
+        ),
+        format!(
+            "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS searchable boolean NOT NULL DEFAULT true;"
+        ),
         format!("CREATE INDEX IF NOT EXISTS {table}_doc ON {table} (collection, doc_id);"),
         // embedding HNSW ANN 索引（直查档，opclass 随列类型）——否则直查全程顺序扫描（M17）。
         // embedding 列全 NULL（非直查部署）时索引为空、几乎零代价；直查填充后即生效。
@@ -79,8 +87,8 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
         // 列清单发布需 **PG 15+**（核心特性、非扩展，不破"托管 PG 可移植"不变量 #1）。
         //
         // 幂等 + **自愈但不抢占**：① 无 publication → CREATE（带列清单）；② 本表已在该 publication
-        // 但**无列清单**（legacy 全列发布，`prattrs IS NULL`）→ ALTER 收敛到列清单（仅旧部署一次）。
-        // 本表已是列清单、或 publication 属于别的表 → **不动**（避免并发/多表互抢同名 publication）。
+        // → ALTER 收敛到当前列清单（使 additive 源列能进入既有部署的 CDC）。
+        // publication 属于别的表 → **不动**（避免并发实例互抢同名 publication）。
         // `CREATE` 包 `EXCEPTION` 防并发首建 TOCTOU（两连接同时见"无"→ 都建）：并发竞态在 PG 表现为
         // `unique_violation`(23505, pg_publication 唯一索引) 或 `duplicate_object`(42710)，两者都忽略。
         format!(
@@ -94,7 +102,7 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              SELECT 1 FROM pg_publication_rel pr\n\
              JOIN pg_publication p ON p.oid = pr.prpubid\n\
              JOIN pg_class c ON c.oid = pr.prrelid\n\
-             WHERE p.pubname = '{PUBLICATION}' AND c.relname = '{table}' AND pr.prattrs IS NULL\n\
+             WHERE p.pubname = '{PUBLICATION}' AND c.relname = '{table}'\n\
              ) THEN\n\
              ALTER PUBLICATION {PUBLICATION} SET TABLE {table} ({collist});\n\
              END IF;\n\
@@ -306,6 +314,8 @@ pub const COLUMNS: &[&str] = &[
     "chunk_id",
     "kind",
     "text",
+    "metadata",
+    "searchable",
     "page",
     "bbox",
     "heading_path",
@@ -327,8 +337,87 @@ pub const COLUMNS: &[&str] = &[
 pub fn insert_sql(table: &str) -> String {
     format!(
         "INSERT INTO {table} \
-         (collection, doc_id, chunk_id, kind, text, page, bbox, heading_path, section_id, char_len, modality, media, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8, $9, $10, $11, $12::text::jsonb, $13, $14, $15, $16, $17, $18)"
+         (collection, doc_id, chunk_id, kind, text, metadata, searchable, page, bbox, heading_path, section_id, char_len, modality, media, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl) \
+         VALUES ($1, $2, $3, $4, $5, $6::text::jsonb, $7, $8, $9::text::jsonb, $10, $11, $12, $13, $14::text::jsonb, $15, $16, $17, $18, $19, $20)"
+    )
+}
+
+/// Chunk 级幂等 upsert。冲突行只允许同 tenant 覆盖；更新任一真源字段时清空旧 embedding，
+/// 后续由 CDC/embedder 重建，避免正文已变而向量仍旧。
+pub fn upsert_chunk_sql(table: &str) -> String {
+    format!(
+        "INSERT INTO {table} AS target \
+         (collection, doc_id, chunk_id, kind, text, metadata, searchable, page, bbox, heading_path, section_id, char_len, modality, media, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl) \
+         VALUES ($1, $2, $3, $4, $5, $6::text::jsonb, $7, $8, $9::text::jsonb, $10, $11, $12, $13, $14::text::jsonb, $15, $16, $17, $18, $19, $20) \
+         ON CONFLICT (collection, doc_id, chunk_id) DO UPDATE SET \
+         kind = EXCLUDED.kind, text = EXCLUDED.text, metadata = EXCLUDED.metadata, \
+         searchable = EXCLUDED.searchable, page = EXCLUDED.page, bbox = EXCLUDED.bbox, \
+         heading_path = EXCLUDED.heading_path, section_id = EXCLUDED.section_id, \
+         char_len = EXCLUDED.char_len, modality = EXCLUDED.modality, media = EXCLUDED.media, \
+         media_bytes = EXCLUDED.media_bytes, image_vector_status = EXCLUDED.image_vector_status, \
+         time_start_ms = EXCLUDED.time_start_ms, time_end_ms = EXCLUDED.time_end_ms, \
+         tenant = EXCLUDED.tenant, acl = EXCLUDED.acl, embedding = NULL, embed_model = NULL, \
+         updated_at = now() \
+         WHERE target.tenant IS NOT DISTINCT FROM EXCLUDED.tenant \
+         RETURNING 1"
+    )
+}
+
+/// 批量主键读取；LEFT JOIN + ordinality 保持请求顺序并显式保留缺失项。
+pub fn batch_get_sql(table: &str) -> String {
+    format!(
+        "WITH requested(collection, doc_id, chunk_id, ordinality) AS ( \
+           SELECT * FROM unnest($1::text[], $2::text[], $3::bigint[]) WITH ORDINALITY \
+         ) \
+         SELECT requested.ordinality, c.collection, c.doc_id, c.chunk_id, c.kind, c.text, \
+         c.metadata::text AS metadata, c.searchable, c.page, c.bbox::text AS bbox, \
+         c.heading_path, c.section_id, c.char_len, c.modality, c.media::text AS media, \
+         c.media_bytes, c.image_vector_status, c.time_start_ms, c.time_end_ms, c.tenant, c.acl \
+         FROM requested LEFT JOIN {table} AS c \
+         ON c.collection = requested.collection AND c.doc_id = requested.doc_id \
+         AND c.chunk_id = requested.chunk_id ORDER BY requested.ordinality"
+    )
+}
+
+/// 单 chunk 删除，ACL 在 SQL 内原子检查。未授权与不存在都不返回行。
+pub fn delete_chunk_visible_sql(table: &str, tenant_scoped: bool) -> String {
+    let acl = if tenant_scoped {
+        "tenant = $4 AND ('public' = ANY(acl) OR acl && $5)"
+    } else {
+        "('public' = ANY(acl) OR acl && $4)"
+    };
+    format!(
+        "DELETE FROM {table} WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 \
+         AND {acl} RETURNING 1"
+    )
+}
+
+/// 文档内按 chunk_id 游标分页；ACL 在 SQL 内过滤，游标只跨越调用方可见行。
+pub fn list_doc_chunks_sql(table: &str, tenant_scoped: bool) -> String {
+    let (acl, limit) = if tenant_scoped {
+        ("tenant = $4 AND ('public' = ANY(acl) OR acl && $5)", "$6")
+    } else {
+        ("('public' = ANY(acl) OR acl && $4)", "$5")
+    };
+    format!(
+        "SELECT collection, doc_id, chunk_id, kind, text, metadata::text, searchable, page, \
+         bbox::text, heading_path, section_id, char_len, modality, media::text, media_bytes, \
+         image_vector_status, time_start_ms, time_end_ms, tenant, acl FROM {table} \
+         WHERE collection = $1 AND doc_id = $2 AND chunk_id > $3 AND {acl} \
+         ORDER BY chunk_id LIMIT {limit}"
+    )
+}
+
+/// 按 collection owner 删除真源行并返回派生索引/对象清理所需信息。
+pub fn delete_collection_sql(table: &str, tenant_scoped: bool) -> String {
+    let owner = if tenant_scoped {
+        " AND tenant = $2"
+    } else {
+        ""
+    };
+    format!(
+        "DELETE FROM {table} WHERE collection = $1{owner} \
+         RETURNING collection, doc_id, chunk_id, media::text AS media"
     )
 }
 
@@ -349,7 +438,7 @@ pub fn delete_doc_sql(table: &str) -> String {
 /// 读取某 doc 全部 chunk（jsonb 列读成文本）。
 pub fn fetch_doc_sql(table: &str) -> String {
     format!(
-        "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
+        "SELECT collection, doc_id, chunk_id, kind, text, metadata::text, searchable, page, bbox::text, heading_path, \
          section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 ORDER BY chunk_id"
     )
@@ -358,7 +447,7 @@ pub fn fetch_doc_sql(table: &str) -> String {
 /// 按主键读取单个 chunk（CDC 遇 UnchangedToast 不完整 WAL 时重取真源用，见 fastsearch-sync）。
 pub fn fetch_chunk_sql(table: &str) -> String {
     format!(
-        "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
+        "SELECT collection, doc_id, chunk_id, kind, text, metadata::text, searchable, page, bbox::text, heading_path, \
          section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3"
     )
@@ -367,7 +456,7 @@ pub fn fetch_chunk_sql(table: &str) -> String {
 /// 全表读取（初始快照 bootstrap 用），按 (collection, doc_id, chunk_id) 升序、确定性。
 pub fn fetch_all_sql(table: &str) -> String {
     format!(
-        "SELECT collection, doc_id, chunk_id, kind, text, page, bbox::text, heading_path, \
+        "SELECT collection, doc_id, chunk_id, kind, text, metadata::text, searchable, page, bbox::text, heading_path, \
          section_id, char_len, modality, media::text, media_bytes, image_vector_status, time_start_ms, time_end_ms, tenant, acl \
          FROM {table} ORDER BY collection, doc_id, chunk_id"
     )
@@ -395,6 +484,10 @@ pub struct ChunkRow {
     pub chunk_id: i64,
     pub kind: String,
     pub text: String,
+    /// 调用方透传 metadata JSON 对象。
+    pub metadata: String,
+    /// 是否进入全文/向量派生索引。
+    pub searchable: bool,
     pub page: i32,
     pub bbox: String,
     pub heading_path: Vec<String>,
@@ -424,6 +517,8 @@ impl ChunkRow {
             chunk_id: c.chunk_id as i64,
             kind: kind_to_str(c.kind),
             text: c.text.clone(),
+            metadata: serde_json::to_string(&c.metadata)?,
+            searchable: c.searchable,
             page: c.page as i32,
             bbox: serde_json::to_string(&c.bbox)?,
             heading_path: c.heading_path.clone(),
@@ -455,6 +550,7 @@ impl ChunkRow {
             Some(j) => Some(serde_json::from_str(j)?),
             None => None,
         };
+        let metadata = serde_json::from_str(&self.metadata)?;
         Ok(Chunk {
             doc_id: self.doc_id.clone(),
             chunk_id: self.chunk_id as u64,
@@ -470,6 +566,8 @@ impl ChunkRow {
             image_vector_status: self.image_vector_status(),
             tenant: self.tenant.clone(),
             acl: self.acl.clone(),
+            metadata,
+            searchable: self.searchable,
         })
     }
 
@@ -509,6 +607,12 @@ mod tests {
             image_vector_status: None,
             tenant: Some("acme".into()),
             acl: vec!["team-a".into(), "public".into()],
+            metadata: serde_json::from_value(serde_json::json!({
+                "source": "fixture",
+                "ordinal": 3
+            }))
+            .unwrap(),
+            searchable: true,
         }
     }
 
@@ -524,6 +628,9 @@ mod tests {
         assert!(joined.contains("modality text NOT NULL DEFAULT 'text'"));
         assert!(joined.contains("media jsonb"));
         assert!(joined.contains("media_bytes bytea"));
+        assert!(joined.contains("metadata jsonb NOT NULL DEFAULT '{}'::jsonb"));
+        assert!(joined.contains("searchable boolean NOT NULL DEFAULT true"));
+        assert!(joined.contains("ALTER TABLE fastsearch_chunks ADD COLUMN IF NOT EXISTS metadata"));
         assert!(joined.contains("time_start_ms bigint"));
         assert!(joined.contains("time_end_ms bigint"));
         // Publication 用列清单（PG15+）、发布源列、**排除派生列**（断 CDC 写穿反馈环）。
@@ -546,17 +653,46 @@ mod tests {
     #[test]
     fn insert_and_delete_sql_shape() {
         let ins = insert_sql("t");
-        assert!(ins.contains("$17"));
-        assert!(ins.contains("$7::text::jsonb")); // bbox（先 ::text 再 ::jsonb，见 insert_sql 注释）
-        assert!(ins.contains("$12::text::jsonb")); // media
+        assert!(ins.contains("$19"));
+        assert!(ins.contains("$6::text::jsonb")); // metadata
+        assert!(ins.contains("$9::text::jsonb")); // bbox（先 ::text 再 ::jsonb，见 insert_sql 注释）
+        assert!(ins.contains("$14::text::jsonb")); // media
         assert!(ins.contains(
             "modality, media, media_bytes, image_vector_status, time_start_ms, time_end_ms"
         )); // 新列（MM2c + image vector status）
         assert!(!ins.contains("image_meta")); // 遗留列已移除
-        assert!(ins.contains("$18"));
-        assert!(!ins.contains("$19")); // exactly 18 params
+        assert!(ins.contains("$20"));
+        assert!(!ins.contains("$21")); // exactly 20 params
         let del = delete_doc_sql("t");
         assert_eq!(del, "DELETE FROM t WHERE collection = $1 AND doc_id = $2");
+    }
+
+    #[test]
+    fn management_sql_preserves_identity_acl_and_pagination() {
+        let upsert = upsert_chunk_sql("t");
+        assert!(upsert.contains("ON CONFLICT (collection, doc_id, chunk_id)"));
+        assert!(upsert.contains("target.tenant IS NOT DISTINCT FROM EXCLUDED.tenant"));
+        assert!(upsert.contains("embedding = NULL"));
+
+        let get = batch_get_sql("t");
+        assert!(get.contains("WITH ORDINALITY"));
+        assert!(get.contains("LEFT JOIN t AS c"));
+        assert!(get.contains("ORDER BY requested.ordinality"));
+
+        let delete = delete_chunk_visible_sql("t", true);
+        assert!(delete.contains("tenant = $4"));
+        assert!(delete.contains("acl && $5"));
+        let delete_admin = delete_chunk_visible_sql("t", false);
+        assert!(!delete_admin.contains("tenant ="));
+        assert!(delete_admin.contains("acl && $4"));
+
+        let list = list_doc_chunks_sql("t", true);
+        assert!(list.contains("chunk_id > $3"));
+        assert!(list.contains("ORDER BY chunk_id LIMIT $6"));
+
+        let collection = delete_collection_sql("t", true);
+        assert!(collection.contains("collection = $1 AND tenant = $2"));
+        assert!(collection.contains("RETURNING collection, doc_id, chunk_id"));
     }
 
     #[test]
@@ -567,6 +703,8 @@ mod tests {
         assert_eq!(row.chunk_id, 152);
         assert_eq!(row.kind, "table");
         assert_eq!(row.heading_path, vec!["第3章", "财务"]);
+        assert!(row.metadata.contains("\"source\":\"fixture\""));
+        assert!(row.searchable);
         let back = row.to_chunk().unwrap();
         assert_eq!(back, c);
         // modality 由 kind 派生落列（Table 属文本模态）

@@ -65,6 +65,8 @@ pub struct Fields {
     pub bbox: Field,
     /// 媒资引用 JSON（STORED，仅供命中组装 Citation.media/time，不索引/不过滤）。
     pub media: Field,
+    /// 调用方透传 metadata JSON（STORED，不索引/不过滤）。
+    pub metadata: Field,
 }
 
 /// 构建 schema + 字段句柄。text/heading 用给定分词器。
@@ -103,6 +105,7 @@ pub fn build_schema(tokenizer: TokenizerKind) -> (Schema, Fields) {
         heading_path: sb.add_text_field("heading_path", STORED),
         bbox: sb.add_text_field("bbox", STORED),
         media: sb.add_text_field("media", STORED),
+        metadata: sb.add_text_field("metadata", STORED),
     };
 
     (sb.build(), fields)

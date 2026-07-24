@@ -36,6 +36,10 @@ export interface Hit {
   section_id: number;
   /** 高亮片段（仅 `highlight: true` 时回；否则 null）。当作 LLM 上下文的正文。 */
   highlight: string | null;
+  /** 完整 chunk 正文；仅 `includeText: true` 时返回。 */
+  text?: string;
+  /** 调用方透传元数据；仅 `includeMetadata: true` 时返回。 */
+  metadata?: Record<string, unknown>;
   /** auto-merge 命中时被合并进来的兄弟 chunk_id。 */
   merged_chunk_ids: number[];
   /** 时间锚点（字幕/音视频 chunk 的时间区间，秒）；无则 null。 */
@@ -57,6 +61,72 @@ export interface SearchResponse {
   hits: Hit[];
   /** `{field: [{value, count}]}`；未请求分面则为空对象。 */
   facets: Record<string, FacetValue[]>;
+}
+
+/** chunk 的稳定全局标识。 */
+export interface GlobalId {
+  collection: string;
+  doc_id: string;
+  chunk_id: number;
+}
+
+/** FastSearch 接收和管理的通用 chunk。调用方负责在请求前完成切分。 */
+export interface Chunk {
+  doc_id: string;
+  chunk_id: number;
+  kind: string;
+  text: string;
+  page: number;
+  bbox: BBox;
+  heading_path?: string[];
+  section_id?: number;
+  char_len: number;
+  media?: Media | null;
+  image_vector_status?: string | null;
+  tenant?: string | null;
+  acl?: string[];
+  /** 调用方透传数据；FastSearch 不解释、不索引。 */
+  metadata?: Record<string, unknown>;
+  /** `false` 时保留在真源，但不进入全文或向量召回。 */
+  searchable?: boolean;
+}
+
+export interface BatchGetChunkResult {
+  id: GlobalId;
+  /** 不存在或调用方不可见时均为 `null`。 */
+  chunk: Chunk | null;
+}
+
+export interface BatchUpsertChunk {
+  collection: string;
+  chunk: Chunk;
+  /** 可选预计算向量；`searchable=false` 时不得提供。 */
+  vector?: number[];
+}
+
+export interface BatchDeleteChunkResult {
+  id: GlobalId;
+  /** 不存在或调用方不可见时均为 `false`。 */
+  deleted: boolean;
+}
+
+export interface BatchDeleteChunksResponse {
+  results: BatchDeleteChunkResult[];
+  objects_deleted: number;
+  object_errors: string[];
+}
+
+export interface DocumentChunksPage {
+  chunks: Chunk[];
+  /** 下一页传给 `after`；没有下一页时为 `null`。 */
+  next_after: number | null;
+}
+
+export interface DeleteCollectionResponse {
+  deleted_chunks: number;
+  registered_removed: boolean;
+  objects_deleted: number;
+  object_errors: string[];
 }
 
 /** 检索模式：纯关键词 / 纯向量 / 混合（默认）。 */
@@ -133,6 +203,10 @@ export interface SearchOptions {
   searchAfter?: string;
   /** 回高亮片段（进入 Hit.highlight），默认 false。Agent 取上下文应设 true。 */
   highlight?: boolean;
+  /** 回完整 chunk 正文，默认 false。 */
+  includeText?: boolean;
+  /** 回调用方透传 metadata，默认 false。 */
+  includeMetadata?: boolean;
   /** 请求分面的字段（当前支持 `kind` / `doc_id`）。 */
   facets?: string[];
   /** 让服务端附带打分解释（调试用），默认 false。 */

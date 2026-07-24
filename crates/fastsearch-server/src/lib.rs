@@ -43,6 +43,9 @@ struct ObjectTokenTarget {
 /// 防止恶意大 token 触发 B64URL 解码 / JSON 解析的内存尖峰（与速率限制互补）。
 const OBJECT_TOKEN_MAX_BYTES: usize = 4 * 1024;
 const OBJECT_TOKEN_MAX_ENCODED_BYTES: usize = b64url_unpadded_len(OBJECT_TOKEN_MAX_BYTES);
+const MAX_CHUNK_BATCH: usize = 1_000;
+const DEFAULT_CHUNK_PAGE_SIZE: usize = 100;
+const MAX_CHUNK_PAGE_SIZE: usize = 500;
 
 const fn b64url_unpadded_len(decoded_len: usize) -> usize {
     let full = (decoded_len / 3) * 4;
@@ -379,6 +382,9 @@ pub struct ServerState {
     // 键含所有者 tenant：集合注册表按租户隔离，跨租户不可覆盖/读取/枚举（M22）。tenant=None
     // （无租户/管理 key）自成一个作用域。单租户部署（所有 key 同 tenant/无 tenant）行为不变。
     collections: Arc<Mutex<CollectionRegistry>>,
+    /// 服务实例接受的向量维度。PG vector 列和向量后端均为实例级固定维度；
+    /// collection 注册时先校验，避免延迟到写入数据库才失败。
+    vector_dim: Option<usize>,
 }
 
 /// 集合注册表：`(所有者 tenant, 集合名) → 配置`。按租户隔离（M22）。
@@ -407,7 +413,14 @@ impl ServerState {
             asset_signer: None,
             public_base: None,
             collections: Arc::new(Mutex::new(HashMap::new())),
+            vector_dim: None,
         }
+    }
+
+    /// 声明服务实例接受的固定向量维度。
+    pub fn with_vector_dim(mut self, vector_dim: usize) -> Self {
+        self.vector_dim = Some(vector_dim);
+        self
     }
 
     /// 配置资产 URL 签名器（MM6-signer）：开启后 `/v1/assets/resolve` 可签发短时 token URL、
@@ -596,13 +609,20 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/object/{opaque}/bytes", get(object_bytes))
         .route("/v1/assets/resolve", post(assets_resolve))
         .route("/v1/index", post(index))
+        .route("/v1/chunks/batch-get", post(batch_get_chunks))
+        .route("/v1/chunks/batch-upsert", post(batch_upsert_chunks))
+        .route("/v1/chunks/batch-delete", post(batch_delete_chunks))
+        .route("/v1/chunks", get(list_document_chunks))
         .route("/v1/images", post(image_upload))
         .route("/v1/docs/{collection}/{*doc_id}", delete(delete_doc))
         .route(
             "/v1/collections",
             post(create_collection).get(list_collections),
         )
-        .route("/v1/collections/{name}", get(get_collection))
+        .route(
+            "/v1/collections/{name}",
+            get(get_collection).delete(delete_collection),
+        )
         .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         .with_state(state)
 }
@@ -629,6 +649,9 @@ fn openapi_spec() -> Value {
             "heading_path": {"type": "array", "items": {"type": "string"}},
             "section_id": {"type": "integer"},
             "highlight": {"type": ["string", "null"]},
+            "text": {"type": "string", "description": "仅 include_text=true 时返回完整 chunk 正文"},
+            "metadata": {"type": "object", "additionalProperties": true,
+                "description": "仅 include_metadata=true 时返回调用方透传元数据"},
             "merged_chunk_ids": {"type": "array", "items": {"type": "integer"}},
             "cursor": {"type": "string", "description": "深分页游标；作下次 search_after 续取下一页"}
         }
@@ -662,10 +685,62 @@ fn openapi_spec() -> Value {
                         "collapse": {"type": ["object", "null"], "description": "{field, max_per_group}"},
                         "search_after": {"type": ["string", "null"], "description": "深分页游标（取自上一页末条命中的 cursor）"},
                         "highlight": {"type": "boolean", "default": false},
+                        "include_text": {"type": "boolean", "default": false},
+                        "include_metadata": {"type": "boolean", "default": false},
                         "facets": {"type": "array", "items": {"type": "string"}}
                     }
                 },
                 "Hit": hit,
+                "Chunk": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "required": ["doc_id", "chunk_id", "kind", "text", "page", "bbox", "char_len"],
+                    "properties": {
+                        "doc_id": {"type": "string"},
+                        "chunk_id": {"type": "integer", "format": "int64", "minimum": 0},
+                        "kind": {"type": "string", "enum": [
+                            "heading", "paragraph", "table", "code", "list_item",
+                            "image", "audio", "video"
+                        ]},
+                        "text": {"type": "string"},
+                        "page": {"type": "integer", "minimum": 0},
+                        "bbox": {"type": "object", "required": ["x0", "y0", "x1", "y1"],
+                            "properties": {
+                                "x0": {"type": "number"}, "y0": {"type": "number"},
+                                "x1": {"type": "number"}, "y1": {"type": "number"}
+                            }},
+                        "heading_path": {"type": "array", "items": {"type": "string"}, "default": []},
+                        "section_id": {"type": "integer", "format": "int64", "minimum": 0, "default": 0},
+                        "char_len": {"type": "integer", "minimum": 0},
+                        "media": {"type": ["object", "null"], "additionalProperties": true,
+                            "description": "管理读取会脱敏 Object 定位信息"},
+                        "image_vector_status": {"type": ["string", "null"]},
+                        "tenant": {"type": ["string", "null"],
+                            "description": "写入时由认证身份覆盖"},
+                        "acl": {"type": "array", "items": {"type": "string"},
+                            "description": "写入时由认证身份覆盖"},
+                        "metadata": {"type": "object", "additionalProperties": true, "default": {}},
+                        "searchable": {"type": "boolean", "default": true,
+                            "description": "false 时保存在真源但不进入全文/向量检索"}
+                    }
+                },
+                "GlobalId": {
+                    "type": "object",
+                    "required": ["collection", "doc_id", "chunk_id"],
+                    "properties": {
+                        "collection": {"type": "string"},
+                        "doc_id": {"type": "string"},
+                        "chunk_id": {"type": "integer", "format": "int64", "minimum": 0}
+                    }
+                },
+                "IndexChunk": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Chunk"},
+                        {"type": "object", "properties": {
+                            "vector": {"type": ["array", "null"], "items": {"type": "number"}}
+                        }}
+                    ]
+                },
                 "IndexRequest": {
                     "type": "object",
                     "required": ["collection", "doc_id", "chunks"],
@@ -674,9 +749,89 @@ fn openapi_spec() -> Value {
                         "doc_id": {"type": "string"},
                         "store_media": {"type": ["string", "null"], "enum": ["inline", "auto", "object", "reference", null],
                             "description": "媒资存储策略：object/auto 上传 media_bytes 到对象存储；reference 校验已有 Object 引用"},
-                        "chunks": {"type": "array", "items": {"type": "object",
+                        "chunks": {"type": "array", "items": {"$ref": "#/components/schemas/IndexChunk"},
                             "description": "core::Chunk 字段；可附 `vector`(number[]) 携带预计算向量，\
-                                则跳过服务端嵌入直接入向量索引（benchmark/外部 ETL 用）"}}
+                                则跳过服务端嵌入直接入向量索引（benchmark/外部 ETL 用）"}
+                    }
+                },
+                "BatchGetChunksRequest": {
+                    "type": "object",
+                    "required": ["ids"],
+                    "properties": {
+                        "ids": {"type": "array", "maxItems": MAX_CHUNK_BATCH,
+                            "items": {"$ref": "#/components/schemas/GlobalId"}}
+                    }
+                },
+                "BatchGetChunksResponse": {
+                    "type": "object",
+                    "required": ["results"],
+                    "properties": {
+                        "results": {"type": "array", "items": {
+                            "type": "object", "required": ["id", "chunk"],
+                            "properties": {
+                                "id": {"$ref": "#/components/schemas/GlobalId"},
+                                "chunk": {"nullable": true, "allOf": [
+                                    {"$ref": "#/components/schemas/Chunk"}
+                                ]}
+                            }
+                        }}
+                    }
+                },
+                "BatchUpsertChunksRequest": {
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {
+                        "items": {"type": "array", "maxItems": MAX_CHUNK_BATCH, "items": {
+                            "type": "object", "required": ["collection", "chunk"],
+                            "properties": {
+                                "collection": {"type": "string"},
+                                "chunk": {"$ref": "#/components/schemas/Chunk"},
+                                "vector": {"type": ["array", "null"], "items": {"type": "number"}}
+                            }
+                        }}
+                    }
+                },
+                "BatchDeleteChunksRequest": {
+                    "type": "object",
+                    "required": ["ids"],
+                    "properties": {
+                        "ids": {"type": "array", "maxItems": MAX_CHUNK_BATCH,
+                            "items": {"$ref": "#/components/schemas/GlobalId"}}
+                    }
+                },
+                "BatchDeleteChunksResponse": {
+                    "type": "object",
+                    "required": ["results", "objects_deleted", "object_errors"],
+                    "properties": {
+                        "results": {"type": "array", "items": {
+                            "type": "object", "required": ["id", "deleted"],
+                            "properties": {
+                                "id": {"$ref": "#/components/schemas/GlobalId"},
+                                "deleted": {"type": "boolean"}
+                            }
+                        }},
+                        "objects_deleted": {"type": "integer", "minimum": 0},
+                        "object_errors": {"type": "array", "items": {"type": "string"}}
+                    }
+                },
+                "DocumentChunksPage": {
+                    "type": "object",
+                    "required": ["chunks", "next_after"],
+                    "properties": {
+                        "chunks": {"type": "array", "items": {"$ref": "#/components/schemas/Chunk"}},
+                        "next_after": {"type": ["integer", "null"], "format": "int64", "minimum": 0}
+                    }
+                },
+                "DeleteCollectionResponse": {
+                    "type": "object",
+                    "required": [
+                        "deleted_chunks", "registered_removed", "objects_deleted", "object_errors"
+                    ],
+                    "properties": {
+                        "deleted_chunks": {"type": "integer", "minimum": 0},
+                        "registered_removed": {"type": "boolean"},
+                        "objects_deleted": {"type": "integer", "minimum": 0},
+                        "object_errors": {"type": "array", "items": {"type": "string"}}
                     }
                 }
             }
@@ -712,6 +867,73 @@ fn openapi_spec() -> Value {
                     "responses": {"200": {"description": "{indexed: n}"},
                         "400": {"description": "维度不符（集合已注册 dim 且预计算向量等维不符）"},
                         "401": {"description": "认证失败"}}
+                }
+            },
+            "/v1/chunks/batch-get": {
+                "post": {
+                    "summary": "按 GlobalId 批量读取 chunks（顺序稳定；不可见与不存在均返回 null）",
+                    "requestBody": {"required": true, "content": {"application/json":
+                        {"schema": {"$ref": "#/components/schemas/BatchGetChunksRequest"}}}},
+                    "responses": {
+                        "200": {"description": "逐 ID 返回结果", "content": {"application/json":
+                            {"schema": {"$ref": "#/components/schemas/BatchGetChunksResponse"}}}},
+                        "400": {"description": "ID 或批量大小非法"},
+                        "401": {"description": "认证失败"},
+                        "503": {"description": "未配置 PostgreSQL 真源"}
+                    }
+                }
+            },
+            "/v1/chunks/batch-upsert": {
+                "post": {
+                    "summary": "事务性批量 upsert 通用 chunks",
+                    "description": "tenant/acl 由认证身份覆盖；FastSearch 接收已切分 chunks。",
+                    "requestBody": {"required": true, "content": {"application/json":
+                        {"schema": {"$ref": "#/components/schemas/BatchUpsertChunksRequest"}}}},
+                    "responses": {
+                        "200": {"description": "{upserted:n}"},
+                        "400": {"description": "chunk、metadata、向量或批量大小非法"},
+                        "401": {"description": "认证失败"},
+                        "409": {"description": "同 GlobalId 属于其他 tenant"},
+                        "503": {"description": "未配置 PostgreSQL 真源"}
+                    }
+                }
+            },
+            "/v1/chunks/batch-delete": {
+                "post": {
+                    "summary": "按 GlobalId 批量幂等删除 chunks",
+                    "description": "不可见与不存在均报告 deleted=false。",
+                    "requestBody": {"required": true, "content": {"application/json":
+                        {"schema": {"$ref": "#/components/schemas/BatchDeleteChunksRequest"}}}},
+                    "responses": {
+                        "200": {"description": "逐 ID 删除结果", "content": {"application/json":
+                            {"schema": {"$ref": "#/components/schemas/BatchDeleteChunksResponse"}}}},
+                        "400": {"description": "ID 或批量大小非法"},
+                        "401": {"description": "认证失败"},
+                        "503": {"description": "未配置 PostgreSQL 真源"}
+                    }
+                }
+            },
+            "/v1/chunks": {
+                "get": {
+                    "summary": "按 chunk_id 分页列出一个文档的可见 chunks",
+                    "parameters": [
+                        {"name": "collection", "in": "query", "required": true,
+                            "schema": {"type": "string"}},
+                        {"name": "doc_id", "in": "query", "required": true,
+                            "schema": {"type": "string"}},
+                        {"name": "after", "in": "query", "required": false,
+                            "schema": {"type": "integer", "format": "int64", "minimum": 0}},
+                        {"name": "limit", "in": "query", "required": false,
+                            "schema": {"type": "integer", "minimum": 1,
+                                "maximum": MAX_CHUNK_PAGE_SIZE, "default": DEFAULT_CHUNK_PAGE_SIZE}}
+                    ],
+                    "responses": {
+                        "200": {"description": "稳定分页", "content": {"application/json":
+                            {"schema": {"$ref": "#/components/schemas/DocumentChunksPage"}}}},
+                        "400": {"description": "分页参数非法"},
+                        "401": {"description": "认证失败"},
+                        "503": {"description": "未配置 PostgreSQL 真源"}
+                    }
                 }
             },
             "/v1/images": {
@@ -764,7 +986,21 @@ fn openapi_spec() -> Value {
             "/v1/collections/{name}": {
                 "get": {"summary": "读回集合咨询配置 + 服务端实际向量配置（introspection）",
                     "responses": {"200": {"description": "集合配置"},
-                        "404": {"description": "未注册"}, "401": {"description": "认证失败"}}}
+                        "404": {"description": "未注册"}, "401": {"description": "认证失败"}}},
+                "delete": {
+                    "summary": "幂等删除当前 tenant scope 内的 collection",
+                    "description": "删除 PG 真源、派生索引、咨询性注册信息和受管对象。",
+                    "parameters": [
+                        {"name": "name", "in": "path", "required": true,
+                            "schema": {"type": "string"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "删除汇总", "content": {"application/json":
+                            {"schema": {"$ref": "#/components/schemas/DeleteCollectionResponse"}}}},
+                        "401": {"description": "认证失败"},
+                        "503": {"description": "未配置 PostgreSQL 真源"}
+                    }
+                }
             },
             "/v1/similar": {
                 "post": {
@@ -988,7 +1224,7 @@ fn hits_json(
                 }
                 None => None,
             };
-            json!({
+            let mut hit = json!({
                 "citation_id": h.citation.citation_id(),
                 "score": h.score,
                 "bm25": h.bm25,
@@ -1006,7 +1242,18 @@ fn hits_json(
                 "media": media_json,
                 // 深分页游标：把末条命中的此值作为下次请求的 search_after 即续取下一页。
                 "cursor": h.cursor(),
-            })
+            });
+            if let Some(text) = &h.text {
+                hit.as_object_mut()
+                    .unwrap()
+                    .insert("text".into(), Value::String(text.clone()));
+            }
+            if let Some(metadata) = &h.metadata {
+                hit.as_object_mut()
+                    .unwrap()
+                    .insert("metadata".into(), Value::Object(metadata.clone()));
+            }
+            hit
         })
         .collect()
 }
@@ -1646,6 +1893,39 @@ struct IndexBody {
     chunks: Vec<IndexChunk>,
 }
 
+#[derive(Deserialize)]
+struct BatchGetChunksBody {
+    ids: Vec<GlobalId>,
+}
+
+#[derive(Deserialize)]
+struct BatchUpsertChunk {
+    collection: String,
+    chunk: Chunk,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Deserialize)]
+struct BatchUpsertChunksBody {
+    items: Vec<BatchUpsertChunk>,
+}
+
+#[derive(Deserialize)]
+struct BatchDeleteChunksBody {
+    ids: Vec<GlobalId>,
+}
+
+#[derive(Deserialize)]
+struct DocumentChunksQuery {
+    collection: String,
+    doc_id: String,
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum StoreMedia {
@@ -1776,6 +2056,8 @@ async fn image_upload(
         image_vector_status: Some(fastsearch_core::ImageVectorStatus::Pending),
         tenant: principal.tenant.clone(),
         acl,
+        metadata: Default::default(),
+        searchable: true,
     };
     index(
         State(s),
@@ -1844,6 +2126,67 @@ fn apply_ingest_identity(body: &mut IndexBody, principal: &Principal) {
     }
 }
 
+fn validate_chunk_ids(ids: &[GlobalId]) -> Result<(), (StatusCode, String)> {
+    if ids.len() > MAX_CHUNK_BATCH {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("batch size must be <= {MAX_CHUNK_BATCH}"),
+        ));
+    }
+    if ids
+        .iter()
+        .any(|id| id.collection.is_empty() || id.doc_id.is_empty() || id.chunk_id > i64::MAX as u64)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "collection/doc_id must not be empty and chunk_id must fit signed 64-bit storage"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn management_source(
+    s: &ServerState,
+) -> Result<Arc<fastsearch_pg::PgStore>, (StatusCode, String)> {
+    s.engine.lock().await.source_pg_clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "chunk management requires a configured PostgreSQL source store".into(),
+        )
+    })
+}
+
+fn managed_chunk_json(mut chunk: Chunk) -> Result<Value, (StatusCode, String)> {
+    let media = chunk.media.as_ref().map(MediaRef::to_public);
+    chunk.media_bytes = None;
+    let mut value = serde_json::to_value(chunk)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let (Value::Object(object), Some(media)) = (&mut value, media) {
+        object.insert(
+            "media".into(),
+            serde_json::to_value(media)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        );
+    }
+    Ok(value)
+}
+
+fn object_uris_for_chunk(chunk: &Chunk) -> Vec<String> {
+    let mut uris = Vec::new();
+    let Some(media) = &chunk.media else {
+        return uris;
+    };
+    for asset in std::iter::once(&media.asset).chain(media.thumbnail.iter()) {
+        if let AssetPointer::Object { uri } = asset {
+            if !uris.contains(uri) {
+                uris.push(uri.clone());
+            }
+        }
+    }
+    uris
+}
+
 fn image_has_declared_bytes(chunk: &Chunk) -> bool {
     chunk.media_bytes.is_some()
         || chunk
@@ -1853,6 +2196,9 @@ fn image_has_declared_bytes(chunk: &Chunk) -> bool {
 }
 
 fn initial_image_vector_status(ic: &IndexChunk) -> Option<fastsearch_core::ImageVectorStatus> {
+    if !ic.chunk.searchable {
+        return None;
+    }
     (ic.chunk.kind == ChunkKind::Image).then(|| {
         if ic.vector.is_some() {
             fastsearch_core::ImageVectorStatus::Embedded
@@ -1886,12 +2232,25 @@ async fn index(
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     };
     apply_ingest_identity(&mut body, &principal);
+    for ic in &body.chunks {
+        ic.chunk
+            .validate_metadata()
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+    if body.chunks.iter().any(|ic| !ic.chunk.searchable)
+        && s.engine.lock().await.source_pg_clone().is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "searchable=false requires a configured PostgreSQL source store".into(),
+        ));
+    }
     let namespace = object_namespace(principal.tenant.as_deref())?;
     let old_object_uris = {
         let engine = s.engine.lock().await;
         engine
             .object_uris_for_doc(&body.collection, &body.doc_id)
-            .map_err(&err500)?
+            .map_err(err500)?
     };
     let mut new_object_uris = Vec::new();
 
@@ -1919,7 +2278,7 @@ async fn index(
             );
             let obj = engine
                 .put_object(&key, &bytes, &media_type)
-                .map_err(&err500)?;
+                .map_err(err500)?;
             new_object_uris.push(obj.uri.clone());
             let asset = AssetPointer::Object { uri: obj.uri };
             match &mut ic.chunk.media {
@@ -1961,6 +2320,9 @@ async fn index(
         .and_then(|c| c.dim)
     {
         for ic in &body.chunks {
+            if !ic.chunk.searchable {
+                continue;
+            }
             if let Some(v) = &ic.vector {
                 if v.len() != dim {
                     return Err((
@@ -1980,7 +2342,17 @@ async fn index(
     // 每 chunk 一个向量槽：携带预计算向量者直接占位；其余锁外嵌入。
     // 图片 chunk 优先用 inline/object 字节；没有字节才退化为 caption/OCR 文本。
     // 无嵌入后端且无预计算向量 → 该槽留空、退化为纯全文。
-    let mut vectors: Vec<Option<Vec<f32>>> = body.chunks.iter().map(|c| c.vector.clone()).collect();
+    let mut vectors: Vec<Option<Vec<f32>>> = body
+        .chunks
+        .iter()
+        .map(|c| {
+            if c.chunk.searchable {
+                c.vector.clone()
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut image_statuses: Vec<Option<fastsearch_core::ImageVectorStatus>> = body
         .chunks
         .iter()
@@ -1994,6 +2366,9 @@ async fn index(
             Option<fastsearch_core::ImageVectorStatus>,
         )> = Vec::new();
         for (i, ic) in body.chunks.iter().enumerate() {
+            if !ic.chunk.searchable {
+                continue;
+            }
             if ic.vector.is_some() {
                 continue;
             }
@@ -2110,18 +2485,16 @@ async fn index(
     let mut engine = s.engine.lock().await;
     engine
         .remove_doc(&body.collection, &body.doc_id)
-        .map_err(&err500)?;
+        .map_err(err500)?;
     for (ic, v) in body.chunks.iter().zip(vectors) {
         match v {
             Some(v) => engine
                 .ingest_vector(&body.collection, &ic.chunk, v)
-                .map_err(&err500)?,
-            None => engine
-                .ingest(&body.collection, &ic.chunk)
-                .map_err(&err500)?,
+                .map_err(err500)?,
+            None => engine.ingest(&body.collection, &ic.chunk).map_err(err500)?,
         }
     }
-    engine.commit().map_err(&err500)?;
+    engine.commit().map_err(err500)?;
     for uri in old_object_uris
         .iter()
         .filter(|uri| !new_object_uris.iter().any(|new_uri| new_uri == *uri))
@@ -2143,6 +2516,383 @@ async fn index(
         status: 200,
     });
     Ok(Json(json!({ "indexed": n })))
+}
+
+async fn batch_get_chunks(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchGetChunksBody>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    validate_chunk_ids(&body.ids)?;
+    let pg = management_source(&s).await?;
+    let rows = pg
+        .batch_get(&body.ids)
+        .await
+        .map_err(|e| internal_err("pg batch get", e))?;
+    let acl = acl_for(&principal);
+    let mut results = Vec::with_capacity(body.ids.len());
+    for (id, row) in body.ids.iter().zip(rows) {
+        let chunk = match row {
+            Some(chunk) if acl.visible(&chunk) => Some(managed_chunk_json(chunk)?),
+            _ => None,
+        };
+        results.push(json!({ "id": id, "chunk": chunk }));
+    }
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/chunks/batch-get",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: None,
+        doc_id: None,
+        hits: Some(results.iter().filter(|r| !r["chunk"].is_null()).count()),
+        status: 200,
+    });
+    Ok(Json(json!({ "results": results })))
+}
+
+async fn batch_upsert_chunks(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(mut body): Json<BatchUpsertChunksBody>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    if body.items.len() > MAX_CHUNK_BATCH {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("batch size must be <= {MAX_CHUNK_BATCH}"),
+        ));
+    }
+    let acl = ingest_acl_for(&principal);
+    for item in &mut body.items {
+        if item.collection.is_empty()
+            || item.chunk.doc_id.is_empty()
+            || item.chunk.chunk_id > i64::MAX as u64
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "collection/doc_id must not be empty and chunk_id must fit signed 64-bit storage"
+                    .into(),
+            ));
+        }
+        if !item.chunk.searchable && item.vector.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "searchable=false chunks must not include a vector".into(),
+            ));
+        }
+        item.chunk.tenant = principal.tenant.clone();
+        item.chunk.acl = acl.clone();
+        item.chunk
+            .validate_metadata()
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+    let pg = management_source(&s).await?;
+    let ids: Vec<GlobalId> = body
+        .items
+        .iter()
+        .map(|item| item.chunk.global_id(&item.collection))
+        .collect();
+    let old_rows = pg
+        .batch_get(&ids)
+        .await
+        .map_err(|e| internal_err("pg batch get before upsert", e))?;
+
+    {
+        let engine = s.engine.lock().await;
+        for item in &body.items {
+            for uri in object_uris_for_chunk(&item.chunk) {
+                engine
+                    .validate_object_ref(&uri, principal.tenant.as_deref())
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            }
+        }
+    }
+
+    let mut vectors: Vec<Option<Vec<f32>>> = body
+        .items
+        .iter()
+        .map(|item| {
+            if item.chunk.searchable {
+                item.vector.clone()
+            } else {
+                None
+            }
+        })
+        .collect();
+    if s.embedder.is_some() {
+        let pending: Vec<(usize, String)> = body
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(index, item)| {
+                item.chunk.searchable
+                    && vectors[*index].is_none()
+                    && !item.chunk.text.trim().is_empty()
+            })
+            .map(|(index, item)| (index, item.chunk.text.clone()))
+            .collect();
+        if !pending.is_empty() {
+            let texts = pending.iter().map(|(_, text)| text.clone()).collect();
+            let embedded = s.embed(texts, EmbedKind::Passage).await.map_err(|e| {
+                s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                (StatusCode::INTERNAL_SERVER_ERROR, e)
+            })?;
+            if embedded.len() != pending.len() {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "embedder returned an unexpected number of vectors".into(),
+                ));
+            }
+            for ((index, _), vector) in pending.into_iter().zip(embedded) {
+                vectors[index] = Some(vector);
+            }
+        }
+    }
+
+    let registry = s.collections.lock().await;
+    for (item, vector) in body.items.iter().zip(&vectors) {
+        let Some(vector) = vector else {
+            continue;
+        };
+        if let Some(expected) = registry
+            .get(&(principal.tenant.clone(), item.collection.clone()))
+            .and_then(|spec| spec.dim)
+        {
+            if vector.len() != expected {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "collection '{}' expects dim {expected}, chunk {} has {}",
+                        item.collection,
+                        item.chunk.chunk_id,
+                        vector.len()
+                    ),
+                ));
+            }
+        }
+    }
+    drop(registry);
+
+    let rows: Vec<(String, Chunk)> = body
+        .items
+        .iter()
+        .map(|item| (item.collection.clone(), item.chunk.clone()))
+        .collect();
+    let upserted = pg.upsert_chunks(&rows).await.map_err(|e| match e {
+        fastsearch_pg::PgError::Conflict(message) => (StatusCode::CONFLICT, message),
+        other => internal_err("pg batch upsert", other),
+    })?;
+
+    let pgvector = s.engine.lock().await.has_pg_vector();
+    if pgvector {
+        for (item, vector) in body.items.iter().zip(&vectors) {
+            if let Some(vector) = vector {
+                pg.set_embedding(
+                    &item.collection,
+                    &item.chunk.doc_id,
+                    item.chunk.chunk_id,
+                    vector,
+                    if item.vector.is_some() {
+                        "api-precomputed"
+                    } else {
+                        "api-embedder"
+                    },
+                )
+                .await
+                .map_err(|e| internal_err("pg set embedding", e))?;
+            }
+        }
+    }
+
+    {
+        let mut engine = s.engine.lock().await;
+        for (item, vector) in body.items.iter().zip(vectors) {
+            match vector {
+                Some(vector) => engine.ingest_vector(&item.collection, &item.chunk, vector),
+                None => engine.ingest(&item.collection, &item.chunk),
+            }
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        engine
+            .commit()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let mut retained = Vec::new();
+        for item in &body.items {
+            retained.extend(object_uris_for_chunk(&item.chunk));
+        }
+        for old in old_rows.into_iter().flatten() {
+            for uri in object_uris_for_chunk(&old) {
+                if !retained.contains(&uri) {
+                    if let Err(error) = engine.delete_object(&uri) {
+                        eprintln!("old object cleanup after chunk upsert failed: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    s.metrics.indexed.fetch_add(upserted, Ordering::Relaxed);
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/chunks/batch-upsert",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: None,
+        doc_id: None,
+        hits: Some(upserted as usize),
+        status: 200,
+    });
+    Ok(Json(json!({ "upserted": upserted })))
+}
+
+async fn batch_delete_chunks(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchDeleteChunksBody>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    validate_chunk_ids(&body.ids)?;
+    let pg = management_source(&s).await?;
+    let acl = acl_for(&principal);
+    let old_rows = pg
+        .batch_get(&body.ids)
+        .await
+        .map_err(|e| internal_err("pg batch get before delete", e))?;
+    let deleted = pg
+        .delete_chunks_visible(&body.ids, &acl)
+        .await
+        .map_err(|e| internal_err("pg batch delete", e))?;
+    let deleted_ids: Vec<GlobalId> = body
+        .ids
+        .iter()
+        .zip(&deleted)
+        .filter(|(_, deleted)| **deleted)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut object_uris = Vec::new();
+    for ((row, was_deleted), id) in old_rows.into_iter().zip(&deleted).zip(&body.ids) {
+        if *was_deleted {
+            if let Some(row) = row {
+                if acl.visible(&row) && row.global_id(&id.collection) == *id {
+                    object_uris.extend(object_uris_for_chunk(&row));
+                }
+            }
+        }
+    }
+    object_uris.sort();
+    object_uris.dedup();
+
+    let mut object_errors = Vec::new();
+    {
+        let mut engine = s.engine.lock().await;
+        engine
+            .remove_many(&deleted_ids)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        engine
+            .commit()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for uri in &object_uris {
+            if let Err(error) = engine.delete_object(uri) {
+                object_errors.push(error.to_string());
+            }
+        }
+    }
+
+    let results: Vec<Value> = body
+        .ids
+        .iter()
+        .zip(deleted)
+        .map(|(id, deleted)| json!({ "id": id, "deleted": deleted }))
+        .collect();
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/chunks/batch-delete",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: None,
+        doc_id: None,
+        hits: Some(deleted_ids.len()),
+        status: 200,
+    });
+    Ok(Json(json!({
+        "results": results,
+        "objects_deleted": object_uris.len().saturating_sub(object_errors.len()),
+        "object_errors": object_errors,
+    })))
+}
+
+async fn list_document_chunks(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<DocumentChunksQuery>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    if query.collection.is_empty() || query.doc_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "collection and doc_id must not be empty".into(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(DEFAULT_CHUNK_PAGE_SIZE);
+    if limit == 0 || limit > MAX_CHUNK_PAGE_SIZE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("limit must be in 1..={MAX_CHUNK_PAGE_SIZE}"),
+        ));
+    }
+    let pg = management_source(&s).await?;
+    let acl = acl_for(&principal);
+    let mut chunks = pg
+        .list_doc_chunks(
+            &query.collection,
+            &query.doc_id,
+            query.after,
+            limit + 1,
+            &acl,
+        )
+        .await
+        .map_err(|e| internal_err("pg list document chunks", e))?;
+    let has_more = chunks.len() > limit;
+    if has_more {
+        chunks.pop();
+    }
+    let next_after = has_more
+        .then(|| chunks.last().map(|chunk| chunk.chunk_id))
+        .flatten();
+    let mut items = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        items.push(managed_chunk_json(chunk)?);
+    }
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/chunks",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: Some(query.collection),
+        doc_id: Some(query.doc_id),
+        hits: Some(items.len()),
+        status: 200,
+    });
+    Ok(Json(json!({ "chunks": items, "next_after": next_after })))
 }
 
 async fn delete_doc(
@@ -2235,7 +2985,7 @@ async fn server_vector_info(s: &ServerState) -> Value {
     json!({
         // pgvector 直查档下后端索引仍是底层暴力档，但召回在 PG → 用 "pgvector" 如实标注。
         "vector_backend": if engine.has_pg_vector() { "pgvector" } else { engine.vector_backend() },
-        "vector_dim": engine.vector_dim(),
+        "vector_dim": s.vector_dim.or_else(|| engine.vector_dim()),
         "vector_count": engine.vector_len(),
         "embedded": s.embedder.is_some(),
     })
@@ -2252,6 +3002,23 @@ async fn create_collection(
     let principal = require_principal(&s, &headers)?;
     if body.name.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "name must not be empty".into()));
+    }
+    if body.dim == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "dim must be greater than zero".into(),
+        ));
+    }
+    if let (Some(requested), Some(configured)) = (body.dim, s.vector_dim) {
+        if requested != configured {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "collection '{}' requests dim {requested}, server expects {configured}",
+                    body.name
+                ),
+            ));
+        }
     }
     let spec = CollectionSpec {
         dim: body.dim,
@@ -2298,6 +3065,68 @@ async fn get_collection(
         "dim": spec.dim,
         "distance": spec.distance.unwrap_or_else(|| "cosine".into()),
         "server": info,
+    })))
+}
+
+/// 幂等删除当前 owner scope 的 collection：PG 真源先删并返回实际 GID/对象，
+/// 再清派生索引、受管对象和咨询性 registry。未注册/已删除仍返回 200。
+async fn delete_collection(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name must not be empty".into()));
+    }
+    let pg = management_source(&s).await?;
+    let deleted = pg
+        .delete_collection(&name, principal.tenant.as_deref())
+        .await
+        .map_err(|e| internal_err("pg delete collection", e))?;
+
+    let mut object_errors = Vec::new();
+    {
+        let mut engine = s.engine.lock().await;
+        engine
+            .remove_many(&deleted.ids)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        engine
+            .commit()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        for uri in &deleted.object_uris {
+            if let Err(error) = engine.delete_object(uri) {
+                object_errors.push(error.to_string());
+            }
+        }
+    }
+    let registered_removed = s
+        .collections
+        .lock()
+        .await
+        .remove(&(principal.tenant.clone(), name.clone()))
+        .is_some();
+    let deleted_count = deleted.ids.len();
+    let object_count = deleted.object_uris.len();
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/collections/{name}",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: Some(name),
+        doc_id: None,
+        hits: Some(deleted_count),
+        status: 200,
+    });
+    Ok(Json(json!({
+        "deleted_chunks": deleted_count,
+        "registered_removed": registered_removed,
+        "objects_deleted": object_count.saturating_sub(object_errors.len()),
+        "object_errors": object_errors,
     })))
 }
 
@@ -3199,6 +4028,8 @@ mod tests {
             image_vector_status: None,
             tenant: Some("acme".into()),
             acl: acl.into_iter().map(String::from).collect(),
+            metadata: Default::default(),
+            searchable: true,
         }
     }
 
@@ -3217,6 +4048,30 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn api_json_request(
+        app: &Router,
+        method: axum::http::Method,
+        uri: &str,
+        key: &str,
+        body: Option<Value>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-api-key", key);
+        let body = match body {
+            Some(value) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(&value).unwrap())
+            }
+            None => Body::empty(),
+        };
+        app.clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -3331,6 +4186,113 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["page"], 7);
         assert_eq!(hits[0]["citation_id"], "kb:d.pdf:1");
+    }
+
+    #[tokio::test]
+    async fn search_collection_filter_isolates_collections() {
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine
+            .ingest("kb-a", &chunk(1, "shared retrieval text", vec!["team-a"]))
+            .unwrap();
+        engine
+            .ingest("kb-b", &chunk(2, "shared retrieval text", vec!["team-a"]))
+            .unwrap();
+        engine.commit().unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let req = SearchRequest {
+            query: "shared retrieval text".into(),
+            filter: Some(Filter::Eq(
+                "collection".into(),
+                FieldValue::Str("kb-b".into()),
+            )),
+            top_k: 10,
+            ..Default::default()
+        };
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hits = body_json(resp).await["hits"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["citation_id"], "kb-b:rep.pdf:2");
+    }
+
+    #[tokio::test]
+    async fn search_output_text_and_metadata_are_opt_in() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let body = r#"{"collection":"kb","doc_id":"d.pdf","chunks":[
+            {"doc_id":"d.pdf","chunk_id":1,"kind":"paragraph","text":"hello visible","page":1,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":13,
+             "metadata":{"source":"visible"}}]}"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(
+                        r#"{"query":"hello","top_k":5,"include_text":true,"include_metadata":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hits = body_json(resp).await["hits"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["chunk_id"], 1);
+        assert_eq!(hits[0]["text"], "hello visible");
+        assert_eq!(hits[0]["metadata"]["source"], "visible");
+    }
+
+    #[tokio::test]
+    async fn searchable_false_requires_postgres_source_store() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let body = r#"{"collection":"kb","doc_id":"d.pdf","chunks":[
+            {"doc_id":"d.pdf","chunk_id":1,"kind":"paragraph","text":"hidden","page":1,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":6,
+             "searchable":false}]}"#;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -3776,7 +4738,7 @@ mod tests {
     #[tokio::test]
     async fn collections_register_and_introspect() {
         let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
-        let app = router(ServerState::new(engine, keys()));
+        let app = router(ServerState::new(engine, keys()).with_vector_dim(3));
         let post = |body: &'static str| {
             Request::builder()
                 .method("POST")
@@ -3797,6 +4759,7 @@ mod tests {
         assert_eq!(v["dim"], 3);
         assert_eq!(v["distance"], "cosine"); // 默认
         assert_eq!(v["server"]["vector_backend"], "brute"); // 服务端实际后端
+        assert_eq!(v["server"]["vector_dim"], 3);
         assert_eq!(v["server"]["embedded"], false);
 
         // GET 读回
@@ -3844,6 +4807,31 @@ mod tests {
             .unwrap();
         let v = body_json(resp).await;
         assert_eq!(v["collections"], json!(["kb"]));
+    }
+
+    #[tokio::test]
+    async fn collection_registration_rejects_server_dimension_mismatch() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()).with_vector_dim(1024));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/collections")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"name":"kb","dim":768}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "collection 'kb' requests dim 768, server expects 1024"
+        );
     }
 
     // M22：集合注册表按租户隔离——他租户不可覆盖/读取/枚举本租户的集合。
@@ -4182,6 +5170,11 @@ mod tests {
         assert_eq!(v["openapi"], "3.0.3");
         assert!(v["paths"]["/v1/search"]["post"].is_object());
         assert!(v["paths"]["/v1/index"]["post"].is_object());
+        assert!(v["paths"]["/v1/chunks/batch-get"]["post"].is_object());
+        assert!(v["paths"]["/v1/chunks/batch-upsert"]["post"].is_object());
+        assert!(v["paths"]["/v1/chunks/batch-delete"]["post"].is_object());
+        assert!(v["paths"]["/v1/chunks"]["get"].is_object());
+        assert!(v["paths"]["/v1/collections/{name}"]["delete"].is_object());
         // MM6-signer 两端点入契约（四张脸契约一致）。
         assert!(v["paths"]["/v1/assets/resolve"]["post"].is_object());
         assert!(v["paths"]["/v1/asset/{citation_id}/bytes"]["get"].is_object());
@@ -4189,6 +5182,19 @@ mod tests {
         assert!(
             v["components"]["schemas"]["SearchRequest"]["properties"]["query_image_base64"]
                 .is_object()
+        );
+        assert!(
+            v["components"]["schemas"]["SearchRequest"]["properties"]["include_metadata"]
+                .is_object()
+        );
+        assert_eq!(
+            v["components"]["schemas"]["Chunk"]["properties"]["searchable"]["default"],
+            true
+        );
+        assert!(v["components"]["schemas"]["GlobalId"]["properties"]["collection"].is_object());
+        assert_eq!(
+            v["components"]["schemas"]["BatchGetChunksRequest"]["properties"]["ids"]["maxItems"],
+            MAX_CHUNK_BATCH
         );
         assert!(
             v["paths"]["/v1/search"]["post"]["requestBody"]["content"]["multipart/form-data"]
@@ -4257,7 +5263,7 @@ mod tests {
     #[test]
     fn hits_json_redacts_object_media() {
         use fastsearch_core::{AssetPointer, BBox, Citation, GlobalId, MediaRef};
-        let hit = fastsearch_engine::SearchHit {
+        let mut hit = fastsearch_engine::SearchHit {
             id: GlobalId {
                 collection: "kb".into(),
                 doc_id: "img.png".into(),
@@ -4293,20 +5299,395 @@ mod tests {
             vector: Some(1.0),
             rerank: None,
             highlight: None,
+            text: None,
+            metadata: None,
             merged_chunk_ids: vec![],
         };
         let signer = AssetSigner::new(b"k".to_vec(), 300);
-        let s = serde_json::to_string(&hits_json(
-            &[hit],
+        let default_json = hits_json(
+            &[hit.clone()],
             Some(&signer),
             Some("https://fastsearch.example"),
-        ))
-        .unwrap();
+        );
+        let s = serde_json::to_string(&default_json).unwrap();
         assert!(s.contains(r#""kind":"object""#));
         assert!(s.contains(r#""url":"https://fastsearch.example/v1/object/"#));
         assert!(!s.contains("s3://"));
         assert!(!s.contains("private-bucket"));
         assert!(!s.contains("secret/key.png"));
+        assert!(default_json[0].get("text").is_none());
+        assert!(default_json[0].get("metadata").is_none());
+
+        hit.text = Some("complete text".into());
+        hit.metadata =
+            Some(serde_json::from_value(serde_json::json!({"source": "external"})).unwrap());
+        let included = hits_json(&[hit], None, None);
+        assert_eq!(included[0]["text"], "complete text");
+        assert_eq!(included[0]["metadata"]["source"], "external");
+    }
+
+    #[test]
+    fn managed_chunk_json_redacts_bytes_and_object_location() {
+        let mut managed = chunk(1, "image caption", vec!["team-a"]);
+        managed.kind = ChunkKind::Image;
+        managed.media = Some(MediaRef {
+            asset: AssetPointer::Object {
+                uri: "s3://private-bucket/secret/key.png".into(),
+            },
+            media_type: Some("image/png".into()),
+            time: None,
+            region: None,
+            caption_source: Some("caller".into()),
+            thumbnail: Some(AssetPointer::Object {
+                uri: "s3://private-bucket/secret/thumb.png".into(),
+            }),
+        });
+        managed.media_bytes = Some(vec![1, 2, 3]);
+
+        let value = managed_chunk_json(managed).unwrap();
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert_eq!(value["media"]["asset"]["kind"], "object");
+        assert_eq!(value["media"]["thumbnail"]["kind"], "object");
+        assert!(value.get("media_bytes").is_none());
+        assert!(!encoded.contains("s3://"));
+        assert!(!encoded.contains("private-bucket"));
+        assert!(!encoded.contains("secret/key.png"));
+    }
+
+    #[tokio::test]
+    async fn chunk_management_requires_postgres_source() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+        let requests = [
+            (
+                axum::http::Method::POST,
+                "/v1/chunks/batch-get",
+                Some(json!({"ids": []})),
+            ),
+            (
+                axum::http::Method::POST,
+                "/v1/chunks/batch-upsert",
+                Some(json!({"items": []})),
+            ),
+            (
+                axum::http::Method::POST,
+                "/v1/chunks/batch-delete",
+                Some(json!({"ids": []})),
+            ),
+            (
+                axum::http::Method::GET,
+                "/v1/chunks?collection=kb&doc_id=d.pdf",
+                None,
+            ),
+            (axum::http::Method::DELETE, "/v1/collections/kb", None),
+        ];
+        for (method, uri, body) in requests {
+            let response = api_json_request(&app, method, uri, "k-team-a", body).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn searchable_false_is_stored_in_pg_but_not_searchable() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip searchable_false_is_stored_in_pg_but_not_searchable: DATABASE_URL not set"
+            );
+            return;
+        };
+        use fastsearch_pg::{PgConfig, PgStore};
+
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_searchable_it".into();
+        let store = Arc::new(PgStore::connect(cfg).await.expect("connect"));
+        store.ensure_schema().await.expect("schema");
+        store.delete_doc("kb", "d.pdf").await.ok();
+
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_source_store(store.clone());
+        let app = router(ServerState::new(engine, keys()));
+        let body = r#"{"collection":"kb","doc_id":"d.pdf","chunks":[
+            {"doc_id":"d.pdf","chunk_id":1,"kind":"paragraph","text":"hello visible","page":1,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":13},
+            {"doc_id":"d.pdf","chunk_id":2,"kind":"paragraph","text":"hello hidden","page":2,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":12,
+             "metadata":{"source":"hidden"},"searchable":false}]}"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store.fetch_doc("kb", "d.pdf").await.expect("fetch");
+        assert_eq!(stored.len(), 2);
+        let hidden = stored.iter().find(|chunk| chunk.chunk_id == 2).unwrap();
+        assert!(!hidden.searchable);
+        assert_eq!(hidden.metadata["source"], "hidden");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"query":"hello","top_k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let hits = body_json(resp).await["hits"].as_array().unwrap().clone();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["chunk_id"], 1);
+        store.delete_doc("kb", "d.pdf").await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunk_management_routes_enforce_acl_tenant_and_idempotency() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip chunk_management_routes_enforce_acl_tenant_and_idempotency: \
+                 DATABASE_URL not set"
+            );
+            return;
+        };
+        use fastsearch_pg::{PgConfig, PgStore};
+
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_management_routes_it".into();
+        let store = Arc::new(PgStore::connect(cfg).await.expect("connect"));
+        store.ensure_schema().await.expect("schema");
+        let collection = format!("management-routes-{}", std::process::id());
+        store
+            .delete_collection(&collection, None)
+            .await
+            .expect("clean");
+
+        let mut api_keys = keys();
+        api_keys.insert(
+            "k-other".into(),
+            Principal {
+                tenant: Some("other".into()),
+                tags: vec!["team-x".into()],
+            },
+        );
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_source_store(store.clone());
+        let app = router(ServerState::new(engine, api_keys));
+
+        for key in ["k-team-a", "k-other"] {
+            let response = api_json_request(
+                &app,
+                axum::http::Method::POST,
+                "/v1/collections",
+                key,
+                Some(json!({"name": collection})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let make_chunk = |chunk_id: u64, text: &str, searchable: bool| {
+            json!({
+                "doc_id": "doc-a",
+                "chunk_id": chunk_id,
+                "kind": "paragraph",
+                "text": text,
+                "page": chunk_id,
+                "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0},
+                "char_len": text.len(),
+                "metadata": {"caller_id": format!("source-{chunk_id}")},
+                "searchable": searchable,
+                "tenant": "caller-cannot-set",
+                "acl": ["caller-cannot-set"]
+            })
+        };
+        let response = api_json_request(
+            &app,
+            axum::http::Method::POST,
+            "/v1/chunks/batch-upsert",
+            "k-team-a",
+            Some(json!({"items": [
+                {"collection": collection, "chunk": make_chunk(1, "visible alpha", true)},
+                {"collection": collection, "chunk": make_chunk(2, "contextsecret", false)}
+            ]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["upserted"], 2);
+
+        let response = api_json_request(
+            &app,
+            axum::http::Method::POST,
+            "/v1/chunks/batch-upsert",
+            "k-team-b",
+            Some(json!({"items": [
+                {"collection": collection, "chunk": make_chunk(3, "team beta", true)}
+            ]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = api_json_request(
+            &app,
+            axum::http::Method::POST,
+            "/v1/chunks/batch-upsert",
+            "k-other",
+            Some(json!({"items": [
+                {"collection": collection, "chunk": make_chunk(4, "other tenant", true)}
+            ]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 同一 GlobalId 不能被另一个 tenant 覆盖。
+        let response = api_json_request(
+            &app,
+            axum::http::Method::POST,
+            "/v1/chunks/batch-upsert",
+            "k-other",
+            Some(json!({"items": [
+                {"collection": collection, "chunk": make_chunk(1, "overwrite", true)}
+            ]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let ids = json!([
+            {"collection": collection, "doc_id": "doc-a", "chunk_id": 2},
+            {"collection": collection, "doc_id": "missing", "chunk_id": 9},
+            {"collection": collection, "doc_id": "doc-a", "chunk_id": 3},
+            {"collection": collection, "doc_id": "doc-a", "chunk_id": 1}
+        ]);
+        let response = api_json_request(
+            &app,
+            axum::http::Method::POST,
+            "/v1/chunks/batch-get",
+            "k-team-a",
+            Some(json!({"ids": ids})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let results = body_json(response).await["results"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0]["id"]["chunk_id"], 2);
+        assert_eq!(results[0]["chunk"]["metadata"]["caller_id"], "source-2");
+        assert_eq!(results[0]["chunk"]["tenant"], "acme");
+        assert_eq!(results[0]["chunk"]["acl"], json!(["team-a"]));
+        assert!(results[1]["chunk"].is_null());
+        assert!(results[2]["chunk"].is_null(), "other ACL must look missing");
+        assert_eq!(results[3]["chunk"]["chunk_id"], 1);
+
+        // context-only chunk 留在真源，但不进入检索。
+        let response = api_json_request(
+            &app,
+            axum::http::Method::POST,
+            "/v1/search",
+            "k-team-a",
+            Some(json!({
+                "query": "contextsecret",
+                "mode": "keyword",
+                "top_k": 10,
+                "filter": {"eq": ["collection", collection]}
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_json(response).await["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let uri = format!("/v1/chunks?collection={collection}&doc_id=doc-a&limit=1");
+        let response =
+            api_json_request(&app, axum::http::Method::GET, &uri, "k-team-a", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let first_page = body_json(response).await;
+        assert_eq!(first_page["chunks"][0]["chunk_id"], 1);
+        assert_eq!(first_page["next_after"], 1);
+
+        let uri = format!("/v1/chunks?collection={collection}&doc_id=doc-a&after=1&limit=10");
+        let response =
+            api_json_request(&app, axum::http::Method::GET, &uri, "k-team-a", None).await;
+        let second_page = body_json(response).await;
+        assert_eq!(second_page["chunks"].as_array().unwrap().len(), 1);
+        assert_eq!(second_page["chunks"][0]["chunk_id"], 2);
+        assert!(second_page["next_after"].is_null());
+
+        let delete_ids = json!([
+            {"collection": collection, "doc_id": "doc-a", "chunk_id": 1},
+            {"collection": collection, "doc_id": "doc-a", "chunk_id": 3}
+        ]);
+        for expected in [json!([true, false]), json!([false, false])] {
+            let response = api_json_request(
+                &app,
+                axum::http::Method::POST,
+                "/v1/chunks/batch-delete",
+                "k-team-a",
+                Some(json!({"ids": delete_ids})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let deleted: Vec<Value> = body_json(response).await["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|result| result["deleted"].clone())
+                .collect();
+            assert_eq!(Value::Array(deleted), expected);
+        }
+
+        // Collection 删除按 tenant owner scope：同 tenant 的剩余 ACL 行一并删除，其他 tenant 保留。
+        let uri = format!("/v1/collections/{collection}");
+        let response =
+            api_json_request(&app, axum::http::Method::DELETE, &uri, "k-team-a", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let deleted = body_json(response).await;
+        assert_eq!(deleted["deleted_chunks"], 2);
+        assert_eq!(deleted["registered_removed"], true);
+
+        let response = api_json_request(
+            &app,
+            axum::http::Method::POST,
+            "/v1/chunks/batch-get",
+            "k-other",
+            Some(json!({"ids": [
+                {"collection": collection, "doc_id": "doc-a", "chunk_id": 4}
+            ]})),
+        )
+        .await;
+        assert_eq!(
+            body_json(response).await["results"][0]["chunk"]["chunk_id"],
+            4
+        );
+
+        let response =
+            api_json_request(&app, axum::http::Method::DELETE, &uri, "k-team-a", None).await;
+        let repeated = body_json(response).await;
+        assert_eq!(repeated["deleted_chunks"], 0);
+        assert_eq!(repeated["registered_removed"], false);
+
+        let response = api_json_request(&app, axum::http::Method::GET, &uri, "k-other", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response =
+            api_json_request(&app, axum::http::Method::DELETE, &uri, "k-other", None).await;
+        assert_eq!(body_json(response).await["deleted_chunks"], 1);
+        store
+            .delete_collection(&collection, None)
+            .await
+            .expect("cleanup");
     }
 
     /// 真语义混合（env-gated，需本地 Ollama）：经 server 灌入带嵌入的 passage，再用
@@ -4541,6 +5922,8 @@ mod tests {
             image_vector_status: None,
             tenant: Some("acme".into()),
             acl: vec!["team-a".into()],
+            metadata: Default::default(),
+            searchable: true,
         };
 
         // 引擎索引：放 chunk（resolve 取 MediaRef）。PG 真源：放字节。

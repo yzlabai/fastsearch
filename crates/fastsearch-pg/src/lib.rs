@@ -12,7 +12,8 @@ pub use sql::{
     ann_index_sql, pgvector_search_sql, ChunkRow, SqlParam, VectorType, COLUMNS, PUBLICATION,
 };
 
-use fastsearch_core::Chunk;
+use fastsearch_core::{AclFilter, AssetPointer, Chunk, GlobalId, MediaRef};
+use std::collections::HashSet;
 use tokio::sync::Mutex;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, NoTls, Row};
@@ -75,6 +76,12 @@ pub struct PgStore {
     cfg: PgConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedCollection {
+    pub ids: Vec<GlobalId>,
+    pub object_uris: Vec<String>,
+}
+
 impl PgStore {
     /// 连接（后台驱动连接 future）。表名经标识符校验后才用于 SQL 拼接（防御性：表名是运维配置、
     /// 非客户端输入，但若未来被外部影响，此校验阻断注入面）。
@@ -110,6 +117,46 @@ impl PgStore {
         }
         batch.push_str("COMMIT;\n");
         self.client.lock().await.batch_execute(&batch).await?;
+        self.ensure_embedding_type().await?;
+        Ok(())
+    }
+
+    async fn ensure_embedding_type(&self) -> Result<()> {
+        let actual = self
+            .client
+            .lock()
+            .await
+            .query_opt(
+                "SELECT format_type(a.atttypid, a.atttypmod) AS embedding_type \
+                 FROM pg_attribute a \
+                 WHERE a.attrelid = to_regclass($1) \
+                   AND a.attname = 'embedding' \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped",
+                &[&self.cfg.table],
+            )
+            .await?
+            .ok_or_else(|| {
+                PgError::Mapping(format!(
+                    "table '{}' has no embedding column",
+                    self.cfg.table
+                ))
+            })?
+            .try_get::<_, String>("embedding_type")?;
+        let expected = format!(
+            "{}({})",
+            match self.cfg.vector_type {
+                VectorType::Vector => "vector",
+                VectorType::HalfVec => "halfvec",
+            },
+            self.cfg.vector_dim
+        );
+        if actual != expected {
+            return Err(PgError::Config(format!(
+                "table '{}' embedding type is {actual}, but runtime expects {expected}; use a matching FASTSEARCH_VECTOR_DIM or migrate/recreate the table",
+                self.cfg.table
+            )));
+        }
         Ok(())
     }
 
@@ -128,12 +175,14 @@ impl PgStore {
         let mut n = 0u64;
         for c in chunks {
             let row = ChunkRow::from_chunk(collection, c)?;
-            let params: [&(dyn ToSql + Sync); 18] = [
+            let params: [&(dyn ToSql + Sync); 20] = [
                 &row.collection,
                 &row.doc_id,
                 &row.chunk_id,
                 &row.kind,
                 &row.text,
+                &row.metadata,
+                &row.searchable,
                 &row.page,
                 &row.bbox,
                 &row.heading_path,
@@ -175,6 +224,194 @@ impl PgStore {
             .query(&q, &[&collection, &doc_id])
             .await?;
         rows.iter().map(row_to_chunk).collect()
+    }
+
+    /// 批量按 GlobalId 读取，返回项与请求严格同序；不存在的项为 None。
+    pub async fn batch_get(&self, ids: &[GlobalId]) -> Result<Vec<Option<Chunk>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let collections: Vec<String> = ids.iter().map(|id| id.collection.clone()).collect();
+        let doc_ids: Vec<String> = ids.iter().map(|id| id.doc_id.clone()).collect();
+        let chunk_ids: Vec<i64> = ids.iter().map(|id| id.chunk_id as i64).collect();
+        let q = sql::batch_get_sql(&self.cfg.table);
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(&q, &[&collections, &doc_ids, &chunk_ids])
+            .await?;
+        rows.iter()
+            .map(
+                |row| match row.try_get::<_, Option<String>>("collection")? {
+                    Some(_) => Ok(Some(row_to_chunk(row)?)),
+                    None => Ok(None),
+                },
+            )
+            .collect()
+    }
+
+    /// 跨文档/集合的 chunk 级幂等 upsert，整个 batch 单事务提交。
+    ///
+    /// 冲突行 tenant 不同则整批失败，避免调用方覆盖其他租户的同 GlobalId。
+    pub async fn upsert_chunks(&self, rows: &[(String, Chunk)]) -> Result<u64> {
+        for (_, chunk) in rows {
+            chunk.validate_metadata()?;
+        }
+        let sql = sql::upsert_chunk_sql(&self.cfg.table);
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let mut count = 0u64;
+        for (collection, chunk) in rows {
+            let row = ChunkRow::from_chunk(collection, chunk)?;
+            let params: [&(dyn ToSql + Sync); 20] = [
+                &row.collection,
+                &row.doc_id,
+                &row.chunk_id,
+                &row.kind,
+                &row.text,
+                &row.metadata,
+                &row.searchable,
+                &row.page,
+                &row.bbox,
+                &row.heading_path,
+                &row.section_id,
+                &row.char_len,
+                &row.modality,
+                &row.media,
+                &row.media_bytes,
+                &row.image_vector_status,
+                &row.time_start_ms,
+                &row.time_end_ms,
+                &row.tenant,
+                &row.acl,
+            ];
+            if tx.query_opt(&sql, &params).await?.is_none() {
+                return Err(PgError::Conflict(format!(
+                    "chunk {}:{}:{} belongs to another tenant",
+                    collection, chunk.doc_id, chunk.chunk_id
+                )));
+            }
+            count += 1;
+        }
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// 批量删除可见 chunk；结果与请求同序。不存在和未授权统一返回 false。
+    pub async fn delete_chunks_visible(
+        &self,
+        ids: &[GlobalId],
+        acl: &AclFilter,
+    ) -> Result<Vec<bool>> {
+        let sql = sql::delete_chunk_visible_sql(&self.cfg.table, acl.tenant.is_some());
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let mut deleted = Vec::with_capacity(ids.len());
+        for id in ids {
+            let chunk_id = id.chunk_id as i64;
+            let row = if let Some(tenant) = &acl.tenant {
+                tx.query_opt(
+                    &sql,
+                    &[
+                        &id.collection,
+                        &id.doc_id,
+                        &chunk_id,
+                        tenant,
+                        &acl.allowed_tags,
+                    ],
+                )
+                .await?
+            } else {
+                tx.query_opt(
+                    &sql,
+                    &[&id.collection, &id.doc_id, &chunk_id, &acl.allowed_tags],
+                )
+                .await?
+            };
+            deleted.push(row.is_some());
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    /// 文档内按 chunk_id 升序分页，只返回调用方可见行。
+    pub async fn list_doc_chunks(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        after_chunk_id: Option<u64>,
+        limit: usize,
+        acl: &AclFilter,
+    ) -> Result<Vec<Chunk>> {
+        let q = sql::list_doc_chunks_sql(&self.cfg.table, acl.tenant.is_some());
+        let after = after_chunk_id.map_or(-1, |id| id as i64);
+        let limit = limit as i64;
+        let rows = if let Some(tenant) = &acl.tenant {
+            self.client
+                .lock()
+                .await
+                .query(
+                    &q,
+                    &[
+                        &collection,
+                        &doc_id,
+                        &after,
+                        tenant,
+                        &acl.allowed_tags,
+                        &limit,
+                    ],
+                )
+                .await?
+        } else {
+            self.client
+                .lock()
+                .await
+                .query(
+                    &q,
+                    &[&collection, &doc_id, &after, &acl.allowed_tags, &limit],
+                )
+                .await?
+        };
+        rows.iter().map(row_to_chunk).collect()
+    }
+
+    /// 幂等删除一个 owner scope 内的 collection，返回实际删除的 GID 与受管对象 URI。
+    pub async fn delete_collection(
+        &self,
+        collection: &str,
+        owner_tenant: Option<&str>,
+    ) -> Result<DeletedCollection> {
+        let q = sql::delete_collection_sql(&self.cfg.table, owner_tenant.is_some());
+        let rows = match owner_tenant {
+            Some(tenant) => {
+                self.client
+                    .lock()
+                    .await
+                    .query(&q, &[&collection, &tenant])
+                    .await?
+            }
+            None => self.client.lock().await.query(&q, &[&collection]).await?,
+        };
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut object_uris = HashSet::new();
+        for row in rows {
+            ids.push(GlobalId {
+                collection: row.try_get("collection")?,
+                doc_id: row.try_get("doc_id")?,
+                chunk_id: row.try_get::<_, i64>("chunk_id")? as u64,
+            });
+            if let Some(media_json) = row.try_get::<_, Option<String>>("media")? {
+                let media: MediaRef = serde_json::from_str(&media_json)?;
+                collect_object_uri(&media.asset, &mut object_uris);
+                if let Some(thumbnail) = &media.thumbnail {
+                    collect_object_uri(thumbnail, &mut object_uris);
+                }
+            }
+        }
+        let mut object_uris: Vec<String> = object_uris.into_iter().collect();
+        object_uris.sort();
+        Ok(DeletedCollection { ids, object_uris })
     }
 
     /// 按主键取 inline 媒资字节（媒资网关 `/v1/asset` Inline 路径，MM6-inline 用）。
@@ -335,6 +572,12 @@ impl PgStore {
     }
 }
 
+fn collect_object_uri(asset: &AssetPointer, out: &mut HashSet<String>) {
+    if let AssetPointer::Object { uri } = asset {
+        out.insert(uri.clone());
+    }
+}
+
 /// 校验 SQL 标识符（表名）：`[A-Za-z_][A-Za-z0-9_]*`，长度 ≤63（PG 上限）。
 /// 表名在 `sql.rs` 经 `format!` 拼进 SQL（值用参数化、标识符不能参数化），故在此把关。
 fn validate_identifier(name: &str) -> Result<()> {
@@ -480,6 +723,8 @@ fn row_to_chunk(r: &Row) -> Result<Chunk> {
         chunk_id: r.try_get("chunk_id")?,
         kind: r.try_get("kind")?,
         text: r.try_get("text")?,
+        metadata: r.try_get("metadata")?,
+        searchable: r.try_get("searchable")?,
         page: r.try_get("page")?,
         bbox: r.try_get("bbox")?,
         heading_path: r.try_get("heading_path")?,
@@ -564,6 +809,8 @@ mod tests {
             image_vector_status: None,
             tenant: None,
             acl: vec!["public".into()],
+            metadata: Default::default(),
+            searchable: true,
         }
     }
 
@@ -604,6 +851,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ensure_schema_rejects_existing_vector_dimension_mismatch() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip ensure_schema_rejects_existing_vector_dimension_mismatch: DATABASE_URL not set"
+            );
+            return;
+        };
+        let table = format!("fastsearch_chunks_dim_guard_{}", std::process::id());
+        let mut initial = PgConfig::new(url.clone()).with_vector_dim(4);
+        initial.table = table.clone();
+        let store = PgStore::connect(initial).await.expect("connect");
+        store.ensure_schema().await.expect("initial schema");
+
+        let mut mismatched = PgConfig::new(url).with_vector_dim(3);
+        mismatched.table = table.clone();
+        let store = PgStore::connect(mismatched).await.expect("reconnect");
+        let error = store
+            .ensure_schema()
+            .await
+            .expect_err("dimension mismatch must fail");
+        assert!(
+            error.to_string().contains("halfvec(4)") && error.to_string().contains("halfvec(3)"),
+            "unexpected error: {error}"
+        );
+
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+            .await
+            .expect("cleanup");
+    }
+
     /// 集成测试：仅当 `DATABASE_URL` 设置时运行；否则跳过（不算失败）。
     #[tokio::test]
     async fn integration_roundtrip() {
@@ -641,6 +923,163 @@ mod tests {
         assert_eq!(
             store.fetch_doc("kb", "a.pdf").await.expect("fetch3").len(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_chunk_management_lifecycle() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip integration_chunk_management_lifecycle: DATABASE_URL not set");
+            return;
+        };
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_chunks_it".into();
+        let store = PgStore::connect(cfg).await.expect("connect");
+        store.ensure_schema().await.expect("schema");
+        let collection = format!("management-{}", std::process::id());
+        store
+            .delete_collection(&collection, None)
+            .await
+            .expect("clean");
+
+        let mut first = sample("doc-a", 1);
+        first.tenant = Some("tenant-a".into());
+        first.acl = vec!["team-a".into()];
+        first
+            .metadata
+            .insert("source".into(), serde_json::json!("first"));
+        let mut second = sample("doc-a", 2);
+        second.tenant = Some("tenant-a".into());
+        second.acl = vec!["public".into()];
+        second.searchable = false;
+        let mut private = sample("doc-a", 3);
+        private.tenant = Some("tenant-b".into());
+        private.acl = vec!["team-b".into()];
+
+        assert_eq!(
+            store
+                .upsert_chunks(&[
+                    (collection.clone(), first.clone()),
+                    (collection.clone(), second.clone()),
+                    (collection.clone(), private.clone()),
+                ])
+                .await
+                .unwrap(),
+            3
+        );
+
+        let ids = vec![
+            first.global_id(&collection),
+            GlobalId {
+                collection: collection.clone(),
+                doc_id: "missing".into(),
+                chunk_id: 9,
+            },
+            second.global_id(&collection),
+        ];
+        let got = store.batch_get(&ids).await.unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].as_ref().unwrap().metadata["source"], "first");
+        assert!(got[1].is_none());
+        assert!(!got[2].as_ref().unwrap().searchable);
+
+        let acl = AclFilter {
+            tenant: Some("tenant-a".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        let page = store
+            .list_doc_chunks(&collection, "doc-a", None, 1, &acl)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].chunk_id, 1);
+        let page = store
+            .list_doc_chunks(&collection, "doc-a", Some(1), 10, &acl)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].chunk_id, 2);
+
+        let deleted = store
+            .delete_chunks_visible(
+                &[first.global_id(&collection), private.global_id(&collection)],
+                &acl,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, vec![true, false]);
+
+        let removed = store
+            .delete_collection(&collection, Some("tenant-a"))
+            .await
+            .unwrap();
+        assert_eq!(removed.ids, vec![second.global_id(&collection)]);
+        assert!(removed.object_uris.is_empty());
+        let other = store
+            .batch_get(&[private.global_id(&collection)])
+            .await
+            .unwrap();
+        assert!(other[0].is_some(), "tenant-b row must remain");
+        store
+            .delete_collection(&collection, None)
+            .await
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn integration_schema_upgrade_adds_metadata_and_searchable() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip integration_schema_upgrade_adds_metadata_and_searchable: DATABASE_URL not set");
+            return;
+        };
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_upgrade_it".into();
+        let store = PgStore::connect(cfg).await.expect("connect");
+        let ddl = sql::ddl(
+            &store.cfg.table,
+            store.cfg.vector_type,
+            store.cfg.vector_dim,
+        );
+        let legacy_create = ddl[1]
+            .replace("metadata jsonb NOT NULL DEFAULT '{}'::jsonb,\n", "")
+            .replace("searchable boolean NOT NULL DEFAULT true,\n", "");
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {};\n{}\n{}",
+                store.cfg.table, ddl[0], legacy_create
+            ))
+            .await
+            .expect("legacy schema");
+
+        store.ensure_schema().await.expect("upgrade schema");
+        let columns = store
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = $1 AND column_name IN ('metadata', 'searchable') \
+                 ORDER BY column_name",
+                &[&store.cfg.table],
+            )
+            .await
+            .expect("columns");
+        assert_eq!(columns.len(), 2);
+
+        let mut c = sample("legacy.pdf", 1);
+        c.metadata
+            .insert("source".into(), serde_json::json!("upgrade"));
+        c.searchable = false;
+        store
+            .upsert_doc("kb", "legacy.pdf", &[c.clone()])
+            .await
+            .expect("upsert");
+        assert_eq!(
+            store.fetch_doc("kb", "legacy.pdf").await.expect("fetch"),
+            vec![c]
         );
     }
 

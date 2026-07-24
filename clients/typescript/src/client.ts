@@ -9,6 +9,12 @@
 
 import { FastsearchError } from "./errors.js";
 import type {
+  BatchDeleteChunksResponse,
+  BatchGetChunkResult,
+  BatchUpsertChunk,
+  DeleteCollectionResponse,
+  DocumentChunksPage,
+  GlobalId,
   Hit,
   ResolvedAsset,
   SearchOptions,
@@ -180,6 +186,8 @@ export class FastsearchClient {
     if (opts.collapse !== undefined) body.collapse = opts.collapse;
     if (opts.searchAfter !== undefined) body.search_after = opts.searchAfter;
     if (opts.highlight !== undefined) body.highlight = opts.highlight;
+    if (opts.includeText !== undefined) body.include_text = opts.includeText;
+    if (opts.includeMetadata !== undefined) body.include_metadata = opts.includeMetadata;
     if (opts.facets !== undefined) body.facets = opts.facets;
     if (opts.explain !== undefined) body.explain = opts.explain;
     const out = await this.postJson<SearchResponse>("/v1/search", body, {
@@ -345,6 +353,94 @@ export class FastsearchClient {
       objects_deleted?: number;
       object_errors?: string[];
     };
+  }
+
+  // ---- chunk / collection 管理 -------------------------------------------
+
+  /**
+   * 按稳定 GlobalId 批量读取 chunk。返回顺序与请求一致；
+   * 不存在或当前身份不可见的项都返回 `chunk: null`。
+   */
+  async batchGetChunks(
+    ids: GlobalId[],
+    opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<BatchGetChunkResult[]> {
+    const out = await this.postJson<{ results?: BatchGetChunkResult[] }>(
+      "/v1/chunks/batch-get",
+      { ids },
+      opts,
+    );
+    return out.results ?? [];
+  }
+
+  /**
+   * 事务性批量 upsert chunk 真源。服务端从 API Key 注入 tenant/acl；
+   * 调用方传入的同名字段不会改变身份边界。
+   */
+  async batchUpsertChunks(
+    items: BatchUpsertChunk[],
+    opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<number> {
+    const out = await this.postJson<{ upserted?: number }>(
+      "/v1/chunks/batch-upsert",
+      { items },
+      opts,
+    );
+    return out.upserted ?? 0;
+  }
+
+  /**
+   * 按 GlobalId 批量幂等删除。不可见与不存在均报告 `deleted: false`。
+   */
+  async batchDeleteChunks(
+    ids: GlobalId[],
+    opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<BatchDeleteChunksResponse> {
+    return await this.postJson<BatchDeleteChunksResponse>(
+      "/v1/chunks/batch-delete",
+      { ids },
+      opts,
+    );
+  }
+
+  /** 按 chunk_id 升序分页读取一个文档的可见 chunks。 */
+  async listDocumentChunks(
+    collection: string,
+    docId: string,
+    opts: {
+      after?: number;
+      limit?: number;
+      signal?: AbortSignal;
+      timeoutMs?: number;
+    } = {},
+  ): Promise<DocumentChunksPage> {
+    const query = new URLSearchParams({ collection, doc_id: docId });
+    if (opts.after !== undefined) query.set("after", String(opts.after));
+    if (opts.limit !== undefined) query.set("limit", String(opts.limit));
+    const resp = await this.request(
+      "GET",
+      `/v1/chunks?${query.toString()}`,
+      undefined,
+      opts,
+    );
+    return (await resp.json()) as DocumentChunksPage;
+  }
+
+  /**
+   * 幂等删除当前 API Key 所属 tenant scope 内的 collection，
+   * 包括 PG 真源、派生索引、注册信息和受管对象。
+   */
+  async deleteCollection(
+    name: string,
+    opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<DeleteCollectionResponse> {
+    const resp = await this.request(
+      "DELETE",
+      `/v1/collections/${encodeURIComponent(name)}`,
+      undefined,
+      opts,
+    );
+    return (await resp.json()) as DeleteCollectionResponse;
   }
 
   // ---- 健康/契约 ---------------------------------------------------------

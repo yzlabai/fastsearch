@@ -288,7 +288,7 @@ pub fn parse_message(buf: &[u8]) -> Result<PgMessage> {
 fn expect(r: &mut Reader, want: u8) -> Result<()> {
     let got = r.u8()?;
     if got != want {
-        bail!("pgoutput: expected {:#x}, got {:#x}", want, got);
+        bail!("pgoutput: expected {want:#x}, got {got:#x}");
     }
     Ok(())
 }
@@ -309,7 +309,7 @@ fn read_tuple(r: &mut Reader) -> Result<TupleData> {
                 let len = r.u32()? as usize;
                 TupleValue::Bytes(r.take(len)?.to_vec())
             }
-            other => bail!("pgoutput: unknown tuple column kind {:#x}", other),
+            other => bail!("pgoutput: unknown tuple column kind {other:#x}"),
         };
         values.push(v);
     }

@@ -11,6 +11,8 @@ import {
   formatHitsForLLM,
   hitToDocument,
   makeSearchTool,
+  type BatchUpsertChunk,
+  type GlobalId,
   type Hit,
 } from "../src/index.js";
 
@@ -107,6 +109,8 @@ test("search maps camelCase options to snake_case body", async () => {
     autoMerge: true,
     searchAfter: "cur-1",
     highlight: true,
+    includeText: true,
+    includeMetadata: true,
     filter: f.eq("kind", "table"),
     facets: ["doc_id"],
   });
@@ -120,6 +124,8 @@ test("search maps camelCase options to snake_case body", async () => {
     auto_merge: true,
     search_after: "cur-1",
     highlight: true,
+    include_text: true,
+    include_metadata: true,
     // M23：collection 作用域强制注入，与用户 filter `and` 合并。
     filter: { and: [{ eq: ["collection", "kb"] }, { eq: ["kind", "table"] }] },
     facets: ["doc_id"],
@@ -224,6 +230,79 @@ test("deleteDoc issues DELETE and keeps doc_id slashes", async () => {
   assert.equal(calls[0]!.headers["x-api-key"], "dev");
   assert.equal(out.deleted, true);
   assert.equal(out.pg_deleted, 3);
+});
+
+// ---- chunk / collection 管理 ---------------------------------------------
+
+test("chunk management methods preserve IDs, order, pagination, and delete semantics", async () => {
+  const ids: GlobalId[] = [
+    { collection: "kb/a", doc_id: "doc one", chunk_id: 2 },
+    { collection: "kb/a", doc_id: "missing", chunk_id: 9 },
+  ];
+  const item: BatchUpsertChunk = {
+    collection: "kb/a",
+    chunk: {
+      doc_id: "doc one",
+      chunk_id: 2,
+      kind: "paragraph",
+      text: "hello",
+      page: 1,
+      bbox: { x0: 0, y0: 0, x1: 1, y1: 1 },
+      char_len: 5,
+      metadata: { source: "caller" },
+      searchable: false,
+    },
+  };
+  const { fetch, calls } = stub((rec) => {
+    if (rec.url.endsWith("/v1/chunks/batch-get")) {
+      return { json: { results: [{ id: ids[0], chunk: item.chunk }, { id: ids[1], chunk: null }] } };
+    }
+    if (rec.url.endsWith("/v1/chunks/batch-upsert")) {
+      return { json: { upserted: 1 } };
+    }
+    if (rec.url.endsWith("/v1/chunks/batch-delete")) {
+      return {
+        json: {
+          results: [{ id: ids[0], deleted: true }, { id: ids[1], deleted: false }],
+          objects_deleted: 0,
+          object_errors: [],
+        },
+      };
+    }
+    if (rec.url.includes("/v1/chunks?")) {
+      return { json: { chunks: [item.chunk], next_after: 2 } };
+    }
+    return {
+      json: {
+        deleted_chunks: 1,
+        registered_removed: true,
+        objects_deleted: 0,
+        object_errors: [],
+      },
+    };
+  });
+  const c = new FastsearchClient({ baseUrl: "http://x", apiKey: "dev", fetch });
+
+  const got = await c.batchGetChunks(ids);
+  assert.deepEqual(got.map((result) => result.id), ids);
+  assert.equal(got[1]!.chunk, null);
+  assert.equal(await c.batchUpsertChunks([item]), 1);
+  const deleted = await c.batchDeleteChunks(ids);
+  assert.deepEqual(deleted.results.map((result) => result.deleted), [true, false]);
+  const page = await c.listDocumentChunks("kb/a", "doc one", { after: 1, limit: 20 });
+  assert.equal(page.next_after, 2);
+  const collection = await c.deleteCollection("kb/a");
+  assert.equal(collection.deleted_chunks, 1);
+
+  assert.deepEqual(calls[0]!.body, { ids });
+  assert.deepEqual(calls[1]!.body, { items: [item] });
+  assert.deepEqual(calls[2]!.body, { ids });
+  assert.equal(
+    calls[3]!.url,
+    "http://x/v1/chunks?collection=kb%2Fa&doc_id=doc+one&after=1&limit=20",
+  );
+  assert.equal(calls[4]!.method, "DELETE");
+  assert.equal(calls[4]!.url, "http://x/v1/collections/kb%2Fa");
 });
 
 // ---- paginate / 资产 ------------------------------------------------------
