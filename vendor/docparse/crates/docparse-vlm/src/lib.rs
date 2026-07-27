@@ -141,6 +141,20 @@ impl VlmClient {
             .map_err(|e| anyhow::anyhow!("vlm request failed: {e}"))?
             .into_json()
             .context("vlm response is not JSON")?;
+        // An answer cut off at the cap comes back as finish_reason "length".
+        // Reject it rather than parse it: a model that did not stop on its own
+        // gives no way to tell a finished answer from the opening of a
+        // fabrication. Observed on a real run — a blank crop produced
+        // `<td>1</td><td>2</td>…` counting to the cap, and the repetition guard
+        // downstream cannot catch it because an incrementing sequence never
+        // repeats literally. Failing here lands the caller on its deterministic
+        // result, which is the outcome we want when the model is confabulating.
+        if resp["choices"][0]["finish_reason"] == "length" {
+            anyhow::bail!(
+                "vlm answer hit the {max_tokens}-token cap without finishing \
+                 (finish_reason=length); keeping the deterministic result"
+            );
+        }
         let text = resp["choices"][0]["message"]["content"]
             .as_str()
             .context("vlm response missing choices[0].message.content")?

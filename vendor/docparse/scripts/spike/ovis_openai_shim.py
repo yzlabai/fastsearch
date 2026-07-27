@@ -110,11 +110,17 @@ class Handler(BaseHTTPRequestHandler):
                                   int(req.get("max_tokens") or 1024),
                                   float(req.get("temperature") or 0.0))
             dt = time.time() - t
-            print(f"  {ntok:4d} tok in {dt:5.1f}s ({ntok / max(dt, 1e-6):.1f} tok/s)", flush=True)
+            cap = int(req.get("max_tokens") or 1024)
+            # Report truncation the way OpenAI does — the Rust client keys off
+            # this to reject answers the model never finished. Getting it wrong
+            # here would make the shim look healthier than a real service.
+            reason = "length" if ntok >= cap else "stop"
+            print(f"  {ntok:4d} tok in {dt:5.1f}s ({ntok / max(dt, 1e-6):.1f} tok/s) "
+                  f"finish={reason}", flush=True)
             self._send(200, {
                 "object": "chat.completion",
                 "model": req.get("model", STATE["name"]),
-                "choices": [{"index": 0, "finish_reason": "stop",
+                "choices": [{"index": 0, "finish_reason": reason,
                              "message": {"role": "assistant", "content": text}}],
                 "usage": {"completion_tokens": ntok},
             })

@@ -217,6 +217,60 @@ mod tests {
         assert!(out.iter().all(|r| r.is_err()), "failures stay per-item");
     }
 
+    /// A truncated answer must fail, not be parsed. The model does run to the
+    /// cap in practice (observed: a blank crop generated `<td>1</td><td>2</td>…`
+    /// counting upward until it ran out of budget), and the repetition guard
+    /// downstream cannot catch that shape — an incrementing sequence never
+    /// repeats literally. `finish_reason` is the signal that does catch it.
+    #[test]
+    fn answer_cut_off_at_the_cap_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 1 << 20];
+            let mut total = 0usize;
+            loop {
+                let n = s.read(&mut buf[total..]).unwrap();
+                total += n;
+                let t = String::from_utf8_lossy(&buf[..total]).into_owned();
+                if let Some(e) = t.find("\r\n\r\n") {
+                    let cl: usize = t
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                        .and_then(|l| l.split(':').nth(1))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if total >= e + 4 + cl {
+                        break;
+                    }
+                }
+            }
+            // Well-formed table *prefix* + truncation flag: the point is that a
+            // parseable prefix must not rescue an unfinished answer.
+            let body = r#"{"choices":[{"finish_reason":"length","message":{"content":
+                "<table><tr><td>1</td><td>2</td></tr><tr><td>3</td><td>4</td></tr></table><tr><td>5"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes());
+        });
+
+        let buf = vec![7u8; 64 * 64 * 3];
+        let out =
+            reader(format!("http://127.0.0.1:{port}")).read(RegionImage::new(&buf, 64, 64), 2000);
+        let err = out
+            .expect_err("a cut-off answer must not be accepted")
+            .to_string();
+        assert!(
+            err.contains("cap") && err.contains("2000"),
+            "error should name the cap it hit, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
     #[test]
     fn source_tag_names_the_model() {
         let r = reader("http://127.0.0.1:1".into());
