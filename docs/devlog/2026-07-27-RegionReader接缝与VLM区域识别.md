@@ -118,4 +118,69 @@ trait 放 `core` 而非 `ocr`：否则轻量的 `docparse-vlm` 要反依赖重 t
 **门 0 不过则 v1 形态不成立**，第 3 步起的代码作废、要转向「整页模式 + schema 锁步」。但第 1–2 步
 （接缝 + `VlmClient` 参数修正）两条路都要，不白做。
 
-运行验证的具体做法见 [spec §7](../plans/2026-07-27-OvisOCR2接入需求分析与功能设计.md)。
+运行验证的具体做法见 [spec §7.5 运行手册](../plans/2026-07-27-OvisOCR2接入需求分析与功能设计.md)。
+
+---
+
+## 第二阶段（同日晚）：并到 upstream、研究怎么真跑、把 e2e 变成可复现的
+
+### 并到 upstream，顺带改变了 v2 的结论
+
+push 被拒——远端多了 PR #3（外部贡献者，通用 chunk 管理协议）且**动了同一个 `ingest.rs`**。先看清对方
+改了什么（只在 `from_docparse_chunk` 加两个新字段，与我不同 hunk）再 rebase，干净通过，重跑全套
+（341 绿）才 push。
+
+**意外收获**：PR #3 给 `core::Chunk` 加了 `metadata`（调用方透传，不进索引）与 `searchable`。这直接
+推翻了我判「整页模式」死刑的理由之一——原话是"fastsearch `Chunk.bbox` 非 `Option` → 无法诚实表达
+'这条没有页内坐标'"，而 `metadata` 就是 `source`/`coord_level` 的现成落点。阻塞从**两侧 schema 锁步**
+收敛为**单侧一件事**：让 docparse 的 `Chunk` 把 `source` 活过 `chunk_document`。已回写 spec §8。
+
+教训：判一条路"死"的时候，那个理由的**保质期**取决于别人也在动的代码。
+
+### 研究怎么真跑四道门（spec §7.5）
+
+spec §4 写的 `vllm serve`（CUDA）**在本机不可用**：M5 Max / 128 GB / 无 N 卡。列了四条替代路径
+（[vllm-mlx](https://github.com/waybarrios/vllm-mlx) 显式支持多模态，首选但 Qwen3.5 新架构有风险；
+vllm-metal 覆盖更窄；vLLM CPU 源码构建慢但够用；远程 GPU）。
+
+**真正有用的是一个分解**：四道门的硬件要求根本不同。门 0/1/2 问的是"模型输出什么 / 我方怎么装配 /
+准不准"，任何能出结果的端点都行；只有**门 3（速度）必须在部署目标上跑**——Mac CPU 档的数字没有意义。
+所以不必等 GPU 才能开始，而最该先跑、决定 v1 立论是否成立的门 0，恰好完全不依赖 GPU。
+
+门 2 也不用从零写：`scripts/eval/omnidocbench/` 已有 `e2e_table_eval.py`（TEDS_X）与
+`compare_layout_backends.sh`——一个"同页、同打分器、唯一变量=后端"的 A/B 骨架，正是门 2 要的形状。
+缺的只是把变量换成 `--table-model` ↔ `--table-vlm` 的兄弟脚本。这样"相对当次重测基线取增量"的口径
+由**脚本结构**保证，不靠人记得住。
+
+### 补上四处（本轮 review 的产出）
+
+**1. mock e2e 此前不可复现** —— 这是最该修的。整个特性最强的证据（CLI→服务→IR、rowspan 还原、请求
+形状）只存在于我这次会话的 scratchpad 里，跑完即失。单测覆盖了各个零件，唯独**接线**没有任何东西守着。
+现补 `vendor/docparse/scripts/vlm_stub_e2e.py`：stdlib-only、无 GPU/模型/网络，自建 stub 端点 + 合成
+ruled-table PDF，5 秒跑完 15 条断言（含"服务挂了要降级且不冒领 `source` 标注"）。
+
+写它的过程本身又抓到一个认知错误：第一版用 `srv.shutdown()` 模拟"服务不可用"，结果**挂了 120 秒**——
+`shutdown()` 只停 serve 循环，监听 socket 还开着，连接被接受后黑洞掉，一直等到客户端 120s 超时。
+要 `server_close()` 才是端口拒绝。由此发现一条该记的已知限制：**"端口拒绝"是立即降级，"黑洞式挂起"
+是每个区域各等满 120s**，两者代价差一个数量级。已写进 17-cli.md 已知限制。
+
+**2–3. 又漏了两处 spec 回写**，且是**上一轮同型错误的重演**：上轮漏的是 docparse 的
+capabilities/status，这轮漏的是 fastsearch 的 **`docs/specs/17-cli.md`**（模块权威 spec，AI_AGENT_DEV_SPEC
+§0 第 5 步点名要回写）和 **`vlm-service-driven-capabilities.md`**（我自己 spec §9 第 7 步列着的）。
+17-cli.md 里那句"VLM 自然图语义描述 = `parse-vlm` 下一迭代"甚至**已经变成假话**——`parse-vlm` 存在了，
+且含义不是自然图描述。
+
+**模式**：我倾向于更新"正在看的叙述性文档"（README 类、摄取指南、CLAUDE.md），而漏掉"按模块/按主题的
+权威文档"（specs/、refer/）。前者是我写代码时会打开的，后者不是。两轮各栽一次，说明这不是偶然。
+
+**4. 无遗留 TODO/FIXME**（`git diff 74621cf..HEAD` 全量扫过），代码面干净。
+
+### 仍然开着的
+
+| 项 | 状态 |
+|---|---|
+| 四道门 | **一道没跑**，需 vLLM 端点；门 0 最优先且不需 GPU |
+| `compare_table_backends.sh`（门 2 的 A/B） | 已在 §7.5 定形，未写 |
+| 2e 图内嵌表 recall / 2c 图表→表格 / 2b 页型判官 | 未做，管线可复用 |
+| `--transcribe-vlm` 上服务面 | CLI-only（与 `--transcribe-model` 一致，非破例） |
+| 整页模式 v2 | 阻塞已缩小为 docparse 单侧加 `source` 字段 |

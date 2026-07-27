@@ -28,7 +28,7 @@ fastsearch eval      --golden <g.json> [--baseline <b.json>] [--tol] [--k] [--mo
 ```
 - **`search`**：默认 `--mode hybrid`——server 有嵌入器则混合，否则自动退化关键词（不报错）。`--collection` 经 `filter: Eq("collection",…)` 限定作用域（collection 两端可过滤）。
 - **`index-dir <DIR>`**：递归遍历 `.md/.txt/.markdown/.text`，每文件 `chunk_text` 切块（markdown 标题→`Heading` + `heading_path`、空行分段）→ POST `/v1/index`（`doc_id`=相对路径）。**有界并发**（`--concurrency`，默认 4，`std::thread::scope` + 原子游标/聚合，抵消单文件 POST 往返延迟）+ **进度输出 + 逐文件 continue-on-error**（有失败则退出码 1；计数确定、进度行可能交错）。"喂文件夹→检索"经 server → 反得**混合检索**。
-- **`ingest`**：客户端 docparse 解析（`parse` feature，9 格式+图片；`parse-ocr`/`parse-tables` env 指模型目录）→ 适配 chunks → POST `/v1/index`。
+- **`ingest`**：客户端 docparse 解析（`parse` feature，9 格式+图片；`parse-ocr`/`parse-tables` env 指模型目录；`parse-vlm` env 指 VLM 服务）→ 适配 chunks → POST `/v1/index`。
 - INPUT 为 docparse chunks 文件或 `-`/省略读 stdin；JSON 数组 或 NDJSON。
 
 ## 3. 公开接口（lib 部分，便于测试）
@@ -75,10 +75,14 @@ pub fn cmd_eval(opts) -> Result<(Metrics, Option<Result<(),String>>)>;
 - [x] **重构为纯 REST 客户端（2026-06-28）**：删嵌入式引擎（engine/text 依赖移除，`cargo tree` 校验）；search/similar/index/index-dir/ingest/eval 全走 server REST；`--server`/`--key`(+env)；`ureq` HTTP。**喂文件夹保留**——改为客户端分块→POST，经 server 得混合检索。+7 客户端单测（纯函数 + mock HTTP：search/index/index-dir/错误上浮）；**真二进制端到端验证**：起 server（dev key）→ `index-dir`(2 文件 5 chunk) → `search "毛利率"` 命中、`--json` 全字段、stdin `index` + `search "alpha"` 命中。收口三绿。
 - [x] **多格式摄取（`--features parse`）**：客户端 docparse 注册表分发 PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML + 图片 → 适配 → POST `/v1/index`。解析在客户端（守搜索热路径零 docparse + CI 门禁）。`multiformat_dispatch` 测试。
 - [x] **OCR / 表格识别（`--features parse-ocr` / `parse-tables`）**：客户端解析期增强（env 指 ONNX 模型目录），抽出的文本/结构随 chunks 上传。真模型 env-gated 验证（见历史 devlog）。
+- [x] **VLM 区域识别（`--features parse-vlm`，2026-07-27，代码落地／质量门待跑）**：表格区域经外部 OpenAI 兼容服务（vLLM/SGLang）重识别为 HTML 表；另设 `FASTSEARCH_LAYOUT_MODEL` 时加整页**区域级**转写。上游是 docparse 的 `RegionReader` 接缝——UniRec（进程内 ONNX）与 VLM（HTTP）互为可换后端。**坐标不丢**：几何仍来自版面/表格检测，模型只负责"读"，`resolve_citation` 页内高亮照旧成立（整页端到端模式会丢正文坐标，故不走）。env：`FASTSEARCH_VLM_URL`/`_MODEL`（必需）、`_KEY`、`FASTSEARCH_LAYOUT_MODEL`（设了才开转写）、`FASTSEARCH_VLM_MAX_PAGES`（默认 50）。顺序上 VLM 在 UniRec 之前，UniRec 跳过 `table:vlm:` 开头的表 → 两者可同配（VLM 优先 + UniRec 兜底）。+1 单测（未配 env 即恒等）；docparse 侧 `scripts/vlm_stub_e2e.py` 无 GPU 复现整条接线。见 [接入 spec](../plans/2026-07-27-OvisOCR2接入需求分析与功能设计.md)、[devlog](../devlog/2026-07-27-RegionReader接缝与VLM区域识别.md)。
 
 **已知限制 / 下一迭代：**
 - CLI **不再离线**：所有命令需可达 server（用户决策；喂文件夹改为联网上传，反得混合检索）。
 - 连接配置仅 `--server`/`--key`+env；**多 server profile**（Algolia 式）下一迭代。
 - `index-dir` 已有**有界并发**（`--concurrency`）；进度 ETA / 多文件合并为单批 NDJSON（Meilisearch-importer 式）下一迭代。
-- OCR/UniRec 模型需运行时下载；UniRec 自回归 CPU 慢。VLM 自然图语义描述 = `parse-vlm` 下一迭代。
+- OCR/UniRec 模型需运行时下载；UniRec 自回归 CPU 慢。
+- `parse-vlm` **真实模型四道门（形态/坐标/质量/速度）一道没跑**（需 vLLM+GPU，本机无 N 卡）；mock 全绿不代表质量。运行手册见接入 spec §7.5。
+- `parse-vlm` 单次 VLM 调用超时 120s（`docparse-vlm` 常量）：服务**黑洞式挂起**（连得上但不回）时，每个区域都要等满这 120s。端口拒绝的场景是立即降级的，两者代价差很远。
+- **VLM 自然图语义描述**（`--vlm-describe` 那条 caption 路）摄取侧仍未透传 = 下一迭代。
 - `eval` 会写入目标 server 的 golden 集合——指向专用/临时集合或测试 server。

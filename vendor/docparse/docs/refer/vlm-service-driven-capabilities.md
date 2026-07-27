@@ -17,6 +17,22 @@
 
 **接入点已统一**:`docparse-vlm::VlmClient` —— `POST {url}/v1/chat/completions` + base64 PNG data-URL,一个协议通吃 vLLM、LM Studio 与 OpenAI 系云端等;CLI 面 `--vlm-url --vlm-model [--vlm-api-key]`;协议被 mock 单测锁定,服务失败一律优雅降级回确定性结果。**新增 VLM 任务 ≈ 一个 prompt 模板 + 一个结果归一函数**,不再有协议/渲染/裁剪工作。
 
+> **状态更新(2026-07-27)**:新增 `RegionReader` 接缝(`docparse-core::region_reader`)后,VLM 成为与内嵌
+> UniRec **可互换的识别后端**,§2 的三处缺口接线已落地、只差真实模型验收:
+>
+> | 缺口 | 原路线 | 现状 |
+> |---|---|---|
+> | 2a 整页转写 | Qwen2.5-VL 7B 起步 / 32B 才到生产线 | `--transcribe-vlm` 已接;档位被 **OvisOCR2(0.8B)** 拉低到可部署 —— 但走的是**区域级**(版面模型给几何),不是整页端到端,因为后者丢正文坐标 |
+> | 2d 公式→LaTeX | VLM 服务 | 随区域转写一并覆盖(prompt 要求保 LaTeX) |
+> | 2e 图内嵌表 recall | VLM 服务 | **仍未覆盖**:`--table-vlm` 作用域同 `--vlm-tables`,只在"已检出的表";漏检要 figure 区域也送 VLM,与 2c 共管线,未做 |
+> | 2b 页型判官 | 3–7B 视觉模型 | 未做(OvisOCR2 不是分类器) |
+> | 2c 图表→表格 | VLM 服务 | 未做(管线可复用,差一个 prompt + 归一函数) |
+> | 2f MCP/REST 透传 | — | `--table-vlm` **已上四张脸**(EnhanceOpts/MCP/REST,约束由 `EnhanceOpts::validate` 跨面统一);`--transcribe-vlm` 仍 CLI-only(同 `--transcribe-model`) |
+>
+> **诚实记账**:以上均为**接线**落地,mock 端到端可复现(`scripts/vlm_stub_e2e.py`,无需 GPU);
+> **真实模型的形态/坐标/质量/速度四道门一道没跑**。动机、门控与运行手册见 fastsearch 侧
+> `docs/plans/2026-07-27-OvisOCR2接入需求分析与功能设计.md`。
+
 ## 1. 已实现,只差真实服务验收(按需接任意 OpenAI 兼容服务回填)
 
 | 能力 | 旗标 | 现状 | 验收动作 |
