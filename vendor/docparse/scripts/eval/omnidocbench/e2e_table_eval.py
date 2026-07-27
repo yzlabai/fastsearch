@@ -85,7 +85,18 @@ def main():
         gt = html_to_cells(gt_html)
         if not pdf or not gt:
             continue
-        cmd = [BIN, pdf, "--ocr", "--layout", "--table-model", MODEL, "-f", "json"]
+        cmd = [BIN, pdf, "--ocr", "--layout", "-f", "json"]
+        # Table-backend A/B: OMNIDOC_TABLE_BACKEND selects the embedded UniRec
+        # (default) vs a served VLM. Same pages, same scorer, one variable —
+        # which is what makes the delta attributable to the backend.
+        if os.environ.get("OMNIDOC_TABLE_BACKEND") == "vlm":
+            cmd += ["--table-vlm",
+                    "--vlm-url", os.environ["OMNIDOC_VLM_URL"],
+                    "--vlm-model", os.environ["OMNIDOC_VLM_MODEL"]]
+            if os.environ.get("OMNIDOC_VLM_KEY"):
+                cmd += ["--vlm-api-key", os.environ["OMNIDOC_VLM_KEY"]]
+        else:
+            cmd += ["--table-model", MODEL]
         # Layout-backend A/B: OMNIDOC_LAYOUT_MODEL selects YOLO vs PP-DocLayoutV2.
         lm = os.environ.get("OMNIDOC_LAYOUT_MODEL")
         if lm:
