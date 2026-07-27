@@ -15,6 +15,8 @@
 //! RAG chunk — figure and description stay one unit instead of a free-floating
 //! text block.
 
+pub mod region;
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use docparse_core::ir::{BBox, Cell, Document, Element};
@@ -25,9 +27,15 @@ const MIN_FIGURE_COVERAGE: f32 = 0.01;
 const RENDER_SCALE: f32 = 2.0;
 /// Network timeout per VLM call.
 const TIMEOUT_SECS: u64 = 120;
-/// Crops are downscaled to this max side before encoding: VLMs don't need
-/// more, and an unscaled full-page figure would base64 to ~8MB.
-const MAX_IMAGE_SIDE: usize = 1024;
+/// Crops are downscaled to this max side before encoding: captioning doesn't
+/// need more, and an unscaled full-page figure would base64 to ~8MB.
+/// Recognition tasks raise it (see [`VlmConfig::with_max_image_side`]).
+const DEFAULT_MAX_IMAGE_SIDE: usize = 1024;
+
+/// Generation cap for a one-or-two-sentence figure caption.
+const DESCRIBE_MAX_TOKENS: usize = 256;
+/// Generation cap for a table answer — a large table runs ~1000 tokens.
+const TABLE_MAX_TOKENS: usize = 2000;
 
 const DESCRIBE_PROMPT: &str = "Describe this figure from a document in one or two sentences. \
      If it is a chart or diagram, state what it shows, including axes and key values. \
@@ -40,6 +48,27 @@ pub struct VlmConfig {
     /// Model name as the service knows it, as the service knows it.
     pub model: String,
     pub api_key: Option<String>,
+    /// Longest image side sent to the service. Captioning is fine at the
+    /// default; a recognition model with a dynamic resolution budget is not —
+    /// downscaling to 1024 would impose exactly the fixed-resolution ceiling
+    /// such a model is chosen to escape.
+    pub max_image_side: usize,
+}
+
+impl VlmConfig {
+    pub fn new(url: String, model: String, api_key: Option<String>) -> Self {
+        Self {
+            url,
+            model,
+            api_key,
+            max_image_side: DEFAULT_MAX_IMAGE_SIDE,
+        }
+    }
+
+    pub fn with_max_image_side(mut self, px: usize) -> Self {
+        self.max_image_side = px;
+        self
+    }
 }
 
 pub struct VlmClient {
@@ -60,8 +89,21 @@ impl VlmClient {
     }
 
     /// One image + prompt → model text. RGB input is PNG-encoded in process.
-    pub fn ask_about_image(&self, rgb: &[u8], w: u32, h: u32, prompt: &str) -> Result<String> {
-        let (w, h, rgb) = downscale_max(rgb, w as usize, h as usize, MAX_IMAGE_SIDE);
+    ///
+    /// `max_tokens` is sent, not merely advisory: document models degenerate
+    /// into repetition loops on hard input, and without a cap the service
+    /// happily generates to its own default before anyone can reject the
+    /// answer. `temperature` is pinned to 0 — sampling buys nothing on a
+    /// recognition task and raises the odds of exactly that failure.
+    pub fn ask_about_image(
+        &self,
+        rgb: &[u8],
+        w: u32,
+        h: u32,
+        prompt: &str,
+        max_tokens: usize,
+    ) -> Result<String> {
+        let (w, h, rgb) = downscale_max(rgb, w as usize, h as usize, self.cfg.max_image_side);
         let (w, h) = (w as u32, h as u32);
         let png = encode_png_rgb(&rgb, w, h);
         let data_url = format!(
@@ -70,6 +112,8 @@ impl VlmClient {
         );
         let body = serde_json::json!({
             "model": self.cfg.model,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -150,7 +194,13 @@ pub fn annotate_pictures(
             else {
                 continue;
             };
-            match client.ask_about_image(&crop, cw as u32, ch as u32, DESCRIBE_PROMPT) {
+            match client.ask_about_image(
+                &crop,
+                cw as u32,
+                ch as u32,
+                DESCRIBE_PROMPT,
+                DESCRIBE_MAX_TOKENS,
+            ) {
                 Ok(text) => {
                     if let Element::Image(im) = &mut page.elements[i] {
                         im.caption = Some(text);
@@ -204,7 +254,13 @@ pub fn refine_tables(doc: &mut Document, pdf_bytes: Vec<u8>, client: &VlmClient)
             ) else {
                 continue;
             };
-            match client.ask_about_image(&crop, cw as u32, ch as u32, TABLE_PROMPT) {
+            match client.ask_about_image(
+                &crop,
+                cw as u32,
+                ch as u32,
+                TABLE_PROMPT,
+                TABLE_MAX_TOKENS,
+            ) {
                 Ok(text) => {
                     let Some(grid) = parse_tsv_grid(&text) else {
                         eprintln!(
@@ -568,6 +624,11 @@ mod tests {
             let body_start = text.find("\r\n\r\n").unwrap() + 4;
             let body: serde_json::Value = serde_json::from_str(&text[body_start..]).unwrap();
             assert_eq!(body["model"], "test-vlm");
+            // Generation must be capped and sampling off — an uncapped
+            // recognition call can burn the service's default budget on a
+            // repetition loop before anyone gets to reject the answer.
+            assert_eq!(body["max_tokens"], 256, "max_tokens must reach the service");
+            assert_eq!(body["temperature"], 0.0, "recognition never samples");
             assert!(body["messages"][0]["content"][1]["image_url"]["url"]
                 .as_str()
                 .unwrap()
@@ -582,13 +643,15 @@ mod tests {
             s.write_all(resp.as_bytes()).unwrap();
         });
 
-        let client = VlmClient::new(VlmConfig {
-            url: format!("http://127.0.0.1:{port}"),
-            model: "test-vlm".into(),
-            api_key: Some("k123".into()),
-        });
+        let client = VlmClient::new(VlmConfig::new(
+            format!("http://127.0.0.1:{port}"),
+            "test-vlm".into(),
+            Some("k123".into()),
+        ));
         let rgb = vec![128u8; 32 * 32 * 3];
-        let out = client.ask_about_image(&rgb, 32, 32, "describe").unwrap();
+        let out = client
+            .ask_about_image(&rgb, 32, 32, "describe", 256)
+            .unwrap();
         assert_eq!(out, "A bar chart.");
         handle.join().unwrap();
     }

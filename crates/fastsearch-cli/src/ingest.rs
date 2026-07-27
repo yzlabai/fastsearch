@@ -24,8 +24,9 @@ pub struct IngestOpts {
 }
 
 /// docparse 多格式解析器注册表（轻量、无 ONNX）：按 `DocumentParser::supports`（扩展名/magic）
-/// 派发。重增强器经 feature + 模型目录接入：OCR=`parse-ocr`（已落地）、表格=`parse-tables`（已落地）；
-/// 自然图 VLM 描述=`parse-vlm`（下一迭代，需服务）。
+/// 派发。重增强器经 feature + env 接入：OCR=`parse-ocr`、表格=`parse-tables`（均进程内 ONNX，
+/// 指模型目录）；VLM 区域识别=`parse-vlm`（外部 OpenAI 兼容服务，指 URL+模型名，见 [`apply_vlm`]）。
+/// 自然图 VLM 描述（`--vlm-describe` 那条 caption 路）仍未接入，属下一迭代。
 fn parsers() -> Vec<Box<dyn docparse_core::parser::DocumentParser>> {
     vec![
         Box::new(docparse_pdf::PdfParser::default()),
@@ -103,6 +104,107 @@ fn apply_tables(
     Ok(doc)
 }
 
+/// 每文档最多送给 VLM 的页数（`FASTSEARCH_VLM_MAX_PAGES` 可覆盖）。一份 100 页 PDF
+/// 每页 ~15 个区域就是 1500 次调用——无闸的话一次 `ingest` 会跑成小时级。
+#[cfg(feature = "parse-vlm")]
+const VLM_DEFAULT_MAX_PAGES: usize = 50;
+
+/// VLM 区域识别（`parse-vlm` feature，**需外部 OpenAI 兼容服务**，如 vLLM 起 OvisOCR2）。
+/// 仅当 `FASTSEARCH_VLM_URL` + `FASTSEARCH_VLM_MODEL` 都设时启用；否则原样返回。
+///
+/// **能力按配置浮现**（同 `apply_ocr`/`apply_tables` 的 env 门控风格）：
+/// - 恒定：表格区域经 VLM 重识别为 HTML 表（保留 rowspan/colspan 拓扑）；
+/// - 额外：`FASTSEARCH_LAYOUT_MODEL` 指向版面 ONNX 时，再做整页**区域级**转写。
+///
+/// **坐标不丢**：区域几何来自版面/表格检测，VLM 只负责"读"——`resolve_citation`
+/// 的页内高亮因此仍然成立（整页端到端模式会丢正文坐标，故不走那条路）。
+///
+/// 仅 PDF（需源字节栅格化，同 `apply_tables`）；图片扫描件照旧走 `apply_ocr`（PP-OCR）。
+/// 任何服务失败 → 保留确定性结果，解析不失败。
+#[cfg(feature = "parse-vlm")]
+fn apply_vlm(
+    mut doc: docparse_core::ir::Document,
+    file: &std::path::Path,
+) -> Result<docparse_core::ir::Document> {
+    use docparse_core::region_reader::RegionReader as _; // source_tag()
+    use docparse_vlm::region::VlmRegionReader;
+
+    let (Some(url), Some(model)) = (
+        std::env::var_os("FASTSEARCH_VLM_URL"),
+        std::env::var_os("FASTSEARCH_VLM_MODEL"),
+    ) else {
+        return Ok(doc);
+    };
+    let is_pdf = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if !is_pdf {
+        return Ok(doc); // 非 PDF：无源字节可栅格化；图片走 apply_ocr
+    }
+    let cfg = docparse_vlm::VlmConfig::new(
+        url.to_string_lossy().into_owned(),
+        model.to_string_lossy().into_owned(),
+        std::env::var("FASTSEARCH_VLM_KEY").ok(),
+    );
+    let bytes = std::fs::read(file).with_context(|| format!("read pdf {}", file.display()))?;
+
+    // 页数闸：超出的页保留确定性结果，并**明确告知**跳过了多少（不静默截断）。
+    // 写坏了的 env 也要吭声——静默按默认值跑会让人以为闸生效了。
+    let max_pages = match std::env::var("FASTSEARCH_VLM_MAX_PAGES") {
+        Err(_) => VLM_DEFAULT_MAX_PAGES,
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "VLM: FASTSEARCH_VLM_MAX_PAGES={v:?} 不是合法页数，按默认 {VLM_DEFAULT_MAX_PAGES} 处理"
+            );
+            VLM_DEFAULT_MAX_PAGES
+        }),
+    };
+    let tail = doc.pages.split_off(max_pages.min(doc.pages.len()));
+    if !tail.is_empty() {
+        eprintln!(
+            "VLM: 仅处理前 {max_pages} 页，跳过 {} 页（FASTSEARCH_VLM_MAX_PAGES 可调）",
+            tail.len()
+        );
+    }
+
+    let table_reader = VlmRegionReader::for_table(cfg.clone()).context("build VLM table reader")?;
+    match docparse_ocr::table_model::refine_tables(&mut doc, bytes.clone(), &table_reader) {
+        Ok(n) => eprintln!(
+            "VLM: 重识别 {n} 个表格结构（{}）",
+            table_reader.source_tag()
+        ),
+        Err(e) => eprintln!("VLM: 表格重识别整体失败，保留确定性结果: {e:#}"),
+    }
+
+    // 转写要区域几何，故以版面模型的存在为开关。
+    if let Some(layout_path) = std::env::var_os("FASTSEARCH_LAYOUT_MODEL") {
+        let layout = docparse_ocr::layout::LayoutModel::new(std::path::Path::new(&layout_path))
+            .with_context(|| {
+                format!(
+                    "load layout model from {}",
+                    std::path::Path::new(&layout_path).display()
+                )
+            })?;
+        let text_reader = VlmRegionReader::for_text(cfg).context("build VLM text reader")?;
+        match docparse_ocr::transcribe::transcribe_pages(&mut doc, bytes, &layout, &text_reader) {
+            Ok(n) => eprintln!("VLM: 区域级转写 {n} 页（{}）", text_reader.source_tag()),
+            Err(e) => eprintln!("VLM: 转写整体失败，保留确定性结果: {e:#}"),
+        }
+    }
+
+    doc.pages.extend(tail);
+    Ok(doc)
+}
+
+#[cfg(not(feature = "parse-vlm"))]
+fn apply_vlm(
+    doc: docparse_core::ir::Document,
+    _file: &std::path::Path,
+) -> Result<docparse_core::ir::Document> {
+    Ok(doc)
+}
+
 /// **客户端解析 → 适配 → POST /v1/index**（doc 级替换由 server 保证）：按扩展名选 docparse
 /// 解析器 → 解析+分块 → `from_docparse_chunk` 适配 → 上传 server。返回 indexed 条数。
 /// 解析在客户端（守"搜索热路径零 docparse"+ CI 门禁）；检索/嵌入/落盘归 server。
@@ -120,8 +222,15 @@ pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
     let doc = parser
         .parse(&opts.file)
         .with_context(|| format!("docparse {} parse {}", parser.name(), opts.file.display()))?;
-    let doc = apply_ocr(doc)?; // parse-ocr feature + 模型目录时跑 OCR；否则原样
-    let doc = apply_tables(doc, &opts.file)?; // parse-tables feature + 模型目录时 UniRec 表格识别
+    // 增强器串联，每一段都由 feature + env 双重门控，未配则恒等。
+    //
+    // 顺序上 VLM 在 UniRec **之前**：两者作用于同一批 `Element::Table`，都配上时
+    // VLM 优先（显式配了服务就是想用它），UniRec 再兜底 VLM 失败/拒收的表——
+    // `refine_tables` 跳过 source 已是 `table:vlm:` 的表，故不会连跑两次推理、
+    // 也不会互相盲目覆盖。
+    let doc = apply_ocr(doc)?; // parse-ocr：扫描页 PP-OCR 抽文本
+    let doc = apply_vlm(doc, &opts.file)?; // parse-vlm：VLM 区域识别（需服务）
+    let doc = apply_tables(doc, &opts.file)?; // parse-tables：UniRec 表格结构
     let dchunks = docparse_core::chunk::chunk_document(&doc);
     let chunks: Vec<Chunk> = dchunks
         .iter()
@@ -222,6 +331,41 @@ pub fn from_docparse_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T6 — 未配服务时 `apply_vlm` 必须是**恒等变换**：不建 client、不发请求、
+    /// 不改文档。这是"重依赖 opt-in"的可执行断言——没配 env 的用户（含 CI）
+    /// 走的路径必须与没编译这个 feature 时完全一致。
+    ///
+    /// 无 `parse-vlm` feature 时同样跑：那条 `#[cfg(not(...))]` 分支也要守恒等。
+    #[test]
+    fn apply_vlm_is_identity_without_service_env() {
+        // 本测试只在 env 未设时有意义；设了就跳过（不去动进程全局 env，
+        // 那会与并行跑的其他测试打架）。
+        if std::env::var_os("FASTSEARCH_VLM_URL").is_some() {
+            eprintln!("skip apply_vlm_is_identity_without_service_env: FASTSEARCH_VLM_URL set");
+            return;
+        }
+        let doc = docparse_core::ir::Document {
+            source: "r.pdf".into(),
+            provenance: None,
+            pages: vec![docparse_core::ir::Page {
+                number: 1,
+                width: 612.0,
+                height: 792.0,
+                elements: Vec::new(),
+            }],
+        };
+        // 存在的 .pdf 路径：若真去读文件/发请求，这里会露馅（文件是空的，
+        // 栅格化必失败）——恒等分支必须在此之前就返回。
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = dir.path().join("r.pdf");
+        std::fs::write(&pdf, b"").unwrap();
+
+        let out =
+            apply_vlm(doc.clone(), &pdf).expect("no service configured → no-op, not an error");
+        assert_eq!(out.pages.len(), doc.pages.len());
+        assert_eq!(out.source, doc.source);
+    }
 
     fn dc_chunk(
         id: usize,

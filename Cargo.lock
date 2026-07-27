@@ -1045,6 +1045,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "docparse-vlm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "docparse-core",
+ "docparse-raster",
+ "rayon",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "docparse-xlsx"
 version = "0.1.0"
 dependencies = [
@@ -1245,6 +1258,7 @@ dependencies = [
  "docparse-pptx",
  "docparse-raster",
  "docparse-srt",
+ "docparse-vlm",
  "docparse-xlsx",
  "fastsearch-core",
  "fastsearch-eval",

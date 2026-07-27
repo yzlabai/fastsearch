@@ -16,6 +16,7 @@
 
 use crate::{find_file, resize_bilinear};
 use anyhow::{Context, Result};
+use docparse_core::region_reader::{RegionImage, RegionReader};
 use std::path::Path;
 use tract_onnx::prelude::*;
 
@@ -218,6 +219,20 @@ impl UniRec {
             .replace('\u{ffff}', "");
         let s = collapse_runs(&s, '_', 3);
         collapse_runs(&s, '.', 3)
+    }
+}
+
+/// The in-process backend behind [`RegionReader`]. `read_batch` stays on the
+/// serial default on purpose: tract already spreads one inference across the
+/// cores, so reading regions concurrently would only make it contend with
+/// itself.
+impl RegionReader for UniRec {
+    fn read(&self, img: RegionImage<'_>, max_tokens: usize) -> Result<String> {
+        self.recognize(img.rgb, img.w, img.h, max_tokens)
+    }
+
+    fn source_tag(&self) -> String {
+        "unirec-0.1b".to_string()
     }
 }
 

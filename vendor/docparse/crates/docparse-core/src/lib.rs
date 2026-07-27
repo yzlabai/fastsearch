@@ -29,6 +29,7 @@ pub mod output;
 pub mod parser;
 pub mod quality;
 pub mod reading_order;
+pub mod region_reader;
 #[cfg(feature = "schema")]
 pub mod schema;
 pub mod synth;

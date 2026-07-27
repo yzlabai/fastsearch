@@ -7,23 +7,42 @@
 //! replicating the value into every spanned position (the same convention as
 //! the eval pipeline and ODL's grid output).
 
-use crate::unirec::UniRec;
 use anyhow::Result;
 use docparse_core::ir::{BBox, Cell, Document, Element, Table};
+use docparse_core::region_reader::{RegionImage, RegionReader};
 
 /// Render scale for table regions (pixels per PDF point).
 const RENDER_SCALE: f32 = 3.0;
 /// Generation cap — large tables run ~1000 tokens; runaway output is cut.
 const MAX_TOKENS: usize = 2000;
+/// Marks a table some VLM already re-extracted; the in-process backend leaves
+/// those alone rather than paying for a second inference that would blindly
+/// overwrite the first (precedence: VLM wins, UniRec backfills whatever the
+/// VLM declined or failed on).
+///
+/// Matched as a *substring*, not a prefix, because two producers write it in
+/// different shapes and both mean the same thing:
+///   - this module via a [`RegionReader`] → `"table:vlm:<model>"`
+///   - `docparse_vlm::refine_tables` (the older TSV prompt) → `"vlm:<model>"`
+///
+/// No non-VLM source contains it (the embedded ones are `table:`/`transcribe:`/
+/// `formula:` + a model name), so a substring test is both sufficient and the
+/// only form that survives the two spellings.
+const VLM_SOURCE_MARK: &str = "vlm:";
 
-/// Re-extract every detected table with UniRec. Returns the number replaced.
+/// Re-extract every detected table with `reader`. Returns the number replaced.
 /// Per-table failures are reported on stderr and skipped (deterministic grid
 /// stands), mirroring the VLM task's contract.
-pub fn refine_tables(doc: &mut Document, pdf_bytes: Vec<u8>, model: &UniRec) -> Result<usize> {
+pub fn refine_tables(
+    doc: &mut Document,
+    pdf_bytes: Vec<u8>,
+    reader: &dyn RegionReader,
+) -> Result<usize> {
     let raster = docparse_raster::Rasterizer::new(pdf_bytes)?;
+    let source = format!("table:{}", reader.source_tag());
     let mut refined = 0usize;
     for page in &mut doc.pages {
-        let has_tables = page.elements.iter().any(|e| matches!(e, Element::Table(_)));
+        let has_tables = page.elements.iter().any(is_refinable_table);
         if !has_tables {
             continue;
         }
@@ -34,37 +53,52 @@ pub fn refine_tables(doc: &mut Document, pdf_bytes: Vec<u8>, model: &UniRec) -> 
                 continue;
             }
         };
-        for el in &mut page.elements {
-            let Element::Table(table) = el else { continue };
-            let Some((cw, ch, crop)) = crop_region(
-                &rgb,
-                w as usize,
-                h as usize,
-                &table.bbox,
-                page.height,
-                RENDER_SCALE,
-            ) else {
+        // Crop first, read as one batch, then write back: a network-bound
+        // reader pipelines the whole page instead of stalling per table (an
+        // in-process one falls through to the serial default and behaves
+        // exactly as before).
+        let (idxs, crops): (Vec<usize>, Vec<Crop>) = page
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| is_refinable_table(e))
+            .filter_map(|(i, e)| {
+                let Element::Table(t) = e else { return None };
+                crop_region(
+                    &rgb,
+                    w as usize,
+                    h as usize,
+                    &t.bbox,
+                    page.height,
+                    RENDER_SCALE,
+                )
+                .map(|c| (i, c))
+            })
+            .unzip();
+        if idxs.is_empty() {
+            continue;
+        }
+        let imgs: Vec<RegionImage<'_>> = crops
+            .iter()
+            .map(|(cw, ch, buf)| RegionImage::new(buf, *cw, *ch))
+            .collect();
+
+        for (i, out) in idxs.into_iter().zip(reader.read_batch(&imgs, MAX_TOKENS)) {
+            let Element::Table(table) = &mut page.elements[i] else {
                 continue;
             };
-            match model.recognize(&crop, cw, ch, MAX_TOKENS) {
-                Ok(text) if crate::unirec::looks_degenerate(&text) => {
-                    eprintln!(
-                        "table-model: page {} degenerate answer; keeping deterministic rows",
+            match out {
+                Ok(text) => match refined_rows(&text, &table.bbox) {
+                    Some(rows) => {
+                        table.rows = rows;
+                        table.source = Some(source.clone());
+                        refined += 1;
+                    }
+                    None => eprintln!(
+                        "table-model: page {} answer is not a usable table; keeping deterministic rows",
                         page.number
-                    );
-                }
-                Ok(text) => {
-                    let Some(grid) = parse_html_table(&text) else {
-                        eprintln!(
-                            "table-model: page {} answer is not a usable table; keeping deterministic rows",
-                            page.number
-                        );
-                        continue;
-                    };
-                    table.rows = grid_cells(&grid, &table.bbox);
-                    table.source = Some("table:unirec-0.1b".to_string());
-                    refined += 1;
-                }
+                    ),
+                },
                 Err(e) => eprintln!(
                     "table-model: inference failed on page {}: {e:#}",
                     page.number
@@ -76,6 +110,35 @@ pub fn refine_tables(doc: &mut Document, pdf_bytes: Vec<u8>, model: &UniRec) -> 
     // the caller after all enhancers (covers --layout without --table-model too).
     Ok(refined)
 }
+
+/// A table this backend should spend an inference on — i.e. one a VLM pass
+/// hasn't already re-extracted.
+fn is_refinable_table(el: &Element) -> bool {
+    match el {
+        Element::Table(t) => !t
+            .source
+            .as_deref()
+            .is_some_and(|s| s.contains(VLM_SOURCE_MARK)),
+        _ => false,
+    }
+}
+
+/// The whole decision a model answer goes through: reject runaway repetition,
+/// reject anything that isn't a real grid, otherwise lay the parsed grid over
+/// the table's (real) bbox. `None` = keep the deterministic rows.
+///
+/// Pulled out of the render/infer shell so it is unit-testable — this is the
+/// part that decides what lands in the document.
+pub(crate) fn refined_rows(text: &str, bbox: &BBox) -> Option<Vec<Vec<Cell>>> {
+    if crate::unirec::looks_degenerate(text) {
+        return None;
+    }
+    Some(grid_cells(&parse_html_table(text)?, bbox))
+}
+
+/// A cropped region as `(width, height, packed RGB8)` — what [`crop_region`]
+/// hands to a [`RegionReader`].
+pub(crate) type Crop = (usize, usize, Vec<u8>);
 
 /// Crop a PDF-space bbox (with a small margin) out of a page render.
 pub(crate) fn crop_region(
@@ -316,6 +379,86 @@ pub type RefinedTable = Table;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bbox() -> BBox {
+        BBox {
+            x0: 100.0,
+            y0: 200.0,
+            x1: 300.0,
+            y1: 300.0,
+        }
+    }
+
+    /// T4a — the table path's acceptance gate, end to end over one answer:
+    /// a real grid lands on the (real) table bbox.
+    #[test]
+    fn refined_rows_lays_grid_over_the_table_bbox() {
+        let rows = refined_rows(
+            "<table><tr><td>a</td><td>b</td></tr>\
+             <tr><td>c</td><td>d</td></tr></table>",
+            &bbox(),
+        )
+        .expect("a 2x2 grid is usable");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].text, "a");
+        // Row 0 is the TOP row in PDF space (the y1 side).
+        assert_eq!(rows[0][0].bbox.y1, 300.0);
+        assert_eq!(rows[1][1].bbox.x1, 300.0);
+    }
+
+    /// T4a — and the two ways an answer gets rejected. Note this path has NO
+    /// char-ratio gate (that one is transcribe-only): rejection is degeneracy
+    /// or "not a grid", nothing else.
+    #[test]
+    fn refined_rows_rejects_degenerate_and_non_grid() {
+        // Runaway repetition: enough volume to look substantial, still junk.
+        let runaway = "abcdefg ".repeat(12);
+        assert!(
+            refined_rows(&runaway, &bbox()).is_none(),
+            "repetition loop must never replace a detected table"
+        );
+        assert!(
+            refined_rows("I cannot see a table in this image.", &bbox()).is_none(),
+            "a prose refusal is not a grid"
+        );
+        assert!(
+            refined_rows("<table><tr><td>only</td></tr></table>", &bbox()).is_none(),
+            "1x1 is not a real grid"
+        );
+    }
+
+    /// T1a — the backend-swap precedence rule: a table a VLM already
+    /// re-extracted is skipped, so the two backends can both be configured
+    /// without paying twice and without the second blindly clobbering the first.
+    #[test]
+    fn vlm_refined_tables_are_left_alone() {
+        let mut t = Table {
+            bbox: bbox(),
+            page: 1,
+            rows: Vec::new(),
+            source: None,
+        };
+        assert!(
+            is_refinable_table(&Element::Table(t.clone())),
+            "fresh table"
+        );
+
+        t.source = Some("table:unirec-0.1b".to_string());
+        assert!(
+            is_refinable_table(&Element::Table(t.clone())),
+            "an in-process pass does not block a re-run"
+        );
+
+        // Both producers' spellings must be recognized — they are written in
+        // different crates and mean the same thing.
+        for tag in ["table:vlm:OvisOCR2", "vlm:qwen2.5-vl"] {
+            t.source = Some(tag.to_string());
+            assert!(
+                !is_refinable_table(&Element::Table(t.clone())),
+                "{tag}: a VLM-refined table is skipped by the in-process backend"
+            );
+        }
+    }
 
     #[test]
     fn spans_expand_by_replication() {

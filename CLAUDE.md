@@ -31,6 +31,9 @@ FASTSEARCH_OCR_MODELS=/path/to/docparse-rs/models/ppocr-v5 \
 # 表格结构识别（非 VLM 的确定性 ONNX：UniRec；--features parse-tables，需 UniRec 模型目录）
 FASTSEARCH_UNIREC_MODELS=/path/to/docparse-rs/models/unirec \
   cargo run -p fastsearch-cli --features parse-tables --bin fastsearch -- ingest --server http://localhost:8642 --key dev --collection kb --doc-id r.pdf r.pdf
+# VLM 区域识别（--features parse-vlm，需外部 OpenAI 兼容服务；表格→HTML，另设版面模型则加区域级转写）
+FASTSEARCH_VLM_URL=http://localhost:8000 FASTSEARCH_VLM_MODEL=OvisOCR2 \
+  cargo run -p fastsearch-cli --features parse-vlm --bin fastsearch -- ingest --server http://localhost:8642 --key dev --collection kb --doc-id r.pdf r.pdf
 
 # Postgres 集成测试（默认跳过；设 DATABASE_URL 才跑，CI 用 pgvector/pgvector 镜像）
 DATABASE_URL=postgres://user@localhost/db cargo test -p fastsearch-pg
@@ -38,7 +41,9 @@ DATABASE_URL=postgres://user@localhost/db cargo test -p fastsearch-pg
 FASTSEARCH_OCR_MODELS=…/models/ppocr-v5 FASTSEARCH_OCR_TEST_IMAGE=…/page.png cargo test -p fastsearch-cli --features parse-ocr ocr_end_to_end
 ```
 
-> **构建分档**：默认 `cargo build`（搜索热路径，**零 docparse/ONNX 依赖**）；`--features parse`（多格式解析，轻量、无 ONNX）；`--features parse-ocr`（+PP-OCR 扫描件抽文本）；`--features parse-tables`（+UniRec **非 VLM** 表格结构识别，拉 raster/tract ONNX）。重 ONNX 档运行时需指模型目录（env），仅摄取侧；`vendor/docparse` 有自有 workspace、被根 `exclude`，不进默认收口。
+> **构建分档**：默认 `cargo build`（搜索热路径，**零 docparse/ONNX 依赖**）；`--features parse`（多格式解析，轻量、无 ONNX）；`--features parse-ocr`（+PP-OCR 扫描件抽文本）；`--features parse-tables`（+UniRec **非 VLM** 表格结构识别，拉 raster/tract ONNX）；`--features parse-vlm`（+**VLM 区域识别**，需外部 OpenAI 兼容服务，env 指 URL+模型名）。重档运行时需指模型目录/服务地址（env），仅摄取侧；`vendor/docparse` 有自有 workspace、被根 `exclude`，不进默认收口。
+>
+> **识别后端可换**（2026-07-27）：`docparse-core::region_reader::RegionReader` 是"区域图→文本"的**唯一接缝**——`UniRec`（进程内 tract）与 `VlmRegionReader`（HTTP 服务）互为实现，表格重识别/整页转写两处编排对二者一视同仁。并发策略归后端（`read_batch` 默认串行，HTTP 后端覆写为有界并发）。**坐标始终来自版面/表格检测**，VLM 只负责"读"，故 `resolve_citation` 页内高亮不受影响。
 
 **收口（push 前必跑，等价于"完整类型检查"）**：`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` 三者全过，详见 AI_AGENT_DEV_SPEC §收口。
 
@@ -72,7 +77,7 @@ docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(
 | `engine` | 整合 text+vector+rerank+sync sink → 端到端排序管线 | `run()` 是管线主体；`search`/`search_with_facets`；实现 `sync::IndexSink`（适配器，避免 text 反依赖 sync） |
 | `eval` | 相关性评测：nDCG/recall/MRR + `assert_no_regression`(CI 门禁) | 纯函数 |
 | `server` | REST(axum) + API-Key 认证 + **ACL 服务端注入不可绕过** + /metrics | `principal_from_headers`→`acl_for`→`engine.search(req, Some(acl))`；客户端无法传/绕过 ACL |
-| `cli` | `fastsearch` 二进制：**server 的纯 REST 客户端**（不嵌引擎）。`search`/`similar`/`index`/`index-dir`(喂文件夹)/`eval` 走 server REST；`ingest`(多格式解析) 在**客户端**解析→POST `/v1/index` | 逻辑在 lib，main 是壳；`ureq` HTTP，`--server`/`--key`(env `FASTSEARCH_SERVER`/`_KEY`)。仅依赖 `core`(纯类型)+`eval`(纯指标)，**无 engine/text 依赖**。`ingest` 走 `--features parse`（docparse 注册表分发 9 格式+图片）/`parse-ocr`/`parse-tables`（env 指模型目录）；解析在客户端→守搜索热路径零 docparse。检索/嵌入/落盘全归 server，CLI 因此白嫖全套混合检索 |
+| `cli` | `fastsearch` 二进制：**server 的纯 REST 客户端**（不嵌引擎）。`search`/`similar`/`index`/`index-dir`(喂文件夹)/`eval` 走 server REST；`ingest`(多格式解析) 在**客户端**解析→POST `/v1/index` | 逻辑在 lib，main 是壳；`ureq` HTTP，`--server`/`--key`(env `FASTSEARCH_SERVER`/`_KEY`)。仅依赖 `core`(纯类型)+`eval`(纯指标)，**无 engine/text 依赖**。`ingest` 走 `--features parse`（docparse 注册表分发 9 格式+图片）/`parse-ocr`/`parse-tables`（env 指模型目录）/`parse-vlm`（env 指 VLM 服务）；解析在客户端→守搜索热路径零 docparse。检索/嵌入/落盘全归 server，CLI 因此白嫖全套混合检索 |
 | `mcp` | 第四张脸：MCP（stdio+JSON-RPC）暴露 `search`/`resolve_citation` 工具 | 逻辑在 lib（`McpServer::handle` 纯函数可单测），main 是 stdio 壳；**ACL 服务端注入不可绕过** |
 | `clients/{python,ts}` | 零依赖 SDK（封装 REST）+ LangChain/LlamaIndex 适配 | — |
 

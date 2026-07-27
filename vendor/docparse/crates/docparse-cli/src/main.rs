@@ -152,6 +152,23 @@ struct Cli {
     #[arg(long)]
     vlm_tables: bool,
 
+    /// Re-extract detected tables with a VLM asking for HTML (PDF only) —
+    /// the recognition path, as opposed to --vlm-tables' TSV prompt. HTML
+    /// carries rowspan/colspan topology a TSV grid structurally cannot, and
+    /// reuses the embedded backend's parser. Requires --vlm-url/--vlm-model;
+    /// replaced tables carry source "table:vlm:<model>", failures keep the
+    /// deterministic grid.
+    #[arg(long, conflicts_with_all = ["table_model", "vlm_tables"])]
+    table_vlm: bool,
+
+    /// Re-recognize whole pages with a VLM (PDF only): layout regions read in
+    /// reading order, replacing the page's text at region-level positions —
+    /// the same shape as --transcribe-model, with a served model instead of
+    /// the embedded one. Requires --vlm-url/--vlm-model and a layout model
+    /// (--layout-model). Chunks carry source "transcribe:vlm:<model>".
+    #[arg(long, conflicts_with = "transcribe_model")]
+    transcribe_vlm: bool,
+
     /// OpenAI-compatible service base URL (vLLM / LM Studio / cloud),
     /// e.g. http://127.0.0.1:8000
     #[arg(long)]
@@ -494,11 +511,7 @@ fn vlm_config(
     api_key: Option<String>,
 ) -> Option<docparse_vlm::VlmConfig> {
     match (url, model) {
-        (Some(url), Some(model)) => Some(docparse_vlm::VlmConfig {
-            url,
-            model,
-            api_key,
-        }),
+        (Some(url), Some(model)) => Some(docparse_vlm::VlmConfig::new(url, model, api_key)),
         _ => None,
     }
 }
@@ -620,7 +633,7 @@ impl EnhanceState {
         }
         if o.table_model {
             let model = self.unirec()?;
-            docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(path)?, &model)?;
+            docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(path)?, &*model)?;
         }
         if o.formula_model {
             let layout = self.loaded_layout()?;
@@ -1071,6 +1084,58 @@ fn parse_and_enhance(
         }
     }
 
+    // Served-model twins of --table-model / --transcribe-model: same
+    // orchestration, same gates, same provenance discipline — only the
+    // RegionReader behind them differs.
+    if cli.table_vlm || cli.transcribe_vlm {
+        if !is_pdf {
+            if log {
+                eprintln!(
+                    "--table-vlm/--transcribe-vlm currently support PDF inputs only; skipped"
+                );
+            }
+        } else {
+            let cfg = vlm_config(
+                cli.vlm_url.clone(),
+                cli.vlm_model.clone(),
+                cli.vlm_api_key.clone(),
+            )
+            .ok_or_else(|| {
+                anyhow::anyhow!("--table-vlm/--transcribe-vlm require --vlm-url and --vlm-model")
+            })?;
+            if cli.table_vlm {
+                let reader = docparse_vlm::region::VlmRegionReader::for_table(cfg.clone())?;
+                let n = {
+                    let _g = reporter.map(|r| r.spinner("table-vlm"));
+                    docparse_ocr::table_model::refine_tables(
+                        &mut doc,
+                        std::fs::read(input)?,
+                        &reader,
+                    )?
+                };
+                if log {
+                    eprintln!("{{\"table_vlm_refined\": {n}}}");
+                }
+            }
+            if cli.transcribe_vlm {
+                let layout = models.layout.get(&cli.layout_model)?;
+                let reader = docparse_vlm::region::VlmRegionReader::for_text(cfg)?;
+                let n = {
+                    let _g = reporter.map(|r| r.spinner("transcribe-vlm"));
+                    docparse_ocr::transcribe::transcribe_pages(
+                        &mut doc,
+                        std::fs::read(input)?,
+                        layout,
+                        &reader,
+                    )?
+                };
+                if log {
+                    eprintln!("{{\"transcribed_pages_vlm\": {n}}}");
+                }
+            }
+        }
+    }
+
     if cli.vlm_describe || cli.vlm_tables {
         if !is_pdf {
             if log {
@@ -1081,11 +1146,11 @@ fn parse_and_enhance(
                 (Some(u), Some(m)) => (u, m),
                 _ => anyhow::bail!("--vlm-describe/--vlm-tables require --vlm-url and --vlm-model"),
             };
-            let client = docparse_vlm::VlmClient::new(docparse_vlm::VlmConfig {
+            let client = docparse_vlm::VlmClient::new(docparse_vlm::VlmConfig::new(
                 url,
                 model,
-                api_key: cli.vlm_api_key.clone(),
-            });
+                cli.vlm_api_key.clone(),
+            ));
             if cli.vlm_describe {
                 let n = {
                     let _g = reporter.map(|r| r.spinner("vlm-describe"));

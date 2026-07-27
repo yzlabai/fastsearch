@@ -44,6 +44,9 @@ docparse-img = { path = "../../vendor/docparse/crates/docparse-img", optional = 
 docparse-ocr = { path = "../../vendor/docparse/crates/docparse-ocr", optional = true }
 # PDF→图 栅格化（纯 Rust hayro，无 pdfium）：表格识别裁剪区域用。
 docparse-raster = { path = "../../vendor/docparse/crates/docparse-raster", optional = true }
+# VLM 区域识别后端（OpenAI 兼容 HTTP：vLLM/SGLang/LM Studio）。crate 本身轻（ureq+base64+rayon），
+# 但编排复用 docparse-ocr 的 refine_tables/transcribe_pages，故 parse-vlm 仍是重档。
+docparse-vlm = { path = "../../vendor/docparse/crates/docparse-vlm", optional = true }
 
 [features]
 # 开启 docparse 多格式解析（core + 轻量格式解析器 + 图片，**无 ONNX/渲染**）；默认不开，保持 CLI 精简。
@@ -67,6 +70,11 @@ parse-ocr = ["parse", "dep:docparse-ocr"]
 # 拉入 docparse-ocr（UniRec）+ docparse-raster（PDF 栅格化裁剪）。运行时需 env `FASTSEARCH_UNIREC_MODELS`
 # （如 docparse-rs/models/unirec）。VLM 表格识别是另一条路（gated 于 VLM 服务），此为本地 ONNX 路。
 parse-tables = ["parse", "dep:docparse-ocr", "dep:docparse-raster"]
+# VLM 区域识别（**需外部 OpenAI 兼容服务**，如 vLLM 起 OvisOCR2）：表格区域 → HTML 重识别；
+# 另设版面模型时 → 整页区域级转写。与 parse-tables 同为重档（编排在 docparse-ocr，含 tract）。
+# 运行时 env：`FASTSEARCH_VLM_URL` + `FASTSEARCH_VLM_MODEL`（必需）、`FASTSEARCH_VLM_KEY`、
+# `FASTSEARCH_LAYOUT_MODEL`（设了才开转写）、`FASTSEARCH_VLM_MAX_PAGES`（默认 50）。
+parse-vlm = ["parse", "dep:docparse-ocr", "dep:docparse-raster", "dep:docparse-vlm"]
 
 [dev-dependencies]
 tempfile.workspace = true

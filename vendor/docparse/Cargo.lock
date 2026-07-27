@@ -833,6 +833,7 @@ dependencies = [
  "base64",
  "docparse-core",
  "docparse-raster",
+ "rayon",
  "serde_json",
  "ureq",
 ]

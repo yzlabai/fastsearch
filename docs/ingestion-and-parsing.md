@@ -46,8 +46,9 @@ search"; `ingest` just adds the in-process parsing step.
 | `--features parse` | + multi-format parsers (9 formats + images) | lightweight, pure-Rust, no ONNX |
 | `--features parse-ocr` | + **PP-OCR text extraction** for scans/images | heavy (tract/ONNX) |
 | `--features parse-tables` | + **non-VLM table structure recognition** (UniRec ONNX) | heavy (tract/ONNX + pure-Rust rasterization) |
+| `--features parse-vlm` | + **VLM region recognition** (tables as HTML / region-level transcription), **needs an external service** | heavy (shares the tract-side orchestration) + a GPU service |
 
-> The heavy tiers (parse-ocr/parse-tables) only affect the **ingestion side**; the search/server binary can keep
+> The heavy tiers (parse-ocr/parse-tables/parse-vlm) only affect the **ingestion side**; the search/server binary can keep
 > using the default lean build.
 
 ---
@@ -89,9 +90,48 @@ FASTSEARCH_UNIREC_MODELS=/path/to/models/unirec \
 
 ---
 
+## VLM region recognition (`--features parse-vlm`, **needs an external service**)
+
+The same orchestration and the same `RegionReader` seam as the UniRec route above — only the
+recognition backend changes, to an OpenAI-compatible HTTP service (vLLM / SGLang / LM Studio). It is
+for the pages UniRec can't crack: hard academic tables, CJK design layouts.
+
+**Coordinates survive**: region geometry still comes from layout/table detection and the VLM only
+*reads*, so `resolve_citation`'s in-page highlighting keeps working. (A whole-page end-to-end parse
+would drop body-text coordinates, which is why this project does **not** take that route.)
+
+```bash
+# Service side, once: e.g. vLLM serving a page-parsing model
+vllm serve ATH-MaaS/OvisOCR2 --port 8000
+
+cargo build -p fastsearch-cli --features parse-vlm --bin fastsearch
+FASTSEARCH_VLM_URL=http://localhost:8000 FASTSEARCH_VLM_MODEL=OvisOCR2 \
+  ./target/debug/fastsearch ingest --server http://localhost:8642 --key dev --collection kb --doc-id r.pdf r.pdf
+
+# Add a layout model to also enable region-level whole-page transcription
+FASTSEARCH_LAYOUT_MODEL=/path/to/models/layout-ppv2/PP-DoclayoutV2_simp.onnx \
+  ./target/debug/fastsearch ingest ...
+```
+
+| env | required | effect |
+|---|---|---|
+| `FASTSEARCH_VLM_URL` | ✅ | service base URL |
+| `FASTSEARCH_VLM_MODEL` | ✅ | model name as the service knows it |
+| `FASTSEARCH_VLM_KEY` | — | bearer token |
+| `FASTSEARCH_LAYOUT_MODEL` | — | layout ONNX path; **set it to enable transcription**, otherwise tables only |
+| `FASTSEARCH_VLM_MAX_PAGES` | — | per-document page cap sent to the VLM (default 50) |
+
+- **Capability follows configuration**: the two required env vars give table re-extraction; a layout model adds transcription.
+- **Precedence**: the VLM pass runs before UniRec, and UniRec skips tables whose `source` already starts with `table:vlm:` — so both can be configured (VLM wins, UniRec backfills) without double inference or blind overwrites.
+- **PDF only** (needs source bytes to rasterize, same as parse-tables); image scans keep going through `parse-ocr`.
+- **Failure degrades**: unreachable/timeout/junk answer → the deterministic result stands, parsing does not fail.
+- ⚠️ **Not verified against a real model yet** (`待运行验证`): the mock end-to-end passes (request shape, HTML table rowspan/colspan expansion, `source` tagging), but the quality/speed gates have not been run — see [the integration spec §7](plans/2026-07-27-OvisOCR2接入需求分析与功能设计.md).
+
+---
+
 ## Not wired yet (next iteration)
 
-- **VLM natural-image captioning** (`parse-vlm`): caption figures/charts; needs an OpenAI-compatible VLM service (e.g. Ollama llava).
+- **VLM natural-image captioning**: caption figures/charts (docparse has `--vlm-describe`; not surfaced on the fastsearch ingest side).
 - **Formula → LaTeX** (same UniRec model), **standalone layout enhancement**: same ONNX route, can follow.
 
 ---
