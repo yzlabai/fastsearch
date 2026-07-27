@@ -21,6 +21,7 @@ use docparse_pdf::PdfParser;
 use docparse_pptx::PptxParser;
 use docparse_srt::SrtParser;
 use docparse_tex::TexParser;
+use docparse_vlm::region::VlmRegionReader;
 use docparse_xlsx::XlsxParser;
 use std::path::PathBuf;
 
@@ -574,6 +575,11 @@ pub(crate) struct EnhanceState {
     vlm: Option<docparse_vlm::VlmConfig>,
     unirec: std::sync::OnceLock<Result<std::sync::Arc<docparse_ocr::unirec::UniRec>, String>>,
     layout: std::sync::OnceLock<Result<std::sync::Arc<docparse_ocr::layout::LayoutModel>, String>>,
+    /// Server-lifetime too, for a different reason than the models: the reader
+    /// owns the bounded request pool. Built per request it would spawn threads
+    /// per request *and* silently un-bound the concurrency limit — N in-flight
+    /// requests would each get their own budget and together flood the service.
+    table_vlm: std::sync::OnceLock<Result<std::sync::Arc<VlmRegionReader>, String>>,
 }
 
 impl EnhanceState {
@@ -590,7 +596,24 @@ impl EnhanceState {
             vlm,
             unirec: std::sync::OnceLock::new(),
             layout: std::sync::OnceLock::new(),
+            table_vlm: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The shared VLM table reader (and with it, the one bounded request pool
+    /// for this server).
+    fn table_vlm_reader(&self) -> anyhow::Result<std::sync::Arc<VlmRegionReader>> {
+        let cfg = self.vlm.clone().ok_or_else(|| {
+            anyhow::anyhow!("vlm not configured (start with --vlm-url and --vlm-model)")
+        })?;
+        self.table_vlm
+            .get_or_init(|| {
+                VlmRegionReader::for_table(cfg)
+                    .map(std::sync::Arc::new)
+                    .map_err(|e| format!("{e:#}"))
+            })
+            .clone()
+            .map_err(|e| anyhow::anyhow!("vlm table reader unavailable: {e}"))
     }
 
     fn unirec(&self) -> anyhow::Result<std::sync::Arc<docparse_ocr::unirec::UniRec>> {
@@ -673,8 +696,8 @@ impl EnhanceState {
                 anyhow::anyhow!("vlm not configured (start with --vlm-url and --vlm-model)")
             })?;
             if o.table_vlm {
-                let reader = docparse_vlm::region::VlmRegionReader::for_table(cfg.clone())?;
-                docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(path)?, &reader)?;
+                let reader = self.table_vlm_reader()?;
+                docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(path)?, &*reader)?;
             }
             let client = docparse_vlm::VlmClient::new(cfg);
             if o.vlm_describe {
