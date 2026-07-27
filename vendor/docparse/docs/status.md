@@ -18,6 +18,8 @@
 - **G9** 全部（G9d TEDS 验收门过）；
 - IR 0.7.0（Cell span 语义 + 图片 base64 内嵌）。
 
+**RegionReader 接缝 + VLM 识别后端（2026-07-27，代码已落地／质量门待跑）**：把"区域图→文本"抽成 `docparse-core::region_reader::RegionReader` 唯一接缝，`UniRec`（进程内 tract）与 `VlmRegionReader`（OpenAI 兼容 HTTP）成为**可互换后端**，`table_model`/`transcribe` 两处编排对二者一视同仁；并发策略归后端（`read_batch` 默认串行，网络后端覆写为有界并发 4）。新面：`--table-vlm`（表格走 HTML prompt，复用现成 `parse_html_table` 拿 rowspan/colspan，胜过 TSV 路）、`--transcribe-vlm`（区域级转写），**四张脸一致**（`--table-vlm` 已上 `EnhanceOpts`/MCP/REST；`conflicts_with` 表达不了的服务面约束由 `EnhanceOpts::validate` 统一）。顺带修 `VlmClient` **此前请求体根本不发 `max_tokens`/`temperature`**（识别档必须封顶，否则复读只能事后拒收）、`max_image_side` 提为可配（识别档 2048——1024 上限会把动态分辨率模型的优势掐掉，重演 Phase 6 记录的固定分辨率天花板）。**坐标不丢**：几何仍来自版面/表格检测，模型只负责"读"。**诚实记账**：mock 端到端已通（source 标注 / rowspan 还原 / 请求体形状 / `read_batch` 顺序契约有变异测试守护），**真实模型的形态·坐标·质量·速度四道门全部未跑**（需 vLLM+GPU）；动机与门控见 fastsearch 侧 `docs/plans/2026-07-27-OvisOCR2接入需求分析与功能设计.md`。
+
 **Phase 5（H1–H7）** 收官（2026-06-12）：CCITT 扫描解码、cls 旋转、读序异常分/路由收口、双栏左列重排、APTED 尺子、隐藏文本盲区（架构边界=不做）、打磨篮子。
 
 **Phase 6（OmniDocBench 提分，2026-06-12，主负结论）**：逐一证伪所有便宜旋钮——学术表 0.52 是 **UniRec-0.1B 固定 960×1408 输入在大/宽/密表上的真实天花板**（行列诊断:主因大表 UNDER-segment + 超宽表 NO-PRED；**看图核对**把 #4/#16 初判的"口径反噬"推翻=实为模型 over-split）；落地 B1（e2e 表评测 strip_math 对称）+ B2（UniRec EOS 门控失控退化抢救，零回归）；B3 area 下采样 / 抬 max_tokens（0.517→0.466）/ 抬分辨率 1280×1792（净≈0 但救饥饿表=扭曲合身表 + 3× 慢破速度门）实测 no-op/反降/破门；真杠杆=更大/多分辨率表模型 / `--vlm-tables` 服务（均在内嵌+保速域外）。

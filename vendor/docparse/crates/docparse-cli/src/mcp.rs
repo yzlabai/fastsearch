@@ -133,7 +133,9 @@ fn tool_specs() -> Value {
                     "vlm_describe": { "type": "boolean",
                                       "description": "Caption figures via the configured VLM service (PDF only; needs server --vlm-url/--vlm-model)" },
                     "vlm_tables": { "type": "boolean",
-                                    "description": "Re-extract tables via the configured VLM service (PDF only)" },
+                                    "description": "Re-extract tables via the configured VLM service, TSV prompt (PDF only)" },
+                    "table_vlm": { "type": "boolean",
+                                   "description": "Re-extract tables via the configured VLM service, HTML prompt - keeps rowspan/colspan (PDF only). Exclusive with table_model/vlm_tables" },
                     "images": { "type": "string", "enum": ["embedded"],
                                 "description": "\"embedded\" adds data_base64 + data_media_type to image elements (json format)" }
                 },
@@ -156,7 +158,8 @@ fn tool_specs() -> Value {
                     "table_model": { "type": "boolean", "description": "UniRec table structure (PDF only)" },
                     "formula_model": { "type": "boolean", "description": "Formulas to LaTeX (PDF only)" },
                     "vlm_describe": { "type": "boolean", "description": "VLM figure captions (PDF only)" },
-                    "vlm_tables": { "type": "boolean", "description": "VLM table re-extraction (PDF only)" }
+                    "vlm_tables": { "type": "boolean", "description": "VLM table re-extraction, TSV prompt (PDF only)" },
+                    "table_vlm": { "type": "boolean", "description": "VLM table re-extraction, HTML prompt - keeps rowspan/colspan (PDF only)" }
                 },
                 "required": ["path"]
             }
@@ -465,6 +468,7 @@ fn parse_enhanced(
         formula_model: flag("formula_model"),
         vlm_describe: flag("vlm_describe"),
         vlm_tables: flag("vlm_tables"),
+        table_vlm: flag("table_vlm"),
     };
     state.apply(doc, path, opts)
 }

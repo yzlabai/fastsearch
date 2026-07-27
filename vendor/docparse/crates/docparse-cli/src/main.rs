@@ -529,6 +529,11 @@ pub(crate) struct EnhanceOpts {
     pub formula_model: bool,
     pub vlm_describe: bool,
     pub vlm_tables: bool,
+    /// VLM table re-extraction via the HTML prompt (the recognition path).
+    /// Distinct from `vlm_tables`' TSV prompt, and mutually exclusive with it
+    /// and with `table_model` — the CLI enforces that with clap, the service
+    /// faces check it at request time (see [`EnhanceOpts::validate`]).
+    pub table_vlm: bool,
 }
 
 impl EnhanceOpts {
@@ -538,6 +543,23 @@ impl EnhanceOpts {
             || self.formula_model
             || self.vlm_describe
             || self.vlm_tables
+            || self.table_vlm
+    }
+
+    /// Reject combinations the CLI forbids via clap, so MCP/REST can't reach a
+    /// state the CLI cannot — "four faces, one output" means the *constraints*
+    /// travel too, not just the capabilities.
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        let table_backends = [self.table_model, self.vlm_tables, self.table_vlm]
+            .iter()
+            .filter(|on| **on)
+            .count();
+        anyhow::ensure!(
+            table_backends <= 1,
+            "pick one table backend: table_model (embedded), vlm_tables (VLM/TSV) \
+             or table_vlm (VLM/HTML)"
+        );
+        Ok(())
     }
 }
 
@@ -608,6 +630,7 @@ impl EnhanceState {
         path: &std::path::Path,
         o: EnhanceOpts,
     ) -> anyhow::Result<docparse_core::ir::Document> {
+        o.validate()?;
         if o.ocr {
             let enhancer = self
                 .ocr
@@ -645,10 +668,14 @@ impl EnhanceState {
                 &model,
             )?;
         }
-        if o.vlm_describe || o.vlm_tables {
+        if o.vlm_describe || o.vlm_tables || o.table_vlm {
             let cfg = self.vlm.clone().ok_or_else(|| {
                 anyhow::anyhow!("vlm not configured (start with --vlm-url and --vlm-model)")
             })?;
+            if o.table_vlm {
+                let reader = docparse_vlm::region::VlmRegionReader::for_table(cfg.clone())?;
+                docparse_ocr::table_model::refine_tables(&mut doc, std::fs::read(path)?, &reader)?;
+            }
             let client = docparse_vlm::VlmClient::new(cfg);
             if o.vlm_describe {
                 docparse_vlm::annotate_pictures(&mut doc, std::fs::read(path)?, &client)?;
@@ -1298,4 +1325,66 @@ fn iso8601_utc(secs: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "Four faces, one output" has to cover *constraints*, not just
+    /// capabilities: the CLI forbids stacking table backends via clap
+    /// `conflicts_with`, which MCP/REST cannot express — so the same rule lives
+    /// in `validate()` and every face runs it before enhancing.
+    #[test]
+    fn table_backends_are_mutually_exclusive_on_every_face() {
+        for set in [
+            EnhanceOpts {
+                table_model: true,
+                ..Default::default()
+            },
+            EnhanceOpts {
+                vlm_tables: true,
+                ..Default::default()
+            },
+            EnhanceOpts {
+                table_vlm: true,
+                ..Default::default()
+            },
+            EnhanceOpts::default(),
+        ] {
+            assert!(set.validate().is_ok(), "one backend (or none) is fine");
+        }
+
+        let both = EnhanceOpts {
+            table_model: true,
+            table_vlm: true,
+            ..Default::default()
+        };
+        let err = both.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("table_model") && err.contains("table_vlm"),
+            "the error must name the options to pick between, got: {err}"
+        );
+
+        let both_vlm = EnhanceOpts {
+            vlm_tables: true,
+            table_vlm: true,
+            ..Default::default()
+        };
+        assert!(
+            both_vlm.validate().is_err(),
+            "two VLM table prompts conflict"
+        );
+    }
+
+    /// A VLM-only request still has to be recognized as PDF-only work, or the
+    /// service faces would skip the whole enhancement stage for it.
+    #[test]
+    fn table_vlm_counts_as_pdf_only_work() {
+        let o = EnhanceOpts {
+            table_vlm: true,
+            ..Default::default()
+        };
+        assert!(o.any_pdf_only());
+    }
 }

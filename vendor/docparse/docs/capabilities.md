@@ -56,7 +56,7 @@
 **OKF**：`--okf-resource-base <uri>`、`--okf-tar`、`--force`。
 **OCR**：`--ocr`、`--ocr-models <dir>`（默认 `models/ppocr-v6`，缺则 TTY 确认下载 / `DOCPARSE_OCR_DOWNLOAD=1`）。
 **版面/结构**：`--layout`、`--layout-model <path>`（YOLO 默认 / PPV2 自动识别）、`--table-model <dir>`、`--formula-model <dir>`、`--transcribe-model <dir>`。
-**VLM**：`--vlm-describe`、`--vlm-tables`、`--vlm-url`、`--vlm-model`、`--vlm-api-key`。
+**VLM**：`--vlm-describe`、`--vlm-tables`、`--table-vlm`、`--transcribe-vlm`、`--vlm-url`、`--vlm-model`、`--vlm-api-key`。
 **图片**：`--image-dir <dir>`、`--image-embed`。
 **质量/可观测**：`--quality`、`--profile`、`--route-plan`（均出 JSON 到 stderr）、`--progress auto\|always\|never\|json`、`-q/--quiet`、`--stats`。
 **子命令**：`mcp`、`serve --port`、`schema [--name N] [--write]`。
@@ -97,7 +97,9 @@
 | 公式→LaTeX | `--formula-model` | UniRec-0.1B | 是 | PDF | `formula:unirec-0.1b` |
 | 整页转写 | `--transcribe-model` | UniRec-0.1B | 是 | PDF | `transcribe:…` |
 | 图说 | `--vlm-describe` | OpenAI 兼容服务 | 否（服务） | PDF | `vlm:<model>` |
-| 表重抽 | `--vlm-tables` | OpenAI 兼容服务 | 否（服务） | PDF | `vlm:<model>` |
+| 表重抽 | `--vlm-tables` | OpenAI 兼容服务（TSV prompt） | 否（服务） | PDF | `vlm:<model>` |
+| 表重抽（识别档） | `--table-vlm` | OpenAI 兼容服务（HTML prompt，保 rowspan/colspan） | 否（服务） | PDF | `table:vlm:<model>` |
+| 整页转写（服务档） | `--transcribe-vlm` | OpenAI 兼容服务 + 版面模型给几何 | 版面模型是 | PDF | `transcribe:vlm:<model>` |
 
 数字页零模型；模型整批/整服务只载一次；任一模型 flag 开则批量强制串行（防爆内存）。所有增强产物带 `source` 溯源、confidence 封顶，确定性结果始终独立成立。
 

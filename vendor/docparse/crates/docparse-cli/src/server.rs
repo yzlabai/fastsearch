@@ -160,7 +160,8 @@ fn openapi_doc() -> serde_json::Value {
                         bool_param("table_model", "UniRec table structure (needs --unirec-models)."),
                         bool_param("formula_model", "Display formulas to LaTeX (needs --unirec-models)."),
                         bool_param("vlm_describe", "VLM figure captions (needs --vlm-url/--vlm-model)."),
-                        bool_param("vlm_tables", "VLM table re-extraction.")
+                        bool_param("vlm_tables", "VLM table re-extraction, TSV prompt."),
+                        bool_param("table_vlm", "VLM table re-extraction, HTML prompt (keeps rowspan/colspan); exclusive with table_model/vlm_tables.")
                     ],
                     "requestBody": {
                         "required": true,
@@ -215,6 +216,7 @@ async fn parse(
         formula_model: flag("formula_model"),
         vlm_describe: flag("vlm_describe"),
         vlm_tables: flag("vlm_tables"),
+        table_vlm: flag("table_vlm"),
     };
     // First field that carries a filename = the document (extension picks the
     // parser backend, same as the CLI).

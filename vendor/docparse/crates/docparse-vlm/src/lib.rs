@@ -1,19 +1,25 @@
-//! VLM enhancer over OpenAI-compatible services (plan G8b).
+//! VLM enhancers over OpenAI-compatible services (plan G8b).
 //!
-//! One protocol covers vLLM, LM Studio and cloud endpoints:
+//! One protocol covers vLLM, SGLang, LM Studio and cloud endpoints:
 //! `POST {url}/v1/chat/completions` with a base64 PNG data-URL image. The
 //! deterministic pipeline never depends on this — tasks are opt-in per call,
-//! results come back as [`TextChunk`]s with `source: "vlm:<model>"` and
-//! reduced confidence, and any service failure degrades to "no annotation",
-//! never a parse failure.
+//! results carry `source: "vlm:<model>"` and reduced confidence, and any
+//! service failure degrades to "no annotation", never a parse failure.
 //!
-//! First task — picture description: each sizable figure region is cropped
-//! from an on-demand page render (`docparse-raster`, works for embedded
-//! rasters *and* vector-drawn charts alike) and captioned by the model. The
-//! caption is written back onto the figure's [`ImageChunk::caption`] (with
-//! `caption_source: "vlm:<model>"`), so the chunker folds it into that image's
-//! RAG chunk — figure and description stay one unit instead of a free-floating
-//! text block.
+//! Two families of task live here, and they want different things from the
+//! client (which is why [`VlmConfig`] carries a per-task image cap):
+//!
+//! * **Annotation** (this module): picture description and the TSV-prompt table
+//!   pass. Each region is cropped from an on-demand page render
+//!   (`docparse-raster`, which handles embedded rasters *and* vector-drawn
+//!   charts alike) and captioned. A caption is written back onto the figure's
+//!   [`ImageChunk::caption`] with `caption_source: "vlm:<model>"`, so the
+//!   chunker folds it into that image's RAG chunk — figure and description stay
+//!   one unit instead of a free-floating text block. Modest resolution is fine.
+//! * **Recognition** ([`region`]): a [`docparse_core::region_reader::RegionReader`]
+//!   implementation that makes a served model interchangeable with the embedded
+//!   UniRec backend for table re-extraction and page transcription. It needs the
+//!   model's full resolution budget and pipelines a page's regions concurrently.
 
 pub mod region;
 
