@@ -79,7 +79,7 @@ def main():
         if len(tabs) == 1:
             singles.append((page["page_info"]["image_path"], tabs[0]["html"]))
     singles = singles[:n]
-    scores = []
+    scores, failures = [], []
     for i, (ip, gt_html) in enumerate(singles):
         pdf = wrap_pdf(ip)
         gt = html_to_cells(gt_html)
@@ -103,6 +103,13 @@ def main():
             cmd += ["--layout-model", lm]
         r = subprocess.run(cmd, capture_output=True, text=True)
         pred = None
+        if r.returncode != 0:
+            # A run that never produced output must not be averaged in as a 0 —
+            # "0.000 over 6 pages" reads like "the backend is terrible" when it
+            # actually means "nothing ran" (observed: a missing --ocr model tier
+            # failed every invocation, and both arms reported a clean 0.000).
+            failures.append(f"{ip[:24]}: exit {r.returncode}: "
+                            f"{(r.stderr or '').strip().splitlines()[-1][:120] if r.stderr else '?'}")
         if r.returncode == 0 and r.stdout.strip():
             doc = json.loads(r.stdout)
             for p in doc["pages"]:
@@ -112,9 +119,16 @@ def main():
         teds = S.teds_x({"tables_cells": [pred]}, {"tables_cells": [gt]}) if pred else 0.0
         scores.append(teds)
         print(f"[{i+1}/{len(singles)}] e2e TEDS {teds:.3f}  ({ip[:24]}{' no-table' if not pred else ''})")
+    if failures:
+        print(f"\n!! {len(failures)}/{len(scores)} invocations FAILED — the mean below is "
+              f"not a quality measurement:")
+        for f in failures[:5]:
+            print(f"   {f}")
     if scores:
+        ok = len(scores) - len(failures)
         print(f"\n== end-to-end (detect+recognize) table TEDS_X: "
-              f"mean {sum(scores)/len(scores):.3f} over {len(scores)} single-table pages ==")
+              f"mean {sum(scores)/len(scores):.3f} over {len(scores)} single-table pages "
+              f"({ok} produced output) ==")
 
 
 if __name__ == "__main__":
