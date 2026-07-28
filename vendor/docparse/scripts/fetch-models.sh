@@ -39,7 +39,13 @@ dl_file() {
   local repo="$1" glob="$2" dest="$3"
   local tmp
   tmp="$(mktemp -d)"
-  "${HF[@]}" "$repo" --include "$glob" --local-dir "$tmp" >/dev/null
+  # Two patterns on purpose: newer `hf` requires `**/` to match at least one
+  # directory, so a `**/x.onnx` glob silently misses a file sitting at the repo
+  # root — which is how the layout tier broke (the repo never moved; the CLI's
+  # glob semantics changed under it). Passing the bare basename as well covers
+  # root-level files without giving up the survives-reorganization property.
+  "${HF[@]}" "$repo" --include "$glob" --include "$(basename "$glob")" \
+    --local-dir "$tmp" >/dev/null
   local found
   found="$(find "$tmp" -type f -name "$(basename "$glob")" | head -1)"
   if [ -z "$found" ]; then
