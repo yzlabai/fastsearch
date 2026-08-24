@@ -1715,7 +1715,15 @@ impl Engine {
 
         // rerank：宽召回后重排（req.rerank 存在时）。对候选文本打分、按 rerank 分降序、
         // 同分按 gid，再截 top_k。rerank 分写入命中（透明）；原 bm25/vector/fused 保留。
-        if let Some(spec) = &req.rerank {
+        //
+        // **纯图片 query（`query=""` + `query_image`/`vector`）整段跳过**：`Reranker` trait 只吃文本
+        // （`rerank(&str, &[String])`），空 query 下任何实现都给不出有意义的分——词项 baseline 直接
+        // 返回全 0（rerank/lib.rs `q.is_empty()`），全同分则下面按 gid 排序，**视觉相似度序被摧毁**
+        // （与 H1-A 同源，但正文再全也救不了没有 query）。跳过时保持融合/视觉序、`hit.rerank` 留
+        // `None`（响应 `null`，调用方可见"这次没重排"）；`rerank.top_k` 是喂给重排器的成本钮，
+        // 重排器没被调用就不用它裁结果，条数仍由 `req.top_k` 收口。不报错——以图搜图顺带带上
+        // rerank 是常见用法。多模态 reranker 落地后改为按 caps 显式开启。
+        if let Some(spec) = req.rerank.as_ref().filter(|_| !req.query.trim().is_empty()) {
             // rerank 窗口：只对融合分最高的 `rerank.top_k` 个候选重排（hits 此时已是融合序），其余
             // 低分候选丢弃——重排后也进不了最终 top_k。接真 cross-encoder 时这限住延迟/费用（M5）。
             hits.truncate(spec.top_k);
@@ -3595,6 +3603,67 @@ mod tests {
             hit.rerank,
             Some(1.0),
             "rerank 应对真源正文完全重叠打 1.0，而非空串 0.0"
+        );
+    }
+
+    #[test]
+    fn image_only_query_skips_lexical_rerank() {
+        // 以图搜图（query="" + 查询向量）时带 rerank：词项 reranker 对空 query 返回全 0 分，
+        // 若照常按分排序则全部同分 → 退化 gid 升序 → **视觉相似度序被摧毁**。
+        // 期望：整段跳过重排，保持视觉序，且 hit.rerank 为 None（调用方看得见没重排）。
+        use fastsearch_core::RerankSpec;
+        use fastsearch_sync::IndexSink;
+        let mut e = engine();
+        e.set_embedder(Box::new(HashEmbedder::new(32)));
+        // 三条正文互不相同 → 向量与查询图的相似度不同；下面用 chunk 3 的正文当查询向量，
+        // 使"视觉序"(3 在前) 与 "gid 序"(1 在前) **不同**，测试才有证伪力。
+        for (id, text) in [(1u64, "alpha alpha"), (2, "beta beta"), (3, "gamma gamma")] {
+            e.apply_upsert("kb", &chunk("d.pdf", id, ChunkKind::Paragraph, text, 1))
+                .unwrap();
+        }
+        e.commit().unwrap();
+        let qv = HashEmbedder::new(32)
+            .embed(&["gamma gamma".into()], EmbedKind::Query)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let base = SearchRequest {
+            query: String::new(),
+            vector: Some(qv),
+            mode: SearchMode::Vector,
+            top_k: 5,
+            candidates: 10,
+            ..Default::default()
+        };
+
+        // 基线：不带 rerank 的纯视觉序。
+        let visual: Vec<u64> = e
+            .search(&base, None)
+            .unwrap()
+            .iter()
+            .map(|h| h.id.chunk_id)
+            .collect();
+        assert_eq!(visual[0], 3, "查询向量取自 chunk 3 正文，它应排第一");
+        assert_ne!(
+            visual,
+            vec![1, 2, 3],
+            "视觉序必须不等于 gid 升序，否则本测试无法证伪"
+        );
+
+        // 带 rerank：必须与基线**逐条相同**，且没有任何 rerank 分。
+        let with_rerank = SearchRequest {
+            rerank: Some(RerankSpec {
+                model: "lexical".into(),
+                top_k: 10,
+            }),
+            ..base
+        };
+        let hits = e.search(&with_rerank, None).unwrap();
+        let got: Vec<u64> = hits.iter().map(|h| h.id.chunk_id).collect();
+        assert_eq!(got, visual, "空 query 下 rerank 不得改动视觉序");
+        assert!(
+            hits.iter().all(|h| h.rerank.is_none()),
+            "跳过重排时 rerank 应留 None（而非 0 分），让调用方看得见"
         );
     }
 

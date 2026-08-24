@@ -641,7 +641,8 @@ fn openapi_spec() -> Value {
             "score": {"type": "number"},
             "bm25": {"type": ["number", "null"]},
             "vector": {"type": ["number", "null"]},
-            "rerank": {"type": ["number", "null"]},
+            "rerank": {"type": ["number", "null"], "description":
+                "重排分；null = 本次未重排（未请求 rerank，或 query 为空的纯图片检索被跳过）"},
             "doc_id": {"type": "string"},
             "chunk_id": {"type": "integer"},
             "page": {"type": "integer"},
@@ -680,7 +681,10 @@ fn openapi_spec() -> Value {
                         "ef_search": {"type": ["integer", "null"], "description":
                             "HNSW 检索期探索宽度逐查询覆盖（越大召回越高越慢；暴力/pgvector 档忽略）"},
                         "top_k": {"type": "integer", "default": 20},
-                        "rerank": {"type": ["object", "null"]},
+                        "rerank": {"type": ["object", "null"], "description":
+                            "{model, top_k}；重排窗口取融合分最高的 top_k 条。\
+                             **query 为空时（纯图片检索）整段忽略**——重排器只吃文本，空 query 下\
+                             无信息量，强行重排会把视觉相似度序压成 id 序；此时命中的 rerank 为 null"},
                         "auto_merge": {"type": "boolean", "default": false},
                         "collapse": {"type": ["object", "null"], "description": "{field, max_per_group}"},
                         "search_after": {"type": ["string", "null"], "description": "深分页游标（取自上一页末条命中的 cursor）"},

@@ -99,9 +99,21 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 - [x] v2.7（2026-07-23，通用 chunk 协议）：`SearchHit` opt-in 返回完整正文/metadata，keyword/vector-only/hybrid 语义一致；`searchable=false` 在直接 ingest 与 CDC 更新时从全文/向量派生索引移除。派生 schema checkpoint 升至 v2，旧版本明确要求从真源重建而不会自动删除目录。
 - [x] v2.8（2026-07-23，chunk 生命周期）：新增 `remove_many` 供 server 在一个提交周期清理任意
   GlobalId；普通 text-only upsert 同步删除旧向量，覆盖 chunk 级向量转文本回归。
+- [x] v2.9（2026-08-24，纯图片 query 不进词项 rerank）：`run()` 的 rerank 段在 **`req.query` 去空白
+  为空**（以图搜图：`query=""` + `query_image`/`vector`）时**整段跳过**——`Reranker` trait 只吃文本
+  （`rerank(&str, &[String])`），空 query 下词项 baseline 返回全 0 分，随后"按分降序 + 同分 gid"
+  会把**视觉相似度序整体压成 gid 升序**（与 H1-A 同源，但正文再全也救不了没有 query）。跳过时保持
+  融合/视觉序、`hit.rerank` 留 `None`（响应 `null`，调用方看得见没重排）；`rerank.top_k` 是喂给重排器
+  的成本钮，重排器未被调用即不用它裁结果，条数仍由 `req.top_k` 收口。不报错（以图搜图顺带带 rerank
+  是常见用法）。+1 单测 `image_only_query_skips_lexical_rerank`（构造"向量序≠gid 序"，去掉修复即红）。
+  详见 [plan](../plans/2026-08-24-image-only-query跳过词项rerank.md)。
 
 **已知限制 / 下一迭代：**
 - ✅ auto-merging（v1.3）、rerank 钩子、CDC 自动 embedding（v1.6）、search_after（v2.1）、单集合重建（v2.2）均已实现。
+- **rerank 仍只在"query 为空"这一支跳过**：query 非空但被分词器切空（纯标点、分词器不认的语种）时，
+  词项 reranker 依然返回全同分 → 退化 gid 序。根治需把"重排无信息量"变成显式信号
+  （`Option<Vec<f64>>` 或 trait 加 `informative(query)`），属契约变更，下一迭代。
+  多模态 reranker 落地后，把"query 为空则跳过"升级为"按 reranker caps 选择"。
 - 引擎并发去串行（Mutex→RwLock/副本）为后续——影响 server CDC 与检索的串行（见 19-server / [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。
 - ✅ pgvector 直查的 **CDC 自动写穿已落地**（2026-06-27，B6 续作）：`apply_upsert` 在 `set_pg_vector` 模式把嵌入写回 PG `embedding` 列（`set_embedding`），列清单 publication 排除派生列 + 幂等守卫双防线断 CDC 反馈环。Docker pgvector 真机验证。详见 [12-pg spec §7 v1.5](12-pg.md)、[devlog](../devlog/2026-06-27-B6-CDC写穿与断反馈环.md)。
 - ✅ **M1 图像嵌入路由基线已落地**（2026-06-27，MM10）：`apply_upsert` 对无文本但 `caps.image`+inline 字节的 chunk 走图像嵌入；以图搜图 `query_image`（MM9）。真视觉模型/跨模态 gated。

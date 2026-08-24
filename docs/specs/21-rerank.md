@@ -30,6 +30,12 @@ pub struct LexicalOverlapReranker;
 - `LexicalOverlapReranker`：分 = |query_tokens ∩ doc_tokens| / |query_tokens ∪ doc_tokens|（Jaccard，小写、按非字母数字切词）。query 空 → 全 0。
 - 确定性、不 panic；候选空 → 空。
 - 引擎用法：rerank 分**替换**最终排序键（重排），但保留原 bm25/vector/fused 分在命中里；同分 tie-break 按 gid。
+- **本 trait 结构上只吃文本**（`rerank(query: &str, candidates: &[String])`）：**没有文本 query 时，
+  任何实现都给不出有意义的分**。因此"要不要重排"的判断归**编排层**，不归 reranker——
+  reranker 对空 query 返回全 0 是正确行为，`Engine::run()` 负责在 `req.query` 去空白为空时
+  （纯图片检索）**整段跳过重排**，保持融合/视觉序、命中 `rerank` 留 `None`。
+  否则全 0 → 全同分 → 按 gid tie-break → 视觉相似度序被整体压平（2026-08-24 已修，见
+  [14-engine spec v2.9](14-engine.md)、[plan](../plans/2026-08-24-image-only-query跳过词项rerank.md)）。
 
 ## 4. 依赖
 
@@ -40,10 +46,18 @@ pub struct LexicalOverlapReranker;
 1. 词项重叠：query 与候选完全重叠→1，无重叠→0，部分→Jaccard 值对照。
 2. 重排：候选按 rerank 分降序；同分按 gid。
 3. 空 query / 空候选不 panic。
+4. 编排层：纯图片 query（`query=""` + 查询向量）带 rerank 时，结果顺序与不带 rerank **逐条相同**，
+   且命中 `rerank` 全为 `None`（engine 侧 `image_only_query_skips_lexical_rerank`）。
 4. 引擎集成：req.rerank 时，与 query 词项更重叠的命中被提前。
 
 ## 6. 验收标准与状态
 
 - [x] v1 完成：Reranker trait + LexicalOverlapReranker（3 单测）+ 引擎接入（`set_reranker`、req.rerank 时宽召回后重排、rerank 分写入命中）+ engine/server 透出 + 活服务验证（"apple banana" → chunk2 rerank=1.0 居首）。clippy 净、fmt 净。
+
+- [x] v1.1（2026-08-24）：明确"空文本 query 不重排"的**编排层**契约（见 §3 末条），engine 侧落地 +1 回归测试。
+
+**已知限制：** query 非空但被分词器切空（纯标点、分词器不认的语种）时，仍返回全同分 → 退化 gid 序。
+根治需把"重排无信息量"变成显式信号（`Option<Vec<f64>>`，或 trait 加 `informative(query) -> bool`），
+属 trait 契约变更，单独立项。多模态 reranker 落地后，"query 为空则跳过"应升级为"按 reranker caps 选择"。
 
 **下一迭代（仅"无 LLM 兜底"入口需要时）：** 纯 Rust **轻量 LTR**（线性/小 GBDT over bm25/vector/heading 命中/精确短语/proximity 等特征，用 eval golden 训练，确定性、可解释、可 CI）经 `set_reranker` 注入；rerank 批处理/缓存。**不做**进程内神经 cross-encoder。
