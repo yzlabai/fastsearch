@@ -33,7 +33,7 @@ fastsearch-server (:8642)  ← hybrid search engine (Rust crate in this repo)
 **① Start the fastsearch engine** (at the repo root, not `example/`)
 
 ```bash
-FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" \
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" \
   cargo run -p fastsearch-server --bin fastsearch-server
 # Listens on :8642, API Key = dev. No embedding backend → pure keyword (BM25) mode, enough for this example.
 ```

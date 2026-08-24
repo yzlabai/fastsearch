@@ -16,7 +16,7 @@ cargo clippy --workspace --all-targets -- -D warnings   # lint，目标零 warni
 cargo fmt --all            # 格式化（--check 仅校验）
 
 # 起 server（真源/索引/嵌入/落盘都在这）
-FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" cargo run -p fastsearch-server --bin fastsearch-server  # REST :8642
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" cargo run -p fastsearch-server --bin fastsearch-server  # REST :8642
 
 # CLI 是 server 的**纯 REST 客户端**（--server/--key，或 env FASTSEARCH_SERVER/FASTSEARCH_KEY）
 cargo run -p fastsearch-cli --bin fastsearch -- index --server http://localhost:8642 --key dev --collection kb --doc-id r.pdf chunks.json

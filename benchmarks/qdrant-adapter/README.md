@@ -44,7 +44,7 @@ cp -r /path/to/fastsearch/benchmarks/qdrant-adapter engine/clients/fastsearch
 #    引擎名填 "fastsearch"，写入 hnsw/quant 参数
 
 # 4) 起 fastsearch server（嵌入后端可关，向量直传不需要嵌入）
-FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" fastsearch-server &
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" fastsearch-server &
 
 # 5) 跑
 python run.py --engines fastsearch --datasets glove-100-angular

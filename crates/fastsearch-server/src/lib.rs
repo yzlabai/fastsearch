@@ -1129,6 +1129,18 @@ async fn metrics(State(s): State<ServerState>) -> String {
         g(&m.rate_limited),
     );
 
+    // 诚实记账（不变量 #2）：派生索引可重建性取决于是否配了 PG 真源。这不是配置声明，
+    // 是运行时事实——运维可直接对 `== 0` 告警（该实例崩溃后无法从真源重建）。
+    let source_store = u64::from(s.engine.lock().await.source_pg_clone().is_some());
+    out.push_str(
+        "# HELP fastsearch_source_store_configured PostgreSQL source of truth configured (1) \
+         or local-only/ephemeral (0).\n\
+         # TYPE fastsearch_source_store_configured gauge\n",
+    );
+    out.push_str(&format!(
+        "fastsearch_source_store_configured {source_store}\n"
+    ));
+
     // 检索延迟直方图（Prometheus 累积 le 桶）。
     out.push_str(
         "# HELP fastsearch_search_latency_seconds Search latency in seconds.\n\
@@ -2032,7 +2044,7 @@ async fn image_upload(
     let doc_id = doc_id.ok_or_else(|| (StatusCode::BAD_REQUEST, "doc_id is required".into()))?;
     let (bytes, media_type) =
         image.ok_or_else(|| (StatusCode::BAD_REQUEST, "image is required".into()))?;
-    let acl = ingest_acl_for(&principal);
+    let acl = ingest_acl_for(&principal)?;
     let chunk = Chunk {
         doc_id: doc_id.clone(),
         chunk_id: 1,
@@ -2113,21 +2125,39 @@ fn object_namespace(tenant: Option<&str>) -> Result<String, (StatusCode, String)
     }
 }
 
-fn ingest_acl_for(principal: &Principal) -> Vec<String> {
+/// 写入时赋予 chunk 的 ACL：**只能来自身份的 tags**。
+///
+/// fail-closed（2026-08-24）：身份没有 tags 时**拒绝写入**，而不是默认 `["public"]`。
+/// 此前的默认把"忘了给密钥配标签"这一配置遗漏，静默升级成了"数据对外公开"——
+/// 而 `AclFilter::visible` 对含 `public` 的行放行任何调用者（含其它租户的无 tenant 密钥）。
+/// 身份归调用方（见 governance/2026-08-24-职责边界），故引擎不替调用方猜测可见性。
+///
+/// **public 依然可用，但必须是显式授权动作**：把 `public` 写进该密钥的 tags
+/// （`admin=:public`，集成指南里本就是既定惯例）。
+fn ingest_acl_for(principal: &Principal) -> Result<Vec<String>, (StatusCode, String)> {
     if principal.tags.is_empty() {
-        vec!["public".into()]
-    } else {
-        principal.tags.clone()
+        return Err((
+            StatusCode::FORBIDDEN,
+            "this API key has no ACL tags, so written data would have no owner; \
+             configure tags for the key (e.g. \"key=tenant:team-a\"), or use \
+             \"key=tenant:public\" to publish explicitly"
+                .into(),
+        ));
     }
+    Ok(principal.tags.clone())
 }
 
-fn apply_ingest_identity(body: &mut IndexBody, principal: &Principal) {
-    let acl = ingest_acl_for(principal);
+fn apply_ingest_identity(
+    body: &mut IndexBody,
+    principal: &Principal,
+) -> Result<(), (StatusCode, String)> {
+    let acl = ingest_acl_for(principal)?;
     for ic in &mut body.chunks {
         ic.chunk.doc_id = body.doc_id.clone();
         ic.chunk.tenant = principal.tenant.clone();
         ic.chunk.acl = acl.clone();
     }
+    Ok(())
 }
 
 fn validate_chunk_ids(ids: &[GlobalId]) -> Result<(), (StatusCode, String)> {
@@ -2235,7 +2265,7 @@ async fn index(
         s.metrics.errors.fetch_add(1, Ordering::Relaxed);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     };
-    apply_ingest_identity(&mut body, &principal);
+    apply_ingest_identity(&mut body, &principal)?;
     for ic in &body.chunks {
         ic.chunk
             .validate_metadata()
@@ -2610,7 +2640,7 @@ async fn batch_upsert_chunks(
             format!("batch size must be <= {MAX_CHUNK_BATCH}"),
         ));
     }
-    let acl = ingest_acl_for(&principal);
+    let acl = ingest_acl_for(&principal)?;
     for item in &mut body.items {
         if item.collection.is_empty()
             || item.chunk.doc_id.is_empty()
@@ -3026,6 +3056,10 @@ async fn server_vector_info(s: &ServerState) -> Value {
         "vector_dim": s.vector_dim.or_else(|| engine.vector_dim()),
         "vector_count": engine.vector_len(),
         "embedded": s.embedder.is_some(),
+        // 诚实记账（不变量 #2）：无 PG 真源时，"派生索引可重建"并不成立——如实报告，
+        // 不让调用方以为崩溃后能从真源恢复。事实由运行时推导，非配置声明。
+        "source_of_truth": if engine.source_pg_clone().is_some() { "postgres" } else { "none" },
+        "rebuildable_from_source": engine.source_pg_clone().is_some(),
     })
 }
 
@@ -3270,13 +3304,151 @@ mod tests {
             tenant: Some("acme".into()),
             tags: vec!["team-a".into()],
         };
-        assert_eq!(ingest_acl_for(&tagged), vec!["team-a".to_string()]);
+        assert_eq!(ingest_acl_for(&tagged).unwrap(), vec!["team-a".to_string()]);
 
+        // 显式 public 标签 → 确实公开（public 依然可达，只是必须显式授权）。
+        let explicit_public = Principal {
+            tenant: None,
+            tags: vec!["public".into()],
+        };
+        assert_eq!(
+            ingest_acl_for(&explicit_public).unwrap(),
+            vec!["public".to_string()]
+        );
+
+        // fail-closed 回归：无标签身份**不再**默认写成 public，而是拒绝写入。
+        // 旧行为把"忘配标签"这一配置遗漏静默升级为"数据公开"。
         let untagged = Principal {
             tenant: None,
             tags: vec![],
         };
-        assert_eq!(ingest_acl_for(&untagged), vec!["public".to_string()]);
+        let (status, msg) = ingest_acl_for(&untagged).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(msg.contains("no ACL tags"), "错误信息应可操作: {msg}");
+    }
+
+    /// 诚实记账（不变量 #2）：无 PG 真源时，introspection 与 metrics 必须**如实说**
+    /// "不可从真源重建"，而不是沉默让运维以为崩溃后能恢复。
+    #[tokio::test]
+    async fn local_only_instance_reports_it_cannot_rebuild_from_source() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()));
+
+        let resp = api_json_request(
+            &app,
+            axum::http::Method::POST,
+            "/v1/collections",
+            "k-team-a",
+            Some(json!({"name": "kb"})),
+        )
+        .await;
+        let info = body_json(resp).await;
+        assert_eq!(info["server"]["source_of_truth"], "none");
+        assert_eq!(info["server"]["rebuildable_from_source"], false);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("\nfastsearch_source_store_configured 0\n"),
+            "metrics 应暴露真源缺席的 gauge 供告警: {text}"
+        );
+        // Prometheus 是**行式**格式：每行必须顶格。曾因字符串续行写错导致 `# TYPE` 带缩进、
+        // HELP 里混入空白串（实跑 /metrics 才发现），此处把格式本身钉死。
+        assert!(
+            text.contains("# TYPE fastsearch_source_store_configured gauge\n"),
+            "TYPE 行必须顶格: {text}"
+        );
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            assert!(
+                !line.starts_with(char::is_whitespace),
+                "metrics 行不得以空白开头: {line:?}"
+            );
+        }
+    }
+
+    /// fail-closed 端到端：无标签密钥在**全部三条写路径**上都被拒（403），且不留副作用。
+    #[tokio::test]
+    async fn untagged_key_cannot_write_on_any_path() {
+        let mut ks = keys();
+        ks.insert(
+            "k-untagged".into(),
+            Principal {
+                tenant: Some("acme".into()),
+                tags: vec![],
+            },
+        );
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, ks).with_embedder(Arc::new(PairEmbedder)));
+
+        let index_body = r#"{"collection":"kb","doc_id":"d.pdf","chunks":[
+            {"doc_id":"d.pdf","chunk_id":1,"kind":"paragraph","text":"hello","page":1,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":5}]}"#;
+        let batch_body = r#"{"items":[{"collection":"kb","chunk":
+            {"doc_id":"d.pdf","chunk_id":1,"kind":"paragraph","text":"hello","page":1,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":5}}]}"#;
+        for (uri, body) in [
+            ("/v1/index", index_body),
+            ("/v1/chunks/batch-upsert", batch_body),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .header("x-api-key", "k-untagged")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{uri} 应拒绝无标签写入"
+            );
+        }
+        // 第三条路径：图片上传（multipart）。
+        let resp = app
+            .clone()
+            .oneshot(upload_image_request_as(
+                "k-untagged",
+                "img",
+                "",
+                b"red-image",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "/v1/images 应拒绝无标签写入"
+        );
+
+        // 无副作用：有标签的身份检索不到任何东西。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"query":"hello","top_k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["hits"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -3456,6 +3628,10 @@ mod tests {
     }
 
     fn upload_image_request(doc_id: &str, text: &str, bytes: &[u8]) -> Request<Body> {
+        upload_image_request_as("k-team-a", doc_id, text, bytes)
+    }
+
+    fn upload_image_request_as(key: &str, doc_id: &str, text: &str, bytes: &[u8]) -> Request<Body> {
         let boundary = "fastsearch-upload-boundary";
         let mut body = Vec::new();
         body.extend_from_slice(
@@ -3484,7 +3660,7 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri("/v1/images")
-            .header("x-api-key", "k-team-a")
+            .header("x-api-key", key)
             .header(
                 "content-type",
                 format!("multipart/form-data; boundary={boundary}"),

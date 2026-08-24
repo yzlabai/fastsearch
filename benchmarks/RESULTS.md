@@ -53,7 +53,7 @@
 docker run -d --name qd -p 6333:6333 qdrant/qdrant:latest
 # 2) fastsearch（release + HNSW）
 cargo build --release -p fastsearch-server
-FASTSEARCH_DATA=$(mktemp -d) FASTSEARCH_KEYS="dev=:" FASTSEARCH_VECTOR_BACKEND=hnsw \
+FASTSEARCH_DATA=$(mktemp -d) FASTSEARCH_KEYS="dev=:public" FASTSEARCH_VECTOR_BACKEND=hnsw \
   ./target/release/fastsearch-server &
 # 3) 跑（需 numpy + requests）
 python3 benchmarks/vector_bench.py --n 5000 --q 500 --dim 64            # 配置 A

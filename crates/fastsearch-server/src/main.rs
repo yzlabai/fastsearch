@@ -3,8 +3,10 @@
 //! 配置（环境变量）：
 //! - `FASTSEARCH_DATA`：索引数据目录（默认 `./data`）。
 //! - `FASTSEARCH_PORT`：监听端口（默认 8642）。
-//! - `FASTSEARCH_KEYS`：API Key 表，格式 `key=tenant:tag1,tag2;key2=:public`
-//!   （tenant 留空=管理员/无租户限制）。未设则建一个 dev key `dev`（无租户限制）。
+//! - `FASTSEARCH_KEYS`（**必填**）：API Key 表，格式 `key=tenant:tag1,tag2;key2=:public`
+//!   （tenant 留空=管理员/无租户限制）。**未设则拒绝启动**——身份归调用方，引擎不自造默认密钥
+//!   （fail-closed，见 `docs/governance/2026-08-24-职责边界-不承担身份与控制面.md`）。
+//!   密钥的 tags 同时是写入时赋予数据的 ACL：**无 tags 的密钥不能写入**（要公开须显式 `:public`）。
 //! - `FASTSEARCH_RATE_LIMIT`：`capacity,refill_per_sec`（每 key 令牌桶）；未设=不限流。
 //! - `FASTSEARCH_AUDIT`：设为 `1`/`stderr` 则每个成功请求向 stderr 输出一行审计 JSON。
 //! - `FASTSEARCH_S3_ENDPOINT` / `_REGION` / `_BUCKET` / `_ACCESS_KEY` / `_SECRET_KEY`：
@@ -16,8 +18,8 @@
 //! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`brute_binary`|`brute_binary_rotated`|`turboquant`|`hnsw`|`pgvector`：向量后端。
 //!   `turboquant`=压缩主索引（只存 2–4bit 码、内存 ↓8~16×、确定，位宽由 `FASTSEARCH_QUANT_BITS` 调，默认 4；
 //!   `FASTSEARCH_TURBO_RERANK=<oversample>` 开 f32 精排 sidecar → 召回近精确、RAM 仍只码）；hnsw=引擎侧近似
-//!   ANN（大规模、近似+非确定，仅首启生效）；pgvector=直查档（ANN 在 PG 跑，需 `DATABASE_URL` +
-//!   embedding 已入 PG，引擎写穿为下一迭代）。
+//!   ANN（大规模、近似+非确定，仅首启生效）；pgvector=直查档（ANN 在 PG 跑，需 `DATABASE_URL`；
+//!   `/v1/index` 与 `/v1/chunks` 均已写穿 embedding 到 PG，CDC 亦然）。
 //! - `FASTSEARCH_CDC=1`（+ `DATABASE_URL`，可选 `FASTSEARCH_CDC_SLOT`/`_PUBLICATION`/`_INTERVAL_MS`）：
 //!   起后台 CDC 同步循环（崩溃安全、落盘续传），从 PG 真源把变更同步到派生索引。
 
@@ -72,20 +74,22 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8642);
-    let keys = match std::env::var("FASTSEARCH_KEYS") {
-        Ok(spec) => parse_keys(&spec),
-        Err(_) => {
-            let mut m = HashMap::new();
-            m.insert(
-                "dev".to_string(),
-                Principal {
-                    tenant: None,
-                    tags: vec![],
-                },
+    // fail-closed：**身份归调用方**（见 governance/2026-08-24-职责边界），正因为 100% 依赖调用方
+    // 接对，才绝不能在他没接对时替他编一个。此前未配置即自造 `dev` 密钥且 `tenant: None`——
+    // 而 `AclFilter::visible` 对无 tenant 的调用者直接放行租户维度，等于自造一把能读**所有租户**
+    // public 行的钥匙。宁可起不来，也不要静默地起在一个谁都没授权过的身份上。
+    let keys = {
+        let spec = std::env::var("FASTSEARCH_KEYS").unwrap_or_default();
+        let keys = parse_keys(&spec);
+        if keys.is_empty() {
+            anyhow::bail!(
+                "FASTSEARCH_KEYS is required (format: \"key=tenant:tag1,tag2; ...\").\n\
+                 \x20 本地开发：FASTSEARCH_KEYS=\"dev=:public\"（无租户 + 显式公开标签）\n\
+                 \x20 多租户： FASTSEARCH_KEYS=\"alice=acme:team-a; bob=acme:team-b\"\n\
+                 服务端从此表把 API key 映射为身份，再强制注入 ACL；不再自动生成默认密钥。"
             );
-            eprintln!("FASTSEARCH_KEYS not set; using dev key 'dev' (no tenant restriction)");
-            m
         }
+        keys
     };
 
     // 默认 jieba（面向 docparse 中文为主的语料）；FASTSEARCH_TOKENIZER=default 可切。
@@ -150,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
     let embed_dim = ecfg.dim;
 
     // pgvector 直查档（B6）：向量召回改在 PG 跑 ANN（需 DATABASE_URL）。引擎侧向量后端仍建
-    // （Brute，空置不用）。注意：embedding 须已在 PG（外部嵌入管线写入；引擎写穿为下一迭代）。
+    // （Brute，空置不用）。embedding 由写路径写穿到 PG（`/v1/index`、`/v1/chunks`）或 CDC 落地时写入。
     if matches!(
         std::env::var("FASTSEARCH_VECTOR_BACKEND").as_deref(),
         Ok("pgvector")
@@ -286,6 +290,8 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // 真源是否就位（诚实记账用）：须在 engine 交给 ServerState 之前取。
+    let has_source_store = engine.source_pg_clone().is_some();
     let mut state = ServerState::new(engine, keys).with_vector_dim(embed_dim);
 
     // 限流：FASTSEARCH_RATE_LIMIT="capacity,refill_per_sec"
@@ -363,6 +369,18 @@ async fn main() -> anyhow::Result<()> {
             rcfg.slot, rcfg.publication, interval
         );
         state.spawn_cdc(rcfg, data.clone(), interval);
+    }
+
+    // 诚实记账（不变量 #2）：没有 PG 真源时，"派生索引可从真源重建"并不成立。这一行不是配置
+    // 回显，是运行时事实——启动时就说清楚，别让运维以为崩溃后能恢复。同一事实另经
+    // introspection（`source_of_truth`）与 metrics（`fastsearch_source_store_configured`）暴露。
+    if has_source_store {
+        eprintln!("source of truth: PostgreSQL（派生索引可从真源重建）");
+    } else {
+        eprintln!(
+            "source of truth: 无（local-only / ephemeral）—— 未配 DATABASE_URL：\
+             派生索引**不可**从真源重建，进程/磁盘丢失即数据丢失"
+        );
     }
 
     let app = router(state);

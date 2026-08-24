@@ -28,7 +28,7 @@ CLI 是 server 的**纯 REST 客户端**（类比 Typesense/Qdrant/Algolia 的 C
 ```bash
 cargo build -p fastsearch-server -p fastsearch-cli
 # 1) 起 server（真源 / 索引 / 嵌入 / 落盘都在这）
-FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" ./target/debug/fastsearch-server &   # REST :8642
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-server &   # REST :8642
 # 2) CLI 作客户端（--server/--key，或 env FASTSEARCH_SERVER/FASTSEARCH_KEY）
 # 喂一个资料文件夹（递归 .md/.txt，markdown 标题成面包屑），随后检索
 ./target/debug/fastsearch index-dir --server http://localhost:8642 --key dev --collection kb ./我的资料

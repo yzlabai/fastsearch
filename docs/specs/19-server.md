@@ -107,6 +107,19 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   去掉写穿即红：0 命中）。**活服务验证**：实跑 server（pgvector 档、**CDC 未开**）→ `psql` 直查真源确认
   两行 `embedding IS NOT NULL` / `embed_model=api-precomputed` → 立即检索命中 → 重复 index 后仍命中。
   详见 [plan §6.1](../plans/2026-08-24-index写穿pgvector对齐chunks.md)。
+- [x] v2.4（2026-08-24，**fail-closed 默认 + 运行档如实标注**）：上游决策
+  [职责边界：不承担身份与控制面](../governance/2026-08-24-职责边界-不承担身份与控制面.md)——
+  身份归调用方，**正因 100% 依赖调用方接对，才不能在他没接对时替他猜**。两处"替他猜"已断根：
+  ① `FASTSEARCH_KEYS` 未设不再自造 `dev` 密钥（`tenant: None` 可读**所有租户**的 public 行），
+  改为**拒绝启动** + 可直接粘贴的修复命令；② 身份无 tags 时不再把写入 ACL 默认成 `["public"]`
+  （把"忘配标签"静默升级为"数据公开"），改为 **403** + 可操作错误信息，覆盖 `/v1/index`、
+  `/v1/chunks/batch-upsert`、`/v1/images` 三条写路径。public 依然可用但必须显式（`key=:public`，
+  集成指南里本就是既定惯例）。**运行档如实标注**（不变量 #2）：真源有无是运行时事实而非配置声明，
+  经启动日志 + introspection（`source_of_truth`/`rebuildable_from_source`）+ metrics gauge
+  `fastsearch_source_store_configured` 三处暴露。**未引入 profile 开关**——一个"生产档"布尔会立刻
+  产生"默认取哪个"的两难。+3 测试（契约单测、三条写路径 403 且无副作用、local-only 如实报告）。
+  文档同步：README×2 / CLAUDE.md / example×2 / 集成指南×2 / benchmarks×2 的 `dev=:` → `dev=:public`。
+  详见 [plan](../plans/2026-08-24-fail-closed默认与运行档如实标注.md)。
 
 **已知限制 / 下一迭代：** 写穿是**每 chunk 一条 UPDATE、顺序 await**（`/v1/chunks` 同此形态），
 `/v1/index` 又不像 batch 端点那样有 `MAX_CHUNK_BATCH` 上限——大文档会产生成百上千次往返。

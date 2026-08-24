@@ -33,7 +33,7 @@
 ```bash
 cargo build -p fastsearch-server -p fastsearch-cli
 # ⓪ CLI 是瘦 REST 客户端——先起 server（索引/嵌入/落盘都在 server）
-FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" ./target/debug/fastsearch-server &   # REST :8642
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-server &   # REST :8642
 
 # ① 喂一个资料文件夹（递归 .md/.txt，markdown 标题自动成面包屑）
 ./target/debug/fastsearch index-dir --server http://localhost:8642 --key dev --collection kb ./我的资料
@@ -266,7 +266,7 @@ FASTSEARCH_KEYS="alice=acme:team-a,public; bob=acme:team-b; admin=:public"
 | 变量 | 作用 |
 |---|---|
 | `FASTSEARCH_DATA` | 索引数据目录（默认 `./data`） |
-| `FASTSEARCH_KEYS` | API Key 表 `key=tenant:tags;...`（不设=单 dev key、无租户限制） |
+| `FASTSEARCH_KEYS` | **必填。** API Key 表 `key=tenant:tags;...`。未设则**拒绝启动**（身份归调用方，引擎不自造默认密钥）。密钥的 tags 即它写入数据的 ACL，故**无 tags 的密钥不能写入**——要公开须显式 `:public`。 |
 | `FASTSEARCH_EMBEDDER` | `ollama`\|`openai`（+ `FASTSEARCH_EMBED_*`）→ 真语义嵌入（开 vector/hybrid） |
 | `FASTSEARCH_VECTOR_BACKEND` | `brute`(默认确定)\|`hnsw`(大规模近似)\|`pgvector`(直查，需 `DATABASE_URL`) |
 | `FASTSEARCH_CDC=1` | 开后台 CDC：PG 写 → 逻辑复制 → 自动嵌入 → 索引（需 `DATABASE_URL`） |

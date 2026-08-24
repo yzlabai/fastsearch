@@ -33,7 +33,7 @@ No PG, no model needed — feed it a **folder** and search:
 ```bash
 cargo build -p fastsearch-server -p fastsearch-cli
 # ⓪ The CLI is a thin REST client — start a server first (it does indexing/embedding/persistence)
-FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" ./target/debug/fastsearch-server &   # REST :8642
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-server &   # REST :8642
 
 # ① Feed a folder (recurses .md/.txt; markdown headings auto-become breadcrumbs)
 ./target/debug/fastsearch index-dir --server http://localhost:8642 --key dev --collection kb ./my-docs
@@ -243,7 +243,7 @@ Hits carry `media` (a media reference) and `time` (an audio/video interval); `re
 | Variable | Effect |
 |---|---|
 | `FASTSEARCH_DATA` | Index data directory (default `./data`) |
-| `FASTSEARCH_KEYS` | API key table `key=tenant:tags;...` (unset = a single dev key, no tenant restriction) |
+| `FASTSEARCH_KEYS` | **Required.** API key table `key=tenant:tags;...`. Unset → the server refuses to start (identity belongs to the caller; no default key is invented). A key's tags become the ACL of everything it writes, so **a key with no tags cannot write** — use `:public` to publish explicitly. |
 | `FASTSEARCH_EMBEDDER` | `ollama`\|`openai` (+ `FASTSEARCH_EMBED_*`) → real semantic embeddings (enables vector/hybrid) |
 | `FASTSEARCH_VECTOR_BACKEND` | `brute` (deterministic default) \| `hnsw` (large-scale approximate) \| `pgvector` (direct query, needs `DATABASE_URL`) |
 | `FASTSEARCH_CDC=1` | Enable background CDC: PG write → logical replication → auto-embed → index (needs `DATABASE_URL`) |

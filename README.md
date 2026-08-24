@@ -28,7 +28,7 @@ The CLI is a thin REST client of the server (like the Typesense/Qdrant/Algolia C
 ```bash
 cargo build -p fastsearch-server -p fastsearch-cli
 # 1) start the server (truth source / indexing / embedding / persistence all live here)
-FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" ./target/debug/fastsearch-server &   # REST :8642
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-server &   # REST :8642
 # 2) CLI as client (--server/--key, or env FASTSEARCH_SERVER/FASTSEARCH_KEY)
 # Feed it a folder (recurses .md/.txt; markdown headings become breadcrumbs), then search
 ./target/debug/fastsearch index-dir --server http://localhost:8642 --key dev --collection kb ./my-docs

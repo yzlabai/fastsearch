@@ -33,7 +33,7 @@ fastsearch-server (:8642)  ← 混合检索引擎（本仓库 Rust crate）
 **① 起 fastsearch 检索引擎**（在仓库根目录，不是 example/）
 
 ```bash
-FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:" \
+FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" \
   cargo run -p fastsearch-server --bin fastsearch-server
 # 监听 :8642，API Key = dev。没配嵌入后端 → 纯关键词(BM25)模式，足够本例。
 ```
