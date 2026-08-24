@@ -2490,7 +2490,13 @@ async fn index(
         // 刚 index 完的文档要等 CDC 消费到这批变更才可向量检索（CDC 没开就永远查不到），
         // 重复 index 同一 doc 更会把已可检索的向量清成 NULL。与 `/v1/chunks`
         // （`batch_upsert_chunks`）的写穿保持一字不差的一致。
-        if s.engine.lock().await.has_pg_vector() {
+        //
+        // 档位判断**先落成 let 再用**（与 `batch_upsert_chunks` 同款写法）：写在 `if` 条件里虽然
+        // 也正确（`if` 条件是终结作用域，临时 MutexGuard 在进入块前即释放，故下面几个 `.await`
+        // 不会持锁），但那依赖一条微妙的临时量作用域规则——一旦有人改成 `if let`，guard 就会
+        // 横跨整块存活，把引擎锁按在每次 PG 往返上（检索全部排队等它）。让它显式、不可误改。
+        let pgvector = s.engine.lock().await.has_pg_vector();
+        if pgvector {
             for (ic, v) in body.chunks.iter().zip(&vectors) {
                 let Some(v) = v else { continue };
                 pg_arc
