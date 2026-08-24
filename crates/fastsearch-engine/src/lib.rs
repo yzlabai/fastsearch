@@ -1059,7 +1059,9 @@ impl Engine {
 
     /// **单集合原地重建**（坏索引/索引损坏 → 从真源 PG 重灌）：清空派生 text+vector 索引，
     /// 用传入的 `rows`（PG 全表/单集合快照，真源）经 `apply_upsert` 重灌（含嵌入），统一
-    /// `commit` 成一次可见切换。**派生可重建**不变量的运维出口；不触 PG，调用方负责 fetch。
+    /// `commit` 成一次可见切换。**派生可重建**不变量的运维出口；**不读** PG，调用方负责 fetch。
+    /// （注：pgvector 直查档下 `apply_upsert` 会把重嵌的向量**写回** PG `embedding` 列——那是 B6
+    /// 写穿语义，直查档的向量本就归 PG；`set_embedding` 自带幂等守卫，同值不产生实际写。）
     ///
     /// 换分词器属"换 schema"，走另一条路（用新 `TextIndexConfig` 新建 Engine + `bootstrap_snapshot`）——
     /// 本方法保持同 schema。返回重灌条数。

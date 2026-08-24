@@ -96,5 +96,22 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - [x] v2.2（2026-07-23，实例级向量维度）：`FASTSEARCH_EMBED_DIM` 同时约束服务端
   collection 注册；`dim=0` 或与实例维度不一致时在写入前返回 400，`server.vector_dim`
   可用于契约自检。单元测试覆盖维度拒绝，真实 Compose smoke 覆盖 1024 接受/768 拒绝。
+- [x] v2.3（2026-08-24，`/v1/index` 的 pgvector 写穿，**Docker pgvector 真机验证**）：直查档（B6）下
+  `/v1/index` 在 PG 真源 `upsert_doc` 成功后把向量写回 PG `embedding` 列（`set_embedding`），与
+  `/v1/chunks`（`batch_upsert_chunks`）的既有写穿**对齐**。此前只有 `/v1/chunks` 与 CDC `apply_upsert`
+  写穿，`/v1/index` 没有：而直查档**读的是 PG `embedding`**、`upsert_doc` 又是 doc 级 delete+insert
+  （新行 embedding 必为 NULL），故刚 index 完的文档要等 CDC 消费到才可向量检索（CDC 没开就永远查不到），
+  重复 index 同一 doc 更会把已可检索的向量清成 NULL。`embed_model` 标记沿用同一约定
+  （`api-precomputed`/`api-embedder`）。+1 env-gated 集成测试
+  `index_writes_embedding_through_to_pg_in_pgvector_mode`（index 后立即向量命中 + 重复 index 仍命中；
+  去掉写穿即红：0 命中）。详见 [plan](../plans/2026-08-24-index写穿pgvector对齐chunks.md)。
 
-**已知限制 / 下一迭代：** RBAC 细粒度策略引擎、TLS（交网关）、并发优化（当前 Mutex 串行；后续 RwLock/副本，见 [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。MCP 工具面已独立实现（`fastsearch-mcp`）。
+**已知限制 / 下一迭代：** 写穿是**每 chunk 一条 UPDATE、顺序 await**（`/v1/chunks` 同此形态），
+`/v1/index` 又不像 batch 端点那样有 `MAX_CHUNK_BATCH` 上限——大文档会产生成百上千次往返。
+本次修复以"与既有路径一字不差地一致"为先，未顺手改批量化；批量 `set_embeddings`
+（`UPDATE ... FROM (VALUES ...)`）属 pg crate 的 API 扩展，单独立项。
+另：写入的真源与 embedding **不在同一事务**（`set_embedding` 是 `upsert_doc`
+提交后的独立 UPDATE，`/v1/chunks` 同）——中间崩溃会留下"真源已提交、embedding 未就绪"的窗口，
+由 CDC 补齐；原子化需新增 `upsert_doc_with_embeddings` 事务 API，且写入响应应显式区分
+`source_committed`/`embedding_ready`/`derived_index_visible`，均属契约变更，单独立项。
+另：RBAC 细粒度策略引擎、TLS（交网关）、并发优化（当前 Mutex 串行；后续 RwLock/副本，见 [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。MCP 工具面已独立实现（`fastsearch-mcp`）。

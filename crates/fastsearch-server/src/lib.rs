@@ -2484,6 +2484,34 @@ async fn index(
             }
             return Err(internal_err("pg upsert", e));
         }
+
+        // B6 写穿：pgvector 直查档的**读路径是 PG `embedding` 列**，不是引擎侧派生向量。而
+        // `upsert_doc` 是 doc 级 delete+insert（新行 embedding 必为 NULL），不在此写回的话，
+        // 刚 index 完的文档要等 CDC 消费到这批变更才可向量检索（CDC 没开就永远查不到），
+        // 重复 index 同一 doc 更会把已可检索的向量清成 NULL。与 `/v1/chunks`
+        // （`batch_upsert_chunks`）的写穿保持一字不差的一致。
+        if s.engine.lock().await.has_pg_vector() {
+            for (ic, v) in body.chunks.iter().zip(&vectors) {
+                let Some(v) = v else { continue };
+                pg_arc
+                    .set_embedding(
+                        &body.collection,
+                        &body.doc_id,
+                        ic.chunk.chunk_id,
+                        v,
+                        if ic.vector.is_some() {
+                            "api-precomputed"
+                        } else {
+                            "api-embedder"
+                        },
+                    )
+                    .await
+                    .map_err(|e| {
+                        s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                        internal_err("pg set embedding", e)
+                    })?;
+            }
+        }
     }
 
     let mut engine = s.engine.lock().await;
@@ -5453,6 +5481,111 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["chunk_id"], 1);
         store.delete_doc("kb", "d.pdf").await.ok();
+    }
+
+    /// B6 写穿回归（需 DATABASE_URL + multi-thread）：pgvector 直查档下 `/v1/index` 必须把向量
+    /// 写回 PG `embedding` 列——直查读的是 PG，而 `upsert_doc` 是 delete+insert（新行 embedding
+    /// 为 NULL）。不写穿则刚 index 完的文档要等 CDC 才可向量检索，重复 index 更会清空已有向量。
+    /// 与 `/v1/chunks` 的既有写穿对齐。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_writes_embedding_through_to_pg_in_pgvector_mode() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip index_writes_embedding_through_to_pg_in_pgvector_mode: DATABASE_URL not set"
+            );
+            return;
+        };
+        use fastsearch_pg::{PgConfig, PgStore};
+
+        let mut cfg = PgConfig::new(url).with_vector_dim(3); // PairEmbedder dim=3
+        cfg.table = "fastsearch_index_writethrough_it".into();
+        let store = Arc::new(PgStore::connect(cfg).await.expect("connect"));
+        store.ensure_schema().await.expect("schema");
+        let collection = format!("writethrough-{}", std::process::id());
+        store.delete_doc(&collection, "d.pdf").await.ok();
+
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        engine.set_source_store(store.clone());
+        engine.set_pg_vector(store.clone()); // 直查档：向量召回在 PG 跑
+        let app = router(ServerState::new(engine, keys()).with_embedder(Arc::new(PairEmbedder)));
+
+        let index_body = serde_json::to_string(&json!({
+            "collection": collection,
+            "doc_id": "d.pdf",
+            "chunks": [
+                {"doc_id":"d.pdf","chunk_id":1,"kind":"paragraph","text":"red chart of revenue",
+                 "page":1,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":20},
+                {"doc_id":"d.pdf","chunk_id":2,"kind":"paragraph","text":"unrelated prose",
+                 "page":2,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},"char_len":15}
+            ]
+        }))
+        .unwrap();
+        let post_index = |body: String| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        // 纯向量检索：命中只可能来自 PG embedding 列（直查档绕过引擎侧向量索引）。
+        let vector_search = || {
+            let req = serde_json::to_string(&SearchRequest {
+                query: "red chart".into(),
+                mode: SearchMode::Vector,
+                top_k: 5,
+                candidates: 20,
+                filter: Some(Filter::Eq(
+                    "collection".into(),
+                    FieldValue::Str(collection.clone()),
+                )),
+                ..Default::default()
+            })
+            .unwrap();
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(req))
+                    .unwrap(),
+            )
+        };
+
+        // A：index 后**立即**可向量检索——不经任何 CDC。
+        assert_eq!(
+            post_index(index_body.clone()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let hits = body_json(vector_search().await.unwrap()).await["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !hits.is_empty(),
+            "写穿缺席则 PG embedding 为 NULL，直查 0 命中（需等 CDC）"
+        );
+        assert_eq!(hits[0]["chunk_id"], 1, "与查询同向量的 chunk 应排第一");
+
+        // C：同 doc 重复 index（delete+insert 会清空 embedding）后仍可检索。
+        assert_eq!(
+            post_index(index_body).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let hits = body_json(vector_search().await.unwrap()).await["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !hits.is_empty(),
+            "重复 index 后必须重新写穿，否则已可检索的向量被清成 NULL"
+        );
+
+        store.delete_doc(&collection, "d.pdf").await.ok();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
