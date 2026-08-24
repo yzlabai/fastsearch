@@ -104,7 +104,9 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   重复 index 同一 doc 更会把已可检索的向量清成 NULL。`embed_model` 标记沿用同一约定
   （`api-precomputed`/`api-embedder`）。+1 env-gated 集成测试
   `index_writes_embedding_through_to_pg_in_pgvector_mode`（index 后立即向量命中 + 重复 index 仍命中；
-  去掉写穿即红：0 命中）。详见 [plan](../plans/2026-08-24-index写穿pgvector对齐chunks.md)。
+  去掉写穿即红：0 命中）。**活服务验证**：实跑 server（pgvector 档、**CDC 未开**）→ `psql` 直查真源确认
+  两行 `embedding IS NOT NULL` / `embed_model=api-precomputed` → 立即检索命中 → 重复 index 后仍命中。
+  详见 [plan §6.1](../plans/2026-08-24-index写穿pgvector对齐chunks.md)。
 
 **已知限制 / 下一迭代：** 写穿是**每 chunk 一条 UPDATE、顺序 await**（`/v1/chunks` 同此形态），
 `/v1/index` 又不像 batch 端点那样有 `MAX_CHUNK_BATCH` 上限——大文档会产生成百上千次往返。

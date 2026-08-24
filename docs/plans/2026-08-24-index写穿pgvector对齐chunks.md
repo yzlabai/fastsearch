@@ -1,7 +1,7 @@
 # `/v1/index` 的 pgvector 写穿：与 `/v1/chunks` 对齐
 
 > 日期：2026-08-24
-> 状态：待运行验证 → 实施后回写（PG 集成测试需 `DATABASE_URL`）
+> 状态：**已实施 + 活服务验证 done**（2026-08-24，Docker pgvector:pg16 真机）
 > 来源：[FastGPT 知识库与多模态检索参考建议](2026-08-24-fastgpt知识库与多模态检索参考建议.md) §4.7 / P0-4
 > 相关 spec：[19-server](../specs/19-server.md)、[12-pg](../specs/12-pg.md)、[14-engine](../specs/14-engine.md)
 
@@ -79,6 +79,24 @@ fastsearch search --collection kb --query "毛利率" --json
    `chunk_management_routes_enforce_acl_tenant_and_idempotency` 等既有 PG 测试仍绿。
 3. 收口：`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings`
    + `cargo test --workspace`；PG 部分需 `DATABASE_URL` 实跑，跑不到就在状态里标 `待运行验证`。
+
+## 6.1 实际验收结果（2026-08-24）
+
+- 集成测试 `index_writes_embedding_through_to_pg_in_pgvector_mode` 对**真实 pgvector:pg16** 实跑绿；
+  **去掉写穿即红**（直查 0 命中），证伪力已验证。
+- **§6 的"断言 B"（直查 PG 确认 `embedding IS NOT NULL` 且 `embed_model` 为约定标记）
+  未进自动化测试**——`PgStore` 没有暴露读 embedding 的公开 API，为此加一个仅测试用的读接口
+  不值当。该断言改由下面的活服务验证以 `psql` 直查真源覆盖，**如实记账，不假装自动化已覆盖**。
+- 收口：fmt 净、clippy `-D warnings` 0 告警、`cargo test --workspace` 343 passed / 0 failed。
+- **活服务验证**（实跑 `fastsearch-server` 二进制，`FASTSEARCH_VECTOR_BACKEND=pgvector` +
+  `DATABASE_URL`，**`FASTSEARCH_CDC` 未置**——即"CDC 不参与"，正是此前查不到的场景）：
+
+  1. 启动日志确认档位：`vector backend: pgvector 直查（ANN 在 PG，需 embedding 已入 PG）`。
+  2. `POST /v1/index` 两条 chunk → `psql` 直查真源：两行均 `embedding IS NOT NULL`、
+     `embed_model = api-precomputed` ✅（覆盖断言 B）。
+  3. 立即 `POST /v1/search`（纯向量）→ 命中 `[3, 1]` ✅ 不经任何 CDC。
+  4. **对同一 doc 重复 `/v1/index`**（此前会把 embedding 清成 NULL）→ 两行仍 `NOT NULL`、
+     检索仍命中 ✅ 覆盖 delete+insert 后的重新写穿。
 
 ## 7. 下一迭代
 

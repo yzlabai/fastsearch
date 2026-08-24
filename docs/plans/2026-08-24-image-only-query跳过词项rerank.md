@@ -1,7 +1,7 @@
 # image-only query 跳过词项 rerank（保住视觉召回序）
 
 > 日期：2026-08-24
-> 状态：待运行验证 → 实施后回写
+> 状态：**已实施 + 活服务验证 done**（2026-08-24）
 > 来源：[FastGPT 知识库与多模态检索参考建议](2026-08-24-fastgpt知识库与多模态检索参考建议.md) §4.4 / P0-3
 > 相关 spec：[14-engine](../specs/14-engine.md)、[21-rerank](../specs/21-rerank.md)
 
@@ -74,6 +74,26 @@ curl -s localhost:8642/v1/search -H 'x-api-key: dev' -H 'content-type: applicati
    `rerank_top_k_caps_window` 三条既有测试**不变、仍绿**（证明只动了空 query 这一支）。
 3. 收口：`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings`
    + `cargo test --workspace` 全过。
+
+## 6.1 实际验收结果（2026-08-24）
+
+- 单测：`image_only_query_skips_lexical_rerank` 绿；**去掉修复即红**（视觉序 `[3,1,2]` 塌成 gid 序
+  `[1,2,3]`），证伪力已验证。三条既有 rerank 测试不变仍绿。
+- 收口：fmt 净、clippy `-D warnings` **0 告警**、`cargo test --workspace` **343 passed / 0 failed**
+  （带 `DATABASE_URL`，PG/CDC 集成测试实跑非跳过）。
+- **活服务验证**（实跑 `fastsearch-server` 二进制 + curl，三条预计算向量令"向量序≠gid 序"）：
+
+  | 臂 | 请求 | 结果 |
+  |---|---|---|
+  | A 基线 | `query=""` + vector，不带 rerank | `[3, 2, 1]`（视觉序） |
+  | B 修复 | 同上 + `rerank{lexical,10}` | `[3, 2, 1]`，`rerank` 全 `null` ✅ 与 A 逐条相同 |
+  | C 对照 | `query="gamma"` + rerank | chunk3 得 1.0 居首 ✅ 正常重排路径未被误伤 |
+
+- **C 臂顺带给出了 §7 那条已知限制的实证**：chunk 1 与 2 都得 0 分（与 "gamma" 无词项重叠），
+  二者顺序退化为 gid 序、向量序丢失。这正是"分词器切空"那类问题的同一形态——
+  当前修复只覆盖 query 为空这一支，此处如实记账。
+- OpenAPI 契约已同步（请求侧说明空 query 忽略 rerank、响应侧说明 `rerank: null` 的两种含义），
+  经 `GET /openapi.json` 实取确认渲染正确。
 
 ## 7. 下一迭代
 

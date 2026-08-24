@@ -57,6 +57,9 @@ pub struct LexicalOverlapReranker;
 - [x] v1.1（2026-08-24）：明确"空文本 query 不重排"的**编排层**契约（见 §3 末条），engine 侧落地 +1 回归测试。
 
 **已知限制：** query 非空但被分词器切空（纯标点、分词器不认的语种）时，仍返回全同分 → 退化 gid 序。
+**同一形态在正常路径上也可观察到**（2026-08-24 活服务实测）：query="gamma" 时，两条与之无词项重叠的
+候选同得 0 分，其相对顺序退化为 gid 序、向量序丢失——即"部分候选同分"与"全部候选同分"是一个问题的
+两种程度，当前只修了后者中 query 为空的那一支。
 根治需把"重排无信息量"变成显式信号（`Option<Vec<f64>>`，或 trait 加 `informative(query) -> bool`），
 属 trait 契约变更，单独立项。多模态 reranker 落地后，"query 为空则跳过"应升级为"按 reranker caps 选择"。
 
