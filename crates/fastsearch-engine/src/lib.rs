@@ -1098,6 +1098,14 @@ impl Engine {
         self.vector_pg.is_some()
     }
 
+    /// 是否配了嵌入后端。供各张脸**如实生成能力描述**（如 MCP 的 tool schema：宣称的能力必须
+    /// 等于实际能力）。**注意它只说明"能不能嵌图/嵌 chunk 正文"**——`run()` 从不嵌入*文本
+    /// query*（那一步在 server 的 `search_request` 里，算完塞进 `req.vector`），所以
+    /// `has_embedder()==true` 并**不**意味着直连引擎的调用方能做文本语义检索。
+    pub fn has_embedder(&self) -> bool {
+        self.embedder.is_some()
+    }
+
     /// **崩溃安全地**消费一批 CDC 变更并落地（生产 CDC 主循环的一拍）：
     /// `peek`（不推进 slot）→ 幂等应用全部（`apply_upsert` 含嵌入）→ `persist`（索引 +
     /// 检查点=slot 高水位）→ **落盘成功后才** `advance_slot`。返回应用条数。

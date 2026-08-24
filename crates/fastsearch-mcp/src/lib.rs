@@ -10,7 +10,7 @@
 //! 协议：`initialize` 握手 → `tools/list` 列工具 → `tools/call` 调用；`ping` 存活；
 //! 通知（`notifications/*`）无响应。详见架构大图"四张脸"。
 
-use fastsearch_core::{AclFilter, SearchRequest};
+use fastsearch_core::{AclFilter, SearchMode, SearchRequest};
 use fastsearch_engine::{AssetFetch, Engine};
 use serde_json::{json, Value};
 
@@ -39,7 +39,7 @@ impl McpServer {
         let result = match method {
             "initialize" => Ok(self.initialize_result()),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_defs() })),
+            "tools/list" => Ok(json!({ "tools": self.tool_defs() })),
             "tools/call" => return Some(self.tools_call(id, msg.get("params"))),
             _ => Err((-32601, format!("method not found: {method}"))),
         };
@@ -80,10 +80,68 @@ impl McpServer {
         }
     }
 
+    /// 本面**自己**能否产出文本查询向量 —— 恒 `false`，这是代码事实而非保守估计：
+    /// `Engine::run()` **从不嵌入文本 query**（`embedder` 只服务 `query_image`），
+    /// 文本 query 的向量是 **server** 在 `search_request` 里算好塞进 `req.vector` 的；
+    /// MCP 直连引擎、没有那一步。⇒ 本面只能如实宣称 `keyword`，语义/混合检索要么由调用方
+    /// 自带 `vector`，要么走 REST（server 配了嵌入后端）。
+    ///
+    /// 远端模式（KB-0.2，MCP 改为 server 的 REST 客户端）落地后，这里应改为**按 server 的
+    /// 实际能力**返回——那时 hybrid 由 server 免费提供，无需在本 crate 里养第二套嵌入配置。
+    fn can_embed_text_query(&self) -> bool {
+        false
+    }
+
+    /// 本实例如实宣称的检索模式。**schema 宣称的能力必须等于实际能力**：宣称了做不到的档，
+    /// agent 会拿着静默退化的结果当语义检索用（本条正是 KB-0.1 修的 bug）。
+    fn search_modes(&self) -> Vec<&'static str> {
+        if self.can_embed_text_query() {
+            vec!["keyword", "vector", "hybrid"]
+        } else {
+            vec!["keyword"]
+        }
+    }
+
+    /// 显式要了本面给不出的档 → **报可自纠的错，而不是静默退化**。
+    ///
+    /// 引擎的既有语义是"`Hybrid` 无 `req.vector` 时退化为全文、`Vector` 无向量时向量路不启用"——
+    /// 对 server 那张脸是合理的（它已经把向量算好了），对**直连引擎且不会算向量**的 MCP 却意味着
+    /// agent 拿到全文结果却以为是语义检索。agent 没有人类的试错直觉，只能读错误文本自纠，
+    /// 所以这里给出"下一步该怎么改"的指引（KB-0.5 的同一条原则）。
+    ///
+    /// **放行两条真能走通的路**：调用方自带 `vector`；或带 `query_image` 且引擎配了 embedder
+    /// （以图搜图，引擎会自己嵌图）。
+    fn reject_unavailable_mode(&self, req: &SearchRequest) -> Result<(), String> {
+        if !matches!(req.mode, SearchMode::Vector | SearchMode::Hybrid) {
+            return Ok(());
+        }
+        if req.vector.is_some() || (req.query_image.is_some() && self.engine.has_embedder()) {
+            return Ok(());
+        }
+        Err(format!(
+            "本 MCP 实例产不出查询向量，mode=\"{}\" 在这里只会静默退化成全文检索，故拒绝。\
+             改法（任选其一）：① 用 mode=\"keyword\"（本实例唯一如实支持的档，见 tools/list）；\
+             ② 需要语义/混合检索时改走 REST POST /v1/search——server 侧配了嵌入后端；\
+             ③ 自行算好查询向量后在入参里带 `vector` 字段。",
+            match req.mode {
+                SearchMode::Vector => "vector",
+                _ => "hybrid",
+            }
+        ))
+    }
+
     /// `search` 工具：入参即 `SearchRequest`（query 必填，mode/top_k/filter 可选）；ACL 服务端注入。
     fn tool_search(&self, args: Value) -> Result<String, String> {
-        let req: SearchRequest =
+        // `mode` 是否**显式**给出：`SearchRequest` 的 serde 默认是 `Hybrid`，而本面 schema 宣称的
+        // 默认是 `keyword`（见 `search_modes`）。不在此对齐的话，agent 省略 mode 就会掉进
+        // "宣称 hybrid、实际全文"的静默退化——即本条要修的 bug。**以 schema 宣称的为准**。
+        let mode_given = args.get("mode").is_some();
+        let mut req: SearchRequest =
             serde_json::from_value(args).map_err(|e| format!("invalid search args: {e}"))?;
+        if !mode_given {
+            req.mode = SearchMode::Keyword;
+        }
+        self.reject_unavailable_mode(&req)?;
         let hits = self
             .engine
             .search(&req, self.acl.as_ref())
@@ -136,18 +194,33 @@ impl McpServer {
     }
 }
 
-/// 两个工具的定义（名称/描述/入参 JSON Schema）。
-pub fn tool_defs() -> Value {
-    json!([
+impl McpServer {
+    /// 两个工具的定义（名称/描述/入参 JSON Schema）。
+    ///
+    /// **按本实例的真实能力生成**（KB-0.1）：`mode` 的 enum 与 default 来自 [`Self::search_modes`]，
+    /// 不再无条件宣称 `hybrid`。描述里也写明本实例的档位——agent 只能读到什么就信什么。
+    pub fn tool_defs(&self) -> Value {
+        let modes = self.search_modes();
+        let semantic = self.can_embed_text_query();
+        let default_mode = if semantic { "hybrid" } else { "keyword" };
+        let search_desc = if semantic {
+            "在 fastsearch 混合检索引擎中检索（keyword/vector/hybrid），返回带引用\
+             （citation_id/page/heading_path/snippet）的命中，供答案层溯源。ACL 由服务端强制。"
+        } else {
+            "在 fastsearch 中做**全文（BM25）**检索，返回带引用（citation_id/page/heading_path/snippet）\
+             的命中，供答案层溯源。ACL 由服务端强制。\
+             **本实例只支持 mode=\"keyword\"**：MCP 面直连引擎、自身不产查询向量，\
+             语义/混合检索请改走 REST POST /v1/search（server 侧配了嵌入后端）。"
+        };
+        json!([
         {
             "name": "search",
-            "description": "在 fastsearch 混合检索引擎中检索（keyword/vector/hybrid），返回带引用\
-                （citation_id/page/heading_path/snippet）的命中，供答案层溯源。ACL 由服务端强制。",
+            "description": search_desc,
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "检索词/问题" },
-                    "mode": { "type": "string", "enum": ["keyword", "vector", "hybrid"], "default": "hybrid" },
+                    "mode": { "type": "string", "enum": modes, "default": default_mode },
                     "top_k": { "type": "integer", "default": 20 },
                     "filter": { "type": "object", "description": "core::Filter AST（可选）" },
                     "highlight": { "type": "boolean", "default": false }
@@ -167,7 +240,8 @@ pub fn tool_defs() -> Value {
                 "required": ["citation_id"]
             }
         }
-    ])
+        ])
+    }
 }
 
 /// MCP `tools/call` 结果：单个文本内容块 + isError 标志。
@@ -282,6 +356,83 @@ mod tests {
         let hits = parsed["hits"].as_array().unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0]["citation_id"], "kb:r.pdf:1");
+    }
+
+    /// KB-0.1 —— **schema 宣称的能力必须等于实际能力**。
+    ///
+    /// 修复前：`mode` 无条件宣称 `["keyword","vector","hybrid"]` 且 `default:"hybrid"`，
+    /// 而本 crate 零 embedder + `Engine::run()` 从不嵌文本 query ⇒ agent 按 schema 用默认档，
+    /// 拿到的永远是纯 keyword 结果且毫不知情。
+    #[test]
+    fn tools_list_advertises_only_real_capability() {
+        let s = server();
+        let list = s
+            .handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+            .unwrap();
+        let search = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "search")
+            .unwrap();
+        let mode = &search["inputSchema"]["properties"]["mode"];
+        assert_eq!(mode["enum"], json!(["keyword"]), "不得宣称做不到的档");
+        assert_eq!(mode["default"], "keyword");
+        // 描述必须把限制讲给 agent 听（它只能读到什么就信什么）。
+        let desc = search["description"].as_str().unwrap();
+        assert!(desc.contains("keyword") && desc.contains("/v1/search"));
+    }
+
+    /// 省略 `mode` 时按 **schema 宣称的默认（keyword）** 走，而不是 `SearchRequest` 的
+    /// serde 默认（Hybrid）—— 后者正是静默退化的入口。行为上仍返回命中，无回归。
+    #[test]
+    fn omitted_mode_runs_keyword_not_silent_hybrid() {
+        let s = server();
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":6,"method":"tools/call",
+                "params": { "name": "search", "arguments": { "query": "毛利率" } }
+            }))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert!(!parsed["hits"].as_array().unwrap().is_empty());
+    }
+
+    /// 显式要一个本面给不出的档 → **可自纠的错误**，不是静默退化成全文。
+    #[test]
+    fn explicit_unavailable_mode_errors_with_actionable_text() {
+        let s = server();
+        for mode in ["hybrid", "vector"] {
+            let r = s
+                .handle(&json!({
+                    "jsonrpc":"2.0","id":7,"method":"tools/call",
+                    "params": { "name": "search",
+                                "arguments": { "query": "毛利率", "mode": mode } }
+                }))
+                .unwrap();
+            assert!(r.get("error").is_none(), "工具级失败不发协议 error");
+            assert_eq!(r["result"]["isError"], true, "mode={mode} 应被拒绝");
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            // agent 只能读错误文本自纠：必须给出可执行的下一步。
+            assert!(text.contains("keyword"), "要告诉 agent 改用哪个档");
+            assert!(text.contains("/v1/search"), "要指出语义检索该走哪条路");
+        }
+    }
+
+    /// 调用方**自带** `vector` 时 vector/hybrid 是真能走通的 —— 守卫不得误伤这条路。
+    #[test]
+    fn caller_supplied_vector_is_not_rejected() {
+        let s = server();
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":8,"method":"tools/call",
+                "params": { "name": "search", "arguments": {
+                    "query": "毛利率", "mode": "vector", "vector": [0.1, 0.2, 0.3] } }
+            }))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], false, "自带向量不该被能力守卫拦下");
     }
 
     #[test]

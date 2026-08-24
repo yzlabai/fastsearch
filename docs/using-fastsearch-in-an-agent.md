@@ -126,6 +126,14 @@ MCP client config (stdio server):
 It exposes two tools:
 
 - **`search`**: input `{query, mode?, top_k?, filter?, highlight?}` → hits with citations (citation_id/page/heading_path/snippet).
+
+> ⚠️ **The MCP face currently supports `mode="keyword"` (full-text/BM25) only** — `tools/list`
+> honestly advertises just that one value. Reason: MCP talks to the **engine directly**, and the
+> engine never embeds a *text* query (that step lives in the server's `/v1/search`), so this face
+> cannot produce a query vector on its own. Passing `hybrid`/`vector` explicitly now returns an
+> **actionable error instead of silently degrading to full-text** (fixed 2026-08-24, KB-0.1).
+> **For semantic/hybrid search use REST `POST /v1/search`** (the server has the embedding backend),
+> or supply a precomputed `vector` in the arguments.
 - **`resolve_citation`**: input `{citation_id}` → media/source location (page+bbox or signed URL).
 
 ACL is injected from server-side env (`FASTSEARCH_MCP_TENANT/TAGS`) — the LLM's tool arguments **cannot** smuggle in or widen permissions.

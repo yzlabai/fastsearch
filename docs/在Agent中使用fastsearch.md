@@ -128,6 +128,14 @@ MCP 客户端配置（stdio server）：
 - **`search`**：入参 `{query, mode?, top_k?, filter?, highlight?}` → 带引用命中（citation_id/page/heading_path/snippet）。
 - **`resolve_citation`**：入参 `{citation_id}` → 媒资/原文位置（page+bbox 或签名 URL）。
 
+> ⚠️ **MCP 面当前只支持 `mode="keyword"`（全文/BM25）**，`tools/list` 里的 enum 会如实只列这一档。
+> 原因：MCP **直连引擎**，而引擎从不嵌入*文本* query（那一步在 server 的 `/v1/search` 里）——
+> 所以本面自己产不出查询向量。显式传 `hybrid`/`vector` 会**明确报错并给出改法**，
+> 而不是静默退化成全文（2026-08-24 修复，KB-0.1）。
+> **需要语义/混合检索：走 REST `POST /v1/search`**（server 侧配了嵌入后端），
+> 或自行算好向量后在入参里带 `vector`。远端模式（让 MCP 直接指向 server、从而白嫖 hybrid）
+> 见[知识库引擎迭代计划 KB-0.2](plans/2026-08-24-知识库引擎迭代计划.md)。
+
 ACL 由服务端 env（`FASTSEARCH_MCP_TENANT/TAGS`）注入——LLM 的工具入参**无法**夹带或放宽权限。
 
 ### 3.2 REST —— 任意 Agent 框架
