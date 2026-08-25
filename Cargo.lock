@@ -1331,6 +1331,7 @@ dependencies = [
  "fastsearch-text",
  "serde",
  "serde_json",
+ "ureq",
 ]
 
 [[package]]

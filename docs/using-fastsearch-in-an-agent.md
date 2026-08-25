@@ -127,7 +127,17 @@ It exposes two tools:
 
 - **`search`**: input `{query, mode?, top_k?, filter?, highlight?}` → hits with citations (citation_id/page/heading_path/snippet).
 
-> ⚠️ **The MCP face currently supports `mode="keyword"` (full-text/BM25) only** — `tools/list`
+> **Two run modes (2026-08-25, KB-0.2)**: set `FASTSEARCH_SERVER` + `FASTSEARCH_KEY` for the
+> **remote mode** (MCP becomes a pure REST client of the server; identity is the API key, ACL is
+> injected server-side from it, and `keyword/vector/hybrid` are all available when the server has an
+> embedding backend — capabilities are probed once at startup via `GET /v1/collections`, and a failed
+> probe **refuses to start** rather than guessing). Without it you get the **local mode** below.
+> Two breaking changes: the local mode now **refuses to start** unless you declare visibility
+> (`FASTSEARCH_MCP_TENANT` or `FASTSEARCH_MCP_ACL=all`), and configuring both modes at once is
+> rejected. `search` accepts only advertised arguments; anything else is refused with the list of
+> accepted fields — an unadvertised capability must never exist as a back door.
+>
+> ⚠️ **In the local mode the MCP face supports `mode="keyword"` (full-text/BM25) only** — `tools/list`
 > honestly advertises just that one value. Reason: MCP talks to the **engine directly**, and the
 > engine never embeds a *text* query (that step lives in the server's `/v1/search`), so this face
 > cannot produce a query vector on its own. Passing `hybrid`/`vector` explicitly now returns an

@@ -66,7 +66,7 @@ impl McpServer {
 二进制壳 `crates/fastsearch-mcp/src/main.rs`：读 env → `Engine::open(&data, cfg)` →
 `McpServer::new` → stdin 逐行 `handle` → stdout 逐行写响应。
 
-### 2.2 远端模式新增（KB-0.2 设计，尚未实现）
+### 2.2 远端模式（KB-0.2，**2026-08-25 已实现**）
 
 不改 `handle` 的形状——**运行模式是 `McpServer` 的后端选择，不是第二套协议**：
 
@@ -472,6 +472,17 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 ## 8. 状态 / 迭代记录 / 已知限制 / 下一迭代
 
 ### 迭代记录
+
+- **2026-08-25 · KB-0.2 远端模式已实施 + 活服务验证**：`Backend::{Local,Remote}`、
+  `RemoteBackend::connect`（启动时 `GET /v1/collections` 探一次、顺带验 key、失败即拒启）、
+  `ServerCaps`、入参允许清单 `SEARCH_ARGS`、远端命中投影 `project_remote_hit`、
+  `remote_resolve`；main 加两档选择 + 冲突拒绝 + 本地档 fail-closed。
+  测试 +7（含 mock server 的探测/出站无 ACL/投影形状/探测失败拒启）；
+  实跑验证：远端档探到 `embedded=false backend=brute` ⇒ schema 如实只列 keyword；
+  检索经 REST 返回投影后的五字段；`query_image` 被允许清单拒绝；两条拒绝启动均生效。
+  **实跑抓到一个单测没抓到的字段名错误**：探测读的是 `server.backend`，而
+  `server_vector_info` 吐的是 `vector_backend` ⇒ 静默变成 `"unknown"`。已修，
+  并把真实字段名写进 mock 响应 + 加断言钉死（这正是"活服务验证"这一步的价值）。
 
 - **v1.0（2026-06-26）**：第四张脸落地（stdio + JSON-RPC，`search`/`resolve_citation`，
   ACL 服务端注入）。6 个 dispatch 单测 + 真 stdio 冒烟。见

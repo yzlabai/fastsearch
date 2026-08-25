@@ -128,13 +128,33 @@ MCP 客户端配置（stdio server）：
 - **`search`**：入参 `{query, mode?, top_k?, filter?, highlight?}` → 带引用命中（citation_id/page/heading_path/snippet）。
 - **`resolve_citation`**：入参 `{citation_id}` → 媒资/原文位置（page+bbox 或签名 URL）。
 
-> ⚠️ **MCP 面当前只支持 `mode="keyword"`（全文/BM25）**，`tools/list` 里的 enum 会如实只列这一档。
-> 原因：MCP **直连引擎**，而引擎从不嵌入*文本* query（那一步在 server 的 `/v1/search` 里）——
-> 所以本面自己产不出查询向量。显式传 `hybrid`/`vector` 会**明确报错并给出改法**，
-> 而不是静默退化成全文（2026-08-24 修复，KB-0.1）。
-> **需要语义/混合检索：走 REST `POST /v1/search`**（server 侧配了嵌入后端），
-> 或自行算好向量后在入参里带 `vector`。远端模式（让 MCP 直接指向 server、从而白嫖 hybrid）
-> 见[知识库引擎迭代计划 KB-0.2](plans/2026-08-24-知识库引擎迭代计划.md)。
+#### 两个运行档（2026-08-25，KB-0.2）
+
+| | **远端档（推荐）** | 本地档 |
+|---|---|---|
+| 怎么开 | 设 `FASTSEARCH_SERVER` + `FASTSEARCH_KEY` | 不设 `FASTSEARCH_SERVER`，用 `FASTSEARCH_DATA` |
+| 检索档位 | **keyword/vector/hybrid**（由 server 的嵌入后端提供） | **仅 keyword** |
+| 身份与 ACL | API key → server 从认证身份注入（与 REST 同一条路） | 进程级常量 `FASTSEARCH_MCP_TENANT/_TAGS` |
+| 适用 | 多租户、与 server 能力对齐 | 单机离线 |
+
+```json
+{ "mcpServers": { "fastsearch": {
+    "command": "/abs/path/target/debug/fastsearch-mcp",
+    "env": { "FASTSEARCH_SERVER": "http://localhost:8642", "FASTSEARCH_KEY": "dev" } } } }
+```
+
+> **schema 按实例真实能力生成**：远端档启动时探一次 `GET /v1/collections`（顺带验 key），
+> 按 server 实测的 `embedded` 决定 `mode` 的 enum；探测失败**拒绝启动**，不猜、不静默回退本地档。
+> 本地档只宣称 `keyword`——MCP 直连引擎，而引擎**从不嵌入文本 query**（那一步在 server 的
+> `/v1/search` 里）。显式传给不出的档会**报错并给出改法**，不静默退化（KB-0.1）。
+>
+> **两条破坏性变更**：① 本地档未显式声明可见范围（`FASTSEARCH_MCP_TENANT` 或
+> `FASTSEARCH_MCP_ACL=all`）→ **拒绝启动**（此前静默"全库可见"，是替调用方猜身份）；
+> ② 同时配 `FASTSEARCH_SERVER` 与 `FASTSEARCH_MCP_TENANT/_TAGS` → **拒绝启动**（二选一）。
+>
+> `search` 只接受宣称过的入参（`query`/`mode`/`top_k`/`filter`/`highlight`/`vector`），
+> 其余一律拒绝并列出可用字段——**未宣称的能力不得作为暗门存在**。以图搜图请走 REST 的
+> `query_image_base64`（本面尚未宣称，需先有 server 实测的 image/cross_modal caps，等 KB-2.4）。
 
 ACL 由服务端 env（`FASTSEARCH_MCP_TENANT/TAGS`）注入——LLM 的工具入参**无法**夹带或放宽权限。
 

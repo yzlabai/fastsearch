@@ -17,15 +17,191 @@ use serde_json::{json, Value};
 /// 支持的 MCP 协议版本（与主流客户端对齐）。
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// MCP 服务：持有引擎 + **服务端固定 ACL**（None=本地全量访问，由部署方决定）。
+/// 从 `GET /v1/collections` 的 `server` 对象（server 侧 `server_vector_info`）读到的**实测**运行档。
+///
+/// **为什么只认这个来源**：`/openapi.json` 是手写静态契约、免认证、只随 crate 版本变，
+/// 不反映本实例配了什么（见 [22-mcp spec §4.5](../../../docs/specs/22-mcp.md)）。
+#[derive(Debug, Clone, Default)]
+pub struct ServerCaps {
+    /// server 是否配了嵌入后端 = 它会在 `/v1/search` 里替我们把文本 query 嵌成向量。
+    ///
+    /// **诚实记账**：`true` 只证明"配了嵌入后端"，**不**证明该向量是语义的
+    /// （`HashEmbedder` 基线也是一个 `Embedder`，而 `server_vector_info` 不吐 `caps().semantic`）。
+    /// 故描述措辞只能是"由 server 侧嵌入后端提供"，不得写成"语义检索"。等 KB-2.4 的实测 caps。
+    pub embedded: bool,
+    pub vector_backend: String,
+    pub source_of_truth: String,
+    /// 本 key 名下**已注册**的集合名。**咨询性**：server 的 collection registry 是进程内
+    /// HashMap、非真源、多副本各持一份（ADR《职责边界》已定为"必须写进对外契约的 caveat"）。
+    pub collections: Vec<String>,
+}
+
+/// 远端后端：server 的瘦 REST 客户端 + **启动时探到的能力**（不可变，供 schema 生成）。
+///
+/// **本结构刻意不持有 `AclFilter`**：远端档的身份是那把 API key，ACL 由 server 的
+/// `principal_from_headers` → `acl_for` 注入。MCP 再持一份只会产生"两处判权且可能不一致"
+/// 的第二真源（spec §4.3-2/3）。
+pub struct RemoteBackend {
+    base: String,
+    key: String,
+    agent: ureq::Agent,
+    caps: ServerCaps,
+}
+
+impl RemoteBackend {
+    /// 连接并**必做一次能力探测**；探测失败 → `Err`（fail-closed，不猜、不静默回退本地档）。
+    ///
+    /// 配置优先级：显式参数 > env（`FASTSEARCH_SERVER` / `FASTSEARCH_KEY`）> `http://localhost:8642`。
+    /// 超时必须显式设：`ureq` 默认无读超时，server 挂起会让 stdio 单线程循环**整个工具面死锁**。
+    pub fn connect(server: Option<String>, key: Option<String>) -> anyhow::Result<Self> {
+        let base = server
+            .or_else(|| std::env::var("FASTSEARCH_SERVER").ok())
+            .unwrap_or_else(|| "http://localhost:8642".into())
+            .trim_end_matches('/')
+            .to_string();
+        let key = key
+            .or_else(|| std::env::var("FASTSEARCH_KEY").ok())
+            .unwrap_or_default();
+        let timeout = std::time::Duration::from_secs(
+            std::env::var("FASTSEARCH_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+        );
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(timeout)
+            .timeout_read(timeout)
+            .timeout_write(timeout)
+            .build();
+        let caps = probe_caps(&agent, &base, &key)?;
+        Ok(RemoteBackend {
+            base,
+            key,
+            agent,
+            caps,
+        })
+    }
+
+    pub fn caps(&self) -> &ServerCaps {
+        &self.caps
+    }
+
+    /// POST 一个 JSON body，成功返回解析后的 JSON；非 2xx / 传输失败都变成**给 agent 看的**文本。
+    fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
+        let url = format!("{}{path}", self.base);
+        match self
+            .agent
+            .post(&url)
+            .set("authorization", &format!("Bearer {}", self.key))
+            .send_json(body.clone())
+        {
+            Ok(r) => r
+                .into_json::<Value>()
+                .map_err(|e| format!("server 响应不是合法 JSON：{e}")),
+            Err(ureq::Error::Status(401, _)) => {
+                Err("server 拒绝了 API key（401）。key 可能已被轮换或撤销：\
+                 请更新 FASTSEARCH_KEY 并重启 MCP。"
+                    .into())
+            }
+            Err(ureq::Error::Status(code, r)) => Err(format!(
+                "server 返回 {code}: {}",
+                r.into_string().unwrap_or_default()
+            )),
+            Err(e) => Err(format!(
+                "请求 {url} 失败：{e}（server 在运行吗？检查 FASTSEARCH_SERVER）"
+            )),
+        }
+    }
+}
+
+/// 能力探测：`GET /v1/collections`。顺带**验 key**——401 在启动期就报，
+/// 而不是等 agent 第一次调用工具才发现（`list_collections` 走 `require_principal`）。
+fn probe_caps(agent: &ureq::Agent, base: &str, key: &str) -> anyhow::Result<ServerCaps> {
+    let url = format!("{base}/v1/collections");
+    let resp = agent
+        .get(&url)
+        .set("authorization", &format!("Bearer {key}"))
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(401, _) => anyhow::anyhow!(
+                "能力探测被拒（401）：API key 无效。设 FASTSEARCH_KEY 或 --key 为 server \
+                 FASTSEARCH_KEYS 里配置过的 key。"
+            ),
+            other => anyhow::anyhow!(
+                "能力探测失败（GET {url}）：{other}。\
+                 远端档拒绝在不知道 server 能力的情况下启动——否则只能靠猜生成 tool schema，\
+                 那正是 KB-0.1 修掉的那类谎。请确认 server 在运行且 FASTSEARCH_SERVER 正确。"
+            ),
+        })?;
+    let v: Value = resp
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("能力探测响应不是合法 JSON：{e}"))?;
+    let srv = v.get("server").cloned().unwrap_or_else(|| json!({}));
+    Ok(ServerCaps {
+        embedded: srv
+            .get("embedded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        vector_backend: srv
+            .get("vector_backend")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        source_of_truth: srv
+            .get("source_of_truth")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        collections: v
+            .get("collections")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        c.as_str()
+                            .map(String::from)
+                            .or_else(|| c.get("name").and_then(Value::as_str).map(String::from))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// 检索后端：本地嵌引擎 或 远端 server 的 REST 客户端。
+///
+/// **运行模式是后端选择，不是第二套协议**——`handle` 的形状两档一致。
+pub enum Backend {
+    /// 本地档：进程内 `Engine` + 进程级固定 ACL（部署方给的常量）。
+    ///
+    /// `Engine` 装箱：它比 `RemoteBackend` 大一个量级，不装箱则整个 `Backend`（连带 `McpServer`）
+    /// 都按最大变体分配——远端档白背一份引擎大小的栈/堆布局。
+    Local {
+        engine: Box<Engine>,
+        acl: Option<AclFilter>,
+    },
+    /// 远端档：server 的纯 REST 客户端，**本进程不持有任何 ACL**。
+    Remote(Box<RemoteBackend>),
+}
+
+/// MCP 服务：持有一个后端（本地嵌引擎 / 远端 REST）。
 pub struct McpServer {
-    engine: Engine,
-    acl: Option<AclFilter>,
+    backend: Backend,
 }
 
 impl McpServer {
+    /// 本地档（保留原签名，既有调用点与测试不动）。
     pub fn new(engine: Engine, acl: Option<AclFilter>) -> Self {
-        McpServer { engine, acl }
+        McpServer {
+            backend: Backend::Local {
+                engine: Box::new(engine),
+                acl,
+            },
+        }
+    }
+
+    pub fn with_backend(backend: Backend) -> Self {
+        McpServer { backend }
     }
 
     /// 处理一条 JSON-RPC 消息：**请求**返回 `Some(响应)`，**通知**（无 `id`）返回 `None`。
@@ -80,16 +256,18 @@ impl McpServer {
         }
     }
 
-    /// 本面**自己**能否产出文本查询向量 —— 恒 `false`，这是代码事实而非保守估计：
-    /// `Engine::run()` **从不嵌入文本 query**（`embedder` 只服务 `query_image`），
-    /// 文本 query 的向量是 **server** 在 `search_request` 里算好塞进 `req.vector` 的；
-    /// MCP 直连引擎、没有那一步。⇒ 本面只能如实宣称 `keyword`，语义/混合检索要么由调用方
-    /// 自带 `vector`，要么走 REST（server 配了嵌入后端）。
+    /// 本面能否产出文本查询向量。
     ///
-    /// 远端模式（KB-0.2，MCP 改为 server 的 REST 客户端）落地后，这里应改为**按 server 的
-    /// 实际能力**返回——那时 hybrid 由 server 免费提供，无需在本 crate 里养第二套嵌入配置。
+    /// - **本地档恒 `false`**，这是代码事实而非保守估计：`Engine::run()` **从不嵌入文本 query**
+    ///   （`embedder` 只服务 `query_image`），文本 query 的向量是 **server** 在 `search_request`
+    ///   里算好塞进 `req.vector` 的；MCP 直连引擎、没有那一步。
+    /// - **远端档看实测**（KB-0.2）：`ServerCaps.embedded` —— server 配了嵌入后端就会替我们算，
+    ///   于是三档都能如实宣称。**这就是"不在 MCP 里养第二套嵌入配置"的兑现方式**。
     fn can_embed_text_query(&self) -> bool {
-        false
+        match &self.backend {
+            Backend::Local { .. } => false,
+            Backend::Remote(r) => r.caps.embedded,
+        }
     }
 
     /// 本实例如实宣称的检索模式。**schema 宣称的能力必须等于实际能力**：宣称了做不到的档，
@@ -115,7 +293,7 @@ impl McpServer {
         if !matches!(req.mode, SearchMode::Vector | SearchMode::Hybrid) {
             return Ok(());
         }
-        if req.vector.is_some() || (req.query_image.is_some() && self.engine.has_embedder()) {
+        if req.vector.is_some() {
             return Ok(());
         }
         Err(format!(
@@ -130,8 +308,45 @@ impl McpServer {
         ))
     }
 
+    /// 本实例 `search` 宣称接受的入参名 —— **允许清单**，与 [`Self::tool_defs`] 的
+    /// `properties` 必须逐字一致（测试 `schema_and_allowlist_agree` 盯住）。
+    const SEARCH_ARGS: [&'static str; 6] =
+        ["query", "mode", "top_k", "filter", "highlight", "vector"];
+
+    /// 拒绝一切未宣称的入参 —— 诚实契约 C1 的执行面：**未宣称的能力不得作为暗门存在**。
+    ///
+    /// 反面教材就在本文件的历史里：`tool_search` 曾把整个 `arguments` 直接反序列化成
+    /// `SearchRequest`，于是 `query_image` 能硬传却从未被宣称，而 schema 默认 `mode=keyword`
+    /// 时 `run()` 的 `want_vec` 为假 ⇒ **图片被完全忽略且毫无提示**。
+    /// 丢弃（serde 默认）与拒绝都不越权，但只有拒绝能让 agent 自纠。
+    fn reject_unadvertised_args(&self, args: &Value) -> Result<(), String> {
+        let Some(obj) = args.as_object() else {
+            return Ok(());
+        };
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !Self::SEARCH_ARGS.contains(k))
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let hint = if unknown.contains(&"query_image") || unknown.contains(&"query_image_base64") {
+            " 以图搜图请走 REST POST /v1/search 的 query_image_base64 或 multipart——\
+             本面尚未宣称该能力（需先有 server 实测的 image/cross_modal caps）。"
+        } else {
+            ""
+        };
+        Err(format!(
+            "不接受的入参：{}。本实例的 search 只接受 {}（见 tools/list 的 inputSchema）。{hint}",
+            unknown.join("、"),
+            Self::SEARCH_ARGS.join("、"),
+        ))
+    }
+
     /// `search` 工具：入参即 `SearchRequest`（query 必填，mode/top_k/filter 可选）；ACL 服务端注入。
     fn tool_search(&self, args: Value) -> Result<String, String> {
+        self.reject_unadvertised_args(&args)?;
         // `mode` 是否**显式**给出：`SearchRequest` 的 serde 默认是 `Hybrid`，而本面 schema 宣称的
         // 默认是 `keyword`（见 `search_modes`）。不在此对齐的话，agent 省略 mode 就会掉进
         // "宣称 hybrid、实际全文"的静默退化——即本条要修的 bug。**以 schema 宣称的为准**。
@@ -142,35 +357,100 @@ impl McpServer {
             req.mode = SearchMode::Keyword;
         }
         self.reject_unavailable_mode(&req)?;
-        let hits = self
-            .engine
-            .search(&req, self.acl.as_ref())
-            .map_err(|e| format!("search failed: {e}"))?;
-        let arr: Vec<Value> = hits
-            .iter()
-            .map(|h| {
-                json!({
-                    "citation_id": h.citation.citation_id(),
-                    "score": h.score,
-                    "page": h.citation.page,
-                    "heading_path": h.citation.heading_path,
-                    "snippet": h.highlight,
+        // 命中形状**两档必须逐字段相同**，否则同一个工具在两种部署下给 agent 两种契约。
+        // 远端拿到的是 server `hits_json` 的富对象（含 bm25/vector/rerank/bbox/media/cursor…），
+        // 必须投影回这五个字段；多出来的等 KB-0.4 决定要不要宣称再开。
+        let arr: Vec<Value> = match &self.backend {
+            Backend::Local { engine, acl } => engine
+                .search(&req, acl.as_ref())
+                .map_err(|e| format!("search failed: {e}"))?
+                .iter()
+                .map(|h| {
+                    json!({
+                        "citation_id": h.citation.citation_id(),
+                        "score": h.score,
+                        "page": h.citation.page,
+                        "heading_path": h.citation.heading_path,
+                        "snippet": h.highlight,
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+            Backend::Remote(r) => {
+                let body = serde_json::to_value(&req).map_err(|e| e.to_string())?;
+                let resp = r.post("/v1/search", &body)?;
+                resp.get("hits")
+                    .and_then(Value::as_array)
+                    .map(|hits| hits.iter().map(project_remote_hit).collect())
+                    .unwrap_or_default()
+            }
+        };
         serde_json::to_string(&json!({ "hits": arr })).map_err(|e| e.to_string())
     }
 
     /// `resolve_citation` 工具：由 citation_id 解析媒资/原文位置（ACL 服务端强制，越权/不存在
     /// 均报"未找到或无权限"，不暴露存在性）。
+    /// 远端档的 `resolve_citation`：`POST /v1/assets/resolve {"ids":[cid]}`。
+    ///
+    /// **越权与不存在同一个回答**：`assets_resolve` 对不可见/不存在的 id 直接 `continue`
+    /// （不暴露存在性）⇒ 空数组 ⇒ 映射成与本地档**字面一致**的 `found:false`。
+    fn remote_resolve(&self, cid: &str) -> Result<String, String> {
+        let Backend::Remote(r) = &self.backend else {
+            unreachable!("remote_resolve 只在远端档调用")
+        };
+        let resp = r.post("/v1/assets/resolve", &json!({ "ids": [cid] }))?;
+        let Some(item) = resp
+            .get("assets")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+        else {
+            return serde_json::to_string(
+                &json!({ "found": false, "reason": "not found or not authorized" }),
+            )
+            .map_err(|e| e.to_string());
+        };
+        // server 未配签名密钥时 inline 分支只回 error —— 报可自纠的错，不把半个资产塞给 agent。
+        if let Some(err) = item.get("error").and_then(Value::as_str) {
+            return Err(format!(
+                "server 无法签发该资产的短时 URL（{err}）。取字节请走 REST GET /v1/asset/{cid}，\
+                 或让运维设置 FASTSEARCH_ASSET_SIGNING_KEY。"
+            ));
+        }
+        let fetch = match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "doc_render" => json!({
+                "kind": "doc_render",
+                "doc_id": item.get("doc_id"), "page": item.get("page"), "bbox": item.get("bbox"),
+            }),
+            "object" => json!({
+                "kind": "signed_url",
+                "url": item.get("url"), "expires_s": item.get("expires_s"),
+            }),
+            // 两档唯一允许的出参差异：远端已经签出 URL 了，本地档没有签名器也不该有。
+            // 差异写进工具 description（见 `tool_defs`）。
+            "inline" => json!({
+                "kind": "inline_ref",
+                "url": item.get("url"), "expires_s": item.get("expires_s"),
+            }),
+            other => return Err(format!("server 返回了未知的资产类型 {other:?}")),
+        };
+        serde_json::to_string(&json!({
+            "found": true,
+            "media_type": item.get("media_type"),
+            "time": item.get("time"),
+            "fetch": fetch,
+        }))
+        .map_err(|e| e.to_string())
+    }
+
     fn tool_resolve_citation(&self, args: Value) -> Result<String, String> {
         let cid = args
             .get("citation_id")
             .and_then(|c| c.as_str())
             .ok_or("missing citation_id")?;
-        let resolved = self
-            .engine
-            .resolve_citation(cid, self.acl.as_ref())
+        let Backend::Local { engine, acl } = &self.backend else {
+            return self.remote_resolve(cid);
+        };
+        let resolved = engine
+            .resolve_citation(cid, acl.as_ref())
             .map_err(|e| format!("resolve failed: {e}"))?;
         let v = match resolved {
             None => json!({ "found": false, "reason": "not found or not authorized" }),
@@ -204,8 +484,13 @@ impl McpServer {
         let semantic = self.can_embed_text_query();
         let default_mode = if semantic { "hybrid" } else { "keyword" };
         let search_desc = if semantic {
+            // **诚实记账**：`embedded:true` 只证明 server 配了嵌入后端，不证明向量是语义的
+            // （HashEmbedder 基线也是 Embedder，而 server_vector_info 不吐 caps().semantic）。
+            // 故只能说"由 server 侧嵌入后端提供"，不得写"语义检索"。等 KB-2.4 的实测 caps。
             "在 fastsearch 混合检索引擎中检索（keyword/vector/hybrid），返回带引用\
-             （citation_id/page/heading_path/snippet）的命中，供答案层溯源。ACL 由服务端强制。"
+             （citation_id/page/heading_path/snippet）的命中，供答案层溯源。\
+             本实例的 vector/hybrid 档**由 server 侧的嵌入后端提供**（是否为语义嵌入取决于该后端配置）。\
+             ACL 由服务端按 API key 强制注入，工具入参无法传递或放宽。"
         } else {
             "在 fastsearch 中做**全文（BM25）**检索，返回带引用（citation_id/page/heading_path/snippet）\
              的命中，供答案层溯源。ACL 由服务端强制。\
@@ -269,6 +554,20 @@ fn tool_text(text: &str, is_error: bool) -> Value {
     })
 }
 
+/// server `hits_json` 的富对象 → MCP 宣称的五字段命中（`highlight` → `snippet`）。
+///
+/// 投影而非透传：多出来的 `bm25`/`vector`/`rerank`/`bbox`/`media`/`cursor` 若原样吐给 agent，
+/// 就变成"远端档有、本地档没有"的隐性契约差异（spec §3.1）。
+fn project_remote_hit(h: &Value) -> Value {
+    json!({
+        "citation_id": h.get("citation_id"),
+        "score": h.get("score"),
+        "page": h.get("page"),
+        "heading_path": h.get("heading_path"),
+        "snippet": h.get("highlight"),
+    })
+}
+
 /// JSON-RPC 成功响应。
 fn ok(id: Option<Value>, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id.unwrap_or(Value::Null), "result": result })
@@ -284,6 +583,7 @@ mod tests {
     use super::*;
     use fastsearch_core::{BBox, Chunk, ChunkKind};
     use fastsearch_text::{TextIndexConfig, TokenizerKind};
+    use std::sync::mpsc;
 
     fn chunk(doc: &str, id: u64, text: &str) -> Chunk {
         Chunk {
@@ -457,6 +757,237 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(r["result"]["isError"], false, "自带向量不该被能力守卫拦下");
+    }
+
+    // ============ 远端档（KB-0.2）============
+
+    /// 起一个按路径分派的 mock server；返回 base URL + 收到的请求（原始字节）。
+    ///
+    /// 必须先读完整个请求再回响应：提前关连接会让客户端写 body 时收到 RST（flaky）。
+    fn spawn_server(
+        probe: &'static str,
+        search: &'static str,
+    ) -> (String, mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8) {
+                let Ok(mut st) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match st.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                        let cl = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() - (p + 4) >= cl {
+                            break;
+                        }
+                    }
+                }
+                let body = if String::from_utf8_lossy(&buf).starts_with("GET /v1/collections") {
+                    probe
+                } else {
+                    search
+                };
+                let _ = tx.send(buf);
+                let _ = write!(
+                    st,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = st.flush();
+            }
+        });
+        (url, rx)
+    }
+
+    /// 探测响应用 server `server_vector_info` 的**真实字段名**——字段名写错会静默变成
+    /// "unknown"（实跑时就这么暴露过一次），故测试里也必须按真名断言。
+    const PROBE_EMBEDDED: &str = r#"{"collections":["kb"],"server":{"embedded":true,
+        "vector_backend":"brute","source_of_truth":"postgres","rebuildable_from_source":true}}"#;
+
+    /// 远端探测把 server 的**实测**运行档映射进 schema：`embedded:true` ⇒ 三档可如实宣称。
+    /// 这正是"不在 MCP 里养第二套嵌入配置"的兑现——hybrid 由 server 免费提供。
+    #[test]
+    fn remote_probe_maps_caps_to_schema() {
+        let (url, _rx) = spawn_server(PROBE_EMBEDDED, r#"{"hits":[]}"#);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        assert!(backend.caps().embedded);
+        // 字段名必须与 server_vector_info 对得上（写错只会静默变 "unknown"）。
+        assert_eq!(backend.caps().vector_backend, "brute");
+        assert_eq!(backend.caps().source_of_truth, "postgres");
+        assert_eq!(backend.caps().collections, vec!["kb".to_string()]);
+        let s = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let defs = s.tool_defs();
+        let mode = &defs[0]["inputSchema"]["properties"]["mode"];
+        assert_eq!(mode["enum"], json!(["keyword", "vector", "hybrid"]));
+        assert_eq!(mode["default"], "hybrid");
+        // 诚实记账：不得把 server 有嵌入后端说成"语义检索"（HashEmbedder 基线也是 Embedder）。
+        let desc = defs[0]["description"].as_str().unwrap();
+        assert!(desc.contains("嵌入后端"), "措辞要说明 hybrid 的来源");
+    }
+
+    /// 探测失败 → **拒绝启动**（fail-closed），绝不静默回退本地档或猜一个 schema。
+    #[test]
+    fn remote_probe_failure_refuses_to_start() {
+        // 未监听的端口：连接直接失败。
+        let msg = match RemoteBackend::connect(Some("http://127.0.0.1:9".into()), Some("k".into()))
+        {
+            Ok(_) => panic!("探测失败必须 Err，绝不能静默启动"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(msg.contains("能力探测失败"), "{msg}");
+        assert!(
+            msg.contains("FASTSEARCH_SERVER"),
+            "要给出可自纠的方向：{msg}"
+        );
+    }
+
+    /// 出站请求**不得携带任何 ACL 面**，且必须带 Bearer——身份是那把 key，ACL 由 server 注入。
+    #[test]
+    fn remote_search_sends_no_acl_and_carries_bearer() {
+        let (url, rx) = spawn_server(PROBE_EMBEDDED, r#"{"hits":[]}"#);
+        let backend = RemoteBackend::connect(Some(url), Some("secret-key".into())).unwrap();
+        let s = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let _ = rx.recv().unwrap(); // 探测请求
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":40,"method":"tools/call",
+                "params": { "name":"search", "arguments": { "query":"毛利率" } }
+            }))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        let req = String::from_utf8(rx.recv().unwrap()).unwrap();
+        assert!(req.contains("bearer secret-key") || req.contains("Bearer secret-key"));
+        let body = req.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(!body.contains("\"tenant\""), "出站 body 不得含 tenant");
+        assert!(!body.contains("\"acl\""), "出站 body 不得含 acl");
+        assert!(
+            !body.contains("query_image"),
+            "出站 body 不得含 query_image"
+        );
+    }
+
+    /// 命中形状两档必须一致：server 的富对象要投影回宣称的五个字段，多余字段不得泄漏给 agent。
+    #[test]
+    fn remote_hit_projection_matches_local_shape() {
+        let (url, rx) = spawn_server(
+            PROBE_EMBEDDED,
+            r#"{"hits":[{"citation_id":"kb:r.pdf:1","score":1.5,"page":7,
+                "heading_path":["财务"],"highlight":"毛利率 42%",
+                "bm25":1.2,"vector":0.8,"rerank":null,"bbox":{"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},
+                "section_id":3,"media":null,"cursor":"abc"}]}"#,
+        );
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let s = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let _ = rx.recv().unwrap();
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":41,"method":"tools/call",
+                "params": { "name":"search", "arguments": { "query":"毛利率" } }
+            }))
+            .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let hit = serde_json::from_str::<Value>(text).unwrap()["hits"][0].clone();
+        let keys: std::collections::BTreeSet<String> =
+            hit.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["citation_id", "heading_path", "page", "score", "snippet"]
+                .iter()
+                .map(|k| k.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "远端命中必须投影成与本地档相同的五字段"
+        );
+        assert_eq!(hit["snippet"], "毛利率 42%", "highlight → snippet");
+    }
+
+    /// 允许清单必须与 schema 宣称的 `properties` **逐字一致**。
+    ///
+    /// 这是 C1 唯一的扩展点：以后任何新入参都必须同时改两处，本测试盯住它们不漂移。
+    #[test]
+    fn schema_and_allowlist_agree() {
+        let s = server();
+        let defs = s.tool_defs();
+        let props = defs[0]["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let allow = McpServer::SEARCH_ARGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(props, allow, "schema properties 与允许清单必须一致");
+    }
+
+    /// 未宣称的入参一律**拒绝**，不是静默丢弃。
+    ///
+    /// `query_image` 是最典型的一条：它此前能硬传（`SearchRequest` 有该字段且无
+    /// `deny_unknown_fields`），而 schema 从未宣称 ⇒ 默认 `keyword` 档下 `want_vec` 为假、
+    /// 图片被完全忽略且毫无提示。
+    #[test]
+    fn unadvertised_args_are_rejected_with_guidance() {
+        let s = server();
+        for (arg, val) in [
+            ("query_image", json!([1, 2, 3])),
+            ("include_text", json!(true)),
+            ("search_after", json!("cursor")),
+        ] {
+            let r = s
+                .handle(&json!({
+                    "jsonrpc":"2.0","id":30,"method":"tools/call",
+                    "params": { "name": "search",
+                                "arguments": { "query": "毛利率", arg: val } }
+                }))
+                .unwrap();
+            assert_eq!(r["result"]["isError"], true, "{arg} 应被拒绝");
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(arg), "错误文本要点名是哪个入参：{text}");
+            assert!(text.contains("query"), "要列出本实例接受的字段");
+        }
+        // 伪造 tenant/acl 同样落在拒绝侧（此前是被 serde 静默丢弃——不越权，但 agent 无从知晓）。
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":31,"method":"tools/call",
+                "params": { "name": "search",
+                            "arguments": { "query": "x", "tenant": "other", "acl": ["admin"] } }
+            }))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], true, "伪造身份字段必须被显式拒绝");
+    }
+
+    /// `query_image` 走 schema 宣称的合法入参时也不该悄悄生效——本地档已彻底拒绝它，
+    /// 于是"带图但被忽略"这个静默失败面消失。
+    #[test]
+    fn image_search_is_refused_with_a_route_not_silently_ignored() {
+        let s = server();
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":32,"method":"tools/call",
+                "params": { "name": "search",
+                            "arguments": { "query": "", "query_image": [1,2,3] } }
+            }))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("query_image_base64"),
+            "要给出以图搜图的正确走法：{text}"
+        );
     }
 
     #[test]
