@@ -43,6 +43,14 @@ enum Command {
         doc_id: String,
         #[arg(long)]
         tenant: Option<String>,
+        /// 文档图片**原始字节**的去向：`object`（默认，server 落对象存储）/
+        /// `inline`（server 内联进 PG bytea；需 server 配 DATABASE_URL，且整本 PDF 易撑爆
+        /// 20MB 请求体上限，故须显式选）/
+        /// `none`（一个字节都不采，PDF 连 decode_images 都不开）。
+        /// 注：`Rgb8`/`Gray8` 裸位图本版**不支持**（需 PNG 编码器，会加重 parse 轻档依赖），
+        /// 这类图如实标 `image_vector_status=missing_bytes`。
+        #[arg(long, value_enum, default_value_t = ImagesArg::Object)]
+        images: ImagesArg,
     },
     /// 灌入 docparse chunks（JSON 数组或 NDJSON；省略 INPUT 读 stdin）→ POST /v1/index。
     Index {
@@ -141,6 +149,27 @@ enum Mode {
     Hybrid,
 }
 
+/// `ingest --images` 的取值（镜像 [`fastsearch_cli::ingest::ImageBytes`]）。
+#[cfg(feature = "parse")]
+#[derive(Clone, Copy, ValueEnum)]
+enum ImagesArg {
+    Object,
+    Inline,
+    None,
+}
+
+#[cfg(feature = "parse")]
+impl From<ImagesArg> for fastsearch_cli::ingest::ImageBytes {
+    fn from(v: ImagesArg) -> Self {
+        use fastsearch_cli::ingest::ImageBytes;
+        match v {
+            ImagesArg::Object => ImageBytes::Object,
+            ImagesArg::Inline => ImageBytes::Inline,
+            ImagesArg::None => ImageBytes::None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum StoreMediaArg {
     Inline,
@@ -223,6 +252,7 @@ fn main() -> Result<()> {
             collection,
             doc_id,
             tenant,
+            images,
         } => {
             let opts = fastsearch_cli::ingest::IngestOpts {
                 file,
@@ -232,6 +262,7 @@ fn main() -> Result<()> {
                 doc_id,
                 tenant,
                 acl: vec!["public".to_string()],
+                images: images.into(),
             };
             let n = fastsearch_cli::ingest::cmd_ingest(&opts)?;
             eprintln!("indexed {n} chunk(s) for doc '{}'", opts.doc_id);

@@ -43,7 +43,7 @@ search"; `ingest` just adds the in-process parsing step.
 | Build | Includes | Weight |
 |---|---|---|
 | `cargo build` (default) | Search hot path (four faces + hybrid retrieval + ACL + CDC) | **zero docparse/ONNX** |
-| `--features parse` | + multi-format parsers (9 formats + images) | lightweight, pure-Rust, no ONNX |
+| `--features parse` | + multi-format parsers (9 formats + images) + **raw image bytes** (see below) | lightweight, pure-Rust, no ONNX |
 | `--features parse-ocr` | + **PP-OCR text extraction** for scans/images | heavy (tract/ONNX) |
 | `--features parse-tables` | + **non-VLM table structure recognition** (UniRec ONNX) | heavy (tract/ONNX + pure-Rust rasterization) |
 | `--features parse-vlm` | + **VLM region recognition** (tables as HTML / region-level transcription), **needs an external service** | heavy (shares the tract-side orchestration) + a GPU service |
@@ -129,9 +129,55 @@ FASTSEARCH_LAYOUT_MODEL=/path/to/models/layout-ppv2/PP-DoclayoutV2_simp.onnx \
 
 ---
 
+## Raw image bytes (`--images`, 2026-08-25)
+
+A parsed figure is more than a rectangle on a page — the **original bytes** are the foundation for
+"show the figure behind a citation", image-to-image search, and visual embeddings. `ingest` now carries
+them along:
+
+```bash
+# Default: bytes ride along with the index request; the server puts them in object storage
+./target/debug/fastsearch ingest --server http://localhost:8642 --key dev \
+  --collection kb --doc-id r.pdf r.pdf
+# stderr: images: 1 张字节已随索引上传（3 KiB）；1 张需 PNG 重编码（Rgb8/Gray8，本版不支持）；0 张解析层无字节
+
+# Fetch the original back (server needs FASTSEARCH_OBJECT_DIR + FASTSEARCH_ASSET_SIGNING_KEY)
+curl -sL -H "Authorization: Bearer dev" http://localhost:8642/v1/asset/kb:r.pdf:0 -o figure.jpg
+```
+
+| `--images` | Where the bytes go | When |
+|---|---|---|
+| `object` (default) | Server uploads to object storage; PG keeps only the uri | Normal case. `/v1/asset/{citation_id}` signs a short-lived URL that serves the original |
+| `inline` | Server inlines them into PG `bytea` | Small crops, or when the bytes should ride the logical-replication stream. **Requires the server to have `DATABASE_URL`**; a whole PDF's base64 easily blows the server's 20MB body limit, hence opt-in |
+| `none` | Nothing collected | Text-only retrieval. The PDF backend does not even turn on `decode_images` — behavior is **field-for-field identical** to before this feature |
+
+**Coverage (stated honestly)**:
+
+| Source | `ImageKind` | Status |
+|---|---|---|
+| JPEG inside a PDF (DCTDecode passthrough) | `Jpeg` | ✅ bytes pass through verbatim, zero new dependencies |
+| DOCX / PPTX / HTML media files | `Encoded` | ✅ bytes pass through verbatim, MIME from the source |
+| **Raw bitmaps** decoded out of Flate/CCITT/JBIG2/JPX in a PDF | `Rgb8` / `Gray8` | ❌ **not supported in this iteration** (see below) |
+| Unsupported encodings (CMYK JPEG, multi-channel JPX…), below the size gate | `None` | ❌ the parser never produced bytes |
+
+The last two are **never dressed up as embedded**: the chunk records
+`image_vector_status = missing_bytes` and the CLI reports the counts on stderr. Coordinates are always
+preserved (`page`/`bbox`/`region` untouched), so `resolve_citation` highlighting and the `/v1/asset`
+`doc_render` jump-to-source still work.
+
+> **Why `Rgb8`/`Gray8` is not supported yet**: those are raw pixel buffers that need PNG encoding to be
+> usable as images. The ready-made encoder is `docparse_vlm::encode_png_rgb` — pulling it in would drag
+> `docparse-vlm` (+`docparse-raster`) into the **lightweight `parse` profile**, breaking its
+> "pure-Rust, no ONNX, no rasterization" promise; writing our own encoder means new `png`/`flate2`
+> dependencies. Both need their own evaluation, so this iteration ships Jpeg/Encoded and labels the rest.
+
+---
+
 ## Not wired yet (next iteration)
 
 - **VLM natural-image captioning**: caption figures/charts (docparse has `--vlm-describe`; not surfaced on the fastsearch ingest side).
+- **`Rgb8`/`Gray8` raw-bitmap byte loop**: blocked on deciding how a PNG encoder can arrive without weighing down the `parse` profile (see above).
+- **Batched upload for large documents**: `ingest` POSTs a whole document in one request today; an image-heavy PDF can hit the server's 20MB body limit (the CLI warns on stderr past 16MB).
 - **Formula → LaTeX** (same UniRec model), **standalone layout enhancement**: same ONNX route, can follow.
 
 ---

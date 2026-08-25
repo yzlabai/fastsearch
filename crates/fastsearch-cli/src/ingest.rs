@@ -8,8 +8,50 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use fastsearch_core::{AssetPointer, BBox, Chunk, ChunkKind, MediaRef};
+use fastsearch_core::{AssetPointer, BBox, Chunk, ChunkKind, ImageVectorStatus, MediaRef};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// 文档图片**原始字节**的去向（CLI `--images`）。
+///
+/// 默认 [`ImageBytes::Object`]：字节随 `/v1/index` 上传，由 server 落对象存储（PG 真源只留
+/// uri），`/v1/asset/{citation_id}` 由此能签发短时 URL 吐回原图。
+/// [`ImageBytes::Inline`] 让 server 把字节内联进 PG `bytea`——整本 PDF 的图片很容易把请求体推过
+/// server 的 20MB `DefaultBodyLimit`，也会把真源表撑大，且 **server 必须配了 `DATABASE_URL`
+/// 才有地方内联**（未配时 `/v1/asset` 对 Inline 一律 404，真机验证 2026-08-25），所以必须显式选。
+/// [`ImageBytes::None`] = 一个字节都不采（与本能力落地前**完全一致**：PDF 连 `decode_images`
+/// 都不开，不付内存代价）。
+///
+/// **本迭代只闭环 `Jpeg`/`Encoded` 两类**（零新依赖）；`Rgb8`/`Gray8` 裸位图的代价见
+/// [`ImagePayload::NeedsEncode`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageBytes {
+    /// 采集 → 上传 → server 落对象存储（默认）。
+    #[default]
+    Object,
+    /// 采集 → 上传 → server 内联进 PG `bytea`（**需 server 配了 PG 真源**）。
+    Inline,
+    /// 不采集（零回归档）。
+    None,
+}
+
+impl ImageBytes {
+    /// 是否需要图片字节——决定 PDF 是否打开 `decode_images`（该开关会materialize
+    /// 每张 ≥16px 的图，image-heavy 文档上是实打实的内存开销，故按需开）。
+    fn wants_bytes(self) -> bool {
+        !matches!(self, ImageBytes::None)
+    }
+
+    /// 映射到 `/v1/index` 的 `store_media`。`None` 档不传该字段——请求体与本能力
+    /// 落地前逐字节一致（server 侧默认 `inline`，但那时根本没有字节）。
+    fn store_media(self) -> Option<crate::StoreMedia> {
+        match self {
+            ImageBytes::Object => Some(crate::StoreMedia::Object),
+            ImageBytes::Inline => Some(crate::StoreMedia::Inline),
+            ImageBytes::None => Option::None,
+        }
+    }
+}
 
 /// `fastsearch ingest <file>` 选项（**客户端侧解析** → POST `/v1/index`）。
 pub struct IngestOpts {
@@ -21,15 +63,21 @@ pub struct IngestOpts {
     pub doc_id: String,
     pub tenant: Option<String>,
     pub acl: Vec<String>,
+    /// 图片原始字节的去向（默认 [`ImageBytes::Object`]）。
+    pub images: ImageBytes,
 }
 
 /// docparse 多格式解析器注册表（轻量、无 ONNX）：按 `DocumentParser::supports`（扩展名/magic）
 /// 派发。重增强器经 feature + env 接入：OCR=`parse-ocr`、表格=`parse-tables`（均进程内 ONNX，
 /// 指模型目录）；VLM 区域识别=`parse-vlm`（外部 OpenAI 兼容服务，指 URL+模型名，见 [`apply_vlm`]）。
 /// 自然图 VLM 描述（`--vlm-describe` 那条 caption 路）仍未接入，属下一迭代。
-fn parsers() -> Vec<Box<dyn docparse_core::parser::DocumentParser>> {
+///
+/// `decode_images`：只在调用方要图片字节时打开（`--images` 非 `none`）。打开后 PDF 后端会
+/// materialize 每张 ≥16px 的图；关着时只 materialize 整页覆盖的扫描候选（省内存，原行为）。
+/// 其余格式（DOCX/PPTX/HTML）的图字节本来就随解析出来，不受此开关影响。
+fn parsers(decode_images: bool) -> Vec<Box<dyn docparse_core::parser::DocumentParser>> {
     vec![
-        Box::new(docparse_pdf::PdfParser::default()),
+        Box::new(docparse_pdf::PdfParser { decode_images }),
         Box::new(docparse_docx::DocxParser),
         Box::new(docparse_html::HtmlParser),
         Box::new(docparse_md::MarkdownParser),
@@ -205,11 +253,161 @@ fn apply_vlm(
     Ok(doc)
 }
 
-/// **客户端解析 → 适配 → POST /v1/index**（doc 级替换由 server 保证）：按扩展名选 docparse
-/// 解析器 → 解析+分块 → `from_docparse_chunk` 适配 → 上传 server。返回 indexed 条数。
-/// 解析在客户端（守"搜索热路径零 docparse"+ CI 门禁）；检索/嵌入/落盘归 server。
-pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
-    let registry = parsers();
+// ==================== 图片字节闭环（KB-1.1） ====================
+//
+// 背景：`docparse_core::chunk::ImageMeta.data_base64` 在本条摄取路径上**永远是空的**
+// （只有 docparse-cli 的 `--image-embed` 才填它，而那是它自己 bin crate 里的私有函数），
+// 于是文档图片过去只剩坐标 + caption 文本，`media_bytes` 恒 None。原始字节其实够得着：
+// `docparse_core::ir::ImageChunk.data` 是 pub 的（`#[serde(skip)]`，只在进程内可见）。
+// 这里在 CLI 侧自己搭桥，**不动 vendor**（vendor 是被根 `exclude` 的独立 workspace）。
+
+/// 图片字节与 chunk 的连接键：`(page, bbox)`。
+///
+/// `chunk_document` 把 `Element::Image` 的 `page`/`bbox` **原样**抄进 image chunk（同一份
+/// 数据的拷贝，中间没有任何浮点运算），所以按位比较 f32 是精确且无歧义的。
+type ImageKey = (usize, [u32; 4]);
+
+fn image_key(page: usize, b: &docparse_core::ir::BBox) -> ImageKey {
+    (
+        page,
+        [
+            b.x0.to_bits(),
+            b.y0.to_bits(),
+            b.x1.to_bits(),
+            b.y1.to_bits(),
+        ],
+    )
+}
+
+/// 单张图的字节采集结果。
+enum ImagePayload {
+    /// 字节**可原样使用**：`Jpeg`（PDF DCTDecode 直通）/ `Encoded`（DOCX/PPTX/HTML 的媒体
+    /// 文件字节）。零新依赖，本迭代支持的就是这两类。
+    Ready { media_type: String, bytes: Vec<u8> },
+    /// 有像素但**需 PNG 编码**才能用：`Rgb8` / `Gray8`（PDF 里 Flate/CCITT/JBIG2/JPX 等解出
+    /// 来的裸位图）。**本迭代不支持**——现成编码器是 `docparse_vlm::encode_png_rgb`，引它会把
+    /// `docparse-vlm`(+`docparse-raster`) 拉进 `parse` **轻档**，使"轻档无 ONNX/无渲染"的
+    /// 依赖面变大；自己写 PNG 编码器则要新增 `png`/`flate2` 依赖。两条路都得单独评估收口，
+    /// 故先落 Jpeg/Encoded 并**如实标注**（见下：状态标 `missing_bytes`，不伪装成已嵌入）。
+    NeedsEncode,
+    /// 解析层就没给字节：`ImageKind::None`（不支持的编码：CMYK JPEG、多通道 JPX…）或
+    /// 低于后端的尺寸闸。
+    NoBytes,
+}
+
+/// 采集到的图片字节，按 `(page, bbox)` 索引。同键可挂多张（PDF 允许两张图完全重叠），
+/// 按出现顺序排队消费。
+#[derive(Default)]
+struct ImageBytesIndex {
+    by_pos: HashMap<ImageKey, Vec<ImagePayload>>,
+}
+
+impl ImageBytesIndex {
+    fn take(&mut self, page: usize, bbox: &docparse_core::ir::BBox) -> Option<ImagePayload> {
+        let slot = self.by_pos.get_mut(&image_key(page, bbox))?;
+        (!slot.is_empty()).then(|| slot.remove(0))
+    }
+}
+
+/// 从解析后的文档里**取走**图片原始字节（`std::mem::take`，不复制、早释放）。
+/// 必须在所有增强器之后、`chunk_document` 之前调用：增强器可能重建页面。
+fn harvest_image_bytes(doc: &mut docparse_core::ir::Document) -> ImageBytesIndex {
+    use docparse_core::ir::{Element, ImageKind};
+    let mut idx = ImageBytesIndex::default();
+    for page in &mut doc.pages {
+        for el in &mut page.elements {
+            let Element::Image(img) = el else { continue };
+            let payload = match img.kind {
+                ImageKind::Jpeg if !img.data.is_empty() => ImagePayload::Ready {
+                    media_type: "image/jpeg".to_string(),
+                    bytes: std::mem::take(&mut img.data),
+                },
+                // 已编码媒体（DOCX/PPTX/HTML）：字节原样直通，MIME 用源声明的。
+                ImageKind::Encoded if !img.data.is_empty() => ImagePayload::Ready {
+                    media_type: img
+                        .data_media_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    bytes: std::mem::take(&mut img.data),
+                },
+                ImageKind::Rgb8 | ImageKind::Gray8 => {
+                    img.data = Vec::new(); // 用不上（见 NeedsEncode 注释），立刻还内存
+                    ImagePayload::NeedsEncode
+                }
+                _ => ImagePayload::NoBytes,
+            };
+            idx.by_pos
+                .entry(image_key(img.page, &img.bbox))
+                .or_default()
+                .push(payload);
+        }
+    }
+    idx
+}
+
+/// 图片字节闭环的记账（如实汇报，别让"没进系统"静默）。
+#[derive(Default, Debug, PartialEq, Eq)]
+struct ImageBytesStats {
+    /// 字节已闭环（`Jpeg`/`Encoded` 直通）。
+    attached: usize,
+    /// 有像素但需 PNG 重编码（`Rgb8`/`Gray8`）——本迭代不支持。
+    needs_encode: usize,
+    /// 解析层无字节 / 未匹配到源图。
+    no_bytes: usize,
+    /// 已附字节合计（用于 20MB 请求体上限提醒）。
+    total_bytes: usize,
+}
+
+/// 把采集到的字节挂到已适配的 fastsearch chunk 上。
+///
+/// **坐标不动**：只写 `media_bytes` / `media.asset` / `media.media_type` /
+/// `image_vector_status`，`page`/`bbox`/`region` 一概不碰——`resolve_citation` 的页内高亮
+/// 因此不受影响。拿不到字节的图**如实**标 `missing_bytes`，绝不留成"看起来已嵌入"。
+fn attach_image_bytes(
+    chunks: &mut [Chunk],
+    dchunks: &[docparse_core::chunk::Chunk],
+    idx: &mut ImageBytesIndex,
+) -> ImageBytesStats {
+    let mut st = ImageBytesStats::default();
+    for (c, dc) in chunks.iter_mut().zip(dchunks) {
+        if c.kind != ChunkKind::Image {
+            continue;
+        }
+        match idx.take(dc.page, &dc.bbox) {
+            Some(ImagePayload::Ready { media_type, bytes }) => {
+                st.attached += 1;
+                st.total_bytes += bytes.len();
+                c.media_bytes = Some(bytes);
+                if let Some(m) = &mut c.media {
+                    // Inline = "字节随本请求走"。server 在 object/auto 档会把它改写成
+                    // Object{uri}（上传后），inline 档则原样保留、字节落 PG bytea。
+                    m.asset = AssetPointer::Inline;
+                    m.media_type = Some(media_type);
+                }
+                // 状态交给 server 判定（有 embedder → Embedded，无则 Pending）。
+                c.image_vector_status = None;
+            }
+            Some(ImagePayload::NeedsEncode) => {
+                st.needs_encode += 1;
+                c.image_vector_status = Some(ImageVectorStatus::MissingBytes);
+            }
+            _ => {
+                st.no_bytes += 1;
+                c.image_vector_status = Some(ImageVectorStatus::MissingBytes);
+            }
+        }
+    }
+    st
+}
+
+/// server 的 `DefaultBodyLimit` 是 20MB；越过这条软线就提醒改 `--images none` 或
+/// 走 `/v1/images` 单张上传，别等 413 才发现。
+const BODY_SOFT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// **解析 → 增强 → 分块 → 适配**（纯本地，**不碰网络**）。`cmd_ingest` = 本函数 + POST。
+/// 单独成函数是为了让图片字节闭环能在无 server / 无外部模型的条件下被单测覆盖。
+pub fn chunks_for_file(opts: &IngestOpts) -> Result<Vec<Chunk>> {
+    let registry = parsers(opts.images.wants_bytes());
     let parser = registry
         .iter()
         .find(|p| p.supports(&opts.file))
@@ -230,21 +428,66 @@ pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
     // 也不会互相盲目覆盖。
     let doc = apply_ocr(doc)?; // parse-ocr：扫描页 PP-OCR 抽文本
     let doc = apply_vlm(doc, &opts.file)?; // parse-vlm：VLM 区域识别（需服务）
-    let doc = apply_tables(doc, &opts.file)?; // parse-tables：UniRec 表格结构
+    let mut doc = apply_tables(doc, &opts.file)?; // parse-tables：UniRec 表格结构
+                                                  // 图片字节在增强器之后、分块之前取走（增强器可能重建页面）。`none` 档完全不进这条路。
+    let mut images = opts
+        .images
+        .wants_bytes()
+        .then(|| harvest_image_bytes(&mut doc));
     let dchunks = docparse_core::chunk::chunk_document(&doc);
-    let chunks: Vec<Chunk> = dchunks
+    let mut chunks: Vec<Chunk> = dchunks
         .iter()
         .map(|d| from_docparse_chunk(d, &opts.doc_id, opts.tenant.clone(), opts.acl.clone()))
         .collect();
+    if let Some(idx) = &mut images {
+        let st = attach_image_bytes(&mut chunks, &dchunks, idx);
+        if st.attached + st.needs_encode + st.no_bytes > 0 {
+            eprintln!(
+                "images: {} 张字节已随索引上传（{} KiB）；{} 张需 PNG 重编码（Rgb8/Gray8，本版不支持）；\
+                 {} 张解析层无字节——后两类如实标 image_vector_status=missing_bytes",
+                st.attached,
+                st.total_bytes / 1024,
+                st.needs_encode,
+                st.no_bytes
+            );
+        }
+        if st.total_bytes > BODY_SOFT_LIMIT {
+            eprintln!(
+                "images: 媒资合计 {} MiB，逼近 server 的 20MB 请求体上限——若被 413 拒，\
+                 改用 --images none 或对大图走 `fastsearch upload-image`（/v1/images 单张上传）",
+                st.total_bytes / (1024 * 1024)
+            );
+        }
+    }
     if std::env::var_os("FASTSEARCH_INGEST_DEBUG").is_some() {
         for (i, c) in chunks.iter().enumerate() {
             let t: String = c.text.chars().take(60).collect();
-            eprintln!("  chunk[{i}] kind={:?} text={t:?}", c.kind);
+            eprintln!(
+                "  chunk[{i}] kind={:?} page={} bbox={:?} media_bytes={:?} img_status={:?} text={t:?}",
+                c.kind,
+                c.page,
+                c.bbox,
+                c.media_bytes.as_ref().map(|b| b.len()),
+                c.image_vector_status.map(|s| s.as_str()),
+            );
         }
     }
+    Ok(chunks)
+}
 
+/// **客户端解析 → 适配 → POST /v1/index**（doc 级替换由 server 保证）：按扩展名选 docparse
+/// 解析器 → 解析+分块 → `from_docparse_chunk` 适配 → 上传 server。返回 indexed 条数。
+/// 解析在客户端（守"搜索热路径零 docparse"+ CI 门禁）；检索/嵌入/落盘归 server。
+pub fn cmd_ingest(opts: &IngestOpts) -> Result<usize> {
+    let chunks = chunks_for_file(opts)?;
     let client = crate::Client::new(opts.server.clone(), opts.key.clone());
-    crate::post_index(&client, &opts.collection, &opts.doc_id, None, &chunks)
+    crate::post_index(
+        &client,
+        &opts.collection,
+        &opts.doc_id,
+        opts.images.store_media(),
+        &chunks,
+    )
 }
 
 /// docparse ChunkKind → fastsearch ChunkKind（前 6 类同构；Audio/Video 来自媒资预处理，非 PDF）。
@@ -469,7 +712,7 @@ mod tests {
             ),
             ("data.csv", "name,val\n甲,1\n乙,2\n"),
         ];
-        let registry = parsers();
+        let registry = parsers(false);
         for (fname, content) in cases {
             let path = dir.path().join(fname);
             std::fs::write(&path, content).unwrap();
@@ -491,6 +734,212 @@ mod tests {
                 "{fname} 适配后应有非空文本 chunk"
             );
         }
+    }
+
+    // ==================== 图片字节闭环（KB-1.1）====================
+    //
+    // 夹具（`tests/fixtures/`，一次性生成、已入库；**无需外部模型/服务/网络**）：
+    // - `figure.jpg` / `figure.png`：同一张 240×180 图的两种编码，作"源图"基准；
+    // - `with-image.pdf`：手写 PDF（612×792），Im0 = 上面的 JPEG（DCTDecode，绘制成
+    //   300×250pt ≈ 15.5% 页覆盖 → 高于分块的 1% 闸、低于 PDF 后端"整页扫描候选"的 50% 闸，
+    //   所以**只有打开 `decode_images` 才拿得到字节**，正好验证按需开关）；
+    //   Im1 = Flate 原始 RGB 位图 40×32（→ `ImageKind::Rgb8`，本版不支持的那类）；
+    // - `with-image.docx`：python-docx 造的 DOCX，内嵌 `figure.png`（→ `ImageKind::Encoded`）。
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    fn ingest_opts(file: &str, images: ImageBytes) -> IngestOpts {
+        IngestOpts {
+            file: fixture(file),
+            // 网络字段用不上：`chunks_for_file` 不碰 server。
+            server: Some("http://127.0.0.1:1".into()),
+            key: Some("dev".into()),
+            collection: "kb".into(),
+            doc_id: file.into(),
+            tenant: None,
+            acl: vec!["public".into()],
+            images,
+        }
+    }
+
+    /// 夹具断言的**可读指纹**（FNV-1a 128 位）——只在断言失败时打印，用来一眼看出
+    /// "字节完全不同"还是"差几个字节"。相等本身由 `assert_eq!(bytes, source)` 保证，
+    /// 不需要密码学强度哈希，故不为测试引入 sha2 依赖。
+    fn fingerprint(bytes: &[u8]) -> String {
+        let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d_u128;
+        for b in bytes {
+            h ^= *b as u128;
+            h = h.wrapping_mul(0x0000_0000_0001_0000_0000_0000_0000_013b_u128);
+        }
+        format!("{h:032x}")
+    }
+
+    /// 验收 1+2+4（PDF）：含图 PDF 的 `Jpeg` 图字节闭环，与源图**逐字节一致**；page/bbox 不变；
+    /// 同页那张 `Rgb8` 裸位图**如实**标 `missing_bytes`，不伪装成已嵌入。
+    #[test]
+    fn pdf_jpeg_bytes_close_the_loop_and_rgb8_is_honest() {
+        let source = std::fs::read(fixture("figure.jpg")).expect("read figure.jpg");
+        let chunks = chunks_for_file(&ingest_opts("with-image.pdf", ImageBytes::Object))
+            .expect("ingest pdf");
+        let images: Vec<&Chunk> = chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Image)
+            .collect();
+        assert_eq!(images.len(), 2, "PDF 应产出 2 个图 chunk（JPEG + 裸位图）");
+
+        // JPEG：字节非空且与源图完全一致。
+        let jpeg = images
+            .iter()
+            .find(|c| c.media_bytes.is_some())
+            .expect("应有一张图带回原始字节");
+        let got = jpeg.media_bytes.as_ref().unwrap();
+        assert_eq!(
+            got.len(),
+            source.len(),
+            "字节长度不符：{} vs 源图 {}",
+            fingerprint(got),
+            fingerprint(&source)
+        );
+        assert_eq!(got, &source, "JPEG 字节必须与源图逐字节一致（hash 一致）");
+        let m = jpeg.media.as_ref().expect("图 chunk 必有 media");
+        assert!(
+            matches!(m.asset, AssetPointer::Inline),
+            "带字节的图 asset 应是 Inline（server 在 object 档再改写成 Object）"
+        );
+        assert_eq!(m.media_type.as_deref(), Some("image/jpeg"));
+        // 坐标不变：region/page/bbox 仍指向页内位置 → resolve_citation 高亮不受影响。
+        assert_eq!(jpeg.page, 1);
+        assert_eq!(m.region, Some(jpeg.bbox));
+        assert!(jpeg.bbox.x1 > jpeg.bbox.x0 && jpeg.bbox.y1 > jpeg.bbox.y0);
+        assert!(
+            jpeg.image_vector_status.is_none(),
+            "有字节 → 状态交给 server"
+        );
+
+        // Rgb8 裸位图：本版不支持 → 无字节、状态如实。
+        let raw = images
+            .iter()
+            .find(|c| c.media_bytes.is_none())
+            .expect("应有一张图没有字节（Rgb8）");
+        assert_eq!(
+            raw.image_vector_status,
+            Some(ImageVectorStatus::MissingBytes),
+            "Rgb8/Gray8 必须如实标 missing_bytes"
+        );
+        assert!(
+            !matches!(raw.media.as_ref().unwrap().asset, AssetPointer::Inline),
+            "没有字节就不能声称 Inline"
+        );
+    }
+
+    /// 验收 1+2（DOCX）：含图 DOCX 的 `Encoded` 图字节闭环，与源 PNG 逐字节一致。
+    /// DOCX 的图字节本来就随解析出来，故不依赖 `decode_images`。
+    #[test]
+    fn docx_encoded_bytes_close_the_loop() {
+        let source = std::fs::read(fixture("figure.png")).expect("read figure.png");
+        let chunks = chunks_for_file(&ingest_opts("with-image.docx", ImageBytes::Object))
+            .expect("ingest docx");
+        let img = chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Image)
+            .expect("DOCX 应产出图 chunk");
+        let got = img.media_bytes.as_ref().expect("DOCX 图应带回原始字节");
+        assert_eq!(
+            got,
+            &source,
+            "PNG 字节必须与源图逐字节一致（{} vs {}）",
+            fingerprint(got),
+            fingerprint(&source)
+        );
+        let m = img.media.as_ref().unwrap();
+        assert!(matches!(m.asset, AssetPointer::Inline));
+        assert_eq!(m.media_type.as_deref(), Some("image/png"));
+        assert_eq!(m.region, Some(img.bbox));
+        assert!(img.bbox.x1 > img.bbox.x0);
+    }
+
+    /// 验收 3：`--images none` 与本能力落地前**完全一致**——一个 `media_bytes` 都不采、
+    /// `image_vector_status` 全 None、asset 仍是 DocRegion，且文本/坐标逐一相同。
+    #[test]
+    fn images_none_is_zero_regression() {
+        for file in ["with-image.pdf", "with-image.docx"] {
+            let off = chunks_for_file(&ingest_opts(file, ImageBytes::None)).expect("ingest none");
+            let on =
+                chunks_for_file(&ingest_opts(file, ImageBytes::Object)).expect("ingest object");
+            assert_eq!(off.len(), on.len(), "{file}: 开关不该改变 chunk 数");
+            for c in &off {
+                assert!(c.media_bytes.is_none(), "{file}: none 档不得有字节");
+                assert!(
+                    c.image_vector_status.is_none(),
+                    "{file}: none 档不得写 image_vector_status"
+                );
+                if c.kind == ChunkKind::Image {
+                    assert!(
+                        matches!(
+                            c.media.as_ref().unwrap().asset,
+                            AssetPointer::DocRegion { .. }
+                        ),
+                        "{file}: none 档图 asset 仍是 DocRegion（跳原文）"
+                    );
+                }
+            }
+            // 文本与坐标两档一致：字节闭环不得动检索/引用面。
+            for (a, b) in off.iter().zip(&on) {
+                assert_eq!(a.text, b.text, "{file}: 文本必须不变");
+                assert_eq!((a.page, a.bbox), (b.page, b.bbox), "{file}: 坐标必须不变");
+                assert_eq!(a.chunk_id, b.chunk_id);
+            }
+        }
+    }
+
+    /// `--images` → `/v1/index` 的 `store_media` 映射（`none` 档不传该字段 → 请求体与
+    /// 落地前一致）。
+    #[test]
+    fn images_mode_maps_to_store_media() {
+        assert!(matches!(
+            ImageBytes::Object.store_media(),
+            Some(crate::StoreMedia::Object)
+        ));
+        assert!(matches!(
+            ImageBytes::Inline.store_media(),
+            Some(crate::StoreMedia::Inline)
+        ));
+        assert!(ImageBytes::None.store_media().is_none());
+        assert!(ImageBytes::Object.wants_bytes() && !ImageBytes::None.wants_bytes());
+        assert_eq!(ImageBytes::default(), ImageBytes::Object);
+    }
+
+    /// `(page, bbox)` 连接键：同位置多图按出现顺序排队消费，用光后不再返回。
+    #[test]
+    fn image_index_queues_overlapping_images() {
+        let bb = docparse_core::ir::BBox {
+            x0: 1.0,
+            y0: 2.0,
+            x1: 3.0,
+            y1: 4.0,
+        };
+        let mut idx = ImageBytesIndex::default();
+        idx.by_pos.insert(
+            image_key(2, &bb),
+            vec![
+                ImagePayload::Ready {
+                    media_type: "image/jpeg".into(),
+                    bytes: vec![1, 2, 3],
+                },
+                ImagePayload::NeedsEncode,
+            ],
+        );
+        assert!(matches!(
+            idx.take(2, &bb),
+            Some(ImagePayload::Ready { bytes, .. }) if bytes == vec![1, 2, 3]
+        ));
+        assert!(matches!(idx.take(2, &bb), Some(ImagePayload::NeedsEncode)));
+        assert!(idx.take(2, &bb).is_none(), "用光后不再返回");
+        assert!(idx.take(1, &bb).is_none(), "页号不同不得串图");
     }
 
     /// OCR 端到端（env-gated，需运行时 ONNX 模型——同 PG 集成测试策略）：设
