@@ -97,6 +97,8 @@ cargo test -p fastsearch-engine --test cdc_closed_loop      # CDC 闭环
 ```
 
 **已知限制 / 下一迭代：**
+
+- **relation 形状守卫（2026-08-25）**：`map()` 只按 `rel_oid` 取 Relation、不校验表身份，而 `row_to_gid` 只需 gid 三列 ⇒ 任何**恰好也有这三列**的旁表（如设计中的 `chunk_signal`）一条 DELETE 就会被映射成 `Change::Delete{gid}`、**误删整个 chunk**（Insert/Update 侧本就被`row_to_chunk` 需要 `kind`/`text` 挡住，只有 Delete 侧无防护）。已加 `relation_is_chunks` 按**声明列集合**判形状，非 chunks 形状一律 `Ok(None)` 忽略。**仍是形状判、非表名判**——真要按表名需给 `ReplicationConfig` 加字段并穿到 server 配置；若将来 publication 收多表，应升级为表名白名单。见 [devlog](../devlog/2026-08-25-Wave1复盘修复-诚实契约与CDC误删守卫.md)。
 - 低延迟**流式**消费（`START_REPLICATION` COPY + keepalive/standby 反馈）：当前用 SQL 轮询，足够正确性与中低频；流式待换支持复制协议的客户端（或自实现 wire）。
 - slot 生命周期监控（`max_slot_wal_keep_size`、滞留告警）、初始快照 + 无缝切换（B3）待续。
 - `initial_snapshot`/`stream` 集成函数待线缆层落地后补。

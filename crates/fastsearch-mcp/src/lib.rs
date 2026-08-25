@@ -210,7 +210,16 @@ impl McpServer {
             "在 fastsearch 中做**全文（BM25）**检索，返回带引用（citation_id/page/heading_path/snippet）\
              的命中，供答案层溯源。ACL 由服务端强制。\
              **本实例只支持 mode=\"keyword\"**：MCP 面直连引擎、自身不产查询向量，\
-             语义/混合检索请改走 REST POST /v1/search（server 侧配了嵌入后端）。"
+             语义/混合检索请改走 REST POST /v1/search（server 侧配了嵌入后端），\
+             或自带 `vector` 入参（见其说明）。"
+        };
+        // `vector` 在两档下含义不同：无语义档时它是**唯一**能开出向量召回的路（故要讲清代价）；
+        // 有语义档时它只是"跳过服务端嵌入"的旁路。
+        let vector_desc = if semantic {
+            "可选：外部预计算的查询向量，传了则跳过服务端嵌入。维度须与索引一致。"
+        } else {
+            "可选：外部预计算的查询向量。本实例自身不产查询向量，**这是在此开出 \
+             mode=vector/hybrid 的唯一途径**；须与索引用同一嵌入模型、同一维度，否则召回无意义。"
         };
         json!([
         {
@@ -223,7 +232,15 @@ impl McpServer {
                     "mode": { "type": "string", "enum": modes, "default": default_mode },
                     "top_k": { "type": "integer", "default": 20 },
                     "filter": { "type": "object", "description": "core::Filter AST（可选）" },
-                    "highlight": { "type": "boolean", "default": false }
+                    "highlight": { "type": "boolean", "default": false },
+                    // 诚实契约是**双向**的：宣称的必须能兑现，**能兑现的也必须宣称**——
+                    // 否则就是暗门（调用方只能靠读源码发现）。`vector` 这条真能走通
+                    // （`reject_unavailable_mode` 明确放行、`caller_supplied_vector_is_not_rejected`
+                    // 测试背书），此前却不在 schema 里，属同一条契约的反向违例。
+                    "vector": {
+                        "type": "array", "items": { "type": "number" },
+                        "description": vector_desc
+                    }
                 },
                 "required": ["query"]
             }
@@ -381,6 +398,13 @@ mod tests {
         // 描述必须把限制讲给 agent 听（它只能读到什么就信什么）。
         let desc = search["description"].as_str().unwrap();
         assert!(desc.contains("keyword") && desc.contains("/v1/search"));
+
+        // 诚实契约的**反向**半边：真能兑现的能力也必须宣称，不得作为暗门存在。
+        // `vector` 真能走通（见 `caller_supplied_vector_is_not_rejected`），故必须在 schema 里，
+        // 且说明要点破"本实例下它是开出向量召回的唯一途径"。
+        let vector = &search["inputSchema"]["properties"]["vector"];
+        assert_eq!(vector["type"], "array", "能兑现的 `vector` 必须被宣称");
+        assert!(vector["description"].as_str().unwrap().contains("唯一"));
     }
 
     /// 省略 `mode` 时按 **schema 宣称的默认（keyword）** 走，而不是 `SearchRequest` 的

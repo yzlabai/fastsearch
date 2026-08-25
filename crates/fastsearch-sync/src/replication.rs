@@ -251,6 +251,10 @@ fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<M
             ..
         } => {
             let rel = relation(relations, rel_oid)?;
+            // 非 chunks 表 → 不是我们的数据，静默忽略（不是毒丸，不计死信）。
+            if !relation_is_chunks(rel) {
+                return Ok(None);
+            }
             if tuple_has_unchanged_toast(&tuple) {
                 // gid 列不 TOAST、必在 → 取出后交 fetch_changes 从真源重取整行（不再对 'u' 报错卡死）。
                 let m = cols(rel, &tuple);
@@ -269,6 +273,11 @@ fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<M
         }
         PgMessage::Delete { rel_oid, key, old } => {
             let rel = relation(relations, rel_oid)?;
+            // **本守卫的主要目标**：见 `relation_is_chunks`。少了它，一张恰好有 gid 三列的
+            // 旁表（如 `chunk_signal`）的 DELETE 会被当成 chunk 删除执行。
+            if !relation_is_chunks(rel) {
+                return Ok(None);
+            }
             let tuple = key
                 .or(old)
                 .context("Delete without key/old tuple (need REPLICA IDENTITY)")?;
@@ -278,6 +287,27 @@ fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<M
         }
         _ => Ok(None),
     }
+}
+
+/// 该 Relation 看起来是不是 **chunks 真源表**（按**声明的列集合**判，不看元组）。
+///
+/// **为什么需要这道守卫**：[`map`] 只按 `rel_oid` 取 Relation、从不校验表身份，而
+/// [`row_to_gid`] 只需要 `collection`/`doc_id`/`chunk_id` 三列。任何**恰好也有这三列**的表
+/// （如设计中的 `chunk_signal`——它的主键正是这三列 + `signal_type`）一旦进了同一个 publication，
+/// 它的一条 DELETE 就会被映射成 `Change::Delete{gid}`，**把整个 chunk 从派生索引里删掉**。
+/// Insert/Update 侧本就被 [`row_to_chunk`] 需要 `kind`/`text` 挡住（退化为确定性毒丸、跳过），
+/// **只有 Delete 侧完全没有防护**——这道不对称正是本守卫要补的。
+///
+/// 此前"安全"只是因为 DDL 用 `ALTER PUBLICATION … SET TABLE`（**替换**语义）使 publication
+/// 恒为单表，属于**碰巧**而非设计。守卫把它变成显式的：非 chunks 形状的 relation 一律不产生变更。
+///
+/// 判据取 gid 三列 + `kind`/`text`——后两列是 chunks 表 NOT NULL 的正文列，
+/// 信号表/作业表都不会有（见 `fastsearch-pg` 的 `ddl`）。
+fn relation_is_chunks(rel: &Relation) -> bool {
+    const REQUIRED: [&str; 5] = ["collection", "doc_id", "chunk_id", "kind", "text"];
+    REQUIRED
+        .iter()
+        .all(|need| rel.columns.iter().any(|c| c.name == *need))
 }
 
 fn relation(relations: &HashMap<u32, Relation>, oid: u32) -> Result<&Relation> {
@@ -453,6 +483,98 @@ mod tests {
     #[test]
     fn esc_quotes() {
         assert_eq!(esc("a'b"), "a''b");
+    }
+
+    /// 造一个 Relation：给定表名与列名。
+    fn rel_with(oid: u32, name: &str, cols: &[&str]) -> Relation {
+        Relation {
+            oid,
+            namespace: "public".into(),
+            name: name.into(),
+            replica_identity: b'd',
+            columns: cols
+                .iter()
+                .map(|c| crate::pgoutput::Column {
+                    flags: 1,
+                    name: (*c).to_string(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                })
+                .collect(),
+        }
+    }
+
+    fn text_tuple(vals: &[&str]) -> TupleData {
+        TupleData {
+            values: vals
+                .iter()
+                .map(|v| TupleValue::Bytes(v.as_bytes().to_vec()))
+                .collect(),
+        }
+    }
+
+    /// **旁表的 DELETE 绝不能被当成 chunk 删除。**
+    ///
+    /// `map` 只按 `rel_oid` 取 Relation、不校验表身份，而 `row_to_gid` 只要
+    /// collection/doc_id/chunk_id 三列——设计中的 `chunk_signal` 主键恰好含这三列。
+    /// 无守卫时，一条信号行的 DELETE 会被映射成 `Change::Delete{gid}`，把整个 chunk 删掉。
+    #[test]
+    fn sibling_table_delete_is_ignored_not_mapped_to_chunk_delete() {
+        let mut relations = HashMap::new();
+        // 旁表：有 gid 三列（+ signal_type），但没有 chunks 的 kind/text。
+        let signal = rel_with(
+            77,
+            "fastsearch_chunk_signal",
+            &["collection", "doc_id", "chunk_id", "signal_type"],
+        );
+        relations.insert(77, signal);
+
+        let out = map(
+            &mut relations,
+            PgMessage::Delete {
+                rel_oid: 77,
+                key: Some(text_tuple(&["kb", "r.pdf", "1", "vlm_caption"])),
+                old: None,
+            },
+        )
+        .expect("旁表不该报错——它只是不关我们的事");
+        assert!(
+            out.is_none(),
+            "旁表 DELETE 必须被忽略；映射成 Change::Delete 会误删整个 chunk"
+        );
+    }
+
+    /// 守卫不得误伤：真 chunks 表的 DELETE 照旧映射成 `Change::Delete`。
+    #[test]
+    fn chunks_table_delete_still_maps() {
+        let mut relations = HashMap::new();
+        relations.insert(
+            9,
+            rel_with(
+                9,
+                "fastsearch_chunks",
+                &["collection", "doc_id", "chunk_id", "kind", "text"],
+            ),
+        );
+        let out = map(
+            &mut relations,
+            PgMessage::Delete {
+                rel_oid: 9,
+                key: Some(text_tuple(&["kb", "r.pdf", "1", "paragraph", "正文"])),
+                old: None,
+            },
+        )
+        .unwrap();
+        match out {
+            Some(Mapped::Ready(Change::Delete { gid })) => {
+                assert_eq!(gid.collection, "kb");
+                assert_eq!(gid.doc_id, "r.pdf");
+                assert_eq!(gid.chunk_id, 1);
+            }
+            Some(Mapped::Refetch { .. }) => panic!("DELETE 不该走 Refetch 路径"),
+            None => panic!("真 chunks 表的 DELETE 必须映射成 Change::Delete，却被忽略了"),
+            Some(Mapped::Ready(other)) => panic!("期望 Change::Delete，得到 {other:?}"),
+        }
     }
 
     #[test]

@@ -1866,10 +1866,14 @@ async fn assets_resolve(
             continue; // 越权/不存在 → 省略（不暴露存在性）
         };
         let item = match a.fetch {
+            // `time` 三个分支都要带：音视频 citation 的深链锚点就是 `TimeSpan`，
+            // 与 PDF 的 page+bbox 同为一等 citation 维度（见 CLAUDE.md 数据模型锚点）。
+            // 单个档 `GET /v1/asset/{cid}` 早就带它，批量档此前三个分支全漏——
+            // 同一件事的两个端点自相矛盾，且**批量档正是答案层一次解析多个引用要走的那条**。
             AssetFetch::InlineRef => match &s.asset_signer {
                 Some(sig) => {
                     let (url, expires_s) = mint_inline_url(sig, cid, a.media_type.as_deref(), now);
-                    json!({"citation_id": cid, "type": "inline", "url": url, "expires_s": expires_s, "media_type": a.media_type})
+                    json!({"citation_id": cid, "type": "inline", "url": url, "expires_s": expires_s, "time": a.time, "media_type": a.media_type})
                 }
                 // 未配签名器：无法签 URL（不返回字节端点直链——它无 token 会 403）。
                 None => {
@@ -1877,10 +1881,10 @@ async fn assets_resolve(
                 }
             },
             AssetFetch::SignedUrl { url, expires_s } => {
-                json!({"citation_id": cid, "type": "object", "url": url, "expires_s": expires_s})
+                json!({"citation_id": cid, "type": "object", "url": url, "expires_s": expires_s, "time": a.time, "media_type": a.media_type})
             }
             AssetFetch::DocRender { doc_id, page, bbox } => {
-                json!({"citation_id": cid, "type": "doc_render", "doc_id": doc_id, "page": page, "bbox": bbox, "media_type": a.media_type})
+                json!({"citation_id": cid, "type": "doc_render", "doc_id": doc_id, "page": page, "bbox": bbox, "time": a.time, "media_type": a.media_type})
             }
         };
         out.push(item);
@@ -3854,6 +3858,73 @@ mod tests {
         assert!(url.contains("ct=image%2Fpng"), "ct 应百分号编码: {url}");
         let st = get_status(signer_app(), url).await;
         assert_eq!(st, StatusCode::NOT_FOUND, "mint URL 验签过、无字节→404");
+    }
+
+    /// 批量档必须与单个档 `GET /v1/asset/{cid}` **同样携带 `time`**。
+    ///
+    /// 修复前：`GET /v1/asset/{cid}` 的 doc_render 分支有 `"time"`，而
+    /// `POST /v1/assets/resolve` 三个分支**全都没有** —— 同一件事的两个端点自相矛盾，
+    /// 且批量档正是答案层一次解析多个引用要走的那条 ⇒ 音视频 citation 一走批量就丢 `TimeSpan`，
+    /// 而 time 与 page/bbox 同为一等 citation 维度。
+    #[tokio::test]
+    async fn assets_resolve_carries_time_like_single_asset_endpoint() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(ServerState::new(engine, keys()).with_asset_signer(b"k".to_vec(), 300));
+        // 音频 chunk：媒资带 TimeSpan，asset 走 doc_region（不需要对象存储/PG 即可解析）。
+        let body = r#"{"collection":"kb","doc_id":"talk.mp3","chunks":[
+            {"doc_id":"talk.mp3","chunk_id":1,"kind":"paragraph","text":"季度回顾","page":1,
+             "bbox":{"x0":0.0,"y0":0.0,"x1":0.0,"y1":0.0},"char_len":4,"acl":["team-a"],"tenant":"acme",
+             "media":{"asset":{"kind":"doc_region","page":1,
+                               "bbox":{"x0":0.0,"y0":0.0,"x1":0.0,"y1":0.0}},
+                      "media_type":"audio/mpeg",
+                      "time":{"start_ms":12000,"end_ms":18500}}}]}"#;
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let batch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/assets/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"ids":["kb:talk.mp3:1"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), StatusCode::OK);
+        let asset = body_json(batch).await["assets"][0].clone();
+        assert_eq!(asset["time"]["start_ms"], 12000, "批量档必须带 time");
+        assert_eq!(asset["time"]["end_ms"], 18500);
+
+        // 与单个档逐字段一致：同一 citation 的 time 不因走哪个端点而不同。
+        let single = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/asset/kb:talk.mp3:1")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(single.status(), StatusCode::OK);
+        assert_eq!(body_json(single).await["time"], asset["time"]);
     }
 
     #[tokio::test]
