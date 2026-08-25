@@ -473,6 +473,14 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 
 ### 迭代记录
 
+- **2026-08-25 · KB-0.3 写入工具 `index_chunks` 已实施 + 活服务验证**：仅远端档宣称且仅远端档可调
+  （C1 全表版）；入参允许清单 `INDEX_ARGS` 与 schema 由 `index_schema_and_allowlist_agree` 钉住；
+  chunk 夹带 `tenant`/`acl` **显式拒绝**（不让 server 静默覆盖）；MCP 替调用方把顶层 `doc_id`
+  补进每条 chunk（`Chunk.doc_id` 必填 + `IndexChunk` 是 flatten ⇒ 缺了在反序列化阶段就 422，
+  `apply_ingest_identity` 的覆盖发生在那之后救不了——**活服务验证抓到，单测的 mock 不校验请求体故漏掉**）。
+  测试 +4；实跑闭环：agent 写入 → `{"indexed":1}` → 立即 `search` 命中该 `citation_id`。
+  `ingest_document`（收原始文件）未做，等 KB-3 上传端点。
+
 - **2026-08-25 · KB-0.2 远端模式已实施 + 活服务验证**：`Backend::{Local,Remote}`、
   `RemoteBackend::connect`（启动时 `GET /v1/collections` 探一次、顺带验 key、失败即拒启）、
   `ServerCaps`、入参允许清单 `SEARCH_ARGS`、远端命中投影 `project_remote_hit`、
@@ -520,7 +528,8 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 ### 下一迭代
 
 - **KB-0.2**：按本文 §4.5–§4.9 实施远端模式（C1 通道，Wave 2）。
-- **KB-0.3**：写入工具 `index_chunks` / `ingest_document`。**依赖远端档**——本地档没有每请求身份，
+- ~~**KB-0.3**：写入工具 `index_chunks`~~ —— **2026-08-25 已实施**（见迭代记录）。
+  `ingest_document` 仍待 KB-3 上传端点。原条目：**依赖远端档**——本地档没有每请求身份，
   在它上面开写入口等于让引擎"替调用方猜写入 ACL"，正是 server v2.4 用 403 拒绝掉的那件事
   ⇒ 按 §4.2 的 C1 全表版：**写入工具只在远端档的 `tools/list` 里出现**。
 - **KB-0.4**：`max_context_chars|tokens` + per-hit 截断 + `include_text`（三者必须同时进
@@ -553,6 +562,15 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
   ⇒ **决策条件写死**：只要本地档保持 ①fail-closed、②只读、③schema 如实只宣称 keyword，
   就保留；三条中任何一条破了，就该弃用而不是打补丁。**最终裁定权归 KB-0.2 的实施者**，
   实施时把结论回写本节。
+
+  > **`[已决 2026-08-25 · KB-0.2 实施者裁定]` 采纳本 spec 的建议：保留，降级为"必须显式选择的单机档"。**
+  > 三条决策条件在本次实施后**均已成立且有测试背书**：
+  > ① fail-closed —— `local_acl()` 未显式声明可见范围即拒绝启动（实跑验证过）；
+  > ② 只读 —— KB-0.3 的写入工具按 C1 全表版只进远端档的 `tools/list`；
+  > ③ 如实只宣称 keyword —— `search_modes()` 由 `can_embed_text_query()` 推导，
+  > 本地档恒 `false`（`tools_list_advertises_only_real_capability`）。
+  > **复审触发**：三条中任何一条被破（尤其"本地档也要能写"），按本节第 4 条改判为弃用，
+  > 而不是给它编一个写入身份。
 
 - **`[待决策]` 远端档探测失败时的策略**：本文取"拒绝启动"（与 server `FASTSEARCH_KEYS`
   fail-closed 同构）。备选"降级为只宣称 keyword"已在 §4.5 论证不采纳，但若实施中发现

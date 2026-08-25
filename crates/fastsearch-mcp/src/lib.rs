@@ -247,6 +247,9 @@ impl McpServer {
         let outcome = match name {
             "search" => self.tool_search(args),
             "resolve_citation" => self.tool_resolve_citation(args),
+            // 本地档不宣称此工具（C1 全表版）⇒ 它在这里也必须真的不可用，
+            // 否则"没宣称但能调"就是又一个暗门。
+            "index_chunks" => self.tool_index_chunks(args),
             other => Err(format!("unknown tool: {other}")),
         };
         match outcome {
@@ -389,6 +392,83 @@ impl McpServer {
 
     /// `resolve_citation` 工具：由 citation_id 解析媒资/原文位置（ACL 服务端强制，越权/不存在
     /// 均报"未找到或无权限"，不暴露存在性）。
+    /// `index_chunks` 宣称接受的入参 —— 同 `SEARCH_ARGS`，与 schema 逐字一致。
+    const INDEX_ARGS: [&'static str; 3] = ["collection", "doc_id", "chunks"];
+
+    /// `index_chunks` 工具（**仅远端档**，KB-0.3）：把已分块内容写入知识库。
+    ///
+    /// **为什么本地档没有这个工具**：本地档的身份是进程级常量、不是每请求身份，
+    /// 在它上面开写入口等于让引擎"替调用方猜写入 ACL"——正是 server 用 403 拒绝掉的那件事
+    /// （见 22-mcp spec §4.2 的 C1 全表版与"待决策"的裁定）。
+    ///
+    /// **解析与分块仍归调用方**：本工具不收原始文件。那是 ADR《职责边界》划定的边界，
+    /// 未被 2026-08-24 的修订推翻（修订只收回"摄取作业面"的状态，不是解析算力）。
+    fn tool_index_chunks(&self, args: Value) -> Result<String, String> {
+        let Backend::Remote(r) = &self.backend else {
+            return Err(
+                "本实例是本地档，不提供写入工具（它没有每请求身份，写入 ACL 无从判定）。\
+                        改用远端档：设 FASTSEARCH_SERVER + FASTSEARCH_KEY。"
+                    .into(),
+            );
+        };
+        let obj = args.as_object().ok_or("arguments 必须是对象")?;
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !Self::INDEX_ARGS.contains(k))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "不接受的入参：{}。index_chunks 只接受 {}。",
+                unknown.join("、"),
+                Self::INDEX_ARGS.join("、")
+            ));
+        }
+        let chunks = obj
+            .get("chunks")
+            .and_then(Value::as_array)
+            .ok_or("chunks 必须是数组")?;
+        if chunks.is_empty() {
+            return Err("chunks 为空：没有可写入的内容。".into());
+        }
+        // **夹带身份 → 显式拒绝**，而不是让 server 静默覆盖。
+        // server 的 `apply_ingest_identity` 无条件用调用者身份覆盖 chunk 的 tenant/acl，
+        // 所以夹带本来"无害"；但静默覆盖会让 agent 以为自己控制了可见性——
+        // 这正是本仓反复在修的那类"悄悄替调用方决定"。宁可让它读到一句话。
+        if let Some(bad) = chunks.iter().position(|c| {
+            c.get("tenant").is_some_and(|v| !v.is_null())
+                || c.get("acl").is_some_and(|v| !v.is_null())
+        }) {
+            return Err(format!(
+                "chunks[{bad}] 夹带了 tenant/acl。写入身份由服务端从本实例的 API key 注入，\
+                 工具入参既不能传也不能放宽——请删掉这两个字段。\
+                 要写到别的租户/标签下，请换一把对应的 key。"
+            ));
+        }
+        // **每条 chunk 补上 `doc_id`**：`core::Chunk.doc_id` 是必填字段，`/v1/index` 的
+        // `IndexChunk` 用 `#[serde(flatten)]` 展开它 ⇒ 缺了直接 422，而 server 侧的
+        // `apply_ingest_identity` 是**反序列化之后**才用 body.doc_id 覆盖它的，救不了。
+        // 让 agent 在每条 chunk 里重复一遍 doc_id 是纯粹的仪式——这里替它补，值反正会被覆盖成同一个。
+        let doc_id = obj.get("doc_id").cloned().unwrap_or(Value::Null);
+        let chunks: Vec<Value> = chunks
+            .iter()
+            .map(|c| {
+                let mut c = c.clone();
+                if let Some(o) = c.as_object_mut() {
+                    o.insert("doc_id".into(), doc_id.clone());
+                }
+                c
+            })
+            .collect();
+        let body = json!({
+            "collection": obj.get("collection"),
+            "doc_id": doc_id,
+            "chunks": chunks,
+        });
+        let resp = r.post("/v1/index", &body)?;
+        serde_json::to_string(&json!({ "indexed": resp.get("indexed") })).map_err(|e| e.to_string())
+    }
+
     /// 远端档的 `resolve_citation`：`POST /v1/assets/resolve {"ids":[cid]}`。
     ///
     /// **越权与不存在同一个回答**：`assets_resolve` 对不可见/不存在的 id 直接 `continue`
@@ -506,7 +586,7 @@ impl McpServer {
             "可选：外部预计算的查询向量。本实例自身不产查询向量，**这是在此开出 \
              mode=vector/hybrid 的唯一途径**；须与索引用同一嵌入模型、同一维度，否则召回无意义。"
         };
-        json!([
+        let mut defs = json!([
         {
             "name": "search",
             "description": search_desc,
@@ -542,7 +622,32 @@ impl McpServer {
                 "required": ["citation_id"]
             }
         }
-        ])
+        ]);
+        // C1 **全表版**：只有远端档具备的能力，在本地档的 tools/list 里**不得出现**——
+        // 不是"出现了但会报错"。本地档没有每请求身份，在它上面开写入口等于让引擎
+        // "替调用方猜写入 ACL"，正是 server 用 403 拒绝掉的那件事。
+        if matches!(self.backend, Backend::Remote(_)) {
+            defs.as_array_mut()
+                .expect("tool_defs 是数组")
+                .push(json!({
+                    "name": "index_chunks",
+                    "description": "把**已分块**的内容写入知识库（doc 级替换：同 doc_id 重复调用会                        整篇替换，不会重复堆积）。写入身份来自本实例的 API key，                        **tenant/acl 由服务端强制注入，工具入参不接受也无法放宽**。                        解析与分块归调用方：本工具不接受原始文件——把文件变成 chunk 的做法见                        docs/文件解析与摄取.md。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "collection": { "type": "string", "description": "目标集合名" },
+                            "doc_id": { "type": "string", "description": "文档标识；同值重复写=整篇替换" },
+                            "chunks": {
+                                "type": "array",
+                                "description": "chunk 数组。每条至少含 chunk_id/kind/text/page/bbox/char_len；                                    **不得含 tenant/acl**（身份由服务端注入）。字段释义见 core::Chunk。",
+                                "items": { "type": "object" }
+                            }
+                        },
+                        "required": ["collection", "doc_id", "chunks"]
+                    }
+                }));
+        }
+        defs
     }
 }
 
@@ -912,6 +1017,130 @@ mod tests {
             "远端命中必须投影成与本地档相同的五字段"
         );
         assert_eq!(hit["snippet"], "毛利率 42%", "highlight → snippet");
+    }
+
+    /// C1 **全表版**：写入工具只在远端档出现——不是"出现了但会报错"。
+    #[test]
+    fn write_tool_is_absent_in_local_mode() {
+        let s = server();
+        let defs = s.tool_defs();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"index_chunks"), "本地档不得宣称写入工具");
+        // 未宣称 ⇒ 也必须真的不可调用，否则"没宣称但能调"就是又一个暗门。
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":50,"method":"tools/call",
+                "params": { "name":"index_chunks",
+                            "arguments": {"collection":"kb","doc_id":"d","chunks":[{}]} }
+            }))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("FASTSEARCH_SERVER"), "要给出改法：{text}");
+    }
+
+    /// 远端档宣称写入工具，且写入落到 `/v1/index`（doc 级替换）。
+    #[test]
+    fn remote_index_chunks_posts_to_v1_index() {
+        let (url, rx) = spawn_server(PROBE_EMBEDDED, r#"{"indexed":2}"#);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let s = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let _ = rx.recv().unwrap(); // 探测
+
+        let defs = s.tool_defs();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"index_chunks"), "远端档必须宣称写入工具");
+
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":51,"method":"tools/call",
+                "params": { "name":"index_chunks", "arguments": {
+                    "collection":"kb","doc_id":"note-1",
+                    "chunks":[{"chunk_id":0,"kind":"paragraph","text":"甲","page":1,
+                               "bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":1}] } }
+            }))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], false);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap()["indexed"], 2);
+
+        let req = String::from_utf8(rx.recv().unwrap()).unwrap();
+        assert!(req.starts_with("POST /v1/index"), "落点必须是 /v1/index");
+        assert!(req.contains("Bearer k") || req.contains("bearer k"));
+        // `core::Chunk.doc_id` 必填且 `IndexChunk` 是 flatten ⇒ 每条 chunk 都得带，
+        // 否则 server 在**反序列化阶段**就 422（`apply_ingest_identity` 的覆盖发生在之后，救不了）。
+        // 这条断言是活服务验证抓到该问题后补的：mock 无脑回固定 JSON，不看请求体，抓不到。
+        let body: Value =
+            serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap_or_default()).unwrap();
+        assert_eq!(
+            body["chunks"][0]["doc_id"], "note-1",
+            "每条 chunk 必须带 doc_id"
+        );
+    }
+
+    /// chunk 里夹带 tenant/acl → **显式拒绝**，不让 server 静默覆盖。
+    ///
+    /// 夹带本来"无害"（`apply_ingest_identity` 无条件覆盖），但静默覆盖会让 agent
+    /// 以为自己控制了可见性——正是本仓反复在修的那类"悄悄替调用方决定"。
+    #[test]
+    fn smuggled_identity_in_chunks_is_refused_not_silently_overwritten() {
+        let (url, rx) = spawn_server(PROBE_EMBEDDED, r#"{"indexed":1}"#);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let s = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let _ = rx.recv().unwrap();
+        for bad in [json!({"tenant":"other"}), json!({"acl":["admin"]})] {
+            let mut chunk = json!({"chunk_id":0,"kind":"paragraph","text":"甲","page":1,
+                                   "bbox":{"x0":0,"y0":0,"x1":1,"y1":1},"char_len":1});
+            for (k, v) in bad.as_object().unwrap() {
+                chunk[k] = v.clone();
+            }
+            let r = s
+                .handle(&json!({
+                    "jsonrpc":"2.0","id":52,"method":"tools/call",
+                    "params": { "name":"index_chunks", "arguments": {
+                        "collection":"kb","doc_id":"d","chunks":[chunk] } }
+                }))
+                .unwrap();
+            assert_eq!(r["result"]["isError"], true, "夹带身份必须被拒");
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("API key"), "要说清身份从哪来：{text}");
+        }
+    }
+
+    /// 写入工具的允许清单同样与 schema 一致（C1 的唯一扩展点）。
+    #[test]
+    fn index_schema_and_allowlist_agree() {
+        let (url, _rx) = spawn_server(PROBE_EMBEDDED, r#"{"indexed":0}"#);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let s = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let defs = s.tool_defs();
+        let tool = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "index_chunks")
+            .unwrap();
+        let props: std::collections::BTreeSet<String> = tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let allow: std::collections::BTreeSet<String> = McpServer::INDEX_ARGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(props, allow);
     }
 
     /// 允许清单必须与 schema 宣称的 `properties` **逐字一致**。

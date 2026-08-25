@@ -144,6 +144,11 @@ It exposes two tools:
 > **actionable error instead of silently degrading to full-text** (fixed 2026-08-24, KB-0.1).
 > **For semantic/hybrid search use REST `POST /v1/search`** (the server has the embedding backend),
 > or supply a precomputed `vector` in the arguments.
+- **`index_chunks`** (**remote mode only**): input `{collection, doc_id, chunks}` → `{indexed}`.
+  Writes pre-chunked content (document-level replace). The write identity comes from the API key;
+  chunks carrying `tenant`/`acl` are **rejected rather than silently overwritten**. Parsing and
+  chunking remain the caller's job. The local mode neither advertises nor accepts this tool — it has
+  no per-request identity, so opening a write path there would make the engine guess the write ACL.
 - **`resolve_citation`**: input `{citation_id}` → media/source location (page+bbox or signed URL).
 
 ACL is injected from server-side env (`FASTSEARCH_MCP_TENANT/TAGS`) — the LLM's tool arguments **cannot** smuggle in or widen permissions.

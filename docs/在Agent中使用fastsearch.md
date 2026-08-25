@@ -125,8 +125,12 @@ MCP 客户端配置（stdio server）：
 
 暴露两个工具：
 
-- **`search`**：入参 `{query, mode?, top_k?, filter?, highlight?}` → 带引用命中（citation_id/page/heading_path/snippet）。
+- **`search`**：入参 `{query, mode?, top_k?, filter?, highlight?, vector?}` → 带引用命中（citation_id/page/heading_path/snippet）。
 - **`resolve_citation`**：入参 `{citation_id}` → 媒资/原文位置（page+bbox 或签名 URL）。
+- **`index_chunks`**（**仅远端档**）：入参 `{collection, doc_id, chunks}` → `{indexed}`。
+  把已分块内容写入知识库（doc 级替换）。**写入身份来自 API key，chunk 里夹带 `tenant`/`acl` 会被拒绝**
+  （而不是被静默覆盖）。解析与分块仍归调用方——见[文件解析与摄取](文件解析与摄取.md)。
+  本地档**不宣称也不可调**：它没有每请求身份，开写入口等于让引擎替调用方猜写入 ACL。
 
 #### 两个运行档（2026-08-25，KB-0.2）
 
