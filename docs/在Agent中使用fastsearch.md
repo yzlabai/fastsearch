@@ -125,7 +125,11 @@ MCP 客户端配置（stdio server）：
 
 暴露两个工具：
 
-- **`search`**：入参 `{query, mode?, top_k?, filter?, highlight?, vector?}` → 带引用命中（citation_id/page/heading_path/snippet）。
+- **`search`**：入参 `{query, mode?, top_k?, filter?, highlight?, vector?, include_text?, max_context_chars?}`
+  → 带引用命中（citation_id/page/heading_path/snippet[/text]）。
+  **上下文预算**：设 `max_context_chars` 后按既有顺序前向累加，放不下的那条若还留得住 80 字符就截断
+  并标 `text_truncated`、否则整条丢弃，响应多出 `dropped` 与 `context_chars`——**截断始终可见**。
+  按**字符**而非 token：本面没有分词器，估算 token 会是编造的数字。不设预算时响应形状不变。
 - **`resolve_citation`**：入参 `{citation_id}` → 媒资/原文位置（page+bbox 或签名 URL）。
 - **`index_chunks`**（**仅远端档**）：入参 `{collection, doc_id, chunks}` → `{indexed}`。
   把已分块内容写入知识库（doc 级替换）。**写入身份来自 API key，chunk 里夹带 `tenant`/`acl` 会被拒绝**

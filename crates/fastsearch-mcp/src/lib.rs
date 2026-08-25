@@ -311,10 +311,42 @@ impl McpServer {
         ))
     }
 
+    /// 给工具描述补一句**本实例**的作用域提示（KB-0.5）：可用 filter 字段 + 已注册集合。
+    ///
+    /// **集合名单只在远端档有，且必须带 caveat**：server 的 collection registry 是进程内
+    /// HashMap、非真源、多副本各持一份，只列本 tenant 名下**显式注册过**的名字
+    /// （ADR《职责边界》已把它定为"必须写进对外契约的 caveat"）⇒ 措辞只能是"已注册（可能不全）"，
+    /// 不得说成"本库全部集合"。本地档没有这个信息就什么都不说——**编一个比不说更糟**。
+    fn scope_hint(&self) -> String {
+        let mut out = String::from(
+            "\n作用域：MCP 不设 collection 入参，限定集合请用 filter 的 \
+             Eq(\"collection\", \"<名字>\")。可用 filter 字段：collection / doc_id / kind / \
+             modality / page（page 支持 Gte/Lte 范围）。",
+        );
+        if let Backend::Remote(r) = &self.backend {
+            if !r.caps.collections.is_empty() {
+                out.push_str(&format!(
+                    "本 key 名下**已注册**的集合（咨询性、可能不全——registry 是 server 进程内内存态、\
+                     非真源）：{}。",
+                    r.caps.collections.join(" / ")
+                ));
+            }
+        }
+        out
+    }
+
     /// 本实例 `search` 宣称接受的入参名 —— **允许清单**，与 [`Self::tool_defs`] 的
     /// `properties` 必须逐字一致（测试 `schema_and_allowlist_agree` 盯住）。
-    const SEARCH_ARGS: [&'static str; 6] =
-        ["query", "mode", "top_k", "filter", "highlight", "vector"];
+    const SEARCH_ARGS: [&'static str; 8] = [
+        "query",
+        "mode",
+        "top_k",
+        "filter",
+        "highlight",
+        "vector",
+        "include_text",
+        "max_context_chars",
+    ];
 
     /// 拒绝一切未宣称的入参 —— 诚实契约 C1 的执行面：**未宣称的能力不得作为暗门存在**。
     ///
@@ -354,6 +386,14 @@ impl McpServer {
         // 默认是 `keyword`（见 `search_modes`）。不在此对齐的话，agent 省略 mode 就会掉进
         // "宣称 hybrid、实际全文"的静默退化——即本条要修的 bug。**以 schema 宣称的为准**。
         let mode_given = args.get("mode").is_some();
+        // `max_context_chars` 是**本面**的旋钮，不是 `SearchRequest` 的字段——先摘走再反序列化，
+        // 否则 serde 会把它当未知字段丢掉（丢掉不报错，于是预算静默失效）。
+        let mut args = args;
+        let budget = args
+            .as_object_mut()
+            .and_then(|o| o.remove("max_context_chars"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
         let mut req: SearchRequest =
             serde_json::from_value(args).map_err(|e| format!("invalid search args: {e}"))?;
         if !mode_given {
@@ -369,13 +409,17 @@ impl McpServer {
                 .map_err(|e| format!("search failed: {e}"))?
                 .iter()
                 .map(|h| {
-                    json!({
+                    let mut v = json!({
                         "citation_id": h.citation.citation_id(),
                         "score": h.score,
                         "page": h.citation.page,
                         "heading_path": h.citation.heading_path,
                         "snippet": h.highlight,
-                    })
+                    });
+                    if req.include_text {
+                        v["text"] = json!(h.text);
+                    }
+                    v
                 })
                 .collect(),
             Backend::Remote(r) => {
@@ -383,11 +427,26 @@ impl McpServer {
                 let resp = r.post("/v1/search", &body)?;
                 resp.get("hits")
                     .and_then(Value::as_array)
-                    .map(|hits| hits.iter().map(project_remote_hit).collect())
+                    .map(|hits| {
+                        hits.iter()
+                            .map(|h| project_remote_hit(h, req.include_text))
+                            .collect()
+                    })
                     .unwrap_or_default()
             }
         };
-        serde_json::to_string(&json!({ "hits": arr })).map_err(|e| e.to_string())
+        // 无预算 → 响应形状与本能力落地前逐字节一致（不给既有调用方平白多出字段）。
+        let Some(budget) = budget else {
+            return serde_json::to_string(&json!({ "hits": arr })).map_err(|e| e.to_string());
+        };
+        let (arr, dropped, used) = apply_budget(arr, budget);
+        serde_json::to_string(&json!({
+            "hits": arr,
+            // 截断必须**对 agent 可见**：静默丢证据 = 让它以为自己看到了全部。
+            "dropped": dropped,
+            "context_chars": used,
+        }))
+        .map_err(|e| e.to_string())
     }
 
     /// `resolve_citation` 工具：由 citation_id 解析媒资/原文位置（ACL 服务端强制，越权/不存在
@@ -586,6 +645,9 @@ impl McpServer {
             "可选：外部预计算的查询向量。本实例自身不产查询向量，**这是在此开出 \
              mode=vector/hybrid 的唯一途径**；须与索引用同一嵌入模型、同一维度，否则召回无意义。"
         };
+        // KB-0.5：agent 没有人类的试错直觉，只能读描述与错误文本。工具描述必须讲清**本实例**
+        // 的作用域与可用字段，而不是泛泛的"混合检索引擎"。
+        let search_desc = format!("{search_desc}{}", self.scope_hint());
         let mut defs = json!([
         {
             "name": "search",
@@ -605,6 +667,14 @@ impl McpServer {
                     "vector": {
                         "type": "array", "items": { "type": "number" },
                         "description": vector_desc
+                    },
+                    "include_text": {
+                        "type": "boolean", "default": false,
+                        "description": "在每条命中里附带完整 chunk 正文。**默认关闭**：整段正文很容易                            冲爆上下文。开它时建议同时设 max_context_chars。"
+                    },
+                    "max_context_chars": {
+                        "type": "integer",
+                        "description": "本次返回的 snippet+text 总**字符数**上限（不是 token：本面没有                            分词器，估算 token 会是编造的数字）。按既有排序前向累加，放不下的那条若还能                            留够 80 字符就截断并标 text_truncated，否则整条丢弃；其后一律不返回。                            设了它时响应会多出 dropped（丢弃条数）与 context_chars（实际用量）——                            截断对调用方始终可见。"
                     }
                 },
                 "required": ["query"]
@@ -663,14 +733,68 @@ fn tool_text(text: &str, is_error: bool) -> Value {
 ///
 /// 投影而非透传：多出来的 `bm25`/`vector`/`rerank`/`bbox`/`media`/`cursor` 若原样吐给 agent，
 /// 就变成"远端档有、本地档没有"的隐性契约差异（spec §3.1）。
-fn project_remote_hit(h: &Value) -> Value {
-    json!({
+fn project_remote_hit(h: &Value, include_text: bool) -> Value {
+    let mut v = json!({
         "citation_id": h.get("citation_id"),
         "score": h.get("score"),
         "page": h.get("page"),
         "heading_path": h.get("heading_path"),
         "snippet": h.get("highlight"),
-    })
+    });
+    if include_text {
+        v["text"] = h.get("text").cloned().unwrap_or(Value::Null);
+    }
+    v
+}
+
+/// 一条命中占的上下文成本（**字符数**，不是字节——CJK 一个字 3 字节，按字节算会离谱地高估）。
+fn hit_cost(h: &Value) -> usize {
+    ["snippet", "text"]
+        .iter()
+        .filter_map(|k| h.get(*k).and_then(Value::as_str))
+        .map(|t| t.chars().count())
+        .sum()
+}
+
+/// 单条命中至少要留这么多字符才值得放进来——否则宁可整条丢掉。
+/// 一个被砍到只剩十几个字的片段对答案层没有价值，却仍要占一条 citation 的位置。
+const MIN_HIT_CHARS: usize = 80;
+
+/// 按预算裁剪命中（KB-0.4）。返回 (裁剪后的命中, 丢弃条数, 实际用掉的字符数)。
+///
+/// **落点在 MCP 层而非 engine**：token/上下文预算是**答案层约束**，塞进通用 engine 的 top-k
+/// 会让"检索该返回什么"与"调用方的上下文有多大"耦死（见 FastGPT 参考建议 §5.2-5）。
+///
+/// **确定性**（不变量 #4）：按融合后的既有顺序前向累加，同输入必同结果——不重排、不抽样。
+/// **截断对 agent 可见**：被砍的那条标 `text_truncated`，整体报 `dropped` 与 `context_chars`；
+/// 静默丢证据是本仓反复在修的那类错。
+fn apply_budget(hits: Vec<Value>, budget: usize) -> (Vec<Value>, usize, usize) {
+    let total = hits.len();
+    let mut out = Vec::with_capacity(total);
+    let mut used = 0usize;
+    for mut h in hits {
+        let cost = hit_cost(&h);
+        if used + cost <= budget {
+            used += cost;
+            out.push(h);
+            continue;
+        }
+        // 放不下整条：能留够 MIN_HIT_CHARS 就截断它，否则整条丢弃。两种情况后续都不再放。
+        let remaining = budget.saturating_sub(used);
+        if remaining >= MIN_HIT_CHARS {
+            if let Some(t) = h.get("text").and_then(Value::as_str) {
+                let kept: String = t.chars().take(remaining).collect();
+                let kept_len = kept.chars().count();
+                h["text"] = json!(format!("{kept}…"));
+                h["text_truncated"] = json!(true);
+                used += kept_len;
+                out.push(h);
+            }
+        }
+        break;
+    }
+    let dropped = total - out.len();
+    (out, dropped, used)
 }
 
 /// JSON-RPC 成功响应。
@@ -862,6 +986,115 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(r["result"]["isError"], false, "自带向量不该被能力守卫拦下");
+    }
+
+    /// 无预算时响应形状与本能力落地前**逐字节一致**——不给既有调用方平白多出字段。
+    #[test]
+    fn no_budget_keeps_response_shape() {
+        let s = server();
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":60,"method":"tools/call",
+                "params": { "name":"search", "arguments": { "query":"毛利率" } }
+            }))
+            .unwrap();
+        let v: Value =
+            serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["hits"], "无预算时不得多出 dropped/context_chars");
+    }
+
+    /// 预算按**既有顺序**前向累加，放不下的整条丢弃，且丢弃对 agent 可见。
+    /// 确定性（不变量 #4）：同输入必同结果——不重排、不抽样。
+    #[test]
+    fn budget_drops_tail_and_reports_it() {
+        let s = server();
+        let call = |budget: usize| {
+            let r = s
+                .handle(&json!({
+                    "jsonrpc":"2.0","id":61,"method":"tools/call",
+                    "params": { "name":"search", "arguments": {
+                        "query":"毛利率 营业收入", "include_text": true,
+                        "max_context_chars": budget } }
+                }))
+                .unwrap();
+            serde_json::from_str::<Value>(r["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap()
+        };
+        // 预算 0：一条都放不下（连 MIN_HIT_CHARS 都留不出），全丢且如实报数。
+        let tight = call(0);
+        assert_eq!(tight["hits"].as_array().unwrap().len(), 0);
+        assert!(tight["dropped"].as_u64().unwrap() >= 1, "丢弃必须被报出来");
+        assert_eq!(tight["context_chars"], 0);
+        // 预算充裕：全给，dropped=0。
+        let loose = call(100_000);
+        assert_eq!(loose["dropped"], 0);
+        assert!(!loose["hits"].as_array().unwrap().is_empty());
+        // 确定性：同输入两次结果逐字节相同。
+        assert_eq!(call(100_000), loose);
+    }
+
+    /// 放不下整条但还留得住 MIN_HIT_CHARS ⇒ **截断而非丢弃**，并标 `text_truncated`。
+    #[test]
+    fn budget_truncates_instead_of_dropping_when_worth_it() {
+        let long: String = "毛利率".repeat(200); // 600 字符
+        let cfg = TextIndexConfig {
+            tokenizer: TokenizerKind::Jieba,
+            ..Default::default()
+        };
+        let mut e = Engine::create_in_ram(cfg).unwrap();
+        e.ingest("kb", &chunk("r.pdf", 1, &long)).unwrap();
+        e.commit().unwrap();
+        let s = McpServer::new(e, None);
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":62,"method":"tools/call",
+                "params": { "name":"search", "arguments": {
+                    "query":"毛利率", "include_text": true, "max_context_chars": 200 } }
+            }))
+            .unwrap();
+        let v: Value =
+            serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let hit = &v["hits"][0];
+        assert_eq!(hit["text_truncated"], true, "被截断必须标出来");
+        let text = hit["text"].as_str().unwrap();
+        assert!(
+            text.chars().count() <= 201,
+            "截断后不得超预算（+1 是省略号）：{}",
+            text.chars().count()
+        );
+        assert!(text.ends_with('…'));
+        assert!(v["context_chars"].as_u64().unwrap() <= 200);
+    }
+
+    /// KB-0.5：描述要讲清**本实例**的作用域与可用 filter 字段，而不是泛泛的"混合检索引擎"。
+    #[test]
+    fn description_tells_agent_the_scope_and_filter_fields() {
+        let s = server();
+        let defs = s.tool_defs();
+        let desc = defs[0]["description"].as_str().unwrap();
+        assert!(desc.contains("collection"), "要讲清怎么限定集合");
+        assert!(
+            desc.contains("modality") && desc.contains("page"),
+            "要列出可用 filter 字段"
+        );
+        // 本地档拿不到集合名单 ⇒ 什么都不说；编一个比不说更糟。
+        assert!(!desc.contains("已注册"), "本地档不得凭空给出集合名单");
+    }
+
+    /// 远端档的集合名单来自探测，**必须带 caveat**（registry 是内存态、非真源、可能不全）。
+    #[test]
+    fn remote_description_lists_collections_with_caveat() {
+        let (url, _rx) = spawn_server(PROBE_EMBEDDED, r#"{"hits":[]}"#);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let s = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let defs = s.tool_defs();
+        let desc = defs[0]["description"].as_str().unwrap();
+        assert!(desc.contains("kb"), "要列出探到的集合");
+        assert!(
+            desc.contains("可能不全"),
+            "必须带 caveat，不得说成本库全部集合"
+        );
     }
 
     // ============ 远端档（KB-0.2）============
@@ -1171,9 +1404,12 @@ mod tests {
     #[test]
     fn unadvertised_args_are_rejected_with_guidance() {
         let s = server();
+        // 注意 `include_text` **不在**此列：KB-0.4 已把它连同 `max_context_chars` 一起宣称
+        // （两者必须同时进 schema 与允许清单——只放开 include_text 而不给预算，
+        // 等于把冲爆上下文的开关递给 agent 却不给刹车）。
         for (arg, val) in [
             ("query_image", json!([1, 2, 3])),
-            ("include_text", json!(true)),
+            ("include_metadata", json!(true)),
             ("search_after", json!("cursor")),
         ] {
             let r = s

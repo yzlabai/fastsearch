@@ -473,6 +473,14 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 
 ### 迭代记录
 
+- **2026-08-26 · KB-0.4/0.5 已实施 + 活服务验证**：`include_text` + `max_context_chars`
+  同时进 schema 与允许清单（只放开前者不给预算 = 把冲爆上下文的开关递给 agent 却不给刹车）；
+  `apply_budget` 按既有顺序前向累加、放不下时留够 `MIN_HIT_CHARS`(80) 就截断并标 `text_truncated`
+  否则整条丢弃，响应报 `dropped`/`context_chars`；**不设预算时响应形状逐字节不变**。
+  旋钮按**字符**而非 token——本面没有分词器，估算 token 是编造的数字（诚实记账）。
+  KB-0.5：描述带本实例作用域（filter 字段 + 远端档探到的集合名单，**带"可能不全"caveat**；
+  本地档没有该信息就什么都不说）。测试 +5。
+
 - **2026-08-25 · KB-0.3 写入工具 `index_chunks` 已实施 + 活服务验证**：仅远端档宣称且仅远端档可调
   （C1 全表版）；入参允许清单 `INDEX_ARGS` 与 schema 由 `index_schema_and_allowlist_agree` 钉住；
   chunk 夹带 `tenant`/`acl` **显式拒绝**（不让 server 静默覆盖）；MCP 替调用方把顶层 `doc_id`
@@ -532,10 +540,9 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
   `ingest_document` 仍待 KB-3 上传端点。原条目：**依赖远端档**——本地档没有每请求身份，
   在它上面开写入口等于让引擎"替调用方猜写入 ACL"，正是 server v2.4 用 403 拒绝掉的那件事
   ⇒ 按 §4.2 的 C1 全表版：**写入工具只在远端档的 `tools/list` 里出现**。
-- **KB-0.4**：`max_context_chars|tokens` + per-hit 截断 + `include_text`（三者必须同时进
-  schema 与允许清单），截断确定且对 agent 可见（"已丢弃 N 条"）。
-- **KB-0.5**：`description` 写清本实例的 collection / 可用 filter 字段 / 能力档位
-  （远端档的 collection 名单来自探测，须带"可能不全"的 caveat）。
+- ~~**KB-0.4** / **KB-0.5**~~ —— **2026-08-26 已实施**（见迭代记录）。
+  余下：SDK 侧（TS/Python）的对应预算旋钮；`include_metadata` 仍在拒绝侧（要连同 metadata
+  的预算语义一起想）。
 - **KB-2.4 之后**：introspection 吐实测 caps ⇒ 才可以诚实地宣称 `query_image_base64`（以图搜图）。
 
 ### 待决策

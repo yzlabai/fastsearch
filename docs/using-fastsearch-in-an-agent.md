@@ -144,6 +144,12 @@ It exposes two tools:
 > **actionable error instead of silently degrading to full-text** (fixed 2026-08-24, KB-0.1).
 > **For semantic/hybrid search use REST `POST /v1/search`** (the server has the embedding backend),
 > or supply a precomputed `vector` in the arguments.
+- **`search`** also takes `include_text` and `max_context_chars`. With a budget set, hits are kept in
+  their existing order until it is exhausted; the hit that no longer fits is truncated (and marked
+  `text_truncated`) if at least 80 characters remain, otherwise dropped, and the response carries
+  `dropped` + `context_chars` — **truncation is always visible**. The budget counts **characters,
+  not tokens**: this face has no tokenizer, so a token estimate would be a made-up number. Without a
+  budget the response shape is unchanged.
 - **`index_chunks`** (**remote mode only**): input `{collection, doc_id, chunks}` → `{indexed}`.
   Writes pre-chunked content (document-level replace). The write identity comes from the API key;
   chunks carrying `tenant`/`acl` are **rejected rather than silently overwritten**. Parsing and
