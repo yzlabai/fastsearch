@@ -12,7 +12,8 @@
 
 mod http;
 pub use http::{
-    build_embedder, EmbedderConfig, EmbedderKind, HttpEmbedder, HttpProtocol, ImageInputFormat,
+    build_embedder, build_embedder_probed, EmbedderConfig, EmbedderKind, HttpEmbedder,
+    HttpProtocol, ImageInputFormat, ProbeReport,
 };
 
 use std::hash::{Hash, Hasher};

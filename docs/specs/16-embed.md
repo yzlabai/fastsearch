@@ -62,3 +62,20 @@ impl HashEmbedder { pub fn new(dim: usize) -> Self; }
 - **管线已接入（2026-06-27 核对）**：**server** 路径自动嵌入——query 走 `EmbedKind::Query`、passage/CDC 写入走 `EmbedKind::Passage`（`engine.set_embedder` + `apply_upsert` 在 CDC 落地主循环自动嵌 chunk → 写派生向量索引）。**CLI 仍纯文本路径**（未装 embedder，BM25-only 或需 `ingest_vector`/`req.vector` 外部传向量）。换嵌入模型维度变化时需同步 PG `vector_dim` 并重建派生索引。
 - **多模态嵌入 MM8a 基础已落地（2026-06-27）**：trait **加法**扩展——`EmbedInput::{Text,Image}` + `Modality` + `EmbedCaps{dim,text,image,cross_modal,semantic}` + `caps()`（默认纯文本语义）+ `embed_multi(&[EmbedInput],kind)`（默认仅 Text、遇 Image 报错）。**既有 `embed(&[String])` 不动 → 文本调用点零改**。`HashEmbedder` 全实现图像路径（字节 4-gram 特征哈希，确定/L2 归一/非语义，`caps{image:true,cross_modal:false,semantic:false}`）→ 图像嵌入路径离线/CI 可跑可测。+5 单测（caps/图像确定性与可分/文图混合/空图零向量/默认拒图）。
 - **MM8b（HttpEmbedder 真图像路由，gated）**：`HttpEmbedder.caps{image:false}`、`embed_multi(Image)` 走默认报错。真图像嵌入需对接**多模态端点**（base64 input，SigLIP-2/JinaCLIP-v2/jina-v4/Voyage/Cohere）并确认**文图同空间**（`cross_modal`）——请求/响应格式需对真模型敲定+验证，故落地前**不写投机未验证代码**（守诚实记账）。属 [多模态计划 M1](../plans/2026-06-25-多模态功能设计与开发计划.md)，待多模态 HTTP 模型服务。引擎/服务侧消费（以图搜图 query_image、CDC 图像嵌入路由）= MM9/MM10。
+
+## 能力探测（KB-2.4，2026-08-26）
+
+`HttpEmbedder::probe()` 在启动时实测一次（固定文本 + 固定 1×1 PNG）：校验数量、维度、有限值 +
+复测确定性。此后 `caps()` **只宣称实测到的**；未探测（Hash 基线 / 显式跳过）才退回照抄配置。
+
+- **`cross_modal` 探不出来**（需跨模态 golden，见 KB-2.5），故仍由配置声明，
+  但被 `image_ok` 收口：`cfg.cross_modal && probe.image_ok`。
+- **`measured_dim` 只在响应通过下层校验时有值**——维度不符在 `parse_response` 就被拒，
+  probe 拿不到向量；失败原因落在 `ProbeReport.notes`。
+- 暴露面：启动日志（降级时吵）、`GET /v1/collections` 的 `server.embed_caps` / `server.embed_probe`、
+  metrics `fastsearch_embed_cap{cap="text|image|cross_modal|semantic"}`。
+- **策略**：默认 `auto`（降级 + 吵，不拒启）；`FASTSEARCH_EMBED_PROBE=require` 则探测未达声明即拒启。
+  与身份 fail-closed 的区别：身份配错会泄露数据，能力宣称错只是检索退化，而"宣称=实测"已由降级保证。
+- **已知限制**：只在启动探一次；模型服务中途换版本不会被发现（周期性重探为下一迭代）。
+
+见 [devlog](../devlog/2026-08-26-KB-2.4-嵌入能力探测.md)。

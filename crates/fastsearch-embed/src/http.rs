@@ -155,10 +155,87 @@ pub fn build_embedder(cfg: &EmbedderConfig) -> Box<dyn Embedder + Send + Sync> {
     }
 }
 
+/// 同 [`build_embedder`]，但对 HTTP 后端**先跑一次能力探测**（KB-2.4），
+/// 使 `caps()` 之后只宣称实测到的能力。返回 (后端, 探测报告)；Hash 基线不探（无外部服务可探）。
+pub fn build_embedder_probed(
+    cfg: &EmbedderConfig,
+) -> (Box<dyn Embedder + Send + Sync>, ProbeReport) {
+    match cfg.kind {
+        EmbedderKind::Hash => (Box::new(HashEmbedder::new(cfg.dim)), ProbeReport::skipped()),
+        EmbedderKind::Http(_) => {
+            let mut e = HttpEmbedder::new(cfg.clone());
+            let r = e.probe();
+            (Box::new(e), r)
+        }
+    }
+}
+
+/// 能力探测结果（KB-2.4）：**实测**到什么就是什么，与配置声明分开记。
+///
+/// 存在的理由：`caps()` 此前**直接照抄配置**——`text`/`semantic` 硬编码 `true`，
+/// `image`/`cross_modal` 来自 env 开关。没有任何证据表明外部模型真的收图、真的同维、
+/// 真的文图同空间。而 `image`/`cross_modal` 是**写入侧和检索侧都要用**的判据
+/// （engine 据此决定要不要嵌图、允不允许文→图），照抄配置等于让一个 env 开关
+/// 决定检索行为的正确性。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeReport {
+    /// 探测是否真的跑起来了（false = 服务不可达/响应不合法，一切能力均未获证实）。
+    pub ran: bool,
+    /// 文本嵌入实测可用（数量对、维度对、值有限）。
+    pub text_ok: bool,
+    /// 图片嵌入实测可用。仅在配置声明 `image` 时才尝试。
+    pub image_ok: bool,
+    /// 实测维度（文本路）。**只在响应通过下层校验时有值**——`parse_response` 会先按
+    /// 配置 `dim` 拒掉不符的响应，那种情况下 probe 根本拿不到向量，失败原因落在 `notes`。
+    pub measured_dim: Option<usize>,
+    /// 同输入两次是否得到同一向量。**不作为准入条件**——有的服务带随机性/负载均衡到不同副本，
+    /// 但不稳定意味着检索结果不可复现，值得让运维看见。
+    pub deterministic: Option<bool>,
+    /// 人类可读的失败原因（成功时为空）。
+    pub notes: Vec<String>,
+}
+
+impl ProbeReport {
+    /// 未探测（如 Hash 基线、或显式 skip）：一切按配置声明走。
+    pub fn skipped() -> Self {
+        ProbeReport {
+            ran: false,
+            text_ok: false,
+            image_ok: false,
+            measured_dim: None,
+            deterministic: None,
+            notes: vec!["probe skipped".into()],
+        }
+    }
+}
+
+/// 探测用的最小 PNG（1×1，透明）——固定字节，便于复现。
+const PROBE_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+/// 校验一条向量是否可用。**维度这一条是纵深防御**：HTTP 路的 `parse_response` 已经先拒了
+/// 不符的响应，但 `vec_ok` 不该依赖那个前提——换个后端实现就不成立了。
+fn vec_ok(v: &[f32], want_dim: usize) -> Option<String> {
+    if v.len() != want_dim {
+        return Some(format!("维度不符：期望 {want_dim}，实得 {}", v.len()));
+    }
+    if v.iter().any(|x| !x.is_finite()) {
+        return Some("响应含 NaN/Inf".into());
+    }
+    Some(String::new()).filter(|s| !s.is_empty())
+}
+
 /// HTTP 嵌入后端。
 pub struct HttpEmbedder {
     cfg: EmbedderConfig,
     agent: ureq::Agent,
+    /// 探测结果；`None` = 未探测（`caps()` 退回照抄配置的老行为）。
+    probed: Option<ProbeReport>,
 }
 
 impl HttpEmbedder {
@@ -166,7 +243,11 @@ impl HttpEmbedder {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build();
-        HttpEmbedder { cfg, agent }
+        HttpEmbedder {
+            cfg,
+            agent,
+            probed: None,
+        }
     }
 
     fn protocol(&self) -> HttpProtocol {
@@ -295,6 +376,65 @@ impl HttpEmbedder {
         }
         Ok(vecs)
     }
+    /// **实测**本后端的能力（KB-2.4）：固定文本 + 固定小图各请求一次，校验数量、维度、有限值，
+    /// 并复测一次文本看是否确定。结果写进 `self.probed`，此后 [`caps`](Self::caps) 只报实测到的。
+    ///
+    /// **为什么必须探**：`caps()` 原本直接照抄配置，而 `image`/`cross_modal` 是引擎在
+    /// **写入侧和检索侧**都要用的判据。一个拼错的 env 开关会让引擎以为能文→图，
+    /// 于是把图片字节送去嵌入、把文本 query 拿去比图片向量——错得静默且难查。
+    ///
+    /// **`cross_modal` 探不出来**：证明"文图同空间"需要带标注的跨模态 golden，不是一次请求能做的。
+    /// 所以它**仍由配置声明**，但被 `image_ok` 收口——图都嵌不出来，谈何同空间。
+    /// 真正的验收在 KB-2.5。
+    pub fn probe(&mut self) -> ProbeReport {
+        let mut r = ProbeReport {
+            ran: true,
+            text_ok: false,
+            image_ok: false,
+            measured_dim: None,
+            deterministic: None,
+            notes: vec![],
+        };
+        let probe_text = vec!["fastsearch capability probe".to_string()];
+        match self.embed(&probe_text, EmbedKind::Passage) {
+            Ok(v) if v.len() == 1 => {
+                r.measured_dim = Some(v[0].len());
+                match vec_ok(&v[0], self.cfg.dim) {
+                    None => {
+                        r.text_ok = true;
+                        // 复测：不作为准入条件，但不稳定 = 检索结果不可复现，要让运维看见。
+                        if let Ok(v2) = self.embed(&probe_text, EmbedKind::Passage) {
+                            r.deterministic = Some(v2.first() == v.first());
+                        }
+                    }
+                    Some(why) => r.notes.push(format!("文本嵌入：{why}")),
+                }
+            }
+            Ok(v) => r
+                .notes
+                .push(format!("文本嵌入：期望 1 条向量，实得 {}", v.len())),
+            Err(e) => r.notes.push(format!("文本嵌入失败：{e}")),
+        }
+        if self.cfg.image {
+            match self.embed_multi(&[EmbedInput::Image(PROBE_PNG.to_vec())], EmbedKind::Passage) {
+                Ok(v) if v.len() == 1 => match vec_ok(&v[0], self.cfg.dim) {
+                    None => r.image_ok = true,
+                    Some(why) => r.notes.push(format!("图片嵌入：{why}")),
+                },
+                Ok(v) => r
+                    .notes
+                    .push(format!("图片嵌入：期望 1 条向量，实得 {}", v.len())),
+                Err(e) => r.notes.push(format!("图片嵌入失败：{e}")),
+            }
+        }
+        self.probed = Some(r.clone());
+        r
+    }
+
+    /// 最近一次探测结果（未探测则 `None`）。
+    pub fn probe_report(&self) -> Option<&ProbeReport> {
+        self.probed.as_ref()
+    }
 }
 
 impl Embedder for HttpEmbedder {
@@ -302,13 +442,29 @@ impl Embedder for HttpEmbedder {
         self.cfg.dim
     }
 
+    /// **宣称的能力 = 实测到的能力**（KB-2.4）。探测跑过就只报实测结果；
+    /// 没探过（Hash 基线 / 显式 skip）才退回照抄配置的老行为。
+    ///
+    /// `cross_modal` 由配置声明**并被 `image` 收口**——图都嵌不出来，谈何文图同空间。
+    /// 它本身探不出来（需要跨模态 golden，见 KB-2.5）。
     fn caps(&self) -> EmbedCaps {
+        let Some(p) = &self.probed else {
+            return EmbedCaps {
+                dim: self.cfg.dim,
+                text: true,
+                image: self.cfg.image,
+                cross_modal: self.cfg.cross_modal,
+                semantic: true,
+            };
+        };
         EmbedCaps {
-            dim: self.cfg.dim,
-            text: true,
-            image: self.cfg.image,
-            cross_modal: self.cfg.cross_modal,
-            semantic: true,
+            dim: p.measured_dim.unwrap_or(self.cfg.dim),
+            text: p.text_ok,
+            image: p.image_ok,
+            cross_modal: self.cfg.cross_modal && p.image_ok,
+            // 探不出"是否语义"（HashEmbedder 也会返回合法向量）。配了外部模型即按语义算，
+            // 但这一条**只是配置声明**，真实语义质量的验收在 KB-2.5。
+            semantic: p.text_ok,
         }
     }
 
@@ -430,6 +586,138 @@ mod tests {
             cross_modal: false,
             image_input_format: ImageInputFormat::DataUrl,
         }
+    }
+
+    // ---- KB-2.4 能力探测 ----------------------------------------------------
+
+    /// 起一个假嵌入服务：按请求体里有没有图片形态返回不同结果，可注入畸形响应。
+    fn spawn_embed_server(
+        text_body: &'static str,
+        image_body: &'static str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(16) {
+                let Ok(mut st) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    match st.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                        let cl = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() - (p + 4) >= cl {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).to_string();
+                // 图片请求的特征：body 里带 base64 data URL / image 字段。
+                let is_image = req.contains("data:image") || req.contains("\"image\"");
+                let body = if is_image { image_body } else { text_body };
+                let _ = tx.send(req);
+                let _ = write!(
+                    st,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = st.flush();
+            }
+        });
+        (url, rx)
+    }
+
+    fn probe_cfg(url: String, dim: usize, image: bool, cross_modal: bool) -> EmbedderConfig {
+        let mut c = http_cfg(HttpProtocol::Ollama, dim);
+        c.url = url;
+        c.image = image;
+        c.cross_modal = cross_modal;
+        c
+    }
+
+    /// 未探测时保持老行为（照抄配置）——不给既有部署带来行为变化。
+    #[test]
+    fn caps_without_probe_falls_back_to_config() {
+        let e = HttpEmbedder::new(probe_cfg("http://127.0.0.1:1".into(), 3, true, true));
+        let c = e.caps();
+        assert!(c.text && c.image && c.cross_modal, "未探测 → 照抄配置");
+    }
+
+    /// **维度不符必须让 text_ok=false**：配置说 3 维、服务返 2 维，此前 `caps()` 照样宣称可用。
+    #[test]
+    fn probe_catches_dimension_mismatch() {
+        let (url, _rx) = spawn_embed_server(r#"{"embeddings":[[1.0,2.0]]}"#, "{}");
+        let mut e = HttpEmbedder::new(probe_cfg(url, 3, false, false));
+        let r = e.probe();
+        assert!(r.ran && !r.text_ok, "维度不符不得算通过");
+        // `measured_dim` 在这里是 None，**这是对的**：维度校验在 `parse_response` 那一层
+        // 就已经把请求拒了（见 `dim_mismatch_errors`），probe 拿不到向量本身。
+        // 实测维度只在响应通过下层校验时才有值；不符的情形由 notes 里的下层错误交代。
+        assert_eq!(r.measured_dim, None);
+        assert!(
+            r.notes.iter().any(|n| n.contains("文本嵌入失败")),
+            "失败原因要带上下层的错误：{:?}",
+            r.notes
+        );
+        assert!(!e.caps().text, "caps 必须跟着实测走");
+    }
+
+    /// **声明了 image 但服务嵌不出图** ⇒ `image` 与 `cross_modal` 双双落地。
+    /// cross_modal 被 image 收口：图都嵌不出来，谈何文图同空间。
+    #[test]
+    fn probe_downgrades_image_and_cross_modal_when_image_fails() {
+        // 图片请求返回畸形响应（没有 embeddings 字段）。
+        let (url, _rx) = spawn_embed_server(r#"{"embeddings":[[1.0,2.0,3.0]]}"#, r#"{"oops":1}"#);
+        let mut e = HttpEmbedder::new(probe_cfg(url, 3, true, true));
+        let r = e.probe();
+        assert!(r.text_ok, "文本路应通过");
+        assert!(!r.image_ok, "图片路应失败");
+        let c = e.caps();
+        assert!(c.text, "文本能力保留");
+        assert!(!c.image, "宣称的 image 必须被实测推翻");
+        assert!(
+            !c.cross_modal,
+            "cross_modal 被 image 收口——嵌不出图就不可能同空间"
+        );
+    }
+
+    /// 服务不可达 ⇒ 一切能力均未获证实，`caps` 全线降级（而不是继续宣称）。
+    #[test]
+    fn probe_unreachable_service_downgrades_everything() {
+        let mut e = HttpEmbedder::new(probe_cfg("http://127.0.0.1:1".into(), 3, true, true));
+        let r = e.probe();
+        assert!(r.ran && !r.text_ok && !r.image_ok);
+        assert!(r.notes.iter().any(|n| n.contains("失败")), "{:?}", r.notes);
+        let c = e.caps();
+        assert!(!c.text && !c.image && !c.cross_modal && !c.semantic);
+    }
+
+    /// 全绿路径：文本 + 图片都通过，且复测一致 ⇒ 记 deterministic=true。
+    #[test]
+    fn probe_all_green_records_determinism() {
+        let (url, _rx) = spawn_embed_server(
+            r#"{"embeddings":[[1.0,2.0,3.0]]}"#,
+            r#"{"embeddings":[[4.0,5.0,6.0]]}"#,
+        );
+        let mut e = HttpEmbedder::new(probe_cfg(url, 3, true, true));
+        let r = e.probe();
+        assert!(r.text_ok && r.image_ok);
+        assert_eq!(r.deterministic, Some(true));
+        let c = e.caps();
+        assert!(c.text && c.image && c.cross_modal && c.semantic);
+        assert_eq!(c.dim, 3);
     }
 
     #[test]

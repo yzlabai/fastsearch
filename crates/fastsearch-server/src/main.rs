@@ -15,6 +15,11 @@
 //! - `FASTSEARCH_OBJECT_BUCKET`：本地对象存储默认 bucket（默认 `fastsearch-assets`）。
 //! - `FASTSEARCH_S3_MAX_IMAGE_BYTES`：对象读写最大字节数（默认 20MiB）。
 //! - `FASTSEARCH_EMBEDDER` = `hash`|`ollama`|`openai`（+ `FASTSEARCH_EMBED_*`）：真语义嵌入后端。
+//! - `FASTSEARCH_EMBED_PROBE` = `require`：启动时的能力探测（KB-2.4）未达配置声明即**拒绝启动**。
+//!   默认（不设）为 `auto`：降级到实测能力 + 吵一嗓子，但仍启动——能力宣称错只让检索退化，
+//!   而"宣称=实测"已由降级本身保证；不值得为一次瞬时抖动让整个服务起不来。
+//!   实测能力见启动日志、`GET /v1/collections` 的 `server.embed_caps`、
+//!   metrics `fastsearch_embed_cap{cap="…"}`。
 //! - `FASTSEARCH_VECTOR_BACKEND` = `brute`(默认)|`brute_binary`|`brute_binary_rotated`|`turboquant`|`hnsw`|`pgvector`：向量后端。
 //!   `turboquant`=压缩主索引（只存 2–4bit 码、内存 ↓8~16×、确定，位宽由 `FASTSEARCH_QUANT_BITS` 调，默认 4；
 //!   `FASTSEARCH_TURBO_RERANK=<oversample>` 开 f32 精排 sidecar → 召回近精确、RAM 仍只码）；hnsw=引擎侧近似
@@ -353,13 +358,54 @@ async fn main() -> anyhow::Result<()> {
     }
     // query 侧嵌入（与 CDC sink 的 engine.embedder 同配置、独立实例）。
     if embed_on {
-        state = state.with_embedder(std::sync::Arc::from(fastsearch_embed::build_embedder(
-            &ecfg,
-        )));
+        // KB-2.4：启动时**实测**一次能力（固定文本 + 固定小图），此后 `caps()` 只宣称实测到的。
+        // 此前 `caps()` 直接照抄配置——一个拼错的 env 开关就能让引擎以为能文→图。
+        let (embedder, report) = fastsearch_embed::build_embedder_probed(&ecfg);
+        let caps = embedder.caps();
+        state = state.with_embedder(std::sync::Arc::from(embedder));
         eprintln!(
             "embedder on: {:?} url={} model={} dim={}",
             ecfg.kind, ecfg.url, ecfg.model, ecfg.dim
         );
+        if report.ran {
+            eprintln!(
+                "embed probe: text={} image={} cross_modal={} deterministic={:?}",
+                caps.text, caps.image, caps.cross_modal, report.deterministic
+            );
+            // **降级要吵**：配置声明与实测不符时，运维必须看得见（否则等于回到照抄配置）。
+            if ecfg.image && !caps.image {
+                eprintln!(
+                    "  warn: 配置声明 image=true，但实测嵌不出图 → 已降级；\n\
+                     \x20       图片写入会退化为 caption 文本，文→图检索不可用。"
+                );
+            }
+            if !caps.text {
+                eprintln!(
+                    "  warn: 实测文本嵌入不可用 → 向量召回将全线退化为纯全文（BM25）。\n\
+                     \x20       检查 FASTSEARCH_EMBED_URL / 模型是否在跑；\n\
+                     \x20       要求探测必须通过请设 FASTSEARCH_EMBED_PROBE=require。"
+                );
+            }
+            for n in &report.notes {
+                eprintln!("  probe: {n}");
+            }
+            // 策略（§10-6 裁定）：默认 `auto` —— 降级 + 吵，但**不拒绝启动**。
+            // 与身份 fail-closed 的区别：身份配错会**泄露数据**，能力宣称错只是检索退化，
+            // 而"宣称=实测"这条已由降级本身保证。为一次瞬时网络抖动让整个搜索服务起不来
+            // （连纯全文都不能用）是不划算的。要严格的部署可显式选 require。
+            if std::env::var("FASTSEARCH_EMBED_PROBE").as_deref() == Ok("require")
+                && (!caps.text || (ecfg.image && !caps.image))
+            {
+                anyhow::bail!(
+                    "FASTSEARCH_EMBED_PROBE=require：嵌入后端能力探测未达配置声明，拒绝启动。\n\
+                     实测 text={} image={}（配置 image={}）。详见上面的 probe 行。",
+                    caps.text,
+                    caps.image,
+                    ecfg.image
+                );
+            }
+        }
+        state = state.with_embed_probe(report);
     }
 
     // 启动后台 CDC 同步循环（若已配置）。

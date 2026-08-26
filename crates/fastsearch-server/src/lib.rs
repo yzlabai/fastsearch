@@ -371,6 +371,8 @@ pub struct ServerState {
     audit: Option<AuditSink>,
     /// 真语义嵌入后端（None=不嵌入，检索退化为 keyword）。
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
+    /// 启动时的嵌入能力探测报告（KB-2.4）；None = 未探测。
+    embed_probe: Option<fastsearch_embed::ProbeReport>,
     /// 资产 URL 签名器（None=不签发短时 URL，`/v1/asset/{cid}/bytes` 一律 403）。
     asset_signer: Option<Arc<AssetSigner>>,
     /// 公网入口 base（用于在 `media.url` 中拼出完整 URL）；
@@ -410,6 +412,7 @@ impl ServerState {
             rate_limiter: None,
             audit: None,
             embedder: None,
+            embed_probe: None,
             asset_signer: None,
             public_base: None,
             collections: Arc::new(Mutex::new(HashMap::new())),
@@ -454,6 +457,12 @@ impl ServerState {
     /// 设置嵌入后端：ingest 自动嵌入 passage、search 自动嵌入 query（开启真混合）。
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder + Send + Sync>) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// 记录启动时的嵌入能力探测报告（KB-2.4），供 introspection / metrics 如实暴露。
+    pub fn with_embed_probe(mut self, report: fastsearch_embed::ProbeReport) -> Self {
+        self.embed_probe = Some(report);
         self
     }
 
@@ -1140,6 +1149,36 @@ async fn metrics(State(s): State<ServerState>) -> String {
     out.push_str(&format!(
         "fastsearch_source_store_configured {source_store}\n"
     ));
+
+    // KB-2.4：**实测**到的嵌入能力（不是配置声明）。运维可直接对
+    // `fastsearch_embed_cap{cap="image"} == 0` 而配置里开了图片 告警——
+    // 那正是"env 开关拼错、引擎却以为能文→图"的信号。
+    if let Some(e) = &s.embedder {
+        let c = e.caps();
+        out.push_str(
+            // 用 `concat!` 而不是反斜杠续行：续行会把下一行的缩进带进字符串，
+            // 而 Prometheus 是**行式**格式、顶格是硬要求。fail-closed 那次就栽在这上面
+            // （靠实跑才发现），这次由测试直接钉死。
+            concat!(
+                "# HELP fastsearch_embed_cap Measured embedding capability ",
+                "(1=proven by the startup probe, 0=not proven). ",
+                "Config claims are NOT reflected here.\n",
+                "# TYPE fastsearch_embed_cap gauge\n",
+            ),
+        );
+        for (name, v) in [
+            ("text", c.text),
+            ("image", c.image),
+            ("cross_modal", c.cross_modal),
+            ("semantic", c.semantic),
+        ] {
+            out.push_str(&format!(
+                "fastsearch_embed_cap{{cap=\"{name}\"}} {}
+",
+                u64::from(v)
+            ));
+        }
+    }
 
     // 检索延迟直方图（Prometheus 累积 le 桶）。
     out.push_str(
@@ -3064,6 +3103,23 @@ async fn server_vector_info(s: &ServerState) -> Value {
         // 不让调用方以为崩溃后能从真源恢复。事实由运行时推导，非配置声明。
         "source_of_truth": if engine.source_pg_clone().is_some() { "postgres" } else { "none" },
         "rebuildable_from_source": engine.source_pg_clone().is_some(),
+        // KB-2.4：**实测**到的嵌入能力（不是配置声明）。调用方据此判断能不能做以图搜图等，
+        // 而不是靠猜。`ran:false` = 未探测（Hash 基线），此时 caps 仍是配置值。
+        "embed_caps": s.embedder.as_ref().map(|e| {
+            let c = e.caps();
+            json!({
+                "text": c.text, "image": c.image,
+                "cross_modal": c.cross_modal, "semantic": c.semantic, "dim": c.dim,
+            })
+        }),
+        "embed_probe": s.embed_probe.as_ref().map(|p| json!({
+            "ran": p.ran,
+            "text_ok": p.text_ok,
+            "image_ok": p.image_ok,
+            "measured_dim": p.measured_dim,
+            "deterministic": p.deterministic,
+            "notes": p.notes,
+        })),
     })
 }
 
@@ -3866,6 +3922,69 @@ mod tests {
     /// `POST /v1/assets/resolve` 三个分支**全都没有** —— 同一件事的两个端点自相矛盾，
     /// 且批量档正是答案层一次解析多个引用要走的那条 ⇒ 音视频 citation 一走批量就丢 `TimeSpan`，
     /// 而 time 与 page/bbox 同为一等 citation 维度。
+    /// KB-2.4：metrics 与 introspection 报的是**实测**能力，不是配置声明。
+    ///
+    /// 用一个只支持文本的 embedder（`caps.image=false`）验证：即便部署方以为配了图片，
+    /// 对外暴露的也只能是实测到的那一份。Prometheus 是**行式**格式，顺带把顶格钉死
+    /// （fail-closed 那次就是靠实跑才发现缩进把整个 metrics 弄坏了）。
+    #[tokio::test]
+    async fn metrics_and_introspection_report_measured_embed_caps() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let app = router(
+            ServerState::new(engine, keys())
+                .with_embedder(Arc::new(fastsearch_embed::HashEmbedder::new(8))),
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let text = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            text.contains("\nfastsearch_embed_cap{cap=\"text\"} 1\n"),
+            "文本能力应为 1：\n{text}"
+        );
+        assert!(
+            text.contains("\nfastsearch_embed_cap{cap=\"semantic\"} 0\n"),
+            "HashEmbedder 不是语义的，绝不能报 1：\n{text}"
+        );
+        for line in text.lines().filter(|l| l.contains("embed_cap")) {
+            assert!(
+                !line.starts_with(char::is_whitespace),
+                "Prometheus 行必须顶格：{line:?}"
+            );
+        }
+
+        // introspection 随集合端点返回，同样只报实测。
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/collections")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["server"]["embed_caps"]["text"], true);
+        assert_eq!(v["server"]["embed_caps"]["semantic"], false);
+        assert_eq!(v["server"]["embed_caps"]["dim"], 8);
+    }
+
     #[tokio::test]
     async fn assets_resolve_carries_time_like_single_asset_endpoint() {
         let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
