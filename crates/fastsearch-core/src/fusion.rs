@@ -54,43 +54,88 @@ impl Default for Fusion {
     }
 }
 
-/// 融合 keyword 与 semantic 两路候选，返回按融合分降序、确定性 tie-break 的结果。
+/// 一路召回：**带来源标识与权重**的候选列表（KB-2.2）。
 ///
-/// - 输入各自可乱序；本函数内部按分排名。
-/// - 一路为空时退化为另一路的相应融合。
-pub fn fuse(keyword: &[Scored], semantic: &[Scored], fusion: &Fusion) -> Vec<Scored> {
+/// `source` 形如 `<召回方式>:<信号>`（如 `keyword:user_text` / `vector:image_caption`），
+/// 与 [KB-2.1](../../../docs/plans/2026-08-25-chunk-signal多表示设计.md) 的 `signal_type` 对齐。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallList {
+    pub source: String,
+    /// 该路权重。**仅加权档用**（RRF 是尺度无关的排名融合，忽略它）。
+    pub weight: f64,
+    pub items: Vec<Scored>,
+}
+
+impl RecallList {
+    pub fn new(source: impl Into<String>, weight: f64, items: Vec<Scored>) -> Self {
+        RecallList {
+            source: source.into(),
+            weight,
+            items,
+        }
+    }
+}
+
+/// **N 路**具名融合（KB-2.2 第一步）。[`fuse`] 是它的两路特例。
+///
+/// 与两路版的关系：
+/// - `Rrf` 天然 N 路——原实现就是 `for path in [keyword, semantic]` 的循环，这里换成遍历 `lists`。
+/// - 加权档（`Normalized`/`Weighted`）的标量在 N 路下没有意义，**改用每路自带的 `weight`**：
+///   两路时 `fuse` 把标量翻译成 `(1-x)` / `x` 两个权重，于是行为**逐位不变**。
+///   （这两个档在 `fuse` 里的实现本就逐字同构，是 2026-07-05 审查记录在案的旧账；
+///   本函数只用一份加权逻辑，不把重复搬进 N 路。）
+///
+/// **确定性（不变量 #4）**：按 `source` 字典序遍历各路再累加浮点。
+/// 用输入顺序累加会让"同一组召回、不同拼装顺序"产生不同的浮点尾数——
+/// 两路时只有两个加数看不出来，N 路化正是这个坑冒头的地方。
+pub fn fuse_n(lists: &[RecallList], fusion: &Fusion) -> Vec<Scored> {
+    // 借用排序：不克隆 items（各路可能很大）。
+    let mut order: Vec<&RecallList> = lists.iter().collect();
+    order.sort_by(|a, b| a.source.cmp(&b.source));
+
     let mut acc: HashMap<GlobalId, f64> = HashMap::new();
     match fusion {
         Fusion::Rrf { rank_constant } => {
-            for path in [keyword, semantic] {
-                for (rank, s) in rank_desc(path).iter().enumerate() {
+            for l in order {
+                for (rank, s) in rank_desc(&l.items).iter().enumerate() {
                     let contrib = 1.0 / (rank_constant + (rank as f64 + 1.0));
                     *acc.entry(s.id.clone()).or_insert(0.0) += contrib;
                 }
             }
         }
-        Fusion::Normalized { semantic_ratio } => {
-            let kw = normalize(keyword);
-            let sem = normalize(semantic);
-            for s in &kw {
-                *acc.entry(s.id.clone()).or_insert(0.0) += (1.0 - semantic_ratio) * s.score;
-            }
-            for s in &sem {
-                *acc.entry(s.id.clone()).or_insert(0.0) += semantic_ratio * s.score;
-            }
-        }
-        Fusion::Weighted { alpha } => {
-            let kw = normalize(keyword);
-            let sem = normalize(semantic);
-            for s in &kw {
-                *acc.entry(s.id.clone()).or_insert(0.0) += (1.0 - alpha) * s.score;
-            }
-            for s in &sem {
-                *acc.entry(s.id.clone()).or_insert(0.0) += alpha * s.score;
+        // 两个加权档数学等价（旧账，见上）⇒ 共用一份实现，权重来自每路的 `weight`。
+        Fusion::Normalized { .. } | Fusion::Weighted { .. } => {
+            for l in order {
+                for s in normalize(&l.items) {
+                    *acc.entry(s.id.clone()).or_insert(0.0) += l.weight * s.score;
+                }
             }
         }
     }
     sort_scored(acc)
+}
+
+/// 融合 keyword 与 semantic 两路候选，返回按融合分降序、确定性 tie-break 的结果。
+///
+/// - 输入各自可乱序；本函数内部按分排名。
+/// - 一路为空时退化为另一路的相应融合。
+pub fn fuse(keyword: &[Scored], semantic: &[Scored], fusion: &Fusion) -> Vec<Scored> {
+    // 两路 = N 路的特例。加权档的标量在这里翻译成两路权重：keyword 得 `1-x`、semantic 得 `x`
+    // （`Normalized.semantic_ratio` 与 `Weighted.alpha` 扮演的是同一个 `x`——它们数学等价）。
+    // 来源名取 `keyword`/`vector`：`fuse_n` 按 source 字典序累加，`keyword` < `vector`，
+    // 与原实现的累加顺序一致 ⇒ 浮点结果逐位不变（由 `n_way_matches_two_way_bitwise` 钉住）。
+    let x = match fusion {
+        Fusion::Rrf { .. } => 0.0, // RRF 忽略权重
+        Fusion::Normalized { semantic_ratio } => *semantic_ratio,
+        Fusion::Weighted { alpha } => *alpha,
+    };
+    fuse_n(
+        &[
+            RecallList::new("keyword", 1.0 - x, keyword.to_vec()),
+            RecallList::new("vector", x, semantic.to_vec()),
+        ],
+        fusion,
+    )
 }
 
 /// 按分降序排名（用于 RRF 取 rank）；同分按 id 升序保证确定性。
@@ -157,6 +202,146 @@ mod tests {
     }
     fn s(n: u64, score: f64) -> Scored {
         Scored { id: id(n), score }
+    }
+
+    // ---- KB-2.2 N 路具名融合 ----------------------------------------------
+
+    /// **本项最重要的一条**：N 路实现喂两路，必须与旧两路实现**逐位相同**。
+    ///
+    /// 不是"约等于"——浮点累加顺序一变，尾数就会漂，而融合分会传导到最终名次。
+    /// 所以断言用 `to_bits()` 比较，不是 `abs() < eps`。
+    #[test]
+    fn n_way_matches_two_way_bitwise() {
+        let kw = vec![s(1, 10.0), s(2, 5.0), s(4, 1.0)];
+        let sem = vec![s(2, 0.9), s(3, 0.8), s(5, 0.1)];
+        for f in [
+            Fusion::Rrf {
+                rank_constant: 60.0,
+            },
+            Fusion::Rrf { rank_constant: 7.5 },
+            Fusion::Normalized {
+                semantic_ratio: 0.7,
+            },
+            Fusion::Weighted { alpha: 0.3 },
+            Fusion::Normalized {
+                semantic_ratio: 0.0,
+            },
+            Fusion::Weighted { alpha: 1.0 },
+        ] {
+            let two = fuse(&kw, &sem, &f);
+            let x = match &f {
+                Fusion::Rrf { .. } => 0.0,
+                Fusion::Normalized { semantic_ratio } => *semantic_ratio,
+                Fusion::Weighted { alpha } => *alpha,
+            };
+            let n = fuse_n(
+                &[
+                    RecallList::new("keyword", 1.0 - x, kw.clone()),
+                    RecallList::new("vector", x, sem.clone()),
+                ],
+                &f,
+            );
+            assert_eq!(two.len(), n.len(), "{f:?}");
+            for (a, b) in two.iter().zip(&n) {
+                assert_eq!(a.id, b.id, "{f:?} 名次必须一致");
+                assert_eq!(
+                    a.score.to_bits(),
+                    b.score.to_bits(),
+                    "{f:?} 融合分必须**逐位**相同，不能只是接近"
+                );
+            }
+        }
+    }
+
+    /// 确定性（不变量 #4）：打乱各路内部顺序**且**打乱路与路的顺序，结果不变。
+    ///
+    /// 后半条是 N 路化新引入的风险面——两路时只有两个加数，累加顺序看不出差别。
+    #[test]
+    fn n_way_deterministic_under_list_shuffle() {
+        let a = RecallList::new("keyword:user_text", 0.5, vec![s(1, 10.0), s(2, 5.0)]);
+        let b = RecallList::new("vector:user_text", 0.3, vec![s(2, 0.9), s(3, 0.8)]);
+        let c = RecallList::new("vector:image_caption", 0.2, vec![s(3, 0.5), s(4, 0.4)]);
+        for f in [
+            Fusion::Rrf {
+                rank_constant: 60.0,
+            },
+            Fusion::Normalized {
+                semantic_ratio: 0.5,
+            },
+        ] {
+            let base = fuse_n(&[a.clone(), b.clone(), c.clone()], &f);
+            for perm in [
+                vec![c.clone(), a.clone(), b.clone()],
+                vec![b.clone(), c.clone(), a.clone()],
+                vec![c.clone(), b.clone(), a.clone()],
+            ] {
+                let got = fuse_n(&perm, &f);
+                assert_eq!(got.len(), base.len(), "{f:?}");
+                for (x, y) in base.iter().zip(&got) {
+                    assert_eq!(x.id, y.id, "{f:?} 路顺序不得影响名次");
+                    assert_eq!(
+                        x.score.to_bits(),
+                        y.score.to_bits(),
+                        "{f:?} 路顺序不得影响浮点尾数"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 三路 RRF：一个候选被两路命中应压过只被一路命中的。
+    #[test]
+    fn n_way_rrf_rewards_multi_source_hits() {
+        let out = fuse_n(
+            &[
+                RecallList::new("keyword:user_text", 1.0, vec![s(1, 9.0), s(9, 1.0)]),
+                RecallList::new("vector:user_text", 1.0, vec![s(1, 0.9)]),
+                RecallList::new("vector:image_caption", 1.0, vec![s(7, 0.5)]),
+            ],
+            &Fusion::Rrf {
+                rank_constant: 60.0,
+            },
+        );
+        assert_eq!(out[0].id, id(1), "被两路命中的应排第一：{out:?}");
+        // id9 在 keyword 里排第 2，id7 在 caption 路排第 1 ⇒ id7 应压过 id9。
+        let pos = |n: u64| out.iter().position(|x| x.id == id(n)).unwrap();
+        assert!(pos(7) < pos(9), "各路第 1 名应压过别路第 2 名：{out:?}");
+    }
+
+    /// 加权档在 N 路下用**每路自带的 weight**（标量在 N 路没有意义）。
+    #[test]
+    fn n_way_weights_come_from_each_list() {
+        let lists = |w_img: f64| {
+            vec![
+                RecallList::new("vector:user_text", 1.0, vec![s(1, 1.0), s(2, 0.0)]),
+                RecallList::new("vector:image_caption", w_img, vec![s(2, 1.0), s(1, 0.0)]),
+            ]
+        };
+        let f = Fusion::Normalized {
+            semantic_ratio: 0.5, // N 路下该标量被忽略
+        };
+        // 图片路权重低 → id1 胜；权重高 → id2 胜。方向必须符合预期。
+        assert_eq!(fuse_n(&lists(0.1), &f)[0].id, id(1));
+        assert_eq!(fuse_n(&lists(9.0), &f)[0].id, id(2));
+    }
+
+    /// 空路不影响结果（N 路版的 `one_path_empty_degrades`）。
+    #[test]
+    fn n_way_empty_lists_are_inert() {
+        let real = RecallList::new("keyword:user_text", 1.0, vec![s(1, 10.0), s(2, 5.0)]);
+        let f = Fusion::Rrf {
+            rank_constant: 60.0,
+        };
+        let alone = fuse_n(std::slice::from_ref(&real), &f);
+        let padded = fuse_n(
+            &[
+                real.clone(),
+                RecallList::new("vector:image_bytes", 1.0, vec![]),
+                RecallList::new("zzz:empty", 3.0, vec![]),
+            ],
+            &f,
+        );
+        assert_eq!(alone, padded, "空路不得改变任何东西");
     }
 
     #[test]
