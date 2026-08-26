@@ -82,6 +82,9 @@ export interface Chunk {
   section_id?: number;
   char_len: number;
   media?: Media | null;
+  /** inline 媒资字节。**是字节数组，不是 base64 字符串**——传字符串会被服务端拒绝
+   * （`invalid type: string, expected a sequence`）。用 `chunksFromDocparse` 会自动处理。 */
+  media_bytes?: number[];
   image_vector_status?: string | null;
   tenant?: string | null;
   acl?: string[];

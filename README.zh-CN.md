@@ -69,6 +69,7 @@ DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG 集成（CI 用 p
 
 - **[在 Agent 中使用 fastsearch](docs/在Agent中使用fastsearch.md)**（开发者使用指南）
 - **[文件解析与摄取](docs/文件解析与摄取.md)**（多格式摄取 · OCR · 表格识别 · 构建分档 · 模型配置）
+- **[接入文档摄取](docs/接入文档摄取.md)**（非 Rust 调用方：解析器 → 字段映射 → `/v1/index`；SDK 适配 helper）
 - [架构速查 / 命令 / 不变量（CLAUDE.md）](CLAUDE.md)
 - [模块拆分与 spec 索引](docs/specs/00-模块拆分.md)
 - [需求分析](docs/plans/2026-06-24-需求分析报告.md) · [产品设计](docs/plans/2026-06-24-产品设计文档.md)

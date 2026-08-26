@@ -11,6 +11,8 @@ import {
   formatHitsForLLM,
   hitToDocument,
   makeSearchTool,
+  chunksFromDocparse,
+  chunkText,
   type BatchUpsertChunk,
   type GlobalId,
   type Hit,
@@ -392,4 +394,81 @@ test("hitToDocument maps highlight to pageContent and rest to metadata", () => {
   assert.equal(doc.metadata.citation_id, "kb:report.pdf:3");
   assert.equal(doc.metadata.page, 7);
   assert.equal("highlight" in doc.metadata, false);
+});
+
+// ---- 摄取适配（KB-1.4）----------------------------------------------------
+
+test("chunksFromDocparse: id→chunk_id、注入 doc_id、结构保留", () => {
+  const out = chunksFromDocparse(
+    [
+      {
+        id: 7,
+        kind: "paragraph",
+        text: "毛利率提升",
+        page: 3,
+        bbox: { x0: 1, y0: 2, x1: 3, y1: 4 },
+        heading_path: ["财务", "毛利"],
+        section_id: 2,
+        char_len: 5,
+      },
+    ],
+    { docId: "r.pdf" },
+  );
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.chunk_id, 7, "id → chunk_id 是唯一的重命名");
+  assert.equal(out[0]!.doc_id, "r.pdf", "doc_id 由适配器注入（docparse 不带）");
+  assert.deepEqual(out[0]!.heading_path, ["财务", "毛利"]);
+  assert.equal(out[0]!.page, 3);
+});
+
+test("chunksFromDocparse: 图片三态映射，且 base64 必须解成字节数组", () => {
+  const bbox = { x0: 0, y0: 0, x1: 10, y1: 10 };
+  const base = { kind: "image", text: "图1", page: 2, bbox, char_len: 2 };
+  const [inline, object, region] = chunksFromDocparse(
+    [
+      // "PNG\r\n" 的前几字节：0x89 'P' 'N' 'G'
+      { ...base, id: 0, image: { data_base64: "iVBORw==", media_type: "image/png" } },
+      { ...base, id: 1, image: { file: "s3://b/k.png", media_type: "image/png" } },
+      { ...base, id: 2, image: { caption: "只有图注" } },
+    ],
+    { docId: "d" },
+  );
+  // ① 有 base64 → inline + 字节数组。**不是 base64 字符串**：服务端只收 sequence。
+  assert.equal((inline!.media as any).asset.kind, "inline");
+  assert.ok(Array.isArray(inline!.media_bytes), "media_bytes 必须是数字数组");
+  assert.deepEqual(inline!.media_bytes!.slice(0, 4), [0x89, 0x50, 0x4e, 0x47]);
+  // ② 有 file → object
+  assert.equal((object!.media as any).asset.kind, "object");
+  assert.equal((object!.media as any).asset.uri, "s3://b/k.png");
+  assert.equal(object!.media_bytes, undefined);
+  // ③ 都没有 → doc_region（只跳原文位置）
+  assert.equal((region!.media as any).asset.kind, "doc_region");
+  assert.equal((region!.media as any).asset.page, 2);
+});
+
+test("chunkText: markdown 标题维护 heading_path，段落成块", () => {
+  const md = "# 年报\n\n第一段正文。\n\n## 财务\n\n毛利率 42%。";
+  const out = chunkText(md, { docId: "n.md", targetChars: 10 });
+  const headings = out.filter((c) => c.kind === "heading").map((c) => c.text);
+  assert.deepEqual(headings, ["年报", "财务"]);
+  const last = out[out.length - 1]!;
+  assert.deepEqual(last.heading_path, ["年报", "财务"], "二级标题下的正文带完整面包屑");
+  // chunk_id 连续、从 0 起（GlobalId 的一部分，必须稳定）。
+  assert.deepEqual(
+    out.map((c) => c.chunk_id),
+    out.map((_, i) => i),
+  );
+});
+
+test("chunkText: 坐标是占位的——纯文本没有版面，不能假装可高亮", () => {
+  const out = chunkText("只有一段。", { docId: "n.md" });
+  assert.equal(out[0]!.page, 1);
+  assert.deepEqual(out[0]!.bbox, { x0: 0, y0: 0, x1: 0, y1: 0 });
+});
+
+test("chunkText: overlap 让相邻块首尾相接，避免答案被切断", () => {
+  const text = "甲".repeat(50) + "\n\n" + "乙".repeat(50);
+  const out = chunkText(text, { docId: "n.md", targetChars: 40, overlap: 5 });
+  assert.ok(out.length >= 2, "应切成多块");
+  assert.ok(out[1]!.text.startsWith("甲"), "第二块以上一块的尾部起头");
 });

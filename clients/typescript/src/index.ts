@@ -16,6 +16,12 @@ export { FastsearchClient } from "./client.js";
 export type { ClientConfig, IndexOptions } from "./client.js";
 export { FastsearchError } from "./errors.js";
 export { f } from "./filter.js";
+export { chunksFromDocparse, chunkText } from "./ingest.js";
+export type {
+  ChunkTextOptions,
+  DocparseChunk,
+  FromDocparseOptions,
+} from "./ingest.js";
 export {
   formatHitsForLLM,
   hitToDocument,

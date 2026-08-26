@@ -37,8 +37,20 @@ export interface ClientConfig {
 
 /** index() 的可选参数。 */
 export interface IndexOptions {
-  /** 缺省 acl（chunk 自身未带 acl 时使用），默认 `["public"]`。 */
+  /**
+   * 缺省 acl（chunk 自身未带 acl 时使用），默认 `["public"]`。
+   *
+   * ⚠️ **服务端会按 API Key 强制覆盖 tenant/acl**（`apply_ingest_identity`），
+   * 所以这个值实际上不影响写入结果。保留它只为不破坏既有调用；
+   * 要控制可见性请换一把对应的 key，而不是设这里。
+   */
   defaultAcl?: string[];
+  /**
+   * 媒资字节的去向：`"inline"` 随 chunk 存进真源、`"object"` 上传对象存储、
+   * `"auto"`（服务端默认）有对象存储就上传否则 inline。
+   * 带 `media_bytes` 的 chunk 才有意义。
+   */
+  storeMedia?: "auto" | "inline" | "object" | "none";
   signal?: AbortSignal;
   timeoutMs?: number;
 }
@@ -298,7 +310,9 @@ export class FastsearchClient {
    * 灌入一个 doc 的 chunks（doc 级替换）。返回灌入条数。
    *
    * `chunks` 为 docparse chunk（含 id/kind/text/page/bbox/...）；本方法补 doc_id、
-   * 映射 id→chunk_id，acl 默认 `["public"]`（可经 `opts.defaultAcl` 覆盖）。
+   * 只做**最小兜底**：补 `doc_id`、映射 id→chunk_id。**完整适配用 `chunksFromDocparse`**——
+   * 本方法**不处理图片**（`image.data_base64` → `media` + `media_bytes`），
+   * 直接丢 docparse 的 image chunk 进来会静默丢掉图片字节。
    */
   async index(
     collection: string,
@@ -317,11 +331,16 @@ export class FastsearchClient {
       if (c.acl === undefined) c.acl = defaultAcl;
       return c;
     });
-    const out = await this.postJson<{ indexed?: number }>(
-      "/v1/index",
-      { collection, doc_id: docId, chunks: mapped },
-      { signal: opts.signal, timeoutMs: opts.timeoutMs },
-    );
+    const body: Record<string, unknown> = {
+      collection,
+      doc_id: docId,
+      chunks: mapped,
+    };
+    if (opts.storeMedia) body.store_media = opts.storeMedia;
+    const out = await this.postJson<{ indexed?: number }>("/v1/index", body, {
+      signal: opts.signal,
+      timeoutMs: opts.timeoutMs,
+    });
     return out.indexed ?? 0;
   }
 

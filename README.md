@@ -69,6 +69,7 @@ DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG integration (CI u
 
 - **[Using fastsearch in an Agent](docs/using-fastsearch-in-an-agent.md)** (developer usage guide)
 - **[Ingestion & parsing](docs/ingestion-and-parsing.md)** — multi-format ingest, OCR, table recognition, build tiers, model setup
+- **[Connecting document ingestion](docs/connecting-document-ingestion.md)** (non-Rust callers: parser → field mapping → `/v1/index`; SDK adapter helpers)
 - [Architecture cheat-sheet / commands / invariants (CLAUDE.md)](CLAUDE.md)
 - [Module breakdown & spec index](docs/specs/00-模块拆分.md)
 - [Requirements analysis](docs/plans/2026-06-24-需求分析报告.md) · [Product design](docs/plans/2026-06-24-产品设计文档.md)

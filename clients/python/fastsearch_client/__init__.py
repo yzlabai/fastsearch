@@ -292,11 +292,27 @@ class FastsearchClient:
 
     # ---- 写入 / 删除 ----------------------------------------------------------
 
-    def index(self, collection: str, doc_id: str, chunks: list[dict]) -> int:
+    def index(
+        self,
+        collection: str,
+        doc_id: str,
+        chunks: list[dict],
+        store_media: str | None = None,
+    ) -> int:
         """灌入一个 doc 的 chunks（doc 级替换）。返回灌入条数。
 
-        chunks 为 docparse chunk dict（含 id/kind/text/page/bbox/...）；本方法补上
-        doc_id 并映射 id→chunk_id，acl 默认 ['public']。
+        本方法只做**最小兜底**：补 ``doc_id``、把 ``id`` 映射成 ``chunk_id``。
+        **完整适配请用** :func:`fastsearch_client.chunks_from_docparse` ——
+        本方法**不处理图片**（``image.data_base64`` → ``media`` + ``media_bytes``），
+        直接把 docparse 的 image chunk 丢进来会静默丢掉图片字节。
+
+        ``store_media``：``"inline"`` 把字节随 chunk 存进真源；``"object"`` 上传对象存储；
+        ``"auto"``（服务端默认）有对象存储就上传、否则 inline。
+
+        .. note::
+           **不要在 chunk 里设 ``tenant``/``acl``**：服务端按 API Key 强制注入并覆盖它们
+           （``apply_ingest_identity``），客户端设的值一律无效。此前本方法会默认塞
+           ``acl=['public']``，那是个会误导人的空动作，已移除。
         """
         mapped = []
         for ch in chunks:
@@ -304,12 +320,11 @@ class FastsearchClient:
             c.setdefault("doc_id", doc_id)
             if "chunk_id" not in c and "id" in c:
                 c["chunk_id"] = c.pop("id")
-            c.setdefault("acl", ["public"])
             mapped.append(c)
-        out = self._post(
-            "/v1/index",
-            {"collection": collection, "doc_id": doc_id, "chunks": mapped},
-        )
+        body: dict = {"collection": collection, "doc_id": doc_id, "chunks": mapped}
+        if store_media is not None:
+            body["store_media"] = store_media
+        out = self._post("/v1/index", body)
         return int(out.get("indexed", 0))
 
     def delete_doc(self, collection: str, doc_id: str) -> dict:
@@ -385,4 +400,11 @@ class FastsearchClient:
         return self._request("GET", "/openapi.json")
 
 
-__all__ = ["FastsearchClient", "FastsearchError"]
+from .ingest import chunk_text, chunks_from_docparse  # noqa: E402
+
+__all__ = [
+    "FastsearchClient",
+    "FastsearchError",
+    "chunk_text",
+    "chunks_from_docparse",
+]
