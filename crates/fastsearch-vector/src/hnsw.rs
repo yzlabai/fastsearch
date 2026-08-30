@@ -588,13 +588,22 @@ mod tests {
         );
     }
 
-    // 逐查询 ef_search 覆盖被真正接受：① None 等同默认 search（路径不变）；
-    // ② 调大 ef 召回不低于很小 ef（同索引、只转此钮——recall-vs-QPS 曲线的核心机制）。
+    // 逐查询 ef_search 覆盖被真正接受：同一张图上，从低 ef 调到高 ef
+    // 必须带来召回增益（只转此钮——recall-vs-QPS 曲线的核心机制）。绝对召回质量由
+    // `recall_vs_brute_force` 独立门禁，避免 hnsw_rs 的随机构图同时决定两种性质。
     #[test]
     fn ef_search_override_honored() {
         let dim = 32;
-        let n = 1500u64; // > BRUTE_FALLBACK_MAX → 真走 HNSW
-        let mut hnsw = HnswVectorIndex::new(HnswParams::default());
+        // > BRUTE_FALLBACK_MAX 才真走 HNSW。
+        let n = 1500u64;
+        // 关闭默认 8× over-fetch，否则 k=10 时 `want=80` 会把传入的低 ef 抬到 80，
+        // 测试实际比较的不是声明的 ef，无法证明覆盖参数生效。
+        let params = HnswParams {
+            ef_search: 10,
+            over_fetch: 1,
+            ..HnswParams::default()
+        };
+        let mut hnsw = HnswVectorIndex::new(params);
         let mut brute = MemVectorIndex::new();
         for i in 0..n {
             let v = vec_for(i, dim);
@@ -620,18 +629,13 @@ mod tests {
             }
             hits as f64 / (k * queries as usize) as f64
         };
-        // None ⇒ 与默认 search 路径一致（用 params.ef_search）。
-        let r_default = recall_at(None);
-        let r_low = recall_at(Some(k)); // ef≈k，最窄遍历
-        let r_high = recall_at(Some(512)); // 宽遍历
-                                           // 调大 ef 不会降低召回（务实下界，避开 ANN 非确定抖动）。
+        // None ⇒ 测试低档 ef=10；逐查询覆盖到 ef=512。两者的有效 ef 不再
+        // 被 over-fetch 拉平。严格增益断言保证“完全忽略 override”的突变会变红。
+        let r_low = recall_at(None);
+        let r_high = recall_at(Some(512));
         assert!(
-            r_high + 1e-9 >= r_low,
-            "ef 调大召回不应更差: low(ef={k})={r_low} high(ef=512)={r_high}"
-        );
-        assert!(
-            r_default > 0.0 && r_high >= 0.9,
-            "default={r_default} high={r_high}"
+            r_high > r_low,
+            "ef override 应产生严格召回增益: low(ef=10)={r_low} high(ef=512)={r_high}"
         );
     }
 
