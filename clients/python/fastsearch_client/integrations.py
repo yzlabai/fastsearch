@@ -59,6 +59,7 @@ _METADATA_KEYS = (
     "bm25",
     "vector",
     "rerank",
+    "rerank_explain",
     "doc_id",
     "chunk_id",
     "page",

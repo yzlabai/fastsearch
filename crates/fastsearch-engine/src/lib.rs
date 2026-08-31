@@ -11,11 +11,13 @@
 
 use fastsearch_core::{
     fuse_n_with_sources, AclFilter, AssetPointer, BBox, Chunk, ChunkKind, Citation, FieldValue,
-    Filter, Fusion, GlobalId, Metadata, RecallList, Scored, SearchMode, SearchRequest, SourceHit,
-    TimeSpan,
+    Filter, Fusion, GlobalId, Metadata, Modality, RecallList, Scored, SearchMode, SearchRequest,
+    SourceHit, TimeSpan,
 };
 use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
-use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
+use fastsearch_rerank::{
+    LexicalOverlapReranker, RerankInput, RerankOutcome, RerankSkipReason, Reranker,
+};
 use fastsearch_sync::replication::{advance_slot, peek_batch, ReplicationBatch, ReplicationConfig};
 use fastsearch_sync::{Change, IndexSink, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
@@ -333,6 +335,44 @@ fn filter_targets_image(filter: Option<&Filter>) -> bool {
     }
 }
 
+/// rerank 的执行状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankStatus {
+    Applied,
+    Skipped,
+}
+
+/// rerank 降级的稳定领域原因码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerankExplainReason {
+    UnsupportedQueryModality,
+    UnsupportedCandidateModality,
+    EmptyQueryTokens,
+    BackendError,
+    InvalidBackendOutput,
+}
+
+impl From<RerankSkipReason> for RerankExplainReason {
+    fn from(reason: RerankSkipReason) -> Self {
+        match reason {
+            RerankSkipReason::UnsupportedQueryModality => Self::UnsupportedQueryModality,
+            RerankSkipReason::UnsupportedCandidateModality => Self::UnsupportedCandidateModality,
+            RerankSkipReason::EmptyQueryTokens => Self::EmptyQueryTokens,
+        }
+    }
+}
+
+/// rerank 的可解释执行状态。只有请求 `explain=true` 且要求 rerank 时才挂到命中。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RerankExplain {
+    pub status: RerankStatus,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RerankExplainReason>,
+}
+
 /// 一条检索命中（带引用与分数明细）。
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -345,6 +385,8 @@ pub struct SearchHit {
     pub vector: Option<f64>,
     /// rerank 分（req.rerank 存在时）。
     pub rerank: Option<f64>,
+    /// rerank 是否真正应用及降级原因；仅 `explain=true` 且请求 rerank 时有值。
+    pub rerank_explain: Option<RerankExplain>,
     /// 高亮片段（HTML）；仅 keyword 命中且 req.highlight 时有值。
     pub highlight: Option<String>,
     /// 完整 chunk 正文；仅 `include_text=true` 时有值。
@@ -365,30 +407,57 @@ impl SearchHit {
     }
 
     /// 本命中的**深分页游标**（不透明 token）：把它作为下一页的 `search_after` 即从此条之后续取。
-    /// 编码 = `排序键 bits(16 hex)` + `:` + `citation_id`（精确 round-trip，确定性）。
+    /// 未重排保持旧格式；已重排额外编码融合分二级键，使 rerank 等分时仍能按原融合序无缝翻页。
     pub fn cursor(&self) -> String {
-        format!(
-            "{:016x}:{}",
-            self.sort_key().to_bits(),
-            self.id.to_citation_id()
-        )
+        match self.rerank {
+            Some(rerank) => format!(
+                "r:{:016x}:{:016x}:{}",
+                rerank.to_bits(),
+                self.score.to_bits(),
+                self.id.to_citation_id()
+            ),
+            None => format!("{:016x}:{}", self.score.to_bits(), self.id.to_citation_id()),
+        }
     }
 }
 
-/// 解析深分页游标 → `(排序键, GlobalId)`。前 16 位十六进制是排序键 bits，其后为 citation_id
-/// （doc_id 可含 `:`，故只在第 17 位的分隔符处切一次）。非法 → InvalidRequest。
-fn parse_cursor(tok: &str) -> Result<(f64, GlobalId)> {
+struct ParsedCursor {
+    primary: f64,
+    fused: Option<f64>,
+    gid: GlobalId,
+}
+
+/// 解析深分页游标。旧格式 `<primary>:<citation>` 继续接受；rerank 新格式
+/// `r:<primary>:<fused>:<citation>` 带融合分二级键。非法 → InvalidRequest。
+fn parse_cursor(tok: &str) -> Result<ParsedCursor> {
     let bad = || {
         EngineError::Core(fastsearch_core::CoreError::InvalidRequest(
             "invalid search_after cursor".into(),
         ))
     };
+    if let Some(rest) = tok.strip_prefix("r:") {
+        if rest.len() < 35 || rest.as_bytes()[16] != b':' || rest.as_bytes()[33] != b':' {
+            return Err(bad());
+        }
+        let primary = u64::from_str_radix(&rest[..16], 16).map_err(|_| bad())?;
+        let fused = u64::from_str_radix(&rest[17..33], 16).map_err(|_| bad())?;
+        let gid = GlobalId::parse(&rest[34..])?;
+        return Ok(ParsedCursor {
+            primary: f64::from_bits(primary),
+            fused: Some(f64::from_bits(fused)),
+            gid,
+        });
+    }
     if tok.len() < 18 || tok.as_bytes()[16] != b':' {
         return Err(bad());
     }
     let bits = u64::from_str_radix(&tok[..16], 16).map_err(|_| bad())?;
     let gid = GlobalId::parse(&tok[17..])?;
-    Ok((f64::from_bits(bits), gid))
+    Ok(ParsedCursor {
+        primary: f64::from_bits(bits),
+        fused: None,
+        gid,
+    })
 }
 
 /// `resolve_citation` 的结果：如何**安全地**取到这段媒资（已过 ACL）。
@@ -2029,6 +2098,7 @@ impl Engine {
                     bm25: kw_score.get(&s.id).copied(),
                     vector: vec_score.get(&s.id).copied(),
                     rerank: None,
+                    rerank_explain: None,
                     highlight: highlight.get(&s.id).cloned(),
                     text: if req.include_text {
                         text_map
@@ -2064,21 +2134,11 @@ impl Engine {
             hits = auto_merge(hits);
         }
 
-        // rerank：宽召回后重排（req.rerank 存在时）。对候选文本打分、按 rerank 分降序、
-        // 同分按 gid，再截 top_k。rerank 分写入命中（透明）；原 bm25/vector/fused 保留。
-        //
-        // **纯图片 query（`query=""` + `query_image`/`vector`）整段跳过**：`Reranker` trait 只吃文本
-        // （`rerank(&str, &[String])`），空 query 下任何实现都给不出有意义的分——词项 baseline 直接
-        // 返回全 0（rerank/lib.rs `q.is_empty()`），全同分则下面按 gid 排序，**视觉相似度序被摧毁**
-        // （与 H1-A 同源，但正文再全也救不了没有 query）。跳过时保持融合/视觉序、`hit.rerank` 留
-        // `None`（响应 `null`，调用方可见"这次没重排"）；`rerank.top_k` 是喂给重排器的成本钮，
-        // 重排器没被调用就不用它裁结果，条数仍由 `req.top_k` 收口。不报错——以图搜图顺带带上
-        // rerank 是常见用法。多模态 reranker 落地后改为按 caps 显式开启。
-        if let Some(spec) = req.rerank.as_ref().filter(|_| !req.query.trim().is_empty()) {
-            // rerank 窗口：只对融合分最高的 `rerank.top_k` 个候选重排（hits 此时已是融合序），其余
-            // 低分候选丢弃——重排后也进不了最终 top_k。接真 cross-encoder 时这限住延迟/费用（M5）。
-            hits.truncate(spec.top_k);
-            let texts: Vec<String> = hits
+        // rerank 是可选精度档：先复制融合窗口，只有 capability 匹配且后端产出有效分数时才提交；
+        // 不适用/无信息量时保留完整融合结果（包括数量），避免全零分或部分模态把排序压成 GID 序。
+        if let Some(spec) = req.rerank.as_ref() {
+            let mut reranked = hits.iter().take(spec.top_k).cloned().collect::<Vec<_>>();
+            let texts: Vec<String> = reranked
                 .iter()
                 .map(|h| match text_map.get(&h.id) {
                     Some(t) => t.clone(),
@@ -2092,19 +2152,100 @@ impl Engine {
                         .unwrap_or_default(),
                 })
                 .collect();
-            let scores = self
-                .reranker
-                .rerank(&req.query, &texts)
-                .map_err(|e| EngineError::Rerank(e.to_string()))?;
-            for (h, sc) in hits.iter_mut().zip(scores) {
-                h.rerank = Some(sc);
+            let query_input = match (
+                req.query.trim().is_empty(),
+                req.query_image.as_deref(),
+                req.vector.is_some(),
+            ) {
+                (false, Some(image), _) => RerankInput::text_image(&req.query, image),
+                (false, None, _) => RerankInput::text(&req.query),
+                (true, image, true) | (true, image @ Some(_), false) => RerankInput::image(image),
+                (true, None, false) => RerankInput::text(&req.query),
+            };
+            let query_kind = query_input.kind();
+            let caps = self.reranker.caps();
+            let mut preflight_skip = None;
+            let mut inputs = Vec::with_capacity(reranked.len());
+            for (hit, text) in reranked.iter().zip(&texts) {
+                let candidate_kind = self
+                    .text
+                    .stored_row_by_gid(&hit.id)?
+                    .map(|row| Modality::of_kind_str(&row.kind));
+                let input = match candidate_kind {
+                    Some(Modality::Text) => RerankInput::text(text),
+                    Some(Modality::Image) => RerankInput::image(None),
+                    Some(Modality::Audio | Modality::Video) | None => {
+                        preflight_skip = Some(RerankSkipReason::UnsupportedCandidateModality);
+                        break;
+                    }
+                };
+                inputs.push(input);
             }
-            hits.sort_by(|a, b| {
-                b.rerank
-                    .partial_cmp(&a.rerank)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            if preflight_skip.is_none() {
+                preflight_skip = caps
+                    .admit(query_kind, inputs.iter().map(|input| input.kind()))
+                    .err();
+            }
+            let outcome = match preflight_skip {
+                Some(reason) => Ok(RerankOutcome::Skipped(reason)),
+                None => self.reranker.rerank(query_input, &inputs),
+            };
+            match outcome {
+                Ok(RerankOutcome::Scores(scores))
+                    if scores.len() == reranked.len()
+                        && scores.iter().all(|score| score.is_finite()) =>
+                {
+                    for (hit, score) in reranked.iter_mut().zip(scores) {
+                        hit.rerank = Some(score);
+                    }
+                    reranked.sort_by(|a, b| {
+                        b.rerank
+                            .partial_cmp(&a.rerank)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| {
+                                b.score
+                                    .partial_cmp(&a.score)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
+                    attach_rerank_explain(
+                        &mut reranked,
+                        req.explain,
+                        &spec.model,
+                        RerankStatus::Applied,
+                        None,
+                    );
+                    hits = reranked;
+                }
+                Ok(RerankOutcome::Scores(_)) => {
+                    attach_rerank_explain(
+                        &mut hits,
+                        req.explain,
+                        &spec.model,
+                        RerankStatus::Skipped,
+                        Some(RerankExplainReason::InvalidBackendOutput),
+                    );
+                }
+                Ok(RerankOutcome::Skipped(reason)) => {
+                    attach_rerank_explain(
+                        &mut hits,
+                        req.explain,
+                        &spec.model,
+                        RerankStatus::Skipped,
+                        Some(reason.into()),
+                    );
+                }
+                Err(_) => {
+                    attach_rerank_explain(
+                        &mut hits,
+                        req.explain,
+                        &spec.model,
+                        RerankStatus::Skipped,
+                        Some(RerankExplainReason::BackendError),
+                    );
+                }
+            }
         }
         // 分组折叠：按最终排名，每组（doc_id/section_id）至多保留 max_per_group 条。
         if let Some(c) = &req.collapse {
@@ -2114,14 +2255,41 @@ impl Engine {
         // 分更低，或同分而 gid 更大）。深度受 `candidates` 候选窗口约束——游标落在窗口外则
         // 该页可能短/空，加大 `candidates` 可加深（标准 search_after 取舍，诚实记账）。
         if let Some(tok) = &req.search_after {
-            let (ck, cgid) = parse_cursor(tok)?;
+            let cursor = parse_cursor(tok)?;
             hits.retain(|h| {
-                let k = h.sort_key();
-                k < ck || (k == ck && h.id > cgid)
+                let primary = h.sort_key();
+                primary < cursor.primary
+                    || (primary == cursor.primary
+                        && match cursor.fused {
+                            Some(fused) => {
+                                h.score < fused || (h.score == fused && h.id > cursor.gid)
+                            }
+                            None => h.id > cursor.gid,
+                        })
             });
         }
         hits.truncate(req.top_k);
         Ok((hits, facets))
+    }
+}
+
+fn attach_rerank_explain(
+    hits: &mut [SearchHit],
+    enabled: bool,
+    model: &str,
+    status: RerankStatus,
+    reason: Option<RerankExplainReason>,
+) {
+    if !enabled {
+        return;
+    }
+    let explanation = RerankExplain {
+        status,
+        model: model.to_owned(),
+        reason,
+    };
+    for hit in hits {
+        hit.rerank_explain = Some(explanation.clone());
     }
 }
 
@@ -4968,6 +5136,7 @@ mod tests {
                 model: "lexical".into(),
                 top_k: 10,
             }),
+            explain: true,
             ..base
         };
         let hits = e.search(&with_rerank, None).unwrap();
@@ -4977,6 +5146,484 @@ mod tests {
             hits.iter().all(|h| h.rerank.is_none()),
             "跳过重排时 rerank 应留 None（而非 0 分），让调用方看得见"
         );
+        assert!(hits.iter().all(|hit| {
+            hit.rerank_explain.as_ref().is_some_and(|explain| {
+                explain.status == RerankStatus::Skipped
+                    && explain.reason == Some(RerankExplainReason::UnsupportedQueryModality)
+            })
+        }));
+    }
+
+    #[test]
+    fn punctuation_only_rerank_preserves_vector_ranking_and_explains_skip() {
+        use fastsearch_core::RerankSpec;
+
+        let mut e = engine();
+        for (id, vector) in [
+            (1u64, vec![0.0, 1.0]),
+            (2, vec![0.8, 0.2]),
+            (3, vec![1.0, 0.0]),
+        ] {
+            e.ingest_vector(
+                "kb",
+                &chunk("punctuation.pdf", id, ChunkKind::Paragraph, "plain text", 1),
+                vector,
+            )
+            .unwrap();
+        }
+        e.commit().unwrap();
+        let base = SearchRequest {
+            query: "!!!".into(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            top_k: 3,
+            candidates: 3,
+            explain: true,
+            ..Default::default()
+        };
+        let baseline = e.search(&base, None).unwrap();
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|hit| hit.id.chunk_id)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+
+        let with_rerank = SearchRequest {
+            rerank: Some(RerankSpec {
+                model: "lexical".into(),
+                top_k: 2,
+            }),
+            ..base
+        };
+        let hits = e.search(&with_rerank, None).unwrap();
+        let ranking_snapshot = |hits: &[SearchHit]| {
+            hits.iter()
+                .map(|hit| {
+                    (
+                        hit.id.clone(),
+                        hit.score.to_bits(),
+                        hit.bm25.map(f32::to_bits),
+                        hit.vector.map(f64::to_bits),
+                        hit.rerank.map(f64::to_bits),
+                        hit.sources.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranking_snapshot(&hits), ranking_snapshot(&baseline));
+        assert!(hits.iter().all(|hit| {
+            let explain = hit.rerank_explain.as_ref().expect("rerank explain");
+            explain.status == RerankStatus::Skipped
+                && explain.reason == Some(RerankExplainReason::EmptyQueryTokens)
+        }));
+    }
+
+    #[test]
+    fn empty_text_without_visual_input_reaches_reranker_tokenizer() {
+        use fastsearch_core::RerankSpec;
+
+        let mut e = engine();
+        e.apply_upsert(
+            "kb",
+            &chunk("empty.pdf", 1, ChunkKind::Paragraph, "plain text", 1),
+        )
+        .unwrap();
+        e.commit().unwrap();
+
+        let hits = e
+            .search(
+                &SearchRequest {
+                    query: String::new(),
+                    mode: SearchMode::Keyword,
+                    top_k: 1,
+                    candidates: 1,
+                    rerank: Some(RerankSpec {
+                        model: "lexical".into(),
+                        top_k: 1,
+                    }),
+                    explain: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert!(hits.iter().all(|hit| {
+            hit.rerank.is_none()
+                && hit.rerank_explain.as_ref().is_some_and(|explain| {
+                    explain.status == RerankStatus::Skipped
+                        && explain.reason == Some(RerankExplainReason::EmptyQueryTokens)
+                })
+        }));
+    }
+
+    #[test]
+    fn text_only_reranker_skips_mixed_modality_candidates_without_reordering() {
+        use fastsearch_core::RerankSpec;
+
+        let mut e = engine();
+        e.ingest_vector(
+            "kb",
+            &chunk("mixed.pdf", 1, ChunkKind::Paragraph, "alpha text", 1),
+            vec![0.8, 0.2],
+        )
+        .unwrap();
+        e.ingest_vector(
+            "kb",
+            &chunk("mixed.pdf", 3, ChunkKind::Image, "alpha chart", 2),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        e.commit().unwrap();
+        let base = SearchRequest {
+            query: "alpha".into(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            top_k: 2,
+            candidates: 2,
+            explain: true,
+            ..Default::default()
+        };
+        let baseline = e.search(&base, None).unwrap();
+        let with_rerank = SearchRequest {
+            rerank: Some(RerankSpec {
+                model: "lexical".into(),
+                top_k: 2,
+            }),
+            ..base
+        };
+        let hits = e.search(&with_rerank, None).unwrap();
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (
+                    hit.id.clone(),
+                    hit.score.to_bits(),
+                    hit.vector.map(f64::to_bits)
+                ))
+                .collect::<Vec<_>>(),
+            baseline
+                .iter()
+                .map(|hit| (
+                    hit.id.clone(),
+                    hit.score.to_bits(),
+                    hit.vector.map(f64::to_bits)
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(hits.iter().all(|hit| {
+            let explain = hit.rerank_explain.as_ref().expect("rerank explain");
+            explain.status == RerankStatus::Skipped
+                && explain.reason == Some(RerankExplainReason::UnsupportedCandidateModality)
+        }));
+    }
+
+    #[test]
+    fn reranker_error_degrades_to_fusion_order_and_explains_failure() {
+        use fastsearch_core::RerankSpec;
+        use fastsearch_rerank::{RerankCaps, RerankInput};
+
+        struct FailingReranker;
+        impl Reranker for FailingReranker {
+            fn caps(&self) -> RerankCaps {
+                RerankCaps::text_only()
+            }
+
+            fn rerank(
+                &self,
+                _query: RerankInput<'_>,
+                _candidates: &[RerankInput<'_>],
+            ) -> anyhow::Result<RerankOutcome> {
+                anyhow::bail!("temporary upstream failure")
+            }
+        }
+
+        let mut e = engine();
+        e.ingest_vector(
+            "kb",
+            &chunk("error.pdf", 1, ChunkKind::Paragraph, "alpha one", 1),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
+        e.ingest_vector(
+            "kb",
+            &chunk("error.pdf", 3, ChunkKind::Paragraph, "alpha three", 2),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        e.commit().unwrap();
+        let base = SearchRequest {
+            query: "alpha".into(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            top_k: 2,
+            candidates: 2,
+            explain: true,
+            ..Default::default()
+        };
+        let baseline = e.search(&base, None).unwrap();
+        e.set_reranker(Box::new(FailingReranker));
+        let with_rerank = SearchRequest {
+            rerank: Some(RerankSpec {
+                model: "remote".into(),
+                top_k: 1,
+            }),
+            ..base
+        };
+        let hits = e
+            .search(&with_rerank, None)
+            .expect("reranker failure must not fail search");
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (
+                    hit.id.clone(),
+                    hit.score.to_bits(),
+                    hit.vector.map(f64::to_bits)
+                ))
+                .collect::<Vec<_>>(),
+            baseline
+                .iter()
+                .map(|hit| (
+                    hit.id.clone(),
+                    hit.score.to_bits(),
+                    hit.vector.map(f64::to_bits)
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(hits.iter().all(|hit| {
+            let explain = hit.rerank_explain.as_ref().expect("rerank explain");
+            explain.status == RerankStatus::Skipped
+                && explain.model == "remote"
+                && explain.reason == Some(RerankExplainReason::BackendError)
+        }));
+    }
+
+    #[test]
+    fn invalid_reranker_outputs_are_independently_rejected_without_partial_scores() {
+        use fastsearch_core::RerankSpec;
+        use fastsearch_rerank::{RerankCaps, RerankInput};
+
+        struct InvalidReranker(Vec<f64>);
+        impl Reranker for InvalidReranker {
+            fn caps(&self) -> RerankCaps {
+                RerankCaps::text_only()
+            }
+
+            fn rerank(
+                &self,
+                _query: RerankInput<'_>,
+                _candidates: &[RerankInput<'_>],
+            ) -> anyhow::Result<RerankOutcome> {
+                Ok(RerankOutcome::Scores(self.0.clone()))
+            }
+        }
+
+        let mut e = engine();
+        e.ingest_vector(
+            "kb",
+            &chunk("invalid.pdf", 1, ChunkKind::Paragraph, "alpha one", 1),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
+        e.ingest_vector(
+            "kb",
+            &chunk("invalid.pdf", 3, ChunkKind::Paragraph, "alpha three", 2),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        e.commit().unwrap();
+        let base = SearchRequest {
+            query: "alpha".into(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            top_k: 2,
+            candidates: 2,
+            explain: true,
+            ..Default::default()
+        };
+        let baseline = e.search(&base, None).unwrap();
+        for (case, scores) in [
+            ("short finite output", vec![0.5]),
+            ("correct-length NaN", vec![f64::NAN, 0.5]),
+            ("correct-length infinity", vec![f64::INFINITY, 0.5]),
+        ] {
+            e.set_reranker(Box::new(InvalidReranker(scores)));
+            let hits = e
+                .search(
+                    &SearchRequest {
+                        rerank: Some(RerankSpec {
+                            model: "invalid".into(),
+                            top_k: 2,
+                        }),
+                        ..base.clone()
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| (
+                        hit.id.clone(),
+                        hit.score.to_bits(),
+                        hit.vector.map(f64::to_bits)
+                    ))
+                    .collect::<Vec<_>>(),
+                baseline
+                    .iter()
+                    .map(|hit| (
+                        hit.id.clone(),
+                        hit.score.to_bits(),
+                        hit.vector.map(f64::to_bits)
+                    ))
+                    .collect::<Vec<_>>(),
+                "{case} must preserve the fusion snapshot"
+            );
+            assert!(
+                hits.iter().all(|hit| {
+                    hit.rerank.is_none()
+                        && hit.rerank_explain.as_ref().is_some_and(|explain| {
+                            explain.status == RerankStatus::Skipped
+                                && explain.reason == Some(RerankExplainReason::InvalidBackendOutput)
+                        })
+                }),
+                "{case} must report invalid_backend_output"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_rerank_scores_preserve_fusion_relative_order() {
+        use fastsearch_core::RerankSpec;
+        use fastsearch_rerank::{RerankCaps, RerankInput};
+
+        struct EqualScoreReranker;
+        impl Reranker for EqualScoreReranker {
+            fn caps(&self) -> RerankCaps {
+                RerankCaps::text_only()
+            }
+
+            fn rerank(
+                &self,
+                _query: RerankInput<'_>,
+                candidates: &[RerankInput<'_>],
+            ) -> anyhow::Result<RerankOutcome> {
+                Ok(RerankOutcome::Scores(vec![0.5; candidates.len()]))
+            }
+        }
+
+        let mut e = engine();
+        e.ingest_vector(
+            "kb",
+            &chunk("ties.pdf", 1, ChunkKind::Paragraph, "alpha one", 1),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
+        e.ingest_vector(
+            "kb",
+            &chunk("ties.pdf", 3, ChunkKind::Paragraph, "alpha three", 2),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        e.commit().unwrap();
+        e.set_reranker(Box::new(EqualScoreReranker));
+        let hits = e
+            .search(
+                &SearchRequest {
+                    query: "alpha".into(),
+                    mode: SearchMode::Vector,
+                    vector: Some(vec![1.0, 0.0]),
+                    top_k: 2,
+                    candidates: 2,
+                    rerank: Some(RerankSpec {
+                        model: "equal".into(),
+                        top_k: 2,
+                    }),
+                    explain: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.id.chunk_id).collect::<Vec<_>>(),
+            vec![3, 1],
+            "reranker 等分没有新证据，应保留原向量/融合相对顺序"
+        );
+        assert!(hits.iter().all(|hit| {
+            hit.rerank == Some(0.5)
+                && hit.rerank_explain.as_ref().is_some_and(|explain| {
+                    explain.status == RerankStatus::Applied && explain.reason.is_none()
+                })
+        }));
+    }
+
+    #[test]
+    fn equal_rerank_scores_remain_pageable_in_fusion_order() {
+        use fastsearch_core::RerankSpec;
+        use fastsearch_rerank::{RerankCaps, RerankInput};
+
+        struct EqualScoreReranker;
+        impl Reranker for EqualScoreReranker {
+            fn caps(&self) -> RerankCaps {
+                RerankCaps::text_only()
+            }
+
+            fn rerank(
+                &self,
+                _query: RerankInput<'_>,
+                candidates: &[RerankInput<'_>],
+            ) -> anyhow::Result<RerankOutcome> {
+                Ok(RerankOutcome::Scores(vec![0.5; candidates.len()]))
+            }
+        }
+
+        let mut e = engine();
+        for (id, vector) in [
+            (1u64, vec![0.0, 1.0]),
+            (2, vec![0.6, 0.4]),
+            (3, vec![0.9, 0.1]),
+            (4, vec![1.0, 0.0]),
+        ] {
+            e.ingest_vector(
+                "kb",
+                &chunk("pageable.pdf", id, ChunkKind::Paragraph, "alpha", 1),
+                vector,
+            )
+            .unwrap();
+        }
+        e.commit().unwrap();
+        e.set_reranker(Box::new(EqualScoreReranker));
+        let request = |top_k, search_after| SearchRequest {
+            query: "alpha".into(),
+            mode: SearchMode::Vector,
+            vector: Some(vec![1.0, 0.0]),
+            top_k,
+            candidates: 4,
+            rerank: Some(RerankSpec {
+                model: "equal".into(),
+                top_k: 4,
+            }),
+            search_after,
+            ..Default::default()
+        };
+        let full = e.search(&request(4, None), None).unwrap();
+        assert_eq!(
+            full.iter().map(|hit| hit.id.chunk_id).collect::<Vec<_>>(),
+            vec![4, 3, 2, 1]
+        );
+
+        let first = e.search(&request(2, None), None).unwrap();
+        let second = e
+            .search(&request(2, Some(first.last().unwrap().cursor())), None)
+            .unwrap();
+        let paged = first
+            .iter()
+            .chain(&second)
+            .map(|hit| hit.id.chunk_id)
+            .collect::<Vec<_>>();
+        assert_eq!(paged, vec![4, 3, 2, 1]);
     }
 
     #[test]

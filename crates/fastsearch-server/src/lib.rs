@@ -824,7 +824,18 @@ fn openapi_spec() -> Value {
             "bm25": {"type": ["number", "null"]},
             "vector": {"type": ["number", "null"]},
             "rerank": {"type": ["number", "null"], "description":
-                "重排分；null = 本次未重排（未请求 rerank，或 query 为空的纯图片检索被跳过）"},
+                "重排分；null = 本次未重排（未请求，或因能力/无信息量/后端错误而保序跳过）"},
+            "rerank_explain": {"type": "object",
+                "description": "仅 explain=true 且请求 rerank 时返回；说明重排 applied 或保序 skipped",
+                "required": ["status", "model"],
+                "properties": {
+                    "status": {"type": "string", "enum": ["applied", "skipped"]},
+                    "model": {"type": "string"},
+                    "reason": {"type": "string", "enum": [
+                        "unsupported_query_modality", "unsupported_candidate_modality",
+                        "empty_query_tokens", "backend_error", "invalid_backend_output"
+                    ]}
+                }},
             "doc_id": {"type": "string"},
             "chunk_id": {"type": "integer"},
             "page": {"type": "integer"},
@@ -880,9 +891,9 @@ fn openapi_spec() -> Value {
                             "HNSW 检索期探索宽度逐查询覆盖（越大召回越高越慢；暴力/pgvector 档忽略）"},
                         "top_k": {"type": "integer", "default": 20},
                         "rerank": {"type": ["object", "null"], "description":
-                            "{model, top_k}；重排窗口取融合分最高的 top_k 条。\
-                             **query 为空时（纯图片检索）整段忽略**——重排器只吃文本，空 query 下\
-                             无信息量，强行重排会把视觉相似度序压成 id 序；此时命中的 rerank 为 null"},
+                            "{model, top_k}；重排窗口取融合分最高的 top_k 条。后端能力不匹配、\
+                             query 无可用 token、后端错误或输出非法时保留完整融合顺序；\
+                             explain=true 时由 rerank_explain 给出稳定原因码"},
                         "auto_merge": {"type": "boolean", "default": false},
                         "collapse": {"type": ["object", "null"], "description": "{field, max_per_group}"},
                         "search_after": {"type": ["string", "null"], "description": "深分页游标（取自上一页末条命中的 cursor）"},
@@ -1560,6 +1571,12 @@ fn hits_json(
                 hit.as_object_mut().unwrap().insert(
                     "sources".into(),
                     serde_json::to_value(sources).unwrap_or(Value::Null),
+                );
+            }
+            if let Some(explanation) = &h.rerank_explain {
+                hit.as_object_mut().unwrap().insert(
+                    "rerank_explain".into(),
+                    serde_json::to_value(explanation).unwrap_or(Value::Null),
                 );
             }
             hit
@@ -6024,6 +6041,7 @@ mod tests {
             "bm25",
             "vector",
             "rerank",
+            "rerank_explain",
             "doc_id",
             "chunk_id",
             "page",
@@ -6049,6 +6067,9 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(actual_hit, expected_hit);
+        let rerank_explain = &v["components"]["schemas"]["Hit"]["properties"]["rerank_explain"];
+        assert_eq!(rerank_explain["properties"]["status"]["enum"][0], "applied");
+        assert_eq!(rerank_explain["properties"]["status"]["enum"][1], "skipped");
         let source_schema = &v["components"]["schemas"]["Hit"]["properties"]["sources"]["items"];
         assert!(source_schema["properties"]["model"].is_object());
         assert!(source_schema["properties"]["model_version"].is_object());
@@ -6182,6 +6203,7 @@ mod tests {
             bm25: None,
             vector: Some(1.0),
             rerank: None,
+            rerank_explain: None,
             highlight: None,
             text: None,
             metadata: None,
@@ -6203,6 +6225,7 @@ mod tests {
         assert!(default_json[0].get("text").is_none());
         assert!(default_json[0].get("metadata").is_none());
         assert!(default_json[0].get("sources").is_none());
+        assert!(default_json[0].get("rerank_explain").is_none());
 
         // FS-002 兼容 golden：explain=false 的序列化字节固定，不只断言缺少新字段。
         let mut stable_hit = hit.clone();
@@ -6242,6 +6265,18 @@ mod tests {
             model: None,
             model_version: None,
         }]);
+        hit.rerank_explain = Some(fastsearch_engine::RerankExplain {
+            status: fastsearch_engine::RerankStatus::Skipped,
+            model: "lexical".into(),
+            reason: Some(fastsearch_engine::RerankExplainReason::UnsupportedCandidateModality),
+        });
+        let explained = hits_json(&[hit.clone()], None, None);
+        assert_eq!(explained[0]["rerank_explain"]["status"], "skipped");
+        assert_eq!(explained[0]["rerank_explain"]["model"], "lexical");
+        assert_eq!(
+            explained[0]["rerank_explain"]["reason"],
+            "unsupported_candidate_modality"
+        );
         let included = hits_json(&[hit], None, None);
         assert_eq!(included[0]["text"], "complete text");
         assert_eq!(included[0]["metadata"]["source"], "external");

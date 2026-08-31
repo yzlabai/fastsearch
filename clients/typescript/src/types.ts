@@ -26,6 +26,8 @@ export interface Hit {
   vector: number | null;
   /** 神经/LTR rerank 分（未启用 rerank 时为 null）。 */
   rerank: number | null;
+  /** 仅 `explain: true` 且请求 rerank 时返回的执行/保序降级原因。 */
+  rerank_explain?: RerankExplain;
   doc_id: string;
   chunk_id: number;
   /** 1-based 页码（源文档无分页则为 0）。 */
@@ -65,6 +67,22 @@ export interface HitSource {
   model?: string;
   /** 该信号的模型版本；关键词和主文本向量路省略。 */
   model_version?: string;
+}
+
+export type RerankStatus = "applied" | "skipped";
+
+export type RerankReason =
+  | "unsupported_query_modality"
+  | "unsupported_candidate_modality"
+  | "empty_query_tokens"
+  | "backend_error"
+  | "invalid_backend_output";
+
+/** rerank 是否真正应用；skipped 时命中顺序保持融合结果。 */
+export interface RerankExplain {
+  status: RerankStatus;
+  model: string;
+  reason?: RerankReason;
 }
 
 /** 一个分面字段的取值分布。 */

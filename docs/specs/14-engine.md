@@ -117,13 +117,11 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
   详见 [plan §6.1](../plans/2026-08-24-image-only-query跳过词项rerank.md)。
 - [x] v2.10（2026-08-31，FS-102）：`IndexSink::apply_changes` 全批 prepare→publish；CDC/快照/rebuild 一次 `embed_multi`，数量/维度/有限值及发布期索引维度/后端上限预检；pgvector 写穿单事务；server 对象/嵌入等待移出全局 Engine 锁，PG 提交与本地发布期间阻断搜索。timeout、返回/索引维度、后端上限、PG 中途失败和纯本地 apply 后崩溃故障注入均验证旧版本不残半状态、重试收敛；跨 PG/本地文件崩溃及本地存储 I/O 回滚属于 FS-103。
 - [x] v2.11（2026-08-31，FS-202）：`source_pg` 从 signal 真源产生实际 N 路 recall list；真实 Engine golden 覆盖 keyword、主文本向量和 image caption 三路、signal-only 候选、provenance 与贡献闭合。无 PG/无信号的旧两路保持不变。
+- [x] v2.12（2026-08-31，FS-203）：rerank 改为 capability 驱动的事务式提交。image-only、纯标点、混合模态、后端 error 与非法输出均保留完整融合结果；`rerank_explain` 返回稳定原因。有效重排等分以融合分为二级键，并用兼容旧格式的新游标无重复/遗漏分页。真实 server 已验证 skip/applied 两路。
 
 **已知限制 / 下一迭代：**
 - ✅ auto-merging（v1.3）、rerank 钩子、CDC 自动 embedding（v1.6）、search_after（v2.1）、单集合重建（v2.2）均已实现。
-- **rerank 仍只在"query 为空"这一支跳过**：query 非空但被分词器切空（纯标点、分词器不认的语种）时，
-  词项 reranker 依然返回全同分 → 退化 gid 序。根治需把"重排无信息量"变成显式信号
-  （`Option<Vec<f64>>` 或 trait 加 `informative(query)`），属契约变更，下一迭代。
-  多模态 reranker 落地后，把"query 为空则跳过"升级为"按 reranker caps 选择"。
+- ✅ rerank 无信息量和模态守卫已由 FS-203 根治；当前限制是只有 Lexical text-only adapter，真实 image/cross-modal reranker 与候选媒资批量读取尚未接入。
 - Engine 仍以 Mutex 保护 PG 写穿、本地发布和搜索；FS-102 已移出对象读取/嵌入等待，是否进一步改 RwLock/分片由新基准与真实负载决定（见 19-server / [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。
 - signal 召回仍是 PG 精确扫描；生产规模 ANN 选型需先完成按信号类型/维度的容量与延迟基准。
 - ✅ pgvector 直查的 **CDC 自动写穿已落地**（2026-06-27，B6 续作）：`apply_upsert` 在 `set_pg_vector` 模式把嵌入写回 PG `embedding` 列（`set_embedding`），列清单 publication 排除派生列 + 幂等守卫双防线断 CDC 反馈环。Docker pgvector 真机验证。详见 [12-pg spec §7 v1.5](12-pg.md)、[devlog](../devlog/2026-06-27-B6-CDC写穿与断反馈环.md)。

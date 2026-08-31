@@ -22,6 +22,11 @@ SAMPLE_HITS = [
         "score": 1.42,
         "bm25": 0.9,
         "vector": 0.7,
+        "rerank_explain": {
+            "status": "skipped",
+            "model": "lexical",
+            "reason": "empty_query_tokens",
+        },
         "doc_id": "rep.pdf",
         "chunk_id": 3,
         "page": 7,
@@ -60,6 +65,7 @@ def test_hit_to_document():
     assert doc.page_content == "本季度<b>毛利率</b>提升至 42%", doc.page_content
     assert doc.metadata["citation_id"] == "kb:rep.pdf:3"
     assert doc.metadata["sources"][0]["source"] == "keyword:user_text"
+    assert doc.metadata["rerank_explain"]["reason"] == "empty_query_tokens"
     assert doc.metadata["page"] == 7
     assert doc.metadata["bbox"]["x1"] == 3.0
     assert doc.metadata["score"] == 1.42

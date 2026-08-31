@@ -81,6 +81,24 @@ function makeHit(over: Partial<Hit> = {}): Hit {
   };
 }
 
+test("hit carries optional rerank explanation without changing legacy hits", () => {
+  const legacy = makeHit();
+  assert.equal(legacy.rerank_explain, undefined);
+
+  const skipped = makeHit({
+    rerank_explain: {
+      status: "skipped",
+      model: "lexical",
+      reason: "empty_query_tokens",
+    },
+  });
+  assert.deepEqual(skipped.rerank_explain, {
+    status: "skipped",
+    model: "lexical",
+    reason: "empty_query_tokens",
+  });
+});
+
 // ---- filter 构造器 --------------------------------------------------------
 
 test("filter builder produces correct AST", () => {
@@ -429,6 +447,11 @@ test("makeSearchTool returns friendly message on empty query and no hits", async
 test("hitToDocument maps highlight to pageContent and rest to metadata", () => {
   const doc = hitToDocument(
     makeHit({
+      rerank_explain: {
+        status: "skipped",
+        model: "lexical",
+        reason: "empty_query_tokens",
+      },
       sources: [
         {
           source: "keyword:user_text",
@@ -446,6 +469,11 @@ test("hitToDocument maps highlight to pageContent and rest to metadata", () => {
     (doc.metadata.sources as Array<{ source: string }>)[0]!.source,
     "keyword:user_text",
   );
+  assert.deepEqual(doc.metadata.rerank_explain, {
+    status: "skipped",
+    model: "lexical",
+    reason: "empty_query_tokens",
+  });
   assert.equal("highlight" in doc.metadata, false);
 });
 
