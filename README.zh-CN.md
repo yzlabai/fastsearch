@@ -8,6 +8,16 @@
 
 > 超越 ParadeDB 的关键：**能跑在任意托管 Postgres（RDS/Supabase/Neon）上**——只需 pgvector + 逻辑复制，**不要求任何 `shared_preload_libraries` 原生扩展**。
 
+## 发布状态
+
+| 交付面 | 仓库版本 | 发布状态（核验于 2026-08-31） |
+|---|---:|---|
+| Rust server / CLI / crates | `0.2.0-rc.1` | 发布候选；从本仓库构建 |
+| TypeScript SDK | `0.3.0` | npm 当前仍为 `0.2.0`；`0.3.0` 待发布 |
+| Python SDK | `0.2.0` | 尚未发布到 PyPI；从 `./clients/python` 安装 |
+
+示例项目有意使用仓库内 TypeScript 0.3.0，因此共享摄取 helper 会在 registry 发布前进入持续测试。兼容性与升级说明见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 架构
 
 ```
@@ -43,7 +53,7 @@ FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-s
 |---|---|
 | `fastsearch-core` | 文档模型、查询/过滤 AST、融合(RRF/归一化/加权)、引用、**ACL** |
 | `fastsearch-text` | Tantivy BM25 + CJK(jieba) + 过滤 + 高亮/分面 + ACL |
-| `fastsearch-vector` | 向量后端三档：暴力(默认确定) / HNSW+u8量化(近似) / pgvector直查；filter-aware |
+| `fastsearch-vector` | 进程内向量后端：确定性暴力/二值/TurboQuant 与 opt-in HNSW；filter-aware。engine 还可路由到 pgvector 直查。 |
 | `fastsearch-embed` | 嵌入后端 trait + 可配置 HTTP 后端（Ollama / OpenAI 兼容） |
 | `fastsearch-pg` | Postgres 真源：DDL、Chunk↔行映射、doc 级替换写、pgvector 直查 |
 | `fastsearch-sync` | CDC apply：pgoutput 解码 + 幂等 + LSN 检查点 + 替换语义 |
@@ -52,7 +62,7 @@ FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-s
 | `fastsearch-server` | REST(axum) + API-Key 认证 + **ACL 不可绕过** + 指标/限流/审计 + 媒资网关 + CDC 生命周期 |
 | `fastsearch-mcp` | 第四张脸：MCP(stdio+JSON-RPC) 暴露 `search`/`resolve_citation` 工具 |
 | `fastsearch-cli` | `fastsearch` 二进制：index / index-dir / search / **ingest（多格式：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/图片 + OCR + 表格识别）** / eval —— 见[文件解析与摄取](docs/文件解析与摄取.md) |
-| `clients/{python,ts}` | 零依赖 SDK + LangChain/LlamaIndex 适配 |
+| `clients/{python,ts}` | 零依赖 SDK + LangChain/LlamaIndex 适配；registry 与源码安装状态见上表及各 SDK README |
 
 **端到端可用**：ingest/CDC → 索引 → 三模式检索（keyword/vector/hybrid）→ 带引用命中，ACL 强制不可绕过。四张脸齐全。
 
@@ -77,4 +87,4 @@ DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG 集成（CI 用 p
 
 ## 许可
 
-Apache-2.0。分词词典用 jieba-rs（**MIT**，含内嵌 dict）——无 CC-BY-SA 等 share-alike 义务，分发附 MIT 归属即可（见 [许可审](docs/governance/2026-06-26-词典与第三方许可审.md)）。
+Apache-2.0，详见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。CI 会根据 Cargo 元数据生成随发布物分发的 `THIRD-PARTY-NOTICES.md`。分词词典用 jieba-rs（**MIT**，含内嵌 dict）——无 CC-BY-SA 等 share-alike 义务，分发附 MIT 归属即可（见 [许可审](docs/governance/2026-06-26-词典与第三方许可审.md)）。

@@ -3,8 +3,9 @@
 //! 引擎侧向量检索后端。核心是 **filter-aware 召回**：过滤/ACL 在打分前施加，
 //! 选择性强的过滤不掉召回——这正是超越 pgvector 后过滤召回崩的点（需求 §6.8）。
 //!
-//! v1 提供 [`MemVectorIndex`]（内存暴力余弦，精确、可测、无需模型）。HNSW + RaBitQ
-//! 量化 + pgvector 直查档为下一迭代。详见 [spec](../../docs/specs/15-vector.md)。
+//! 当前提供确定性的 [`MemVectorIndex`]（精确暴力、二值粗筛与 FHT 旋转）、压缩主索引
+//! [`TurboVectorIndex`]，以及 opt-in 的 [`HnswVectorIndex`]。pgvector 直查由 engine/PG
+//! 路径编排，不属于本 crate 的 [`VectorStore`] 变体。详见 [spec](../../docs/specs/15-vector.md)。
 
 use fastsearch_core::{
     AclFilter, BBox, Citation, FieldSource, FieldValue, Filter, GlobalId, MediaRef, Scored,

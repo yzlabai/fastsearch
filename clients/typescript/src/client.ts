@@ -12,6 +12,7 @@ import type {
   BatchDeleteChunksResponse,
   BatchGetChunkResult,
   BatchUpsertChunk,
+  Chunk,
   DeleteCollectionResponse,
   DocumentChunksPage,
   GlobalId,
@@ -331,7 +332,7 @@ export class FastsearchClient {
   async index(
     collection: string,
     docId: string,
-    chunks: Record<string, unknown>[],
+    chunks: Array<Record<string, unknown> | Chunk>,
     opts: IndexOptions = {},
   ): Promise<number> {
     const defaultAcl = opts.defaultAcl ?? ["public"];

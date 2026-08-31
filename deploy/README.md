@@ -32,8 +32,8 @@ server 副本各自从**复制流/快照重建**派生索引（PG 是真源）�
 
 - **Dockerfile / compose / CloudNativePG manifest：已编写**，标准多阶段 + 标准编排，二进制本地
   `cargo build --release -p fastsearch-server` 已验证可编译。
-- **容器镜像 build / K8s 实跑：`待运行验证`**（与 §顶部"已部署到 test ns"不矛盾：那是一次**手工**
-  部署记录，此处指**自动化镜像 build / CI 未常态验证**）—— 编写当时 Docker Hub registry 不可达（拉
-  `rust:1.88-slim` 基镜 EOF，见 [Dockerfile](../Dockerfile)），未能本环境构建镜像；K8s 部署需集群。
-  registry/集群可用后按上文 `docker compose up --build` 与 `kubectl apply -f deploy/cloudnativepg.yaml` 验证。
+- **Dockerfile 镜像构建：CI 常态验证**（`docker-build` job）。compose 全栈与 K8s manifest
+  仍需可用 registry/集群做环境门禁；顶部 2026-07-01 记录是一次手工 test namespace 部署，
+  不代表每次提交都实跑 K8s。资源可用时按上文 `docker compose up --build` 与
+  `kubectl apply -f deploy/cloudnativepg.yaml` 复验。
 - CDC 闭环本身已在 Docker PG（pgvector + 逻辑复制）真机验证（见 cdc_closed_loop 测试）。

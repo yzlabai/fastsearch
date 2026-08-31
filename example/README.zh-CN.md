@@ -17,7 +17,7 @@ fastsearch-server (:8642)  ← 混合检索引擎（本仓库 Rust crate）
 - **Hono**：后端 HTTP（聊天流式接口 + 文档喂入接口）。
 - **SQLite + Drizzle**：本地存"文档清单"和"聊天历史"（可检索内容的真源在 fastsearch/PG，这里只是清单）。
 - **Vercel AI SDK**：Agent 主体——`streamText` 跑工具循环，默认 **DeepSeek（deepseek-v4-flash）**；`searchKnowledgeBase` 工具调 fastsearch 取证。
-- **`fastsearch-client`**（已发布的 npm SDK）：检索客户端。`makeSearchTool` 把一个 collection 变成现成的 Agent 工具（`run()` 负责检索 + 拼带 `[n]` 标记的上下文 + 来源表），不再手写 REST 客户端。
+- **`fastsearch-client` 0.3.0**（仓库内当前 SDK）：检索客户端与共享 `chunkText` 摄取 helper。`makeSearchTool` 把一个 collection 变成现成的 Agent 工具（`run()` 负责检索 + 拼带 `[n]` 标记的上下文 + 来源表），不再手写 REST 客户端。npm 截至 2026-08-31 仍为 0.2.0，因此本例有意使用 `file:../clients/typescript`。
 - **Vite + React + shadcn/ui**：聊天界面 + 文档喂入面板，回答带可回溯的 `citation_id`。
 
 > 这是给 fastsearch 配套的 *示例*，目的是展示"怎么在 fastsearch 上搭一个 RAG Agent"。
@@ -65,7 +65,7 @@ npm run dev
 npm test
 ```
 
-覆盖朴素切块器（`chunkText`）和 SDK 封装 + Agent 工具接线（写路径 `indexDoc` 的请求体形状；`searchKnowledgeBase` 工具的 `search(highlight:true)` 调用与 `content`/`citations`/`hits` 输出）。用 Node 内置 test runner + tsx。
+覆盖 SDK 共享的 `chunkText` helper 和 SDK 封装 + Agent 工具接线（写路径 `indexDoc` 的请求体形状；`searchKnowledgeBase` 工具的 `search(highlight:true)` 调用与 `content`/`citations`/`hits` 输出）。用 Node 内置 test runner + tsx。
 
 **端到端冒烟**——打活的栈。栈起好后（①+③ 都在跑、`.env` 有 `DEEPSEEK_API_KEY`），新开一个终端：
 
@@ -91,8 +91,7 @@ src/server/
   env.ts                最先加载 .env
   db/schema.ts          Drizzle 表：documents / chunks / messages
   db/index.ts           better-sqlite3 + 启动兜底建表
-  lib/fastsearch.ts     fastsearch-client SDK 单例（+ 朴素切块器用的本地 chunk 类型）
-  lib/chunk.ts          朴素切块（真实管线用 docparse）
+  lib/fastsearch.ts     fastsearch-client SDK 单例与写入封装
   lib/agent.ts          模型 + 系统提示 + fastsearch-client 的 makeSearchTool()
   routes/chat.ts        AI SDK streamText 工具循环，回合落库
   routes/documents.ts   喂入：切块→/v1/index→登记 SQLite；列表
@@ -102,7 +101,7 @@ src/web/
   components/DocumentsPanel.tsx 文档喂入 + 列表
   components/ui/*       shadcn 原语（button/card/input/textarea/badge）
 test/
-  chunk.test.ts         单元：朴素切块器（npm test）
+  chunk.test.ts         集成：SDK 共享 chunkText helper（npm test）
   wrapper.test.ts       集成：SDK 封装 + Agent 工具 vs 假 fastsearch（npm test）
   smoke.mjs             端到端冒烟测试（npm run test:e2e）
 ```

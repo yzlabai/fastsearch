@@ -1,5 +1,7 @@
 # 向量量化压缩主索引（TurboQuant 借鉴）· 设计与开发计划
 
+> 文档状态（2026-08-31）：**历史计划，已归档**。TurboQuant 压缩主索引与可选 f32 sidecar 精排已实施；后续活动需求统一进入[当前迭代开发计划](2026-08-30-迭代开发计划.md)，正文保留当时设计与实施记录。
+
 > 状态：**设计（施工中，Step 1 进行）**｜日期：2026-07-21｜上游：[15-vector spec](../specs/15-vector.md)、
 > [A9 HNSW+量化设计](2026-06-26-A9-向量HNSW与量化设计.md)、CLAUDE.md 不变量 #1/#2/#4/#5/#6。
 > 调研来源：`../../githubworks/turbovec`（Google TurboQuant 的 Rust 实现，arXiv 2504.19874）。

@@ -8,6 +8,10 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "yzlab" }]
 keywords = ["search", "rag", "hybrid-search", "bm25", "vector-search"]
 
+[project.urls]
+Repository = "https://github.com/yzlabai/fastsearch/tree/main/clients/python"
+Documentation = "https://github.com/yzlabai/fastsearch/blob/main/clients/python/README.md"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

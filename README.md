@@ -8,6 +8,16 @@
 
 > The key edge over ParadeDB: **it runs on any managed Postgres (RDS / Supabase / Neon)** — it only needs pgvector + logical replication, and **requires no `shared_preload_libraries` native extension**.
 
+## Release status
+
+| Surface | Repository version | Publication status (checked 2026-08-31) |
+|---|---:|---|
+| Rust server / CLI / crates | `0.2.0-rc.1` | Release candidate; build from this repository |
+| TypeScript SDK | `0.3.0` | npm currently serves `0.2.0`; `0.3.0` is pending publication |
+| Python SDK | `0.2.0` | Not yet published on PyPI; install from `./clients/python` |
+
+The example deliberately uses the repository-local TypeScript 0.3.0 package so its shared ingestion helpers are tested before registry publication. See [CHANGELOG.md](CHANGELOG.md) for compatibility and upgrade notes.
+
 ## Architecture
 
 ```
@@ -43,7 +53,7 @@ For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs
 |---|---|
 | `fastsearch-core` | Document model, query/filter AST, fusion (RRF / normalized / weighted), citations, **ACL** |
 | `fastsearch-text` | Tantivy BM25 + CJK (jieba) + filtering + highlighting/facets + ACL |
-| `fastsearch-vector` | Three vector backends: brute-force (deterministic default) / HNSW+u8 quant (approximate) / pgvector direct; filter-aware |
+| `fastsearch-vector` | In-process vector backends: deterministic brute-force/binary/TurboQuant and opt-in HNSW; filter-aware. The engine can also route directly to pgvector. |
 | `fastsearch-embed` | Embedder trait + configurable HTTP backend (Ollama / OpenAI-compatible) |
 | `fastsearch-pg` | Postgres source of truth: DDL, Chunk↔row mapping, doc-level replace write path, pgvector direct query |
 | `fastsearch-sync` | CDC apply: pgoutput decode + idempotency + LSN checkpoint + replace semantics |
@@ -52,7 +62,7 @@ For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs
 | `fastsearch-server` | REST (axum) + API-key auth + **ACL cannot be bypassed** + metrics/rate-limit/audit + media gateway + CDC lifecycle |
 | `fastsearch-mcp` | The fourth face: MCP (stdio + JSON-RPC) exposing the `search` / `resolve_citation` tools |
 | `fastsearch-cli` | `fastsearch` binary: **thin REST client of the server** (no embedded engine). index / index-dir (feed a folder) / search / similar / **ingest (client-side multi-format parse: PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/image + OCR + table recognition)** / eval — see [Ingestion & parsing](docs/ingestion-and-parsing.md) |
-| `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters. **TS published on npm: `npm install fastsearch-client`** (agent tool defs + RAG helpers — [README](clients/typescript/README.md)); Python from source ([README](clients/python/README.md)) |
+| `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters. Registry and source-install details are recorded above and in the [TypeScript](clients/typescript/README.md) / [Python](clients/python/README.md) READMEs. |
 
 **End-to-end usable**: ingest/CDC → index → three search modes (keyword / vector / hybrid) → hits with citations, ACL enforced and unbypassable. All four faces in place.
 
@@ -77,4 +87,4 @@ DATABASE_URL=postgres://... cargo test -p fastsearch-pg   # PG integration (CI u
 
 ## License
 
-Apache-2.0. Tokenization dictionaries come from jieba-rs (**MIT**, with embedded dict) — no share-alike obligation (e.g. CC-BY-SA); shipping the MIT attribution is sufficient (see the [license review](docs/governance/2026-06-26-词典与第三方许可审.md)).
+Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). CI generates the distributable `THIRD-PARTY-NOTICES.md` from Cargo metadata. Tokenization dictionaries come from jieba-rs (**MIT**, with embedded dict) — no share-alike obligation (e.g. CC-BY-SA); shipping the MIT attribution is sufficient (see the [license review](docs/governance/2026-06-26-词典与第三方许可审.md)).

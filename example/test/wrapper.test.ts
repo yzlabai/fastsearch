@@ -77,9 +77,12 @@ after(async () => {
 
 test("indexDoc：doc 级替换请求体 + 返回写入条数（写路径）", async () => {
   const { indexDoc, COLLECTION } = await import("../src/server/lib/fastsearch.ts");
-  const { chunkText } = await import("../src/server/lib/chunk.ts");
+  const { chunkText } = await import("fastsearch-client");
 
-  const chunks = chunkText("report.pdf", "第一段内容。\n\n第二段更长一点的内容描述。");
+  const chunks = chunkText("第一段内容。\n\n第二段更长一点的内容描述。", {
+    docId: "report.pdf",
+    acl: ["public"],
+  });
   const n = await indexDoc("report.pdf", chunks);
 
   assert.equal(n, chunks.length);

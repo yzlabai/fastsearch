@@ -1,0 +1,11 @@
+fastsearch
+Copyright 2026 fastsearch contributors
+
+This product is licensed under the Apache License, Version 2.0.
+
+The vendored docparse source retains its independent attribution in
+vendor/docparse/LICENSE and vendor/docparse/NOTICE. Other vendored components
+retain the license files shipped in their respective directories.
+
+Runtime dependency attribution is generated from Cargo metadata as
+THIRD-PARTY-NOTICES.md by `cargo about` and is attached to CI release artifacts.

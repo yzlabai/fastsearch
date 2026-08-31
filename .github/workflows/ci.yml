@@ -151,6 +151,8 @@ jobs:
       # 生成第三方许可清单并存档（发布物随附）。
       - name: generate third-party notices
         run: cargo about generate about.hbs > THIRD-PARTY-NOTICES.md
+      - name: release metadata + notices contract
+        run: python3 scripts/ci/check_release_metadata.py --third-party-notices THIRD-PARTY-NOTICES.md
       - name: upload notices artifact
         uses: actions/upload-artifact@v4
         with:

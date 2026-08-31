@@ -1241,7 +1241,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "fastsearch-cli"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-core"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-embed"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1290,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-engine"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "fastsearch-core",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-eval"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "fastsearch-core",
  "serde",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-mcp"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "fastsearch-core",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-pg"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "fastsearch-core",
  "serde_json",
@@ -1347,14 +1347,14 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-rerank"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "fastsearch-server"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-sync"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "fastsearch-core",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-text"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "fastsearch-core",
  "jieba-rs",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "fastsearch-vector"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "fastsearch-core",

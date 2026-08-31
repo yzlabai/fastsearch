@@ -48,12 +48,20 @@ export interface FromDocparseOptions {
 function base64ToBytes(b64: string): number[] {
   // 允许 data URL 形态（`data:image/png;base64,xxxx`）。
   const raw = b64.includes(",") ? b64.slice(b64.lastIndexOf(",") + 1) : b64;
+  const nodeBuffer = (
+    globalThis as typeof globalThis & {
+      Buffer?: {
+        from(input: string, encoding: string): { toString(encoding: string): string };
+      };
+    }
+  ).Buffer;
+  if (typeof atob !== "function" && nodeBuffer === undefined) {
+    throw new Error("base64 decoder unavailable in this runtime");
+  }
   const bin =
     typeof atob === "function"
       ? atob(raw)
-      : // Node 18 之前没有全局 atob；Buffer 兜底。
-        // eslint-disable-next-line no-undef
-        Buffer.from(raw, "base64").toString("binary");
+      : nodeBuffer!.from(raw, "base64").toString("binary");
   const out = new Array<number>(bin.length);
   for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
   return out;

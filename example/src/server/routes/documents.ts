@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { desc, eq } from "drizzle-orm";
+import { chunkText } from "fastsearch-client";
 import { db, schema } from "../db/index.ts";
-import { chunkText } from "../lib/chunk.ts";
 import { COLLECTION, FastsearchError, indexDoc } from "../lib/fastsearch.ts";
 
 export const documentsRoute = new Hono();
@@ -32,7 +32,7 @@ documentsRoute.post("/documents", async (c) => {
     .replace(/^-+|-+$/g, "")
     .slice(0, 80) || `doc-${Date.now()}`;
 
-  const chunks = chunkText(docId, text);
+  const chunks = chunkText(text, { docId });
   if (chunks.length === 0) {
     return c.json({ error: "切块为空（正文太短？）" }, 400);
   }

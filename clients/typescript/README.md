@@ -5,9 +5,13 @@
 零依赖（全局 `fetch`）的 fastsearch REST SDK，**为 LLM agent 开发量身定制**。
 Node 18+ / Deno / Bun / 浏览器通用。ACL 由服务端按 API Key 强制，客户端无法越权。
 
+> 发布状态（核验于 2026-08-31）：仓库代码为 **0.3.0**，npm `latest` 仍为 **0.2.0**。
+> 下方 registry 安装命令当前取得 0.2.0；0.3.0 发布前，仓库内开发与 `example/` 使用本地包。
+
 ```bash
 npm install fastsearch-client
 # 或：pnpm add fastsearch-client · yarn add fastsearch-client · bun add fastsearch-client · deno: import "npm:fastsearch-client"
+# 本仓库中安装当前 0.3.0：npm install ./clients/typescript
 ```
 
 ## 快速上手

@@ -2,6 +2,9 @@
 
 零依赖（仅标准库）的 fastsearch REST 客户端。
 
+> 发布状态（核验于 2026-08-31）：仓库版本为 **0.2.0**，尚未发布到 PyPI。
+> 在仓库根目录执行 `python -m pip install ./clients/python` 安装当前源码包。
+
 ```python
 from fastsearch_client import FastsearchClient
 
