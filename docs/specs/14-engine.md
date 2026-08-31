@@ -1,7 +1,7 @@
 # spec · fastsearch-engine
 
 > 模块 #9（整合层），依赖：core/text/vector/rerank/sync/embed/pg。阶段 P1→P2。
-> 上游：[产品设计 §3.4 排序管线](../plans/2026-06-24-产品设计文档.md)。状态：**已完成 v2.3**
+> 上游：[产品设计 §3.4 排序管线](../plans/2026-06-24-产品设计文档.md)。状态：**已完成 v2.11**
 > （三向量后端档 + 深分页 + 重建 + 媒资解析 + 多模态 + 原子批处理 CDC）。
 
 ## 1. 目的与范围
@@ -54,9 +54,10 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 7. `searchable=false` 的 upsert/CDC 事件从全文和向量索引删除该 gid；PG 真源行不受影响。
 8. text-only chunk upsert 必须删除同 GlobalId 的旧向量，防止 chunk 级更新留下过期向量；批量删除在
    单次 commit 前同步移除全文与向量派生项。
-9. `explain=false` 时 `SearchHit.sources=None`；`explain=true` 时按 source 字典序附上所有命中路。当前只有 user_text 两路，多表示第三路待 `chunk_signal` 接入。
-10. CDC 批次先经 `CdcBatchPreparer` 完成一次批量嵌入和向量校验；共享消费取得 Engine 锁后执行 PG 事务写穿，再由 `apply_prepared_cdc_batch` 发布本地派生状态；准备失败不改变 keyword/vector。
-11. server 共享档使用 `consume_once_shared`，对象读取与嵌入等待不持 `Arc<Mutex<Engine>>`；PG 写穿/本地发布/持久化与检索串行，并返回 prepare/lock-wait/lock-hold 计时。
+9. `explain=false` 时 `SearchHit.sources=None`；`explain=true` 时按 source 字典序附上所有命中路；signal 来源另带可选 model/version。
+10. 配置 `source_pg` 且存在查询向量时，从 ready、同维的 signal 真源追加 `vector:ocr/asr/image_caption/image_bytes`；主表 `vector:user_text` 不重复计权。旧标量融合把 semantic 总权重均分给实际向量路。
+11. CDC 批次先经 `CdcBatchPreparer` 完成一次批量嵌入和向量校验；共享消费取得 Engine 锁后执行 PG 事务写穿，再由 `apply_prepared_cdc_batch` 发布本地派生状态；准备失败不改变 keyword/vector。
+12. server 共享档使用 `consume_once_shared`，对象读取与嵌入等待不持 `Arc<Mutex<Engine>>`；PG 写穿/本地发布/持久化与检索串行，并返回 prepare/lock-wait/lock-hold 计时。
 
 ## 4. 测试用例
 
@@ -115,6 +116,7 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
   `[3,2,1]`；带 rerank 逐条相同且 `rerank` 全 `null`；对照臂（非空 query）重排正常未被误伤。
   详见 [plan §6.1](../plans/2026-08-24-image-only-query跳过词项rerank.md)。
 - [x] v2.10（2026-08-31，FS-102）：`IndexSink::apply_changes` 全批 prepare→publish；CDC/快照/rebuild 一次 `embed_multi`，数量/维度/有限值及发布期索引维度/后端上限预检；pgvector 写穿单事务；server 对象/嵌入等待移出全局 Engine 锁，PG 提交与本地发布期间阻断搜索。timeout、返回/索引维度、后端上限、PG 中途失败和纯本地 apply 后崩溃故障注入均验证旧版本不残半状态、重试收敛；跨 PG/本地文件崩溃及本地存储 I/O 回滚属于 FS-103。
+- [x] v2.11（2026-08-31，FS-202）：`source_pg` 从 signal 真源产生实际 N 路 recall list；真实 Engine golden 覆盖 keyword、主文本向量和 image caption 三路、signal-only 候选、provenance 与贡献闭合。无 PG/无信号的旧两路保持不变。
 
 **已知限制 / 下一迭代：**
 - ✅ auto-merging（v1.3）、rerank 钩子、CDC 自动 embedding（v1.6）、search_after（v2.1）、单集合重建（v2.2）均已实现。
@@ -123,5 +125,6 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
   （`Option<Vec<f64>>` 或 trait 加 `informative(query)`），属契约变更，下一迭代。
   多模态 reranker 落地后，把"query 为空则跳过"升级为"按 reranker caps 选择"。
 - Engine 仍以 Mutex 保护 PG 写穿、本地发布和搜索；FS-102 已移出对象读取/嵌入等待，是否进一步改 RwLock/分片由新基准与真实负载决定（见 19-server / [容量·SLO](../governance/2026-06-26-容量与SLO.md)）。
+- signal 召回仍是 PG 精确扫描；生产规模 ANN 选型需先完成按信号类型/维度的容量与延迟基准。
 - ✅ pgvector 直查的 **CDC 自动写穿已落地**（2026-06-27，B6 续作）：`apply_upsert` 在 `set_pg_vector` 模式把嵌入写回 PG `embedding` 列（`set_embedding`），列清单 publication 排除派生列 + 幂等守卫双防线断 CDC 反馈环。Docker pgvector 真机验证。详见 [12-pg spec §7 v1.5](12-pg.md)、[devlog](../devlog/2026-06-27-B6-CDC写穿与断反馈环.md)。
 - ✅ **M1 图像嵌入路由基线已落地**（2026-06-27，MM10）：`apply_upsert` 对无文本但 `caps.image`+inline 字节的 chunk 走图像嵌入；以图搜图 `query_image`（MM9）。真视觉模型/跨模态 gated。

@@ -61,6 +61,10 @@ export interface HitSource {
   score: number;
   /** 对融合分的实际加数。 */
   contribution: number;
+  /** 该信号的生产模型；关键词和主文本向量路省略。 */
+  model?: string;
+  /** 该信号的模型版本；关键词和主文本向量路省略。 */
+  model_version?: string;
 }
 
 /** 一个分面字段的取值分布。 */

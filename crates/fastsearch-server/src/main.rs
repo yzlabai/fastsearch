@@ -178,8 +178,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 媒资真源（MM6-inline）：媒资网关 `/v1/asset` 的 Inline 路径从 PG `media_bytes` 按需取字节。
-    // 与向量后端无关——只要有 PG 真源（DATABASE_URL）即开启（字节是真源、引擎派生层不持）。
+    // PG 真源：媒资网关从 `media_bytes` 按需取字节，检索从 chunk_signal 追加多表示召回。
+    // 与主向量后端无关——只要有 DATABASE_URL 即开启。
     if let Ok(url) = std::env::var("DATABASE_URL") {
         match fastsearch_pg::PgStore::connect(
             fastsearch_pg::PgConfig::new(url.clone()).with_vector_dim(embed_dim),
@@ -192,9 +192,9 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("warn: ensure_schema failed: {e}（`/v1/index` 真源回写将失败）");
                 }
                 engine.set_source_store(std::sync::Arc::new(pg));
-                eprintln!("media source: PG media_bytes（/v1/asset inline 字节）");
+                eprintln!("source store: PG media_bytes + chunk_signal recall");
             }
-            Err(e) => eprintln!("media source store 连接失败: {e}（inline 字节不可用）"),
+            Err(e) => eprintln!("source store 连接失败: {e}（inline 字节与多表示召回不可用）"),
         }
     }
 

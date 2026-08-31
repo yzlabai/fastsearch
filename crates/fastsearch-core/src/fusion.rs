@@ -99,6 +99,12 @@ pub struct SourceHit {
     pub score: f64,
     /// 该路对最终融合分的实际加数。
     pub contribution: f64,
+    /// Producing model for a source-of-truth signal. Absent for legacy keyword/main-vector paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Producing model version for a source-of-truth signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
 }
 
 /// **N 路**具名融合（KB-2.2 第一步）。[`fuse`] 是它的两路特例。
@@ -149,6 +155,8 @@ pub fn fuse_n_with_sources(
                         rank: rank + 1,
                         score: s.score,
                         contribution: contrib,
+                        model: None,
+                        model_version: None,
                     });
                 }
             }
@@ -172,6 +180,8 @@ pub fn fuse_n_with_sources(
                         rank: rank + 1,
                         score: raw.score,
                         contribution,
+                        model: None,
+                        model_version: None,
                     });
                 }
             }
@@ -635,6 +645,8 @@ mod tests {
                 rank: 2,
                 score: 5.0,
                 contribution: 0.0,
+                model: None,
+                model_version: None,
             }
         );
         assert_eq!(
@@ -644,7 +656,43 @@ mod tests {
                 rank: 1,
                 score: 0.9,
                 contribution: 2.0,
+                model: None,
+                model_version: None,
             }
         );
+    }
+
+    #[test]
+    fn source_provenance_is_additive_and_omits_empty_fields() {
+        let legacy = SourceHit {
+            source: "vector:user_text".into(),
+            rank: 1,
+            score: 0.9,
+            contribution: 1.0,
+            model: None,
+            model_version: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({
+                "source": "vector:user_text",
+                "rank": 1,
+                "score": 0.9,
+                "contribution": 1.0
+            })
+        );
+
+        let signal = SourceHit {
+            source: "vector:image_caption".into(),
+            rank: 2,
+            score: 0.8,
+            contribution: 0.5,
+            model: Some("clip-caption".into()),
+            model_version: Some("2026-08".into()),
+        };
+        let value = serde_json::to_value(&signal).unwrap();
+        assert_eq!(value["model"], "clip-caption");
+        assert_eq!(value["model_version"], "2026-08");
+        assert_eq!(serde_json::from_value::<SourceHit>(value).unwrap(), signal);
     }
 }

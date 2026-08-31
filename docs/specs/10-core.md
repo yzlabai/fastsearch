@@ -136,7 +136,10 @@ pub enum Fusion {
 }
 pub struct Scored { pub id: GlobalId, pub score: f64 }
 pub struct RecallList { pub source: String, pub weight: f64, pub items: Vec<Scored> }
-pub struct SourceHit { pub source: String, pub rank: usize, pub score: f64, pub contribution: f64 }
+pub struct SourceHit {
+    pub source: String, pub rank: usize, pub score: f64, pub contribution: f64,
+    pub model: Option<String>, pub model_version: Option<String>
+}
 ```
 - `fuse(keyword: &[Scored], semantic: &[Scored], fusion: &Fusion) -> Vec<Scored>`：合并两路、按融合分降序、稳定 tie-break（同分按 id 升序，保证确定性）。
 - `fuse_n` / `fuse_n_with_sources`：按 `source` 字典序稳定累加 N 路；后一接口同时返回路内 rank、原始分和实际贡献。
@@ -214,4 +217,5 @@ pub enum CoreError { InvalidRequest(String), InvalidCitation(String), InvalidFil
 - 2026-06-27 回写多模态（MM1，代码已实现）：`ChunkKind` 加 `Audio`/`Video` + `ChunkKind::modality()`；新增 `Modality`/`TimeSpan`/`AssetPointer`/`MediaRef`（§2.1b）；`Chunk.image_meta`→`media`（MM2b，`ImageMeta` 降级为迁移用 `to_media`）；`text` 语义放宽为"可空串的可检索文本表示"；`Citation` 加 `time`/`media`（§2.5）。设计见 [多模态功能设计与开发计划](../plans/2026-06-25-多模态功能设计与开发计划.md)；单测覆盖 modality 派生/serde/citation 回环。
 - 2026-06-28 回写 spec 漂移（代码已实现，spec 落后）：`Chunk` 加 `media_bytes`（MM2c-bytes，inline 字节，serde skip）；`SearchRequest` 加 `query_image`（MM9 以图搜图）、`collapse`（分组折叠）、`search_after`（深分页游标）、`facets`（请求分面字段）；补 `RerankSpec`/`Collapse` 类型定义（§2.2）。均为补文档、无代码改动。
 - 2026-07-23 通用 chunk 协议：`Chunk` 新增不透明 `metadata` 与 `searchable`；`SearchRequest` 新增 opt-in `include_text`/`include_metadata`。字段均有向后兼容默认值，metadata 受统一资源边界约束。
-- 2026-08-31 FS-002：`Fusion::Weights`、`fuse_n_with_sources`/`SourceHit` 与权重校验落地；共享字段矩阵钉住 `SearchRequest` 的 19 个内部字段。现有两路可解释接线在 engine，实际第三路待 FS-201/FS-202。
+- 2026-08-31 FS-002：`Fusion::Weights`、`fuse_n_with_sources`/`SourceHit` 与权重校验落地；共享字段矩阵钉住 `SearchRequest` 的 19 个内部字段。
+- 2026-08-31 FS-202：`SourceHit` 加法增加省略空值的 `model/model_version`，旧来源 JSON 逐位不变；实际第三路由 Engine 从 PG signal 真源接入。

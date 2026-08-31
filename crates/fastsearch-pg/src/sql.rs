@@ -225,6 +225,10 @@ impl WhereBuilder {
         match match_param(is_text, v) {
             Some(p) => {
                 let ph = self.ph(p);
+                // Numeric filter values are represented as i64. Cast the placeholder explicitly
+                // so PostgreSQL does not infer int4 from columns such as `page` and then reject the
+                // tokio-postgres i64 binder. int4/int8 columns compare exactly against bigint.
+                let ph = if is_text { ph } else { format!("{ph}::bigint") };
                 if nullable_denorm(col) {
                     // 超集：列 NULL 行也放行，交后过滤（读权威 media.time）精确判定，守 #5。
                     format!("({col} {op} {ph} OR {col} IS NULL)")
@@ -274,7 +278,17 @@ impl WhereBuilder {
         let params: Option<Vec<SqlParam>> = vs.iter().map(|v| match_param(is_text, v)).collect();
         match params {
             Some(ps) if !ps.is_empty() => {
-                let phs: Vec<String> = ps.into_iter().map(|p| self.ph(p)).collect();
+                let phs: Vec<String> = ps
+                    .into_iter()
+                    .map(|p| {
+                        let ph = self.ph(p);
+                        if is_text {
+                            ph
+                        } else {
+                            format!("{ph}::bigint")
+                        }
+                    })
+                    .collect();
                 let inner = format!("{col} IN ({})", phs.join(", "));
                 if nullable_denorm(col) {
                     format!("({inner} OR {col} IS NULL)")
@@ -328,6 +342,61 @@ pub fn pgvector_search_sql(
          heading_path, bbox::text, media::text, 1 - (embedding <=> $1::text::{vtype}) AS score \
          FROM {table} WHERE {} \
          ORDER BY embedding <=> $1::text::{vtype} LIMIT {limit}",
+        wheres.join(" AND ")
+    );
+    (sql, b.params)
+}
+
+/// Build an exact cosine-search query over ready `chunk_signal.embedding` rows. `$1` is the
+/// query-vector text, `$2` its dimension and `$3` the allowed signal-type names. Each signal type
+/// receives its own candidate window so one populous route cannot crowd the others out before
+/// fusion. The `real[]` source-of-truth column intentionally has no ANN index in FS-202.
+pub fn signal_vector_search_sql(
+    signal_table: &str,
+    chunks_table: &str,
+    limit_per_signal: usize,
+    acl: Option<&AclFilter>,
+    filter: Option<&Filter>,
+) -> (String, Vec<SqlParam>) {
+    let mut b = WhereBuilder {
+        params: Vec::new(),
+        base: 4,
+    };
+    let mut wheres = Vec::new();
+    if let Some(a) = acl {
+        wheres.push(acl_clause(a, &mut b));
+    }
+    if let Some(f) = filter {
+        wheres.push(b.build(f));
+    }
+    if wheres.is_empty() {
+        wheres.push("TRUE".into());
+    }
+    let distance = "embedding::vector <=> $1::text::vector";
+    let sql = format!(
+        "WITH filtered AS (\
+           SELECT c.collection, c.doc_id, c.chunk_id, c.kind, c.modality, c.page, \
+                  c.section_id, c.time_start_ms, c.time_end_ms, c.tenant, c.acl, \
+                  c.heading_path, c.bbox, c.media, \
+                  s.signal_type, s.model, s.model_version, s.embedding \
+           FROM {signal_table} AS s \
+           JOIN {chunks_table} AS c \
+             USING (collection, doc_id, chunk_id) \
+           WHERE s.status = 'ready' AND s.embedding IS NOT NULL \
+             AND s.embedding_dim = $2 AND s.signal_type = ANY($3::text[]) \
+             AND c.searchable = TRUE\
+         ), ranked AS (\
+           SELECT collection, doc_id, chunk_id, kind, modality, page, section_id, tenant, acl, \
+                  heading_path, bbox, media, signal_type, model, model_version, \
+                  1 - ({distance}) AS score, \
+                  row_number() OVER (PARTITION BY signal_type \
+                    ORDER BY {distance}, collection, doc_id, chunk_id) AS signal_rank \
+           FROM filtered WHERE {}\
+         ) \
+         SELECT collection, doc_id, chunk_id, kind, modality, page, section_id, tenant, acl, \
+                heading_path, bbox::text, media::text, signal_type, model, model_version, score \
+         FROM ranked WHERE signal_rank <= {limit_per_signal} \
+         ORDER BY signal_type, score DESC, collection, doc_id, chunk_id",
         wheres.join(" AND ")
     );
     (sql, b.params)
@@ -1052,7 +1121,7 @@ mod tests {
         assert!(sql.contains("tenant = $2"));
         assert!(sql.contains("'public' = ANY(acl) OR acl && $3::text[]"));
         assert!(sql.contains("modality = $4"));
-        assert!(sql.contains("page >= $5"));
+        assert!(sql.contains("page >= $5::bigint"));
         assert!(sql.contains("LIMIT 80"));
         assert_eq!(
             params,
@@ -1129,8 +1198,8 @@ mod tests {
         let (sql, params) = pgvector_search_sql("t", VectorType::Vector, 20, None, Some(&f));
         // 超集守 #5：时间列下推须 `OR col IS NULL`（列 NULL 而 media.time 有值的遗留行不被排除，
         // 交后过滤读权威 media.time 精确判定）。
-        assert!(sql.contains("(time_start_ms >= $2 OR time_start_ms IS NULL)"));
-        assert!(sql.contains("(time_end_ms <= $3 OR time_end_ms IS NULL)"));
+        assert!(sql.contains("(time_start_ms >= $2::bigint OR time_start_ms IS NULL)"));
+        assert!(sql.contains("(time_end_ms <= $3::bigint OR time_end_ms IS NULL)"));
         assert_eq!(
             params,
             vec![SqlParam::Int(1000), SqlParam::Int(9000)],

@@ -98,6 +98,22 @@ pub enum EmbeddingWrite {
     },
 }
 
+/// One source-of-truth signal candidate returned by [`PgStore::signal_vector_search`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalRecallHit {
+    pub scored: fastsearch_core::Scored,
+    pub citation: fastsearch_core::Citation,
+    pub model: Option<String>,
+    pub model_version: Option<String>,
+}
+
+/// A stable named recall route produced from one signal type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalRecallList {
+    pub source: String,
+    pub items: Vec<SignalRecallHit>,
+}
+
 impl PgStore {
     /// 连接（后台驱动连接 future）。表名经标识符校验后才用于 SQL 拼接（防御性：表名是运维配置、
     /// 非客户端输入，但若未来被外部影响，此校验阻断注入面）。
@@ -791,6 +807,98 @@ impl PgStore {
         hits.truncate(k);
         Ok(hits)
     }
+
+    /// Exact multi-representation recall from the signal source of truth. Only ready,
+    /// dimension-compatible, searchable rows participate. ACL/filter use the same SQL-superset +
+    /// Rust-exact contract as [`Self::vector_search`]. Results are grouped by stable public source
+    /// name and each route is independently capped at `k`.
+    pub async fn signal_vector_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        over_fetch: usize,
+        acl: Option<&fastsearch_core::AclFilter>,
+        filter: Option<&fastsearch_core::Filter>,
+    ) -> Result<Vec<SignalRecallList>> {
+        if k == 0 || query.is_empty() {
+            return Ok(Vec::new());
+        }
+        ensure_finite(query)?;
+        let limit = k.saturating_mul(over_fetch.max(1)).max(k);
+        let (statement, sql_params) =
+            sql::signal_vector_search_sql(&self.signal_table, &self.cfg.table, limit, acl, filter);
+        let query_text = format_vector(query);
+        let query_dim = i32::try_from(query.len())
+            .map_err(|_| PgError::Config("query vector dimension exceeds i32".into()))?;
+        let signal_types = vec![
+            SignalType::Ocr.as_str().to_string(),
+            SignalType::Asr.as_str().to_string(),
+            SignalType::VlmCaption.as_str().to_string(),
+            SignalType::ImageBytes.as_str().to_string(),
+        ];
+        let mut owned: Vec<Box<dyn ToSql + Sync>> = vec![
+            Box::new(query_text),
+            Box::new(query_dim),
+            Box::new(signal_types),
+        ];
+        for param in &sql_params {
+            owned.push(match param {
+                SqlParam::Text(value) => Box::new(value.clone()),
+                SqlParam::Int(value) => Box::new(*value),
+                SqlParam::TextArray(values) => Box::new(values.clone()),
+            });
+        }
+        let params: Vec<&(dyn ToSql + Sync)> = owned
+            .iter()
+            .map(|value| &**value as &(dyn ToSql + Sync))
+            .collect();
+        let client = self.client.lock().await;
+        let rows = client.query(&statement, &params).await?;
+
+        let mut grouped = std::collections::BTreeMap::<String, Vec<SignalRecallHit>>::new();
+        for row in &rows {
+            let chunk = PgVecRow::from_row(row)?;
+            if filter.is_some_and(|candidate_filter| !candidate_filter.eval(&chunk))
+                || acl.is_some_and(|candidate_acl| !candidate_acl.visible(&chunk))
+            {
+                continue;
+            }
+            let source = match row.try_get::<_, String>("signal_type")?.as_str() {
+                "ocr" => "vector:ocr",
+                "asr" => "vector:asr",
+                "vlm_caption" => "vector:image_caption",
+                "image_bytes" => "vector:image_bytes",
+                _ => continue,
+            };
+            grouped
+                .entry(source.into())
+                .or_default()
+                .push(SignalRecallHit {
+                    scored: fastsearch_core::Scored {
+                        id: chunk.gid(),
+                        score: row.try_get("score")?,
+                    },
+                    citation: chunk.citation(),
+                    model: row.try_get("model")?,
+                    model_version: row.try_get("model_version")?,
+                });
+        }
+        Ok(grouped
+            .into_iter()
+            .map(|(source, mut items)| {
+                items.sort_by(|left, right| {
+                    right
+                        .scored
+                        .score
+                        .partial_cmp(&left.scored.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| left.scored.id.cmp(&right.scored.id))
+                });
+                items.truncate(k);
+                SignalRecallList { source, items }
+            })
+            .collect())
+    }
 }
 
 async fn stale_doc_signals(
@@ -1057,7 +1165,7 @@ pub async fn fetch_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastsearch_core::{BBox, ChunkKind};
+    use fastsearch_core::{BBox, ChunkKind, SignalStatus};
 
     #[test]
     fn ensure_finite_rejects_nan_inf() {
@@ -2322,6 +2430,157 @@ mod tests {
             .lock()
             .await
             .batch_execute("DROP TABLE IF EXISTS fastsearch_vec_it")
+            .await
+            .ok();
+    }
+
+    /// FS-202 T1: the public signal-recall seam exposes only ready, compatible, visible and
+    /// searchable signals, grouped under stable source names with provenance.
+    #[tokio::test]
+    async fn fs202_signal_vector_search_filters_and_orders() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip fs202_signal_vector_search_filters_and_orders: DATABASE_URL not set");
+            return;
+        };
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_fs202_signal_search_it".into();
+        cfg.vector_dim = 2;
+        cfg.vector_type = VectorType::Vector;
+        let store = PgStore::connect(cfg).await.expect("connect");
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(
+                "DROP TABLE IF EXISTS fastsearch_fs202_signal_search_it_signal CASCADE; \
+                 DROP TABLE IF EXISTS fastsearch_fs202_signal_search_it CASCADE;",
+            )
+            .await
+            .expect("clean");
+        store.ensure_schema().await.expect("schema");
+
+        let mut chunks: Vec<(String, Chunk)> = (1..=6)
+            .map(|id| {
+                let mut chunk = sample("signals.pdf", id);
+                chunk.tenant = Some(if id == 5 { "other" } else { "acme" }.into());
+                chunk.acl = vec![if id == 5 { "secret" } else { "team-a" }.into()];
+                if id == 6 {
+                    chunk.searchable = false;
+                }
+                ("kb".into(), chunk)
+            })
+            .collect();
+        // Make the two equal-score rows observable in GlobalId tie-break order even though their
+        // signals are inserted in the opposite order below.
+        chunks[0].1.page = 11;
+        chunks[1].1.page = 12;
+        chunks[1].1.media = Some(fastsearch_core::MediaRef {
+            asset: AssetPointer::Inline,
+            media_type: Some("audio/wav".into()),
+            time: Some(fastsearch_core::TimeSpan {
+                start_ms: 1_200,
+                end_ms: 2_400,
+            }),
+            region: None,
+            caption_source: None,
+            thumbnail: None,
+        });
+        store.upsert_chunks(&chunks).await.expect("chunks");
+
+        let cases = [
+            (2, SignalStatus::Ready, vec![1.0, 0.0], "caption-v2"),
+            (1, SignalStatus::Ready, vec![1.0, 0.0], "caption-v1"),
+            (3, SignalStatus::Stale, vec![1.0, 0.0], "stale"),
+            (4, SignalStatus::Ready, vec![1.0, 0.0, 0.0], "wrong-dim"),
+            (5, SignalStatus::Ready, vec![1.0, 0.0], "forbidden"),
+            (6, SignalStatus::Ready, vec![1.0, 0.0], "not-searchable"),
+        ];
+        for (chunk_id, status, embedding, version) in cases {
+            store
+                .upsert_signal(&Signal {
+                    gid: GlobalId {
+                        collection: "kb".into(),
+                        doc_id: "signals.pdf".into(),
+                        chunk_id,
+                    },
+                    signal_type: SignalType::VlmCaption,
+                    status,
+                    model: Some("clip-caption".into()),
+                    model_version: Some(version.into()),
+                    signal_text: Some(format!("caption {chunk_id}")),
+                    embedding: Some(embedding),
+                    ..Default::default()
+                })
+                .await
+                .expect("signal");
+        }
+
+        let acl = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        assert!(store
+            .signal_vector_search(&[], 10, 4, Some(&acl), None)
+            .await
+            .expect("empty query is an empty recall route")
+            .is_empty());
+        let lists = store
+            .signal_vector_search(&[1.0, 0.0], 10, 4, Some(&acl), None)
+            .await
+            .expect("signal search");
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].source, "vector:image_caption");
+        assert_eq!(
+            lists[0]
+                .items
+                .iter()
+                .map(|hit| hit.scored.id.chunk_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(lists[0].items[0].citation.page, 11);
+        assert_eq!(lists[0].items[0].model.as_deref(), Some("clip-caption"));
+        assert_eq!(
+            lists[0].items[0].model_version.as_deref(),
+            Some("caption-v1")
+        );
+        assert_eq!(lists[0].items[0].scored.score, 1.0);
+
+        let page_twelve =
+            fastsearch_core::Filter::Eq("page".into(), fastsearch_core::FieldValue::Int(12));
+        let filtered = store
+            .signal_vector_search(&[1.0, 0.0], 10, 4, Some(&acl), Some(&page_twelve))
+            .await
+            .expect("filtered signal search");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].items.len(), 1);
+        assert_eq!(filtered[0].items[0].scored.id.chunk_id, 2);
+
+        let time_filtered = store
+            .signal_vector_search(
+                &[1.0, 0.0],
+                10,
+                4,
+                Some(&acl),
+                Some(&fastsearch_core::Filter::Gte(
+                    "time_start_ms".into(),
+                    fastsearch_core::FieldValue::Int(1_000),
+                )),
+            )
+            .await
+            .expect("time-filtered signal search");
+        assert_eq!(time_filtered.len(), 1);
+        assert_eq!(time_filtered[0].items.len(), 1);
+        assert_eq!(time_filtered[0].items[0].scored.id.chunk_id, 2);
+
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(
+                "DROP TABLE IF EXISTS fastsearch_fs202_signal_search_it_signal CASCADE; \
+                 DROP TABLE IF EXISTS fastsearch_fs202_signal_search_it CASCADE;",
+            )
             .await
             .ok();
     }

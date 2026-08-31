@@ -49,4 +49,5 @@
   get/upsert/delete、document list 与 collection delete；TS 暴露 GlobalId/Chunk/response 类型。
   零网络协议测试分别为 Python 15/15、TypeScript 18/18。
 - [x] **A15（2026-08-31，FS-002）：搜索契约矩阵与 explain**——两端搜索请求精确对齐共享 REST 字段矩阵，补 `ef_search`/`efSearch`，图片参数统一编码为 `query_image_base64`；TS `HitSource` 类型及 TS/Python agent 适配器保留 `sources`。Python 15 个协议测试 + 5 个 ingest 测试、TS 24 个测试通过。
+- [x] **A16（2026-08-31，FS-202）：信号 provenance**——TypeScript `HitSource` 增加可选 `model/model_version`；Python 保持开放 dict，无需升级。旧 server/旧 SDK 双向兼容，TS 26 个测试通过。
 - 下一迭代：Python SDK 发布 PyPI；TS 0.3.0 发 npm。

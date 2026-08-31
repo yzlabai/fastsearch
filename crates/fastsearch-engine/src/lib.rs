@@ -1083,9 +1083,9 @@ pub struct Engine {
     /// （filter/ACL 下推 + iterative scan + 精确后过滤）。仅在 **multi-thread tokio runtime** 下可用
     /// （`run` 内 `block_in_place` 桥接同步检索↔异步 PG 查询）。详见 `set_pg_vector`。
     vector_pg: Option<Arc<fastsearch_pg::PgStore>>,
-    /// 可选 **真源 PG 句柄**（MM6-inline）：媒资网关 `resolve_citation` 的 `Inline` 路径用它
-    /// 按需直查 PG `media_bytes` 字节（字节是真源、引擎派生层不持）。与 `vector_pg` 解耦（语义不同，
-    /// 可指向同一 `PgStore`）。仅在 **multi-thread tokio runtime** 下可用（`block_in_place` 桥接）。
+    /// 可选 **真源 PG 句柄**：媒资网关按需读取 `media_bytes`，检索按需读取 ready signal
+    /// recall list。与 `vector_pg` 解耦（主向量 ANN 与真源读取语义不同，可指向同一
+    /// `PgStore`）。仅在 **multi-thread tokio runtime** 下可用（`block_in_place` 桥接）。
     source_pg: Option<Arc<fastsearch_pg::PgStore>>,
     /// 可选对象存储。Object 图片嵌入和 token 字节端点从这里读取；默认未配置。
     object_store: Option<Arc<dyn ObjectStore>>,
@@ -1481,9 +1481,9 @@ impl Engine {
         Ok(Some(v))
     }
 
-    /// 开启 **媒资真源直查（MM6-inline）**：`resolve_citation` 的 `Inline` 路径据此从 PG
-    /// `media_bytes` 按需取字节（字节是真源、引擎派生层不持）。可与 `set_pg_vector` 共用同一
-    /// `PgStore`。**要求 multi-thread tokio runtime**（`resolve_citation` 内 `block_in_place` 桥接）。
+    /// 开启 **PG 真源直查**：`resolve_citation`/媒资字节路径读取 `media_bytes`，向量/混合检索
+    /// 追加 ready signal recall list。可与 `set_pg_vector` 共用同一 `PgStore`。
+    /// **要求 multi-thread tokio runtime**（同步 Engine 接口内用 `block_in_place` 桥接）。
     pub fn set_source_store(&mut self, store: Arc<fastsearch_pg::PgStore>) {
         self.source_pg = Some(store);
     }
@@ -1879,6 +1879,21 @@ impl Engine {
                 )
                 .map_err(|e| EngineError::Vector(e.to_string()))?
         };
+        let signal_recalls = if want_vec {
+            match (&self.source_pg, query_vec.as_deref()) {
+                (Some(pg), Some(query)) => block_on_pg(pg.signal_vector_search(
+                    query,
+                    candidates,
+                    PG_VECTOR_OVER_FETCH,
+                    acl,
+                    req.filter.as_ref(),
+                ))
+                .map_err(|error| EngineError::Vector(error.to_string()))?,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
 
         // 分面：在（keyword）候选集上按字段计数（kind / doc_id）。
         let facets = compute_facets(&req.facets, &kw_hits);
@@ -1926,8 +1941,27 @@ impl Engine {
             });
         }
 
-        // 融合（一路空自动退化）。引擎当前仍只产出 user_text 的 keyword/vector
-        // 两路；具名 N 路内核为后续 chunk_signal 接线留出公开、可解释的语义。
+        // Signal recall is already grouped and stably ranked by PgStore. Keep model provenance out
+        // of the pure fusion module; enrich SourceHit after fusion by the (source, gid) identity.
+        let mut signal_provenance =
+            HashMap::<(String, GlobalId), (Option<String>, Option<String>)>::new();
+        for list in &signal_recalls {
+            for hit in &list.items {
+                citation
+                    .entry(hit.scored.id.clone())
+                    .or_insert_with(|| hit.citation.clone());
+                vec_score
+                    .entry(hit.scored.id.clone())
+                    .and_modify(|score| *score = score.max(hit.scored.score))
+                    .or_insert(hit.scored.score);
+                signal_provenance.insert(
+                    (list.source.clone(), hit.scored.id.clone()),
+                    (hit.model.clone(), hit.model_version.clone()),
+                );
+            }
+        }
+
+        // 融合（一路空自动退化）。旧两路始终保留；ready、同维的 signal 路从 PG 真源动态追加。
         let kw_list: Vec<Scored> = kw_hits
             .iter()
             .map(|h| Scored {
@@ -1940,21 +1974,50 @@ impl Engine {
             Fusion::Weighted { alpha } => *alpha,
             Fusion::Rrf { .. } | Fusion::Weights { .. } => 1.0,
         };
-        let (fused, source_hits) = fuse_n_with_sources(
-            &[
-                RecallList::new(
-                    "keyword:user_text",
-                    if matches!(&req.fusion, Fusion::Rrf { .. } | Fusion::Weights { .. }) {
-                        1.0
-                    } else {
-                        1.0 - semantic_weight
-                    },
-                    kw_list,
-                ),
-                RecallList::new("vector:user_text", semantic_weight, vec_scored.clone()),
-            ],
-            &req.fusion,
-        );
+        let named_or_rrf = matches!(&req.fusion, Fusion::Rrf { .. } | Fusion::Weights { .. });
+        let active_vector_routes = usize::from(!vec_scored.is_empty())
+            + signal_recalls
+                .iter()
+                .filter(|list| !list.items.is_empty())
+                .count();
+        let route_semantic_weight = if named_or_rrf || active_vector_routes == 0 {
+            semantic_weight
+        } else {
+            semantic_weight / active_vector_routes as f64
+        };
+        let mut recall_lists = Vec::with_capacity(2 + signal_recalls.len());
+        recall_lists.push(RecallList::new(
+            "keyword:user_text",
+            if named_or_rrf {
+                1.0
+            } else {
+                1.0 - semantic_weight
+            },
+            kw_list,
+        ));
+        recall_lists.push(RecallList::new(
+            "vector:user_text",
+            route_semantic_weight,
+            vec_scored.clone(),
+        ));
+        recall_lists.extend(signal_recalls.iter().map(|list| {
+            RecallList::new(
+                list.source.clone(),
+                route_semantic_weight,
+                list.items.iter().map(|hit| hit.scored.clone()).collect(),
+            )
+        }));
+        let (fused, mut source_hits) = fuse_n_with_sources(&recall_lists, &req.fusion);
+        for (gid, sources) in &mut source_hits {
+            for source in sources {
+                if let Some((model, model_version)) =
+                    signal_provenance.get(&(source.source.clone(), gid.clone()))
+                {
+                    source.model.clone_from(model);
+                    source.model_version.clone_from(model_version);
+                }
+            }
+        }
 
         let mut hits: Vec<SearchHit> = fused
             .into_iter()
@@ -4345,6 +4408,199 @@ mod tests {
             weighted[0].id.chunk_id, 2,
             "具名权重只保留 vector:user_text 时，向量最相似的 c2 应居首"
         );
+    }
+
+    /// FS-202 T2: a real Engine request fuses the two legacy paths with a PG-backed image-caption
+    /// signal, and signal-only candidates retain explain provenance.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fs202_engine_fuses_three_real_recall_paths() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip fs202_engine_fuses_three_real_recall_paths: DATABASE_URL not set");
+            return;
+        };
+        let table = format!("fastsearch_fs202_engine_{}", std::process::id());
+        let signal_table = format!("{table}_signal");
+        let (admin, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("admin connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        admin
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {signal_table} CASCADE; DROP TABLE IF EXISTS {table} CASCADE;"
+            ))
+            .await
+            .expect("clean");
+
+        let mut pg_cfg = fastsearch_pg::PgConfig::new(url);
+        pg_cfg.table = table.clone();
+        pg_cfg.vector_dim = 2;
+        pg_cfg.vector_type = fastsearch_pg::VectorType::Vector;
+        let store = Arc::new(
+            fastsearch_pg::PgStore::connect(pg_cfg)
+                .await
+                .expect("connect"),
+        );
+        store.ensure_schema().await.expect("schema");
+
+        let mut keyword = chunk("signals.pdf", 1, ChunkKind::Paragraph, "margin trend", 1);
+        let mut semantic = chunk("signals.pdf", 2, ChunkKind::Paragraph, "semantic result", 2);
+        let mut caption = chunk(
+            "signals.pdf",
+            3,
+            ChunkKind::Image,
+            "chart without query terms",
+            3,
+        );
+        for row in [&mut keyword, &mut semantic, &mut caption] {
+            row.tenant = Some("acme".into());
+            row.acl = vec!["team-a".into()];
+        }
+        store
+            .upsert_chunks(&[
+                ("kb".into(), keyword.clone()),
+                ("kb".into(), semantic.clone()),
+                ("kb".into(), caption.clone()),
+            ])
+            .await
+            .expect("chunks");
+        let mut e = engine();
+        e.ingest_vector("kb", &keyword, vec![0.0, 1.0]).unwrap();
+        e.ingest_vector("kb", &semantic, vec![1.0, 0.0]).unwrap();
+        e.ingest("kb", &caption).unwrap();
+        e.commit().unwrap();
+
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/golden/fs202_multi_signal.json"))
+                .expect("multi-signal golden");
+        let request = SearchRequest {
+            query: golden["query"].as_str().unwrap().into(),
+            mode: SearchMode::Hybrid,
+            vector: Some(
+                golden["vector"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_f64().unwrap() as f32)
+                    .collect(),
+            ),
+            top_k: 3,
+            candidates: 10,
+            explain: true,
+            ..Default::default()
+        };
+        let acl = AclFilter {
+            tenant: Some("acme".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        let legacy_hits = e.search(&request, Some(&acl)).expect("legacy search");
+        e.set_source_store(store.clone());
+        let empty_signal_hits = e
+            .search(&request, Some(&acl))
+            .expect("search without usable signals");
+        let snapshot = |hits: &[SearchHit]| {
+            hits.iter()
+                .map(|hit| {
+                    (
+                        hit.id.clone(),
+                        hit.score.to_bits(),
+                        hit.bm25.map(f32::to_bits),
+                        hit.vector.map(f64::to_bits),
+                        hit.sources.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            snapshot(&legacy_hits),
+            snapshot(&empty_signal_hits),
+            "配置来源库但没有可用信号时必须与旧双路召回逐位一致"
+        );
+
+        store
+            .upsert_signal(&fastsearch_core::Signal {
+                gid: caption.global_id("kb"),
+                signal_type: fastsearch_core::SignalType::VlmCaption,
+                status: fastsearch_core::SignalStatus::Ready,
+                model: Some("clip-caption".into()),
+                model_version: Some("2026-08".into()),
+                signal_text: Some("margin chart".into()),
+                embedding: Some(vec![1.0, 0.0]),
+                ..Default::default()
+            })
+            .await
+            .expect("caption signal");
+        let hits = e.search(&request, Some(&acl)).expect("search");
+        let expected_hits = golden["hits"].as_array().expect("golden hits");
+        assert_eq!(hits.len(), expected_hits.len());
+        for (actual, expected) in hits.iter().zip(expected_hits) {
+            assert_eq!(
+                actual.id.collection,
+                expected["collection"].as_str().unwrap()
+            );
+            assert_eq!(actual.id.doc_id, expected["doc_id"].as_str().unwrap());
+            assert_eq!(actual.id.chunk_id, expected["chunk_id"].as_u64().unwrap());
+            assert!((actual.score - expected["score"].as_f64().unwrap()).abs() < 1e-15);
+            match expected["bm25"].as_f64() {
+                Some(score) => assert!((actual.bm25.unwrap() as f64 - score).abs() < 1e-6),
+                None => assert_eq!(actual.bm25, None),
+            }
+            match expected["vector"].as_f64() {
+                Some(score) => assert!((actual.vector.unwrap() - score).abs() < 1e-15),
+                None => assert_eq!(actual.vector, None),
+            }
+
+            let actual_sources = actual.sources.as_ref().expect("explain sources");
+            let expected_sources = expected["sources"].as_array().expect("golden sources");
+            assert_eq!(actual_sources.len(), expected_sources.len());
+            for (actual_source, expected_source) in
+                actual_sources.iter().zip(expected_sources.iter())
+            {
+                assert_eq!(
+                    actual_source.source,
+                    expected_source["source"].as_str().unwrap()
+                );
+                assert_eq!(
+                    actual_source.rank,
+                    expected_source["rank"].as_u64().unwrap() as usize
+                );
+                assert!(
+                    (actual_source.score - expected_source["score"].as_f64().unwrap()).abs()
+                        < 1e-15
+                );
+                assert!(
+                    (actual_source.contribution
+                        - expected_source["contribution"].as_f64().unwrap())
+                    .abs()
+                        < 1e-15
+                );
+                assert_eq!(
+                    actual_source.model.as_deref(),
+                    expected_source["model"].as_str()
+                );
+                assert_eq!(
+                    actual_source.model_version.as_deref(),
+                    expected_source["model_version"].as_str()
+                );
+            }
+            assert!(
+                (actual_sources
+                    .iter()
+                    .map(|source| source.contribution)
+                    .sum::<f64>()
+                    - actual.score)
+                    .abs()
+                    < 1e-15
+            );
+        }
+
+        admin
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {signal_table} CASCADE; DROP TABLE IF EXISTS {table} CASCADE;"
+            ))
+            .await
+            .ok();
     }
 
     #[test]

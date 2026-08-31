@@ -33,7 +33,9 @@ pg_gates=(
   fs201_signal_crud_and_invalidation
   fs201_signal_reconciliation_and_acl_deletes
   fs201_signal_schema_publication_and_cdc_contract
+  fs202_signal_vector_search_filters_and_orders
   pgvector_backend_via_engine
+  fs202_engine_fuses_three_real_recall_paths
   b6_cdc_write_through_to_pg_embedding
   mm6_inline_serves_bytes_from_source_pg
   cdc_closed_loop_pg_to_search

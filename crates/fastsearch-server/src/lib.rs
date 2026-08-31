@@ -844,7 +844,9 @@ fn openapi_spec() -> Value {
                         "source": {"type": "string"},
                         "rank": {"type": "integer", "minimum": 1},
                         "score": {"type": "number", "description": "该路原始分"},
-                        "contribution": {"type": "number", "description": "对融合分的实际加数"}
+                        "contribution": {"type": "number", "description": "对融合分的实际加数"},
+                        "model": {"type": "string", "description": "信号生产模型；旧两路省略"},
+                        "model_version": {"type": "string", "description": "信号模型版本；旧两路省略"}
                     }}},
             "cursor": {"type": "string", "description": "深分页游标；作下次 search_after 续取下一页"}
         }
@@ -6047,6 +6049,12 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(actual_hit, expected_hit);
+        let source_schema = &v["components"]["schemas"]["Hit"]["properties"]["sources"]["items"];
+        assert!(source_schema["properties"]["model"].is_object());
+        assert!(source_schema["properties"]["model_version"].is_object());
+        let source_required = source_schema["required"].as_array().unwrap();
+        assert!(!source_required.iter().any(|field| field == "model"));
+        assert!(!source_required.iter().any(|field| field == "model_version"));
         assert!(
             v["components"]["schemas"]["SearchRequest"]["properties"]["query_image_base64"]
                 .is_object()
@@ -6231,6 +6239,8 @@ mod tests {
             rank: 1,
             score: 0.9,
             contribution: 1.0 / 61.0,
+            model: None,
+            model_version: None,
         }]);
         let included = hits_json(&[hit], None, None);
         assert_eq!(included[0]["text"], "complete text");
