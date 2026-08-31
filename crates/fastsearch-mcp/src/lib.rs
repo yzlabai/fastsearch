@@ -389,11 +389,21 @@ impl McpServer {
         // `max_context_chars` 是**本面**的旋钮，不是 `SearchRequest` 的字段——先摘走再反序列化，
         // 否则 serde 会把它当未知字段丢掉（丢掉不报错，于是预算静默失效）。
         let mut args = args;
-        let budget = args
+        let budget = match args
             .as_object_mut()
             .and_then(|o| o.remove("max_context_chars"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+        {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        "max_context_chars 必须是当前平台可表示的非负整数（按 Unicode 字符计）"
+                            .to_string()
+                    })?,
+            ),
+        };
         let mut req: SearchRequest =
             serde_json::from_value(args).map_err(|e| format!("invalid search args: {e}"))?;
         if !mode_given {
@@ -439,11 +449,12 @@ impl McpServer {
         let Some(budget) = budget else {
             return serde_json::to_string(&json!({ "hits": arr })).map_err(|e| e.to_string());
         };
-        let (arr, dropped, used) = apply_budget(arr, budget);
+        let (arr, dropped, truncated, used) = apply_budget(arr, budget);
         serde_json::to_string(&json!({
             "hits": arr,
             // 截断必须**对 agent 可见**：静默丢证据 = 让它以为自己看到了全部。
             "dropped": dropped,
+            "truncated": truncated,
             "context_chars": used,
         }))
         .map_err(|e| e.to_string())
@@ -768,10 +779,45 @@ const MIN_HIT_CHARS: usize = 80;
 /// **确定性**（不变量 #4）：按融合后的既有顺序前向累加，同输入必同结果——不重排、不抽样。
 /// **截断对 agent 可见**：被砍的那条标 `text_truncated`，整体报 `dropped` 与 `context_chars`；
 /// 静默丢证据是本仓反复在修的那类错。
-fn apply_budget(hits: Vec<Value>, budget: usize) -> (Vec<Value>, usize, usize) {
+fn truncate_hit_to(h: &mut Value, kept_chars: usize) {
+    let fields = ["snippet", "text"];
+    let mut remaining = kept_chars;
+    let mut last_kept = None;
+    for (index, field) in fields.iter().enumerate() {
+        let Some(value) = h.get(*field).and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let len = value.chars().count();
+        if len <= remaining {
+            remaining -= len;
+            if len > 0 {
+                last_kept = Some(*field);
+            }
+            continue;
+        }
+
+        if remaining > 0 {
+            let prefix: String = value.chars().take(remaining).collect();
+            h[*field] = json!(format!("{prefix}…"));
+        } else if let Some(last) = last_kept {
+            let kept = h[last].as_str().unwrap_or_default();
+            h[last] = json!(format!("{kept}…"));
+        }
+        for later in &fields[index + 1..] {
+            if h.get(*later).is_some() {
+                h[*later] = Value::Null;
+            }
+        }
+        h["text_truncated"] = json!(true);
+        return;
+    }
+}
+
+fn apply_budget(hits: Vec<Value>, budget: usize) -> (Vec<Value>, usize, usize, usize) {
     let total = hits.len();
     let mut out = Vec::with_capacity(total);
     let mut used = 0usize;
+    let mut truncated = 0usize;
     for mut h in hits {
         let cost = hit_cost(&h);
         if used + cost <= budget {
@@ -782,19 +828,15 @@ fn apply_budget(hits: Vec<Value>, budget: usize) -> (Vec<Value>, usize, usize) {
         // 放不下整条：能留够 MIN_HIT_CHARS 就截断它，否则整条丢弃。两种情况后续都不再放。
         let remaining = budget.saturating_sub(used);
         if remaining >= MIN_HIT_CHARS {
-            if let Some(t) = h.get("text").and_then(Value::as_str) {
-                let kept: String = t.chars().take(remaining).collect();
-                let kept_len = kept.chars().count();
-                h["text"] = json!(format!("{kept}…"));
-                h["text_truncated"] = json!(true);
-                used += kept_len;
-                out.push(h);
-            }
+            truncate_hit_to(&mut h, remaining);
+            used += remaining;
+            truncated += 1;
+            out.push(h);
         }
         break;
     }
     let dropped = total - out.len();
-    (out, dropped, used)
+    (out, dropped, truncated, used)
 }
 
 /// JSON-RPC 成功响应。
@@ -1004,6 +1046,24 @@ mod tests {
         assert_eq!(keys, vec!["hits"], "无预算时不得多出 dropped/context_chars");
     }
 
+    #[test]
+    fn invalid_budget_is_rejected_instead_of_silently_disabled() {
+        let s = server();
+        let r = s
+            .handle(&json!({
+                "jsonrpc":"2.0","id":601,"method":"tools/call",
+                "params": { "name":"search", "arguments": {
+                    "query":"毛利率", "max_context_chars": -1 } }
+            }))
+            .unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("非负整数"),
+            "error should be actionable: {text}"
+        );
+    }
+
     /// 预算按**既有顺序**前向累加，放不下的整条丢弃，且丢弃对 agent 可见。
     /// 确定性（不变量 #4）：同输入必同结果——不重排、不抽样。
     #[test]
@@ -1065,6 +1125,47 @@ mod tests {
         );
         assert!(text.ends_with('…'));
         assert!(v["context_chars"].as_u64().unwrap() <= 200);
+    }
+
+    #[test]
+    fn context_budget_matches_the_shared_cross_sdk_contract() {
+        let contract: Value = serde_json::from_str(include_str!(
+            "../../../docs/contracts/context-budget-cases.json"
+        ))
+        .unwrap();
+        assert_eq!(contract["min_hit_chars"], MIN_HIT_CHARS);
+        for case in contract["cases"].as_array().unwrap() {
+            let hits = case["hits"].as_array().unwrap().clone();
+            let budget = case["budget"].as_u64().unwrap() as usize;
+            let (hits, dropped, truncated, context_chars) = apply_budget(hits, budget);
+            let kept: Vec<_> = hits
+                .iter()
+                .map(|hit| hit["citation_id"].as_str().unwrap())
+                .collect();
+            let expected: Vec<_> = case["expected"]["kept_citation_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap())
+                .collect();
+            assert_eq!(kept, expected, "{}", case["name"]);
+            assert_eq!(
+                dropped,
+                case["expected"]["dropped"].as_u64().unwrap() as usize
+            );
+            assert_eq!(
+                truncated,
+                case["expected"]["truncated"].as_u64().unwrap() as usize
+            );
+            assert_eq!(
+                context_chars,
+                case["expected"]["context_chars"].as_u64().unwrap() as usize
+            );
+            if let Some(expected_text) = case["expected"]["last_text"].as_str() {
+                assert_eq!(hits.last().unwrap()["text"], expected_text);
+                assert_eq!(hits.last().unwrap()["text_truncated"], true);
+            }
+        }
     }
 
     /// KB-0.5：描述要讲清**本实例**的作用域与可用 filter 字段，而不是泛泛的"混合检索引擎"。

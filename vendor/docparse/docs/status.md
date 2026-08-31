@@ -5,6 +5,13 @@
 > 执行里程碑历史见 [devlogs/](devlogs/)；
 > **接入 Agent/RAG** 见 [agent-integration.md](agent-integration.md)（CLI/MCP/REST/库 + chunk schema + 引用/增强模式）。
 
+**FastSearch FS-204 · geometry-safe chunk overlap（2026-08-31，已实施）**：
+`docparse-core::chunk::ChunkOptions` 新增默认 0 的 `overlap_chars`；仅在同页正文因 target flush
+时复用不超过上限的完整 layout block，heading/table/image/code/list/page 均作为硬边界。
+重叠 chunk 的 bbox 是复用 block 与新 block 的真实 union，page/heading_path/section_id/char_len
+保持可引用。core-only 93 tests、workspace 309 tests、全 workspace clippy `-D warnings` 与三份真实 PDF 的 text/chunks 回归通过；详见
+[计划](plans/2026-08-31-chunk-overlap-profile.md)与[测试用例](testcases/chunk-overlap-profile.md)。
+
 ## 1. 完成里程碑
 
 **全部完成**（截至 2026-06-11，见 devlogs/ 双部会话总结）：M1–M7、N1–N5、Phase 4 可自主项：

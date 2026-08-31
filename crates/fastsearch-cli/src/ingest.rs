@@ -65,6 +65,8 @@ pub struct IngestOpts {
     pub acl: Vec<String>,
     /// 图片原始字节的去向（默认 [`ImageBytes::Object`]）。
     pub images: ImageBytes,
+    /// 本次解析分块采用的可追溯 profile。
+    pub chunk_profile: crate::ChunkProfile,
 }
 
 /// docparse 多格式解析器注册表（轻量、无 ONNX）：按 `DocumentParser::supports`（扩展名/magic）
@@ -434,10 +436,22 @@ pub fn chunks_for_file(opts: &IngestOpts) -> Result<Vec<Chunk>> {
         .images
         .wants_bytes()
         .then(|| harvest_image_bytes(&mut doc));
-    let dchunks = docparse_core::chunk::chunk_document(&doc);
+    let dchunks = docparse_core::chunk::chunk_document_with(
+        &doc,
+        docparse_core::chunk::ChunkOptions {
+            target_chars: opts.chunk_profile.target_chars(),
+            overlap_chars: opts.chunk_profile.overlap_chars(),
+            table_markdown: opts.chunk_profile.table_markdown(),
+        },
+    );
     let mut chunks: Vec<Chunk> = dchunks
         .iter()
-        .map(|d| from_docparse_chunk(d, &opts.doc_id, opts.tenant.clone(), opts.acl.clone()))
+        .map(|d| {
+            let mut chunk =
+                from_docparse_chunk(d, &opts.doc_id, opts.tenant.clone(), opts.acl.clone());
+            opts.chunk_profile.attach_to(&mut chunk, "docparse");
+            chunk
+        })
         .collect();
     if let Some(idx) = &mut images {
         let st = attach_image_bytes(&mut chunks, &dchunks, idx);
@@ -763,6 +777,23 @@ mod tests {
             tenant: None,
             acl: vec!["public".into()],
             images,
+            chunk_profile: crate::ChunkProfile::docparse_default(),
+        }
+    }
+
+    #[test]
+    fn chunks_for_file_records_the_selected_chunk_profile() {
+        let mut opts = ingest_opts("with-image.docx", ImageBytes::None);
+        opts.chunk_profile = crate::ChunkProfile::new("annual-report", 3, 512, 64, true).unwrap();
+        let chunks = chunks_for_file(&opts).expect("parse fixture");
+        assert!(!chunks.is_empty());
+        for chunk in chunks {
+            assert_eq!(chunk.metadata["chunking"]["chunker"], "docparse");
+            assert_eq!(chunk.metadata["chunking"]["profile"], "annual-report");
+            assert_eq!(chunk.metadata["chunking"]["version"], 3);
+            assert_eq!(chunk.metadata["chunking"]["target_chars"], 512);
+            assert_eq!(chunk.metadata["chunking"]["overlap_chars"], 64);
+            assert_eq!(chunk.metadata["chunking"]["table_markdown"], true);
         }
     }
 

@@ -103,6 +103,49 @@ fn chunk_text_markdown_headings_and_paras() {
 }
 
 #[test]
+fn chunk_text_profile_controls_boundaries_overlap_and_provenance() {
+    let profile = ChunkProfile::new("notes", 2, 20, 5, false).unwrap();
+    let content = format!(
+        "{}\n\n{}\n\n{}",
+        "甲".repeat(15),
+        "乙".repeat(15),
+        "丙".repeat(15)
+    );
+    let chunks = chunk_text_with(&content, "notes.md", &profile);
+    let paragraphs: Vec<_> = chunks
+        .iter()
+        .filter(|chunk| chunk.kind == ChunkKind::Paragraph)
+        .collect();
+
+    assert_eq!(paragraphs.len(), 2);
+    assert_eq!(
+        paragraphs[0].text,
+        format!("{} {}", "甲".repeat(15), "乙".repeat(15))
+    );
+    assert_eq!(
+        paragraphs[1].text,
+        format!("{} {}", "乙".repeat(5), "丙".repeat(15))
+    );
+    assert_eq!(paragraphs[1].char_len, 21);
+    for chunk in chunks {
+        assert_eq!(chunk.metadata["chunking"]["chunker"], "fastsearch_text");
+        assert_eq!(chunk.metadata["chunking"]["profile"], "notes");
+        assert_eq!(chunk.metadata["chunking"]["version"], 2);
+        assert_eq!(chunk.metadata["chunking"]["target_chars"], 20);
+        assert_eq!(chunk.metadata["chunking"]["overlap_chars"], 5);
+        assert_eq!(chunk.metadata["chunking"]["table_markdown"], false);
+    }
+}
+
+#[test]
+fn chunk_profile_rejects_non_progressing_or_untraceable_values() {
+    assert!(ChunkProfile::new("", 1, 100, 10, false).is_err());
+    assert!(ChunkProfile::new("notes", 0, 100, 10, false).is_err());
+    assert!(ChunkProfile::new("notes", 1, 0, 0, false).is_err());
+    assert!(ChunkProfile::new("notes", 1, 100, 100, false).is_err());
+}
+
+#[test]
 fn build_filter_always_scopes_collection() {
     // 仅 collection → 单 Eq
     match build_filter("kb", None, None, None, None) {
@@ -240,11 +283,41 @@ fn cmd_index_dir_feeds_folder_to_server() {
         key: Some("k".into()),
         collection: "kb".into(),
         concurrency: 1,
+        chunk_profile: ChunkProfile::text_default(),
     };
     let (ok, failed, total) = cmd_index_dir(&opts, dir.path()).unwrap();
     assert_eq!(ok, 3, "三个文本文件都应上传");
     assert_eq!(failed, 0);
     assert_eq!(total, 9, "每文件 mock 报 3 chunk → 3×3");
+}
+
+#[test]
+fn cmd_index_dir_posts_selected_chunk_profile_provenance() {
+    let (url, rx) = spawn_capture(r#"{"indexed":1}"#);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("profile.md"), "可追溯的分块配置").unwrap();
+    let opts = IndexDirOpts {
+        server: Some(url),
+        key: Some("k".into()),
+        collection: "kb".into(),
+        concurrency: 1,
+        chunk_profile: ChunkProfile::new("support-kb", 3, 64, 8, false).unwrap(),
+    };
+
+    assert_eq!(cmd_index_dir(&opts, dir.path()).unwrap(), (1, 0, 1));
+    let req = String::from_utf8_lossy(&rx.recv().unwrap()).to_string();
+    assert!(req.starts_with("POST /v1/index "), "request: {req}");
+    for expected in [
+        r#""profile":"support-kb""#,
+        r#""version":3"#,
+        r#""target_chars":64"#,
+        r#""overlap_chars":8"#,
+    ] {
+        assert!(
+            req.contains(expected),
+            "missing {expected} in request: {req}"
+        );
+    }
 }
 
 #[test]
@@ -264,6 +337,7 @@ fn cmd_index_dir_concurrent_uploads_all() {
         key: Some("k".into()),
         collection: "kb".into(),
         concurrency: 6,
+        chunk_profile: ChunkProfile::text_default(),
     };
     let (ok, failed, total) = cmd_index_dir(&opts, dir.path()).unwrap();
     assert_eq!(ok, 20, "20 文件应全部上传（并发不丢）");

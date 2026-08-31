@@ -46,6 +46,32 @@ c.delete_collection("kb")
 c = FastsearchClient("http://127.0.0.1:8642", api_key="dev", retries=2)
 ```
 
+## 纯文本分块与 Agent 上下文预算
+
+```python
+from fastsearch_client import chunk_text, format_hits_for_llm
+
+chunks = chunk_text(
+    markdown,
+    doc_id="notes.md",
+    profile="support-kb",
+    profile_version=2,
+    target_chars=900,
+    overlap=90,
+)
+# 每条 chunk["metadata"]["chunking"] 可反解所选配置；profile 变化只影响新摄取
+c.index("kb", "notes.md", chunks)
+
+hits = c.search("kb", "毛利率", top_k=8, highlight=True, include_text=True)
+ctx = format_hits_for_llm(hits, max_context_chars=2_000)
+# ctx: content/citations + dropped/truncated/context_chars
+```
+
+总预算按 Unicode 字符和既有命中顺序累计 `highlight + text`。首个放不下的命中在剩余至少
+80 字符时截断，否则连同尾部丢弃；不估算 token。未设置预算时 helper 只返回
+`content/citations`，保持最小响应形状。同时设置 `max_chars_per_hit` 时先限制单条，再按实际
+留下的 evidence 做总预算；per-hit 截断不混入总预算的 `truncated`。
+
 ## LangChain / LlamaIndex
 
 `fastsearch_client.integrations` 提供两个生态的检索适配（依赖可选，未装则回退本地等价对象）：

@@ -113,10 +113,33 @@ const tool = makeSearchTool(client, "kb", {
 import { formatHitsForLLM } from "fastsearch-client";
 
 const { hits } = await client.search("kb", query, { topK: 8, highlight: true });
-const { content, citations } = formatHitsForLLM(hits);
+const { content, citations, dropped, truncated, context_chars } = formatHitsForLLM(hits, {
+  maxContextChars: 2_000,
+});
 // content:  "[1] (report.pdf p.7) …片段…\n[2] (report.pdf p.9) …"
 // citations: [{ marker: 1, citation_id, doc_id, page, ... }, ...]
+// dropped/truncated/context_chars：按 Unicode 字符确定性记账；未设预算时不返回这三项
 const prompt = `根据以下资料回答，并用 [n] 标注来源：\n\n${content}\n\n问题：${query}`;
+```
+
+预算按既有命中顺序累计 `highlight + text`。首个放不下的命中在剩余至少 80 字符时截断并标记，
+否则连同尾部丢弃；不估算 token。同时设置 `maxCharsPerHit` 时先限制单条，再按实际留下的
+evidence 做总预算，per-hit 截断不混入总预算的 `truncated`。
+
+## 纯文本分块与 provenance
+
+```ts
+import { chunkText } from "fastsearch-client";
+
+const chunks = chunkText(markdown, {
+  docId: "notes.md",
+  profile: "support-kb",
+  profileVersion: 2,
+  targetChars: 900,
+  overlap: 90,
+});
+// 每条 chunk.metadata.chunking 可反解上述配置；修改 profile 只影响新摄取
+await client.index("kb", "notes.md", chunks);
 ```
 
 ## LangChain.js 检索器

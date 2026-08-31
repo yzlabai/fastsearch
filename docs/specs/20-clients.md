@@ -26,6 +26,8 @@
 - `health() -> bool` / `openapi() -> dict`。
 - 认证：构造时传 api_key → `X-API-Key` 头。ACL 服务端强制。
 - 可选重试：构造参数 `retries`（Python）/`retries`（TS），仅 429/5xx/网络错指数退避，默认 0。
+- `chunkText` / `chunk_text`：可传 profile/version/target/overlap；每条 chunk 写 `metadata.chunking`。profile 仅是可追溯配置，不触发旧文档重切。
+- `formatHitsForLLM` / `format_hits_for_llm`：可传总 Unicode 字符预算；按命中顺序累计 highlight+text，剩余至少 80 字符时截断首个放不下的命中，否则丢尾部；返回 `dropped/truncated/context_chars`。同时设置 per-hit 时先限单条、再按实际留下的 evidence 做总预算，且 per-hit 截断不混入总预算 `truncated`。未传预算时保持原 `content/citations` 形状。
 - `embedder` 为跨版本保留参数；当前 server 只有实例级后端，传非空值会明确 400，不会被静默忽略。
 
 ## 3. 行为规约
@@ -51,4 +53,5 @@
 - [x] **A15（2026-08-31，FS-002）：搜索契约矩阵与 explain**——两端搜索请求精确对齐共享 REST 字段矩阵，补 `ef_search`/`efSearch`，图片参数统一编码为 `query_image_base64`；TS `HitSource` 类型及 TS/Python agent 适配器保留 `sources`。Python 15 个协议测试 + 5 个 ingest 测试、TS 24 个测试通过。
 - [x] **A16（2026-08-31，FS-202）：信号 provenance**——TypeScript `HitSource` 增加可选 `model/model_version`；Python 保持开放 dict，无需升级。旧 server/旧 SDK 双向兼容，TS 26 个测试通过。
 - [x] **A17（2026-08-31，FS-203）：rerank explain**——TypeScript `Hit` 增加可选 `RerankExplain`/状态/稳定原因联合类型；TS/Python 的 LangChain 风格 metadata 适配均保留该字段。默认旧命中无需提供，Python 继续使用开放 dict。TS 27 个、Python 15 个协议测试通过。
+- [x] **A18（2026-08-31，FS-204）：分块 provenance + 上下文预算**——TS/Python 纯文本分块 helper 同步 profile/version/target/overlap 校验与 `metadata.chunking`；修复文末仅 overlap 尾巴被误发成新 chunk。两端与 MCP 共读 `docs/contracts/context-budget-cases.json`，Unicode/CJK/emoji、跨 highlight+text 截断与三项记账一致；无预算返回形状不变。
 - 下一迭代：Python SDK 发布 PyPI；TS 0.3.0 发 npm。

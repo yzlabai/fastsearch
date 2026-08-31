@@ -412,6 +412,60 @@ test("formatHitsForLLM builds markers and parallel citations", () => {
   assert.equal(ctx.citations.length, 2);
   assert.equal(ctx.citations[0]!.marker, 1);
   assert.equal(ctx.citations[1]!.citation_id, "kb:r.pdf:4");
+  assert.deepEqual(Object.keys(ctx).sort(), ["citations", "content"], "no budget keeps shape");
+});
+
+test("formatHitsForLLM matches the shared MCP/Python context budget contract", () => {
+  const contract = JSON.parse(
+    readFileSync("../../docs/contracts/context-budget-cases.json", "utf8"),
+  ) as {
+    cases: Array<{
+      name: string;
+      budget: number;
+      hits: Array<{ citation_id: string; snippet: string; text: string | null }>;
+      expected: {
+        kept_citation_ids: string[];
+        dropped: number;
+        truncated: number;
+        context_chars: number;
+        last_text?: string;
+      };
+    }>;
+  };
+  for (const c of contract.cases) {
+    const hits = c.hits.map((hit, index) =>
+      makeHit({
+        citation_id: hit.citation_id,
+        chunk_id: index + 1,
+        highlight: hit.snippet,
+        text: hit.text ?? undefined,
+      }),
+    );
+    const result = formatHitsForLLM(hits, { maxContextChars: c.budget });
+    assert.deepEqual(
+      result.citations.map((citation) => citation.citation_id),
+      c.expected.kept_citation_ids,
+      c.name,
+    );
+    assert.equal(result.dropped, c.expected.dropped, c.name);
+    assert.equal(result.truncated, c.expected.truncated, c.name);
+    assert.equal(result.context_chars, c.expected.context_chars, c.name);
+    if (c.expected.last_text) assert.ok(result.content.includes(c.expected.last_text), c.name);
+  }
+});
+
+test("per-hit limit is applied before total budget and is not counted as budget truncation", () => {
+  const hits = [
+    makeHit({ citation_id: "kb:p:1", highlight: null, text: "甲".repeat(100) }),
+    makeHit({ citation_id: "kb:p:2", highlight: null, text: "乙".repeat(100) }),
+  ];
+  const result = formatHitsForLLM(hits, { maxCharsPerHit: 10, maxContextChars: 20 });
+  assert.deepEqual(result.citations.map((citation) => citation.citation_id), ["kb:p:1", "kb:p:2"]);
+  assert.equal(result.context_chars, 20);
+  assert.equal(result.dropped, 0);
+  assert.equal(result.truncated, 0, "per-hit truncation is distinct from total-budget truncation");
+  assert.match(result.content, /甲{10}…/);
+  assert.match(result.content, /乙{10}…/);
 });
 
 test("makeSearchTool exposes both tool schemas and runs", async () => {
@@ -609,11 +663,32 @@ test("chunkText: 坐标是占位的——纯文本没有版面，不能假装可
   const out = chunkText("只有一段。", { docId: "n.md" });
   assert.equal(out[0]!.page, 1);
   assert.deepEqual(out[0]!.bbox, { x0: 0, y0: 0, x1: 0, y1: 0 });
+  assert.equal(chunkText("毛利率📈", { docId: "u.md" })[0]!.char_len, 4, "Unicode code points");
 });
 
 test("chunkText: overlap 让相邻块首尾相接，避免答案被切断", () => {
   const text = "甲".repeat(50) + "\n\n" + "乙".repeat(50);
-  const out = chunkText(text, { docId: "n.md", targetChars: 40, overlap: 5 });
-  assert.ok(out.length >= 2, "应切成多块");
+  const out = chunkText(text, {
+    docId: "n.md",
+    targetChars: 40,
+    overlap: 5,
+    profile: "notes",
+    profileVersion: 2,
+  });
+  assert.equal(out.length, 2, "不得把末尾 overlap 单独再发成第三块");
   assert.ok(out[1]!.text.startsWith("甲"), "第二块以上一块的尾部起头");
+  assert.deepEqual(out[0]!.metadata?.chunking, {
+    chunker: "fastsearch_text",
+    profile: "notes",
+    version: 2,
+    target_chars: 40,
+    overlap_chars: 5,
+    table_markdown: false,
+  });
+  assert.throws(
+    () => chunkText("x", { docId: "n.md", targetChars: 10, overlap: 10 }),
+    /smaller than target/,
+  );
+  assert.throws(() => chunkText("x", { docId: "n.md", targetChars: 0 }), /positive integer/);
+  assert.throws(() => chunkText("x", { docId: "n.md", profile: " " }), /must not be empty/);
 });

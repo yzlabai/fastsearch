@@ -1,0 +1,71 @@
+{
+  "min_hit_chars": 80,
+  "cases": [
+    {
+      "name": "exact budget keeps every hit",
+      "budget": 9,
+      "hits": [
+        {"citation_id": "kb:a:1", "snippet": "毛利率", "text": "增长"},
+        {"citation_id": "kb:a:2", "snippet": "cash", "text": null}
+      ],
+      "expected": {
+        "kept_citation_ids": ["kb:a:1", "kb:a:2"],
+        "dropped": 0,
+        "truncated": 0,
+        "context_chars": 9
+      }
+    },
+    {
+      "name": "truncation accounts for snippet before text",
+      "budget": 98,
+      "hits": [
+        {"citation_id": "kb:b:1", "snippet": "lead", "text": "data"},
+        {
+          "citation_id": "kb:b:2",
+          "snippet": "0123456789",
+          "text": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+        },
+        {"citation_id": "kb:b:3", "snippet": "tail", "text": "must drop"}
+      ],
+      "expected": {
+        "kept_citation_ids": ["kb:b:1", "kb:b:2"],
+        "dropped": 1,
+        "truncated": 1,
+        "context_chars": 98,
+        "last_text": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij…"
+      }
+    },
+    {
+      "name": "remaining capacity below minimum drops the tail",
+      "budget": 99,
+      "hits": [
+        {"citation_id": "kb:c:1", "snippet": "", "text": "123456789012345678901234567890"},
+        {
+          "citation_id": "kb:c:2",
+          "snippet": "",
+          "text": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+        },
+        {"citation_id": "kb:c:3", "snippet": "tail", "text": null}
+      ],
+      "expected": {
+        "kept_citation_ids": ["kb:c:1"],
+        "dropped": 2,
+        "truncated": 0,
+        "context_chars": 30
+      }
+    },
+    {
+      "name": "unicode code points are characters not utf8 bytes",
+      "budget": 7,
+      "hits": [
+        {"citation_id": "kb:d:1", "snippet": "毛利率📈", "text": "增长🚀"}
+      ],
+      "expected": {
+        "kept_citation_ids": ["kb:d:1"],
+        "dropped": 0,
+        "truncated": 0,
+        "context_chars": 7
+      }
+    }
+  ]
+}

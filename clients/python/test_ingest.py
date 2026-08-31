@@ -50,12 +50,43 @@ def test_chunk_text_coordinates_are_placeholders():
     out = chunk_text("只有一段。", doc_id="n.md")
     assert out[0]["page"] == 1
     assert out[0]["bbox"] == {"x0": 0.0, "y0": 0.0, "x1": 0.0, "y1": 0.0}
+    assert chunk_text("毛利率📈", doc_id="u.md")[0]["char_len"] == 4
 
 
 def test_chunk_text_overlap():
-    out = chunk_text("甲" * 50 + "\n\n" + "乙" * 50, doc_id="n.md", target_chars=40, overlap=5)
-    assert len(out) >= 2
+    out = chunk_text(
+        "甲" * 50 + "\n\n" + "乙" * 50,
+        doc_id="n.md",
+        target_chars=40,
+        overlap=5,
+        profile="notes",
+        profile_version=2,
+    )
+    assert len(out) == 2, "不得把末尾 overlap 单独再发成第三块"
     assert out[1]["text"].startswith("甲"), "第二块以上一块的尾部起头"
+    assert out[0]["metadata"]["chunking"] == {
+        "chunker": "fastsearch_text",
+        "profile": "notes",
+        "version": 2,
+        "target_chars": 40,
+        "overlap_chars": 5,
+        "table_markdown": False,
+    }
+    try:
+        chunk_text("x", doc_id="n.md", target_chars=10, overlap=10)
+        raise AssertionError("overlap >= target 应报错")
+    except ValueError as exc:
+        assert "smaller than target" in str(exc)
+    invalid = [
+        ({"target_chars": 0}, "positive integer"),
+        ({"profile": " "}, "not be empty"),
+    ]
+    for kwargs, message in invalid:
+        try:
+            chunk_text("x", doc_id="n.md", **kwargs)
+            raise AssertionError("非法 profile 参数应报错")
+        except ValueError as exc:
+            assert message in str(exc)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,11 @@
 
 **image chunk**：`text` = 图说 ⊕ 周边上下文（可检索字段）；`image` = `{ file?, data_base64?, media_type?, caption?, caption_source? }`（渲染/引用）。详见 §4。
 
+**可配置分块（2026-08-31）**：库调用方可用 `chunk_document_with(doc, ChunkOptions)` 设置
+`target_chars`、`overlap_chars` 与 `table_markdown`。overlap 只在同页正文 target 边界复用完整
+layout block；不跨 heading/table/image/code/list/page，不截断 block，因此 page/bbox/section 仍与
+真实源几何一致。默认 overlap 为 0，`chunk_document` 行为兼容。
+
 ---
 
 ## 3. CLI 选项速查

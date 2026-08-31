@@ -97,6 +97,8 @@ def chunk_text(
     text: str,
     *,
     doc_id: str,
+    profile: str = "fastsearch-text",
+    profile_version: int = 1,
     target_chars: int = 900,
     overlap: int = 0,
     acl: Optional[Sequence[str]] = None,
@@ -108,9 +110,23 @@ def chunk_text(
        （从而让 ``resolve_citation`` 能在原文里高亮），得用真正的解析器，见
        :func:`chunks_from_docparse`。不说清这点，调用方会以为自己拿到了可溯源的坐标。
     """
+    if not isinstance(profile, str) or not profile.strip():
+        raise ValueError("profile must not be empty")
+    if isinstance(profile_version, bool) or not isinstance(profile_version, int) or profile_version <= 0:
+        raise ValueError("profile_version must be a positive integer")
+    if isinstance(target_chars, bool) or not isinstance(target_chars, int) or target_chars <= 0:
+        raise ValueError("target_chars must be a positive integer")
+    if (
+        isinstance(overlap, bool)
+        or not isinstance(overlap, int)
+        or overlap < 0
+        or overlap >= target_chars
+    ):
+        raise ValueError("overlap must be a non-negative integer smaller than target_chars")
     chunks: List[Dict[str, Any]] = []
     path: List[tuple] = []
     buf: List[str] = []
+    has_new_content = False
 
     def push(kind: str, body: str) -> None:
         if not body:
@@ -124,19 +140,31 @@ def chunk_text(
             "bbox": dict(_ZERO_BBOX),
             "heading_path": [t for _, t in path],
             "char_len": len(body),
+            "metadata": {
+                "chunking": {
+                    "chunker": "fastsearch_text",
+                    "profile": profile,
+                    "version": profile_version,
+                    "target_chars": target_chars,
+                    "overlap_chars": overlap,
+                    "table_markdown": False,
+                }
+            },
         }
         if acl is not None:
             c["acl"] = list(acl)
         chunks.append(c)
 
-    def flush() -> None:
-        nonlocal buf
+    def flush(carry_overlap: bool) -> None:
+        nonlocal buf, has_new_content
         body = "\n".join(buf).strip()
         buf = []
-        if not body:
+        if not body or not has_new_content:
+            has_new_content = False
             return
         push("paragraph", body)
-        if overlap > 0:
+        has_new_content = False
+        if carry_overlap and overlap > 0:
             tail = body[-overlap:]
             if tail:
                 buf.append(tail)
@@ -144,7 +172,7 @@ def chunk_text(
     for line in text.splitlines():
         m = _HEADING.match(line)
         if m:
-            flush()
+            flush(False)
             level, title = len(m.group(1)), m.group(2)
             while path and path[-1][0] >= level:
                 path.pop()
@@ -153,12 +181,13 @@ def chunk_text(
             continue
         if not line.strip():
             if len("\n".join(buf).strip()) >= target_chars:
-                flush()
+                flush(True)
             elif buf:
                 buf.append("")
             continue
         buf.append(line)
+        has_new_content = True
         if len("\n".join(buf)) >= target_chars:
-            flush()
-    flush()
+            flush(True)
+    flush(False)
     return [c for c in chunks if c["text"].strip()]

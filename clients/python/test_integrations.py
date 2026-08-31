@@ -10,6 +10,7 @@ import sys
 
 from fastsearch_client.integrations import (
     FastsearchRetriever,
+    format_hits_for_llm,
     hit_to_document,
     hit_to_llama_node,
     hits_to_documents,
@@ -82,6 +83,54 @@ def test_hits_to_documents():
     docs = hits_to_documents(SAMPLE_HITS)
     assert len(docs) == 2
     assert [d.metadata["chunk_id"] for d in docs] == [3, 9]
+
+
+def test_format_hits_matches_shared_context_budget_contract():
+    contract_path = pathlib.Path(__file__).parents[2] / "docs/contracts/context-budget-cases.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    for case in contract["cases"]:
+        hits = []
+        for index, source in enumerate(case["hits"], 1):
+            hit = {
+                "citation_id": source["citation_id"],
+                "score": 1.0,
+                "doc_id": "contract.pdf",
+                "chunk_id": index,
+                "page": 1,
+                "heading_path": [],
+                "highlight": source["snippet"],
+            }
+            if source["text"] is not None:
+                hit["text"] = source["text"]
+            hits.append(hit)
+        result = format_hits_for_llm(hits, max_context_chars=case["budget"])
+        assert [citation["citation_id"] for citation in result["citations"]] == case["expected"][
+            "kept_citation_ids"
+        ], case["name"]
+        assert result["dropped"] == case["expected"]["dropped"], case["name"]
+        assert result["truncated"] == case["expected"]["truncated"], case["name"]
+        assert result["context_chars"] == case["expected"]["context_chars"], case["name"]
+        if "last_text" in case["expected"]:
+            assert case["expected"]["last_text"] in result["content"], case["name"]
+
+
+def test_format_hits_without_budget_keeps_response_shape():
+    result = format_hits_for_llm(SAMPLE_HITS)
+    assert set(result) == {"content", "citations"}
+
+
+def test_per_hit_limit_precedes_total_budget():
+    hits = [
+        {**SAMPLE_HITS[0], "citation_id": "kb:p:1", "highlight": None, "text": "甲" * 100},
+        {**SAMPLE_HITS[0], "citation_id": "kb:p:2", "highlight": None, "text": "乙" * 100},
+    ]
+    result = format_hits_for_llm(hits, max_chars_per_hit=10, max_context_chars=20)
+    assert [item["citation_id"] for item in result["citations"]] == ["kb:p:1", "kb:p:2"]
+    assert result["context_chars"] == 20
+    assert result["dropped"] == 0
+    assert result["truncated"] == 0
+    assert "甲" * 10 + "…" in result["content"]
+    assert "乙" * 10 + "…" in result["content"]
 
 
 def test_hit_to_llama_node():
@@ -490,6 +539,9 @@ def main():
     tests = [
         test_hit_to_document,
         test_hits_to_documents,
+        test_format_hits_matches_shared_context_budget_contract,
+        test_format_hits_without_budget_keeps_response_shape,
+        test_per_hit_limit_precedes_total_budget,
         test_hit_to_llama_node,
         test_retriever_invoke_and_param_passthrough,
         test_retriever_kwargs_bind_real_client_signature,

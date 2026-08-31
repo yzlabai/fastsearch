@@ -109,7 +109,7 @@ impl McpServer {
 
 | 工具 | 入参（**允许清单**，见 §4.7） | 出参（单个 text 内容块，内容为 JSON 字符串） |
 |---|---|---|
-| `search` | `query`(必填, string)、`mode`(enum 由 §4.2 推导)、`top_k`(int, 默认 20)、`filter`(core::Filter AST)、`highlight`(bool)、`vector`(number[]，调用方自带查询向量)、`include_text`(bool)、`max_context_chars`(int) | 基础形状 `{"hits":[{citation_id, score, page, heading_path, snippet}]}`；`include_text=true` 时 hit 增 `text`；设预算时顶层增 `dropped`/`context_chars`，截断 hit 增 `text_truncated` |
+| `search` | `query`(必填, string)、`mode`(enum 由 §4.2 推导)、`top_k`(int, 默认 20)、`filter`(core::Filter AST)、`highlight`(bool)、`vector`(number[]，调用方自带查询向量)、`include_text`(bool)、`max_context_chars`(非负 int) | 基础形状 `{"hits":[{citation_id, score, page, heading_path, snippet}]}`；`include_text=true` 时 hit 增 `text`；设预算时顶层增 `dropped`/`truncated`/`context_chars`，截断 hit 增 `text_truncated` |
 | `resolve_citation` | `citation_id`(必填, `"collection:doc_id:chunk_id"`) | `{"found":false,"reason":…}` 或 `{"found":true, media_type, time, fetch:{kind:"doc_render"\|"signed_url"\|"inline_ref", …}}` |
 
 **命中形状在两种模式下必须逐字段相同**：远端模式拿到的是 server `hits_json`
@@ -479,10 +479,15 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 - **2026-08-26 · KB-0.4/0.5 已实施 + 活服务验证**：`include_text` + `max_context_chars`
   同时进 schema 与允许清单（只放开前者不给预算 = 把冲爆上下文的开关递给 agent 却不给刹车）；
   `apply_budget` 按既有顺序前向累加、放不下时留够 `MIN_HIT_CHARS`(80) 就截断并标 `text_truncated`
-  否则整条丢弃，响应报 `dropped`/`context_chars`；**不设预算时响应形状逐字节不变**。
+  否则整条丢弃，响应报 `dropped`/`truncated`/`context_chars`；**不设预算时响应形状逐字节不变**。
   旋钮按**字符**而非 token——本面没有分词器，估算 token 是编造的数字（诚实记账）。
   KB-0.5：描述带本实例作用域（filter 字段 + 远端档探到的集合名单，**带"可能不全"caveat**；
   本地档没有该信息就什么都不说）。测试 +5。
+
+- **2026-08-31 · FS-204 三端预算契约收口**：MCP/TypeScript/Python 共读
+  `docs/contracts/context-budget-cases.json`，统一 Unicode 计数、`snippet/highlight → text` 截断顺序、
+  80 字符最小保留阈值，并补顶层 `truncated` 计数。非法负预算明确工具错误，不再静默退化成无预算。
+  真远端 MCP 二进制以预算 80 验证 `context_chars=80,truncated=1,text_truncated=true`。
 
 - **2026-08-25 · KB-0.3 写入工具 `index_chunks` 已实施 + 活服务验证**：仅远端档宣称且仅远端档可调
   （C1 全表版）；入参允许清单 `INDEX_ARGS` 与 schema 由 `index_schema_and_allowlist_agree` 钉住；

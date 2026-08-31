@@ -267,6 +267,84 @@ pub fn parse_chunks(bytes: &[u8], doc_id: &str) -> Result<Vec<Chunk>> {
 
 // ============================ 文本/markdown 分块（客户端侧，纯函数） ============================
 
+/// 一次客户端分块所采用的可追溯 profile。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkProfile {
+    name: String,
+    version: u32,
+    target_chars: usize,
+    overlap_chars: usize,
+    table_markdown: bool,
+}
+
+impl ChunkProfile {
+    pub fn new(
+        name: impl Into<String>,
+        version: u32,
+        target_chars: usize,
+        overlap_chars: usize,
+        table_markdown: bool,
+    ) -> Result<Self> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(anyhow!("chunk profile name must not be empty"));
+        }
+        if version == 0 {
+            return Err(anyhow!("chunk profile version must be greater than zero"));
+        }
+        if target_chars == 0 {
+            return Err(anyhow!("chunk target must be greater than zero"));
+        }
+        if overlap_chars >= target_chars {
+            return Err(anyhow!(
+                "chunk overlap ({overlap_chars}) must be smaller than target ({target_chars})"
+            ));
+        }
+        Ok(Self {
+            name,
+            version,
+            target_chars,
+            overlap_chars,
+            table_markdown,
+        })
+    }
+
+    pub fn text_default() -> Self {
+        Self::new("fastsearch-text", 1, 900, 0, false).expect("valid built-in text profile")
+    }
+
+    #[cfg(feature = "parse")]
+    pub fn docparse_default() -> Self {
+        Self::new("docparse", 1, 800, 0, false).expect("valid built-in docparse profile")
+    }
+
+    pub fn target_chars(&self) -> usize {
+        self.target_chars
+    }
+
+    pub fn overlap_chars(&self) -> usize {
+        self.overlap_chars
+    }
+
+    pub fn table_markdown(&self) -> bool {
+        self.table_markdown
+    }
+
+    fn attach_to(&self, chunk: &mut Chunk, chunker: &str) {
+        chunk.metadata.insert(
+            "chunking".into(),
+            serde_json::json!({
+                "chunker": chunker,
+                "profile": self.name,
+                "version": self.version,
+                "target_chars": self.target_chars,
+                "overlap_chars": self.overlap_chars,
+                "table_markdown": self.table_markdown,
+            }),
+        );
+    }
+}
+
 /// 解析 markdown 标题行 → `(层级, 标题)`；非标题返回 None。
 fn parse_md_heading(line: &str) -> Option<(usize, String)> {
     let t = line.trim_start();
@@ -291,8 +369,9 @@ fn mk_text_chunk(
     kind: ChunkKind,
     text: String,
     hp: Vec<String>,
+    profile: &ChunkProfile,
 ) -> Chunk {
-    let c = Chunk {
+    let mut c = Chunk {
         doc_id: doc_id.to_string(),
         chunk_id: *id,
         kind,
@@ -315,62 +394,128 @@ fn mk_text_chunk(
         metadata: Default::default(),
         searchable: true,
     };
+    profile.attach_to(&mut c, "fastsearch_text");
     *id += 1;
     c
 }
 
-fn flush_para(
-    buf: &mut Vec<&str>,
-    chunks: &mut Vec<Chunk>,
-    next: &mut u64,
-    doc_id: &str,
-    path: &[(usize, String)],
-) {
-    if buf.is_empty() {
-        return;
-    }
-    let text = buf.join(" ").trim().to_string();
-    buf.clear();
-    if !text.is_empty() {
-        chunks.push(mk_text_chunk(
+struct TextChunker<'a> {
+    doc_id: &'a str,
+    profile: &'a ChunkProfile,
+    chunks: Vec<Chunk>,
+    path: Vec<(usize, String)>,
+    buf: Vec<String>,
+    has_new_content: bool,
+    next: u64,
+}
+
+impl<'a> TextChunker<'a> {
+    fn new(doc_id: &'a str, profile: &'a ChunkProfile) -> Self {
+        Self {
             doc_id,
-            next,
-            ChunkKind::Paragraph,
+            profile,
+            chunks: Vec::new(),
+            path: Vec::new(),
+            buf: Vec::new(),
+            has_new_content: false,
+            next: 0,
+        }
+    }
+
+    fn buffered_chars(&self) -> usize {
+        self.buf.join(" ").trim().chars().count()
+    }
+
+    fn push(&mut self, kind: ChunkKind, text: String) {
+        self.chunks.push(mk_text_chunk(
+            self.doc_id,
+            &mut self.next,
+            kind,
             text,
-            heading_titles(path),
+            heading_titles(&self.path),
+            self.profile,
         ));
+    }
+
+    fn flush_paragraph(&mut self, carry_overlap: bool) {
+        if self.buf.is_empty() || !self.has_new_content {
+            if !carry_overlap {
+                self.buf.clear();
+            }
+            return;
+        }
+        let text = self.buf.join(" ").trim().to_string();
+        self.buf.clear();
+        self.has_new_content = false;
+        if text.is_empty() {
+            return;
+        }
+        let tail = (carry_overlap && self.profile.overlap_chars > 0).then(|| {
+            text.chars()
+                .rev()
+                .take(self.profile.overlap_chars)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>()
+        });
+        self.push(ChunkKind::Paragraph, text);
+        if let Some(tail) = tail.filter(|tail| !tail.is_empty()) {
+            self.buf.push(tail);
+        }
+    }
+
+    fn heading(&mut self, level: usize, title: String) {
+        self.flush_paragraph(false);
+        while self
+            .path
+            .last()
+            .map(|(current, _)| *current >= level)
+            .unwrap_or(false)
+        {
+            self.path.pop();
+        }
+        self.path.push((level, title.clone()));
+        self.push(ChunkKind::Heading, title);
+    }
+
+    fn line(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            if self.buffered_chars() >= self.profile.target_chars {
+                self.flush_paragraph(true);
+            }
+            return;
+        }
+        self.buf.push(line.to_string());
+        self.has_new_content = true;
+        if self.buffered_chars() >= self.profile.target_chars {
+            self.flush_paragraph(true);
+        }
+    }
+
+    fn finish(mut self) -> Vec<Chunk> {
+        self.flush_paragraph(false);
+        self.chunks
     }
 }
 
 /// 把纯文本 / markdown 内容切成 chunk：**空行分段**；markdown 标题（`# …`）更新 `heading_path`
 /// 并自成一个 `Heading` chunk，正文段为 `Paragraph`。供"喂一个文件夹"客户端分块后上传。
 pub fn chunk_text(content: &str, doc_id: &str) -> Vec<Chunk> {
-    let mut chunks = Vec::new();
-    let mut path: Vec<(usize, String)> = Vec::new();
-    let mut buf: Vec<&str> = Vec::new();
-    let mut next = 0u64;
+    chunk_text_with(content, doc_id, &ChunkProfile::text_default())
+}
+
+/// 使用显式 profile 对纯文本/markdown 分块；所有产物带可反解的 `metadata.chunking`。
+pub fn chunk_text_with(content: &str, doc_id: &str, profile: &ChunkProfile) -> Vec<Chunk> {
+    let mut chunker = TextChunker::new(doc_id, profile);
     for line in content.lines() {
         if let Some((level, title)) = parse_md_heading(line) {
-            flush_para(&mut buf, &mut chunks, &mut next, doc_id, &path);
-            while path.last().map(|(l, _)| *l >= level).unwrap_or(false) {
-                path.pop();
-            }
-            path.push((level, title.clone()));
-            chunks.push(mk_text_chunk(
-                doc_id,
-                &mut next,
-                ChunkKind::Heading,
-                title,
-                heading_titles(&path),
-            ));
-        } else if line.trim().is_empty() {
-            flush_para(&mut buf, &mut chunks, &mut next, doc_id, &path);
+            chunker.heading(level, title);
         } else {
-            buf.push(line);
+            chunker.line(line);
         }
     }
-    flush_para(&mut buf, &mut chunks, &mut next, doc_id, &path);
-    chunks
+    chunker.finish()
 }
 
 // ============================ 命令 ============================
@@ -504,6 +649,8 @@ pub struct IndexDirOpts {
     pub collection: String,
     /// 并发上传文件数（≥1）。大文件夹用并发抵消单文件 POST 往返延迟。
     pub concurrency: usize,
+    /// 每个文件共用的纯文本分块 profile。
+    pub chunk_profile: ChunkProfile,
 }
 
 fn is_text_file(p: &Path) -> bool {
@@ -533,10 +680,16 @@ fn rel_path(root: &Path, path: &Path) -> String {
 }
 
 /// 读文件 → 分块 → POST `/v1/index`（doc_id=rel）。返回 chunk 数。
-fn read_chunk_post(client: &Client, collection: &str, rel: &str, path: &Path) -> Result<usize> {
+fn read_chunk_post(
+    client: &Client,
+    collection: &str,
+    rel: &str,
+    path: &Path,
+    profile: &ChunkProfile,
+) -> Result<usize> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let chunks = chunk_text(&content, rel);
+    let chunks = chunk_text_with(&content, rel, profile);
     post_index(client, collection, rel, None, &chunks)
 }
 
@@ -567,7 +720,13 @@ pub fn cmd_index_dir(opts: &IndexDirOpts, root: &Path) -> Result<(usize, usize, 
                 }
                 let rel = rel_path(root, &files[i]);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                match read_chunk_post(&client, &opts.collection, &rel, &files[i]) {
+                match read_chunk_post(
+                    &client,
+                    &opts.collection,
+                    &rel,
+                    &files[i],
+                    &opts.chunk_profile,
+                ) {
                     Ok(cn) => {
                         eprintln!("  [{d}/{n}] {rel} → {cn} chunk(s)");
                         ok.fetch_add(1, Ordering::Relaxed);

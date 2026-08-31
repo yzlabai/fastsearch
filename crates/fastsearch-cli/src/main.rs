@@ -4,8 +4,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use fastsearch_cli::{
-    cmd_eval, cmd_index, cmd_index_dir, cmd_search, cmd_similar, cmd_upload_image, EvalOpts,
-    ImageUploadOpts, IndexDirOpts, IndexOpts, SearchOpts, SimilarOpts, StoreMedia,
+    cmd_eval, cmd_index, cmd_index_dir, cmd_search, cmd_similar, cmd_upload_image, ChunkProfile,
+    EvalOpts, ImageUploadOpts, IndexDirOpts, IndexOpts, SearchOpts, SimilarOpts, StoreMedia,
 };
 use fastsearch_core::SearchMode;
 use serde_json::Value;
@@ -51,6 +51,21 @@ enum Command {
         /// 这类图如实标 `image_vector_status=missing_bytes`。
         #[arg(long, value_enum, default_value_t = ImagesArg::Object)]
         images: ImagesArg,
+        /// 分块 profile 名称（写入每条 chunk 的 metadata.chunking）。
+        #[arg(long, default_value = "docparse")]
+        chunk_profile: String,
+        /// 分块 profile 版本（必须大于 0）。
+        #[arg(long, default_value_t = 1)]
+        chunk_profile_version: u32,
+        /// 正文块软目标字符数。
+        #[arg(long, default_value_t = 800)]
+        chunk_target: usize,
+        /// 相邻正文块最大重叠字符数（完整源 block，必须小于 target）。
+        #[arg(long, default_value_t = 0)]
+        chunk_overlap: usize,
+        /// 表格 chunk 使用 GitHub pipe-table 文本而非 TSV。
+        #[arg(long)]
+        chunk_table_markdown: bool,
     },
     /// 灌入 docparse chunks（JSON 数组或 NDJSON；省略 INPUT 读 stdin）→ POST /v1/index。
     Index {
@@ -88,6 +103,17 @@ enum Command {
         /// 并发上传文件数（大文件夹提速）。
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
+        /// 分块 profile 名称（写入每条 chunk 的 metadata.chunking）。
+        #[arg(long, default_value = "fastsearch-text")]
+        chunk_profile: String,
+        #[arg(long, default_value_t = 1)]
+        chunk_profile_version: u32,
+        /// 纯文本块目标字符数。
+        #[arg(long, default_value_t = 900)]
+        chunk_target: usize,
+        /// 精确字符重叠数（必须小于 target）。
+        #[arg(long, default_value_t = 0)]
+        chunk_overlap: usize,
         /// 资料文件夹路径。
         dir: PathBuf,
     },
@@ -253,7 +279,19 @@ fn main() -> Result<()> {
             doc_id,
             tenant,
             images,
+            chunk_profile,
+            chunk_profile_version,
+            chunk_target,
+            chunk_overlap,
+            chunk_table_markdown,
         } => {
+            let chunk_profile = ChunkProfile::new(
+                chunk_profile,
+                chunk_profile_version,
+                chunk_target,
+                chunk_overlap,
+                chunk_table_markdown,
+            )?;
             let opts = fastsearch_cli::ingest::IngestOpts {
                 file,
                 server,
@@ -263,6 +301,7 @@ fn main() -> Result<()> {
                 tenant,
                 acl: vec!["public".to_string()],
                 images: images.into(),
+                chunk_profile,
             };
             let n = fastsearch_cli::ingest::cmd_ingest(&opts)?;
             eprintln!("indexed {n} chunk(s) for doc '{}'", opts.doc_id);
@@ -307,13 +346,25 @@ fn main() -> Result<()> {
         Command::IndexDir {
             collection,
             concurrency,
+            chunk_profile,
+            chunk_profile_version,
+            chunk_target,
+            chunk_overlap,
             dir,
         } => {
+            let chunk_profile = ChunkProfile::new(
+                chunk_profile,
+                chunk_profile_version,
+                chunk_target,
+                chunk_overlap,
+                false,
+            )?;
             let opts = IndexDirOpts {
                 server,
                 key,
                 collection,
                 concurrency,
+                chunk_profile,
             };
             let (ok, failed, chunks) = cmd_index_dir(&opts, &dir)?;
             eprintln!(

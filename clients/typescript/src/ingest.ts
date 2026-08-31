@@ -133,6 +133,10 @@ export function chunksFromDocparse(
 
 export interface ChunkTextOptions {
   docId: string;
+  /** 可审计的分块配置名，默认 `fastsearch-text`。 */
+  profile?: string;
+  /** 分块配置版本，必须为正整数，默认 1。 */
+  profileVersion?: number;
   /** 目标块长（字符）。累计到该长度就断开，默认 900。 */
   targetChars?: number;
   /** 相邻块的重叠字符数，默认 0。 */
@@ -151,10 +155,28 @@ const ZERO_BBOX: BBox = { x0: 0, y0: 0, x1: 0, y1: 0 };
  * 这一点必须说清楚，否则调用方会以为自己拿到了可溯源的坐标。
  */
 export function chunkText(text: string, opts: ChunkTextOptions): Chunk[] {
-  const { docId, targetChars = 900, overlap = 0, acl } = opts;
+  const {
+    docId,
+    profile = "fastsearch-text",
+    profileVersion = 1,
+    targetChars = 900,
+    overlap = 0,
+    acl,
+  } = opts;
+  if (!profile.trim()) throw new Error("profile must not be empty");
+  if (!Number.isSafeInteger(profileVersion) || profileVersion <= 0) {
+    throw new Error("profileVersion must be a positive integer");
+  }
+  if (!Number.isSafeInteger(targetChars) || targetChars <= 0) {
+    throw new Error("targetChars must be a positive integer");
+  }
+  if (!Number.isSafeInteger(overlap) || overlap < 0 || overlap >= targetChars) {
+    throw new Error("overlap must be a non-negative integer smaller than targetChars");
+  }
   const chunks: Chunk[] = [];
   const path: Array<{ level: number; title: string }> = [];
   let buf: string[] = [];
+  let hasNewContent = false;
 
   const push = (kind: string, body: string) => {
     if (!body) return;
@@ -167,17 +189,31 @@ export function chunkText(text: string, opts: ChunkTextOptions): Chunk[] {
       bbox: ZERO_BBOX,
       heading_path: path.map((p) => p.title),
       char_len: [...body].length,
+      metadata: {
+        chunking: {
+          chunker: "fastsearch_text",
+          profile,
+          version: profileVersion,
+          target_chars: targetChars,
+          overlap_chars: overlap,
+          table_markdown: false,
+        },
+      },
     };
     if (acl) c.acl = acl;
     chunks.push(c);
   };
 
-  const flush = () => {
+  const flush = (carryOverlap: boolean) => {
     const body = buf.join("\n").trim();
     buf = [];
-    if (!body) return;
+    if (!body || !hasNewContent) {
+      hasNewContent = false;
+      return;
+    }
     push("paragraph", body);
-    if (overlap > 0) {
+    hasNewContent = false;
+    if (carryOverlap && overlap > 0) {
       // 尾部重叠：下一块以上一块的末 `overlap` 个字符起头，避免答案跨块被切断。
       const tail = [...body].slice(-overlap).join("");
       if (tail) buf.push(tail);
@@ -187,7 +223,7 @@ export function chunkText(text: string, opts: ChunkTextOptions): Chunk[] {
   for (const line of text.split(/\r?\n/)) {
     const h = /^(#{1,6})\s+(.*\S)\s*$/.exec(line);
     if (h?.[1] && h[2]) {
-      flush();
+      flush(false);
       const level = h[1].length;
       const title = h[2];
       while (path.length && (path[path.length - 1]?.level ?? 0) >= level) path.pop();
@@ -196,13 +232,14 @@ export function chunkText(text: string, opts: ChunkTextOptions): Chunk[] {
       continue;
     }
     if (!line.trim()) {
-      if (buf.join("\n").trim().length >= targetChars) flush();
+      if ([...buf.join("\n").trim()].length >= targetChars) flush(true);
       else if (buf.length) buf.push("");
       continue;
     }
     buf.push(line);
-    if (buf.join("\n").length >= targetChars) flush();
+    hasNewContent = true;
+    if ([...buf.join("\n")].length >= targetChars) flush(true);
   }
-  flush();
+  flush(false);
   return chunks.filter((c) => c.text.trim().length > 0);
 }

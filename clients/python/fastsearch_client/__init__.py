@@ -411,10 +411,12 @@ class FastsearchClient:
 
 
 from .ingest import chunk_text, chunks_from_docparse  # noqa: E402
+from .integrations import format_hits_for_llm  # noqa: E402
 
 __all__ = [
     "FastsearchClient",
     "FastsearchError",
     "chunk_text",
     "chunks_from_docparse",
+    "format_hits_for_llm",
 ]

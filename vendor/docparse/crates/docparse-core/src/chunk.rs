@@ -98,6 +98,10 @@ pub struct ChunkOptions {
     /// Soft target: accumulate consecutive paragraphs up to about this many
     /// characters before emitting a chunk.
     pub target_chars: usize,
+    /// Maximum paragraph overlap in Unicode characters. Overlap reuses only
+    /// complete source blocks so every emitted bbox remains an exact union of
+    /// real source geometry; a tail block larger than this limit is not split.
+    pub overlap_chars: usize,
     /// Table chunk text rendering: `false` = tab/newline (default, compact);
     /// `true` = GitHub pipe table (friendlier for markdown-native RAG consumers).
     pub table_markdown: bool,
@@ -107,6 +111,7 @@ impl Default for ChunkOptions {
     fn default() -> Self {
         Self {
             target_chars: 800,
+            overlap_chars: 0,
             table_markdown: false,
         }
     }
@@ -167,23 +172,6 @@ pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
 
     // Pending paragraph accumulator (single page).
     let mut buf: Option<ParaBuf> = None;
-
-    let flush = |buf: &mut Option<ParaBuf>, chunks: &mut Vec<Chunk>, next_id: &mut usize| {
-        if let Some(p) = buf.take() {
-            chunks.push(Chunk {
-                id: *next_id,
-                kind: ChunkKind::Paragraph,
-                text: p.text,
-                page: p.page,
-                bbox: p.bbox,
-                heading_path: p.heading_path,
-                section_id: p.section_id,
-                char_len: p.char_len,
-                image: None,
-            });
-            *next_id += 1;
-        }
-    };
 
     for (blocks, page) in blocks_per_page.iter().zip(&doc.pages) {
         let tables: Vec<&Table> = page
@@ -271,7 +259,7 @@ pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
                 Item::Block(b) if b.list_item => {
                     // List items stay one chunk each (G9b) — never folded
                     // into prose paragraphs.
-                    flush(&mut buf, &mut chunks, &mut next_id);
+                    flush_paragraph(&mut buf, &mut chunks, &mut next_id, 0);
                     chunks.push(Chunk {
                         id: next_id,
                         kind: ChunkKind::ListItem,
@@ -288,7 +276,7 @@ pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
                 Item::Block(b) if b.code => {
                     // Code blocks are self-contained chunks — never merged
                     // into prose paragraphs (G8a).
-                    flush(&mut buf, &mut chunks, &mut next_id);
+                    flush_paragraph(&mut buf, &mut chunks, &mut next_id, 0);
                     chunks.push(Chunk {
                         id: next_id,
                         kind: ChunkKind::Code,
@@ -303,7 +291,7 @@ pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
                     next_id += 1;
                 }
                 Item::Block(b) if b.heading => {
-                    flush(&mut buf, &mut chunks, &mut next_id);
+                    flush_paragraph(&mut buf, &mut chunks, &mut next_id, 0);
                     // Update the section stack by real heading level (mirrors
                     // outline::build): pop same/deeper ancestors, then push this
                     // heading as its own section. The breadcrumb is the ancestor
@@ -332,18 +320,35 @@ pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
                 Item::Block(b) => {
                     match buf.as_mut() {
                         // Continue accumulating within the same page.
-                        Some(p) if p.page == b.page && p.char_len < opts.target_chars => {
+                        Some(p) if p.page == b.page && p.char_len < opts.target_chars.max(1) => {
                             p.push(b);
                         }
+                        Some(p) if p.page == b.page => {
+                            flush_paragraph(
+                                &mut buf,
+                                &mut chunks,
+                                &mut next_id,
+                                opts.overlap_chars,
+                            );
+                            if let Some(p) = buf.as_mut() {
+                                p.push(b);
+                            } else {
+                                buf = Some(ParaBuf::start(
+                                    b,
+                                    path_of(&sections),
+                                    section_of(&sections),
+                                ));
+                            }
+                        }
                         _ => {
-                            flush(&mut buf, &mut chunks, &mut next_id);
+                            flush_paragraph(&mut buf, &mut chunks, &mut next_id, 0);
                             buf =
                                 Some(ParaBuf::start(b, path_of(&sections), section_of(&sections)));
                         }
                     }
                 }
                 Item::Table(t) => {
-                    flush(&mut buf, &mut chunks, &mut next_id);
+                    flush_paragraph(&mut buf, &mut chunks, &mut next_id, 0);
                     let text = if opts.table_markdown {
                         table_text_markdown(t)
                     } else {
@@ -363,7 +368,7 @@ pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
                     next_id += 1;
                 }
                 Item::Image(im) => {
-                    flush(&mut buf, &mut chunks, &mut next_id);
+                    flush_paragraph(&mut buf, &mut chunks, &mut next_id, 0);
                     // Caption priority: an enhancer-supplied caption (VLM) wins;
                     // otherwise look for an adjacent in-document caption line.
                     let (caption, caption_source) = match (&im.caption, &im.caption_source) {
@@ -395,14 +400,15 @@ pub fn chunk_document_with(doc: &Document, opts: ChunkOptions) -> Vec<Chunk> {
                 }
             }
         }
-        flush(&mut buf, &mut chunks, &mut next_id);
+        flush_paragraph(&mut buf, &mut chunks, &mut next_id, 0);
     }
-    flush(&mut buf, &mut chunks, &mut next_id);
+    flush_paragraph(&mut buf, &mut chunks, &mut next_id, 0);
     chunks
 }
 
 /// Accumulates consecutive paragraph blocks on one page into a chunk.
 struct ParaBuf {
+    parts: Vec<ParaPart>,
     text: String,
     page: usize,
     bbox: BBox,
@@ -411,9 +417,19 @@ struct ParaBuf {
     char_len: usize,
 }
 
+#[derive(Clone)]
+struct ParaPart {
+    text: String,
+    bbox: BBox,
+}
+
 impl ParaBuf {
     fn start(b: &Block, heading_path: Vec<String>, section_id: usize) -> Self {
         Self {
+            parts: vec![ParaPart {
+                text: b.text.clone(),
+                bbox: b.bbox,
+            }],
             text: b.text.clone(),
             page: b.page,
             bbox: b.bbox,
@@ -423,11 +439,91 @@ impl ParaBuf {
         }
     }
     fn push(&mut self, b: &Block) {
+        self.parts.push(ParaPart {
+            text: b.text.clone(),
+            bbox: b.bbox,
+        });
         self.text.push_str("\n\n");
         self.text.push_str(&b.text);
         self.char_len = self.text.chars().count();
         self.bbox = union(self.bbox, b.bbox);
     }
+
+    fn trailing_overlap(&self, max_chars: usize) -> Option<Self> {
+        if max_chars == 0 {
+            return None;
+        }
+        let mut start = self.parts.len();
+        let mut chars = 0usize;
+        for (index, part) in self.parts.iter().enumerate().rev() {
+            let separator = usize::from(start < self.parts.len()) * 2;
+            let next = chars + separator + part.text.chars().count();
+            if next > max_chars {
+                break;
+            }
+            chars = next;
+            start = index;
+        }
+        (start < self.parts.len()).then(|| {
+            Self::from_parts(
+                self.parts[start..].to_vec(),
+                self.page,
+                self.heading_path.clone(),
+                self.section_id,
+            )
+        })
+    }
+
+    fn from_parts(
+        parts: Vec<ParaPart>,
+        page: usize,
+        heading_path: Vec<String>,
+        section_id: usize,
+    ) -> Self {
+        let text = parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let bbox = parts
+            .iter()
+            .skip(1)
+            .fold(parts[0].bbox, |bbox, part| union(bbox, part.bbox));
+        Self {
+            parts,
+            char_len: text.chars().count(),
+            text,
+            page,
+            bbox,
+            heading_path,
+            section_id,
+        }
+    }
+}
+
+fn flush_paragraph(
+    buf: &mut Option<ParaBuf>,
+    chunks: &mut Vec<Chunk>,
+    next_id: &mut usize,
+    overlap_chars: usize,
+) {
+    let Some(paragraph) = buf.take() else {
+        return;
+    };
+    let overlap = paragraph.trailing_overlap(overlap_chars);
+    chunks.push(Chunk {
+        id: *next_id,
+        kind: ChunkKind::Paragraph,
+        text: paragraph.text,
+        page: paragraph.page,
+        bbox: paragraph.bbox,
+        heading_path: paragraph.heading_path,
+        section_id: paragraph.section_id,
+        char_len: paragraph.char_len,
+        image: None,
+    });
+    *next_id += 1;
+    *buf = overlap;
 }
 
 fn union(a: BBox, b: BBox) -> BBox {
@@ -742,6 +838,112 @@ mod tests {
             .unwrap();
         assert_eq!(para.heading_path, vec!["Big Heading".to_string()]);
         assert_eq!(para.page, 1);
+    }
+
+    #[test]
+    fn paragraph_overlap_reuses_complete_blocks_with_exact_source_union() {
+        let boxes = [
+            BBox {
+                x0: 72.0,
+                y0: 700.0,
+                x1: 300.0,
+                y1: 712.0,
+            },
+            BBox {
+                x0: 80.0,
+                y0: 600.0,
+                x1: 320.0,
+                y1: 612.0,
+            },
+            BBox {
+                x0: 90.0,
+                y0: 500.0,
+                x1: 340.0,
+                y1: 512.0,
+            },
+        ];
+        let d = doc(vec![
+            text_at("alpha alpha", boxes[0], 1),
+            text_at("beta beta", boxes[1], 1),
+            text_at("gamma gamma", boxes[2], 1),
+        ]);
+
+        let source_blocks = layout::page_blocks(&d);
+        assert_eq!(source_blocks[0].len(), 3);
+        let chunks = chunk_document_with(
+            &d,
+            ChunkOptions {
+                target_chars: 15,
+                overlap_chars: 10,
+                table_markdown: false,
+            },
+        );
+        let paragraphs: Vec<_> = chunks
+            .iter()
+            .filter(|chunk| chunk.kind == ChunkKind::Paragraph)
+            .collect();
+        assert_eq!(paragraphs.len(), 2);
+        assert_eq!(paragraphs[0].text, "alpha alpha\n\nbeta beta");
+        assert_eq!(paragraphs[1].text, "beta beta\n\ngamma gamma");
+        let expected_first = union(source_blocks[0][0].bbox, source_blocks[0][1].bbox);
+        let expected_second = union(source_blocks[0][1].bbox, source_blocks[0][2].bbox);
+        assert_eq!(
+            (
+                paragraphs[0].bbox.x0,
+                paragraphs[0].bbox.y0,
+                paragraphs[0].bbox.x1,
+                paragraphs[0].bbox.y1,
+            ),
+            (
+                expected_first.x0,
+                expected_first.y0,
+                expected_first.x1,
+                expected_first.y1,
+            )
+        );
+        assert_eq!(
+            (
+                paragraphs[1].bbox.x0,
+                paragraphs[1].bbox.y0,
+                paragraphs[1].bbox.x1,
+                paragraphs[1].bbox.y1,
+            ),
+            (
+                expected_second.x0,
+                expected_second.y0,
+                expected_second.x1,
+                expected_second.y1,
+            )
+        );
+        assert_eq!(paragraphs[1].char_len, paragraphs[1].text.chars().count());
+        assert_eq!(paragraphs[1].page, 1);
+        assert_eq!(paragraphs[1].section_id, 0);
+    }
+
+    #[test]
+    fn paragraph_overlap_does_not_cross_heading_barrier() {
+        let d = doc(vec![
+            text_el("alpha alpha", 10.0, 740.0, 1),
+            text_el("beta beta", 10.0, 700.0, 1),
+            text_el("Section", 24.0, 640.0, 1),
+            text_el("gamma gamma", 10.0, 580.0, 1),
+            text_el("delta delta", 10.0, 540.0, 1),
+        ]);
+        let chunks = chunk_document_with(
+            &d,
+            ChunkOptions {
+                target_chars: 15,
+                overlap_chars: 10,
+                table_markdown: false,
+            },
+        );
+        let after_heading = chunks
+            .iter()
+            .find(|chunk| chunk.text.contains("gamma gamma"))
+            .expect("paragraph after heading");
+        assert!(!after_heading.text.contains("beta beta"));
+        assert_eq!(after_heading.heading_path, vec!["Section"]);
+        assert_ne!(after_heading.section_id, 0);
     }
 
     #[test]

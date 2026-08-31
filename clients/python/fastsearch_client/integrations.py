@@ -18,6 +18,133 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+_MIN_HIT_CHARS = 80
+
+
+def _context_cost(hit: dict) -> int:
+    return sum(len(hit.get(field) or "") for field in ("highlight", "text"))
+
+
+def _truncate_evidence(hit: dict, kept_chars: int, marker: str) -> None:
+    fields = ("highlight", "text")
+    remaining = kept_chars
+    for index, field in enumerate(fields):
+        value = hit.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        if len(value) <= remaining:
+            remaining -= len(value)
+            continue
+        if remaining > 0:
+            hit[field] = value[:remaining]
+        else:
+            hit.pop(field, None)
+        for later in fields[index + 1 :]:
+            hit.pop(later, None)
+        hit[marker] = True
+        return
+
+
+def _apply_per_hit_limit(hits: list[dict], limit: Optional[int]) -> list[dict]:
+    limited = []
+    for source in hits:
+        hit = dict(source)
+        if limit is not None and _context_cost(hit) > limit:
+            _truncate_evidence(hit, limit, "_per_hit_truncated")
+        limited.append(hit)
+    return limited
+
+
+def _apply_context_budget(hits: list[dict], budget: int) -> dict:
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+        raise ValueError("max_context_chars must be a non-negative integer")
+    selected = []
+    used = 0
+    truncated = 0
+    for source in hits:
+        hit = dict(source)
+        cost = _context_cost(hit)
+        if used + cost <= budget:
+            used += cost
+            selected.append(hit)
+            continue
+        remaining = budget - used
+        if remaining >= _MIN_HIT_CHARS:
+            _truncate_evidence(hit, remaining, "text_truncated")
+            used += remaining
+            truncated += 1
+            selected.append(hit)
+        break
+    return {
+        "hits": selected,
+        "dropped": len(hits) - len(selected),
+        "truncated": truncated,
+        "context_chars": used,
+    }
+
+
+def format_hits_for_llm(
+    hits: list[dict],
+    *,
+    max_context_chars: Optional[int] = None,
+    max_chars_per_hit: Optional[int] = None,
+    show_source: bool = True,
+) -> dict:
+    """拼装带 ``[n]`` 标记的 LLM 上下文，并可做确定性的总字符预算。
+
+    字符数按 Unicode code point 计算，不估 token。设置 ``max_context_chars`` 时额外返回
+    ``dropped``、``truncated``、``context_chars``；不设置时保持最小 ``content/citations`` 形状。
+    """
+    if max_chars_per_hit is not None and (
+        isinstance(max_chars_per_hit, bool)
+        or not isinstance(max_chars_per_hit, int)
+        or max_chars_per_hit < 0
+    ):
+        raise ValueError("max_chars_per_hit must be a non-negative integer")
+    limited_hits = _apply_per_hit_limit(hits, max_chars_per_hit)
+    budgeted = (
+        None
+        if max_context_chars is None
+        else _apply_context_budget(limited_hits, max_context_chars)
+    )
+    selected = limited_hits if budgeted is None else budgeted["hits"]
+    lines = []
+    citations = []
+    for index, hit in enumerate(selected, 1):
+        evidence = [
+            value.strip()
+            for value in (hit.get("highlight"), hit.get("text"))
+            if isinstance(value, str) and value.strip()
+        ]
+        text = "\n".join(evidence)
+        truncated = hit.get("text_truncated") or hit.get("_per_hit_truncated")
+        if not text and not truncated:
+            text = " › ".join(hit.get("heading_path") or [])
+        if truncated:
+            text += "…"
+        source = f" ({hit.get('doc_id', '')} p.{hit.get('page', 0)})" if show_source else ""
+        lines.append(f"[{index}]{source} {text}".rstrip())
+        citations.append(
+            {
+                "marker": index,
+                "citation_id": hit.get("citation_id", ""),
+                "doc_id": hit.get("doc_id", ""),
+                "page": hit.get("page", 0),
+                "heading_path": hit.get("heading_path") or [],
+                "score": hit.get("score", 0.0),
+            }
+        )
+    result = {"content": "\n".join(lines), "citations": citations}
+    if budgeted is not None:
+        result.update(
+            {
+                "dropped": budgeted["dropped"],
+                "truncated": budgeted["truncated"],
+                "context_chars": budgeted["context_chars"],
+            }
+        )
+    return result
+
 # ---- LangChain Document（可选依赖，回退本地等价物）----
 try:  # pragma: no cover - 取决于环境是否装 langchain
     from langchain_core.documents import Document as _LCDocument
@@ -195,6 +322,7 @@ def hits_to_llama_nodes(hits: list[dict]) -> list[Any]:
 
 __all__ = [
     "FastsearchRetriever",
+    "format_hits_for_llm",
     "hit_to_document",
     "hits_to_documents",
     "hit_to_llama_node",

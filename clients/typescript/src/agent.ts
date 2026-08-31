@@ -29,20 +29,124 @@ export interface LlmContext {
   /** 形如 `[1] (report.pdf p.7) …片段…` 的带标记上下文块。 */
   content: string;
   citations: Citation[];
+  /** 未进入上下文的尾部命中数；仅设置总预算时返回。 */
+  dropped?: number;
+  /** 已保留但证据文本被截短的命中数；仅设置总预算时返回。 */
+  truncated?: number;
+  /** 实际保留的 Unicode 字符数（不含标记/来源/省略号）；仅设置总预算时返回。 */
+  context_chars?: number;
 }
 
 export interface FormatOptions {
   /** 单条片段最大字符数（截断防超长），默认不截断。 */
   maxCharsPerHit?: number;
+  /** 所有命中的 evidence 总字符预算（Unicode 字符，不估 token）。 */
+  maxContextChars?: number;
   /** 是否在每条前加 `(doc_id p.N)` 出处，默认 true。 */
   showSource?: boolean;
 }
 
 /** 取一条命中的正文：优先高亮片段，回退标题路径（search 不回整段正文）。 */
 function hitText(h: Hit): string {
-  if (h.highlight && h.highlight.trim()) return h.highlight.trim();
+  const evidence = [h.highlight?.trim(), h.text?.trim()].filter(
+    (value): value is string => Boolean(value),
+  );
+  if (evidence.length) return evidence.join("\n");
+  if ((h as BudgetedHit).text_truncated || (h as BudgetedHit).per_hit_truncated) return "";
   if (h.heading_path.length) return h.heading_path.join(" › ");
   return "";
+}
+
+const MIN_HIT_CHARS = 80;
+
+type BudgetedHit = Hit & { text_truncated?: true; per_hit_truncated?: true };
+
+function chars(value: string): string[] {
+  return [...value];
+}
+
+function evidenceCost(hit: Hit): number {
+  return (hit.highlight ? chars(hit.highlight).length : 0) +
+    (hit.text ? chars(hit.text).length : 0);
+}
+
+function truncateEvidence(
+  hit: BudgetedHit,
+  keptChars: number,
+  marker: "text_truncated" | "per_hit_truncated",
+): void {
+  const fields = ["highlight", "text"] as const;
+  let remaining = keptChars;
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index]!;
+    const value = hit[field];
+    if (!value) continue;
+    const points = chars(value);
+    if (points.length <= remaining) {
+      remaining -= points.length;
+      continue;
+    }
+    if (remaining > 0) {
+      const kept = points.slice(0, remaining).join("");
+      if (field === "highlight") hit.highlight = kept;
+      else hit.text = kept;
+    } else if (field === "highlight") {
+      hit.highlight = null;
+    } else {
+      delete hit.text;
+    }
+    for (const later of fields.slice(index + 1)) {
+      if (later === "highlight") hit.highlight = null;
+      else delete hit.text;
+    }
+    hit[marker] = true;
+    return;
+  }
+}
+
+function applyPerHitLimit(hits: Hit[], limit: number | undefined): BudgetedHit[] {
+  return hits.map((source) => {
+    const hit: BudgetedHit = { ...source };
+    if (limit !== undefined && evidenceCost(hit) > limit) {
+      truncateEvidence(hit, limit, "per_hit_truncated");
+    }
+    return hit;
+  });
+}
+
+function applyContextBudget(
+  hits: Hit[],
+  budget: number,
+): { hits: BudgetedHit[]; dropped: number; truncated: number; context_chars: number } {
+  if (!Number.isSafeInteger(budget) || budget < 0) {
+    throw new RangeError("maxContextChars must be a non-negative safe integer");
+  }
+  const out: BudgetedHit[] = [];
+  let used = 0;
+  let truncated = 0;
+  for (const source of hits) {
+    const hit: BudgetedHit = { ...source };
+    const cost = evidenceCost(hit);
+    if (used + cost <= budget) {
+      used += cost;
+      out.push(hit);
+      continue;
+    }
+    const remaining = budget - used;
+    if (remaining >= MIN_HIT_CHARS) {
+      truncateEvidence(hit, remaining, "text_truncated");
+      used += remaining;
+      truncated += 1;
+      out.push(hit);
+    }
+    break;
+  }
+  return {
+    hits: out,
+    dropped: hits.length - out.length,
+    truncated,
+    context_chars: used,
+  };
 }
 
 /**
@@ -55,14 +159,22 @@ export function formatHitsForLLM(
   hits: Hit[],
   opts: FormatOptions = {},
 ): LlmContext {
-  const { maxCharsPerHit, showSource = true } = opts;
+  const { maxCharsPerHit, maxContextChars, showSource = true } = opts;
+  if (maxCharsPerHit !== undefined && (!Number.isSafeInteger(maxCharsPerHit) || maxCharsPerHit < 0)) {
+    throw new RangeError("maxCharsPerHit must be a non-negative safe integer");
+  }
+  const limitedHits = applyPerHitLimit(hits, maxCharsPerHit);
+  const budgeted = maxContextChars === undefined
+    ? undefined
+    : applyContextBudget(limitedHits, maxContextChars);
+  const selectedHits = budgeted?.hits ?? limitedHits;
   const citations: Citation[] = [];
   const lines: string[] = [];
-  hits.forEach((h, i) => {
+  selectedHits.forEach((h, i) => {
     const marker = i + 1;
     let text = hitText(h);
-    if (maxCharsPerHit && text.length > maxCharsPerHit) {
-      text = text.slice(0, maxCharsPerHit) + "…";
+    if (h.text_truncated || h.per_hit_truncated) {
+      text += "…";
     }
     const src = showSource ? ` (${h.doc_id} p.${h.page})` : "";
     lines.push(`[${marker}]${src} ${text}`.trimEnd());
@@ -75,7 +187,13 @@ export function formatHitsForLLM(
       score: h.score,
     });
   });
-  return { content: lines.join("\n"), citations };
+  const result: LlmContext = { content: lines.join("\n"), citations };
+  if (budgeted) {
+    result.dropped = budgeted.dropped;
+    result.truncated = budgeted.truncated;
+    result.context_chars = budgeted.context_chars;
+  }
+  return result;
 }
 
 // ---- 工具 schema（与执行体） ----------------------------------------------
