@@ -274,24 +274,25 @@ async fn main() -> anyhow::Result<()> {
                             )
                             .await?;
                             let rows = store.fetch_all_chunks().await?;
-                            if !rows.is_empty() {
-                                let n = engine.bootstrap_snapshot(&rows, &data, consistent)?;
-                                eprintln!(
-                                    "cdc bootstrap: imported {n} existing row(s) at {consistent:?}"
-                                );
-                            }
+                            // 空表也必须持久化一致点；否则重启时会误判为“已有 slot + 丢失本地数据”。
+                            let n = engine.bootstrap_snapshot(&rows, &data, consistent)?;
+                            eprintln!(
+                                "cdc bootstrap: imported {n} existing row(s) at {consistent:?}"
+                            );
                         }
-                        None => eprintln!(
-                            "warning: slot 已存在但引擎无检查点，跳过快照、从 slot 现位增量"
+                        None if Engine::cdc_recovery_pending(&data)? => eprintln!(
+                            "cdc recovery: slot 已存在且发现未完成批次，将由后台循环重放"
+                        ),
+                        None => anyhow::bail!(
+                            "CDC slot 已存在但本地 checkpoint 为 0，无法证明派生索引包含 slot \
+                             已确认的历史数据，拒绝以 ready 状态启动。请为新副本使用独立 \
+                             FASTSEARCH_CDC_SLOT，或删除该 slot 后从 PostgreSQL 真源重新 bootstrap。"
                         ),
                     }
                 }
                 Some((rcfg, std::time::Duration::from_millis(interval_ms)))
             }
-            Err(_) => {
-                eprintln!("FASTSEARCH_CDC=1 但未设 DATABASE_URL，跳过 CDC");
-                None
-            }
+            Err(_) => anyhow::bail!("FASTSEARCH_CDC=1 requires DATABASE_URL"),
         }
     } else {
         None

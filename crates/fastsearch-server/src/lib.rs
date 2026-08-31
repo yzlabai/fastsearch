@@ -282,10 +282,20 @@ struct Metrics {
     lat_count: AtomicU64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CdcHealthPhase {
+    Disabled,
+    Starting,
+    Healthy,
+    SourceError,
+    RebuildNeeded,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct CdcHealthSnapshot {
     enabled: bool,
-    phase: String,
+    phase: CdcHealthPhase,
     last_applied_lsn: Option<u64>,
     slot_lag_bytes: Option<u64>,
     last_successful_poll_unix_seconds: Option<u64>,
@@ -298,7 +308,7 @@ impl Default for CdcHealthSnapshot {
     fn default() -> Self {
         Self {
             enabled: false,
-            phase: "disabled".into(),
+            phase: CdcHealthPhase::Disabled,
             last_applied_lsn: None,
             slot_lag_bytes: None,
             last_successful_poll_unix_seconds: None,
@@ -307,6 +317,18 @@ impl Default for CdcHealthSnapshot {
             last_error: None,
         }
     }
+}
+
+impl CdcHealthSnapshot {
+    fn is_ready(&self) -> bool {
+        self.enabled && self.phase == CdcHealthPhase::Healthy && !self.rebuild_needed
+    }
+}
+
+fn load_cdc_disk_health(data_dir: &std::path::Path) -> fastsearch_engine::Result<(bool, u64)> {
+    let recovery_pending = Engine::cdc_recovery_pending(data_dir)?;
+    let dead_letter_count = Engine::cdc_dead_letter_count(data_dir)?;
+    Ok((recovery_pending, dead_letter_count))
 }
 
 impl Metrics {
@@ -449,22 +471,16 @@ impl ServerState {
         }
     }
 
-    /// 启用 CDC 依赖健康追踪。后台首轮成功前 readiness 保持阻断；若发现恢复意图，明确
-    /// 标为 rebuild_needed，直到 slot 幂等重放完成。
-    pub fn with_cdc_tracking(self, recovery_pending: bool) -> Self {
-        self.initialize_cdc_tracking(recovery_pending);
-        self
-    }
-
-    fn initialize_cdc_tracking(&self, recovery_pending: bool) {
+    fn initialize_cdc_tracking(&self, recovery_pending: bool, dead_letter_count: u64) {
         let mut health = self.cdc_health.write().unwrap_or_else(|e| e.into_inner());
         health.enabled = true;
-        health.phase = if recovery_pending {
-            "rebuild_needed".into()
+        health.dead_letter_count = dead_letter_count;
+        health.rebuild_needed = recovery_pending || dead_letter_count > 0;
+        health.phase = if health.rebuild_needed {
+            CdcHealthPhase::RebuildNeeded
         } else {
-            "starting".into()
+            CdcHealthPhase::Starting
         };
-        health.rebuild_needed = recovery_pending;
         health.last_error = None;
     }
 
@@ -475,14 +491,19 @@ impl ServerState {
             .clone()
     }
 
-    fn record_cdc_success(&self, stats: CdcConsumeStats, recovery_pending: bool) {
+    fn record_cdc_success(
+        &self,
+        stats: CdcConsumeStats,
+        recovery_pending: bool,
+        dead_letter_count: u64,
+    ) {
         let mut health = self.cdc_health.write().unwrap_or_else(|e| e.into_inner());
-        health.dead_letter_count = health.dead_letter_count.saturating_add(stats.dead_letters);
-        health.rebuild_needed = recovery_pending || health.dead_letter_count > 0;
+        health.dead_letter_count = dead_letter_count;
+        health.rebuild_needed = recovery_pending || dead_letter_count > 0;
         health.phase = if health.rebuild_needed {
-            "rebuild_needed".into()
+            CdcHealthPhase::RebuildNeeded
         } else {
-            "healthy".into()
+            CdcHealthPhase::Healthy
         };
         if stats.last_applied_lsn.0 > 0 {
             health.last_applied_lsn = Some(stats.last_applied_lsn.0);
@@ -492,13 +513,21 @@ impl ServerState {
         health.last_error = None;
     }
 
-    fn record_cdc_error(&self, error: &str, recovery_pending: bool) {
+    fn record_cdc_error(
+        &self,
+        error: &str,
+        recovery_pending: bool,
+        dead_letter_count: Option<u64>,
+    ) {
         let mut health = self.cdc_health.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = dead_letter_count {
+            health.dead_letter_count = count;
+        }
         health.rebuild_needed = recovery_pending || health.dead_letter_count > 0;
         health.phase = if health.rebuild_needed {
-            "rebuild_needed".into()
+            CdcHealthPhase::RebuildNeeded
         } else {
-            "source_error".into()
+            CdcHealthPhase::SourceError
         };
         health.last_error = Some(error.to_string());
     }
@@ -615,16 +644,28 @@ impl ServerState {
         data_dir: std::path::PathBuf,
         interval: std::time::Duration,
     ) {
-        let recovery_pending = Engine::cdc_recovery_pending(&data_dir).unwrap_or(true);
-        self.initialize_cdc_tracking(recovery_pending);
+        let disk_health = load_cdc_disk_health(&data_dir);
+        match disk_health {
+            Ok((pending, dead)) => self.initialize_cdc_tracking(pending, dead),
+            Err(error) => {
+                self.initialize_cdc_tracking(true, 0);
+                self.record_cdc_error(&format!("read CDC recovery state: {error}"), true, None);
+            }
+        }
         let engine = self.engine.clone();
         let state = self.clone();
         tokio::spawn(async move {
             loop {
                 match Engine::consume_once_shared(&engine, &cfg, &data_dir).await {
                     Ok(stats) => {
-                        let pending = Engine::cdc_recovery_pending(&data_dir).unwrap_or(true);
-                        state.record_cdc_success(stats, pending);
+                        match load_cdc_disk_health(&data_dir) {
+                            Ok((pending, dead)) => state.record_cdc_success(stats, pending, dead),
+                            Err(error) => state.record_cdc_error(
+                                &format!("read CDC recovery state: {error}"),
+                                true,
+                                None,
+                            ),
+                        }
                         if stats.applied > 0 {
                             eprintln!(
                                 "cdc: applied {} change(s), commit_lsn={} lag={}B dead={} prepare={}us lock_wait={}us lock_hold={}us",
@@ -639,8 +680,12 @@ impl ServerState {
                         }
                     }
                     Err(err) => {
-                        let pending = Engine::cdc_recovery_pending(&data_dir).unwrap_or(true);
-                        state.record_cdc_error(&err.to_string(), pending);
+                        match load_cdc_disk_health(&data_dir) {
+                            Ok((pending, dead)) => {
+                                state.record_cdc_error(&err.to_string(), pending, Some(dead))
+                            }
+                            Err(_) => state.record_cdc_error(&err.to_string(), true, None),
+                        }
                         eprintln!("cdc error: {err}");
                     }
                 }
@@ -747,7 +792,7 @@ async fn process_ready(State(s): State<ServerState>) -> Response {
         }))
         .into_response();
     }
-    let ready = health.phase == "healthy" && !health.rebuild_needed;
+    let ready = health.is_ready();
     (
         if ready {
             StatusCode::OK
@@ -1306,7 +1351,7 @@ async fn metrics(State(s): State<ServerState>) -> String {
         &mut out,
         "fastsearch_cdc_ready",
         "CDC source has polled successfully with no rebuild requirement (1/0).",
-        u64::from(cdc.enabled && cdc.phase == "healthy" && !cdc.rebuild_needed),
+        u64::from(cdc.is_ready()),
     );
     gauge(
         &mut out,
@@ -4728,7 +4773,8 @@ mod tests {
     #[tokio::test]
     async fn readyz_blocks_when_cdc_recovery_is_pending() {
         let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
-        let state = ServerState::new(engine, keys()).with_cdc_tracking(true);
+        let state = ServerState::new(engine, keys());
+        state.initialize_cdc_tracking(true, 0);
         let app = router(state);
         let resp = app
             .clone()
@@ -4787,7 +4833,8 @@ mod tests {
     #[tokio::test]
     async fn readyz_becomes_dependency_ready_after_successful_cdc_poll() {
         let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
-        let state = ServerState::new(engine, keys()).with_cdc_tracking(false);
+        let state = ServerState::new(engine, keys());
+        state.initialize_cdc_tracking(false, 0);
         state.record_cdc_success(
             fastsearch_engine::CdcConsumeStats {
                 applied: 3,
@@ -4797,6 +4844,7 @@ mod tests {
                 ..Default::default()
             },
             false,
+            0,
         );
         let resp = router(state)
             .oneshot(
@@ -4817,6 +4865,27 @@ mod tests {
         assert!(body["cdc"]["last_successful_poll_unix_seconds"]
             .as_u64()
             .is_some_and(|timestamp| timestamp > 0));
+    }
+
+    #[tokio::test]
+    async fn readyz_keeps_persisted_dead_letters_in_rebuild_needed() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let state = ServerState::new(engine, keys());
+        state.initialize_cdc_tracking(false, 4);
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp).await;
+        assert_eq!(body["cdc"]["phase"], "rebuild_needed");
+        assert_eq!(body["cdc"]["dead_letter_count"], 4);
+        assert_eq!(body["cdc"]["rebuild_needed"], true);
     }
 
     #[tokio::test]

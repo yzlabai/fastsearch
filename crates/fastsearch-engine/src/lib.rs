@@ -142,30 +142,112 @@ impl CdcBatchIntent {
     }
 
     fn save(&self, data_dir: &Path) -> Result<()> {
-        let path = Self::path(data_dir);
-        let tmp = data_dir.join("cdc-batch-intent.json.tmp");
-        let bytes = serde_json::to_vec(self)
-            .map_err(|error| EngineError::Persist(format!("serialize CDC intent: {error}")))?;
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)
-                .map_err(|error| EngineError::Persist(format!("create CDC intent: {error}")))?;
-            file.write_all(&bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|error| EngineError::Persist(format!("write CDC intent: {error}")))?;
+        save_json_state(data_dir, "cdc-batch-intent.json", self, "CDC intent")
+    }
+
+    fn start(data_dir: &Path, commit_lsn: Lsn) -> Result<()> {
+        Self {
+            schema_version: 1,
+            commit_lsn: commit_lsn.0,
+            phase: CdcIntentPhase::Applying,
         }
-        std::fs::rename(&tmp, &path)
-            .map_err(|error| EngineError::Persist(format!("publish CDC intent: {error}")))?;
-        sync_directory(data_dir, "CDC intent")
+        .save(data_dir)
     }
 
     fn clear(data_dir: &Path) -> Result<()> {
+        remove_state_file(data_dir, "cdc-batch-intent.json", "CDC intent")
+    }
+}
+
+/// 确定性毒丸已经推进 slot、无法自动重放；持久化该事实，避免进程重启后错误恢复 ready。
+/// 只有完成一次真源全量 bootstrap 才清除。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CdcRebuildState {
+    schema_version: u32,
+    dead_letters_total: u64,
+    #[serde(default)]
+    last_counted_commit_lsn: u64,
+}
+
+impl CdcRebuildState {
+    fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join("cdc-rebuild-state.json")
+    }
+
+    fn load(data_dir: &Path) -> Result<Self> {
         let path = Self::path(data_dir);
-        match std::fs::remove_file(path) {
-            Ok(()) => sync_directory(data_dir, "CDC intent removal"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(EngineError::Persist(format!("remove CDC intent: {error}"))),
+        if !path.exists() {
+            return Ok(Self::default());
         }
+        let bytes = std::fs::read(path)
+            .map_err(|error| EngineError::Persist(format!("read CDC rebuild state: {error}")))?;
+        let state: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| EngineError::Persist(format!("parse CDC rebuild state: {error}")))?;
+        if state.schema_version != 1 {
+            return Err(EngineError::Persist(format!(
+                "unsupported CDC rebuild-state schema {}",
+                state.schema_version
+            )));
+        }
+        Ok(state)
+    }
+
+    fn save(&self, data_dir: &Path) -> Result<()> {
+        save_json_state(
+            data_dir,
+            "cdc-rebuild-state.json",
+            self,
+            "CDC rebuild state",
+        )
+    }
+
+    fn record_dead_letters(data_dir: &Path, commit_lsn: Lsn, count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let mut state = Self::load(data_dir)?;
+        if commit_lsn.0 <= state.last_counted_commit_lsn {
+            return Ok(());
+        }
+        state.schema_version = 1;
+        state.dead_letters_total = state.dead_letters_total.saturating_add(count);
+        state.last_counted_commit_lsn = commit_lsn.0;
+        state.save(data_dir)
+    }
+
+    fn clear(data_dir: &Path) -> Result<()> {
+        remove_state_file(data_dir, "cdc-rebuild-state.json", "CDC rebuild state")
+    }
+}
+
+fn save_json_state<T: Serialize>(
+    data_dir: &Path,
+    file_name: &str,
+    value: &T,
+    operation: &str,
+) -> Result<()> {
+    let path = data_dir.join(file_name);
+    let tmp = data_dir.join(format!("{file_name}.tmp"));
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| EngineError::Persist(format!("serialize {operation}: {error}")))?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|error| EngineError::Persist(format!("create {operation}: {error}")))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| EngineError::Persist(format!("write {operation}: {error}")))?;
+    }
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| EngineError::Persist(format!("publish {operation}: {error}")))?;
+    sync_directory(data_dir, operation)
+}
+
+fn remove_state_file(data_dir: &Path, file_name: &str, operation: &str) -> Result<()> {
+    match std::fs::remove_file(data_dir.join(file_name)) {
+        Ok(()) => sync_directory(data_dir, &format!("{operation} removal")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(EngineError::Persist(format!("remove {operation}: {error}"))),
     }
 }
 
@@ -175,6 +257,29 @@ fn sync_directory(path: &Path, operation: &str) -> Result<()> {
         .map_err(|error| {
             EngineError::Persist(format!("fsync directory after {operation}: {error}"))
         })
+}
+
+async fn finish_empty_cdc_batch(
+    cfg: &ReplicationConfig,
+    data_dir: &Path,
+    batch: &ReplicationBatch,
+) -> Result<Lsn> {
+    CdcRebuildState::record_dead_letters(data_dir, batch.commit_lsn, batch.dead_letters)?;
+    if batch.commit_lsn > Lsn(0) {
+        advance_cdc_slot(cfg, batch.commit_lsn).await?;
+    }
+    CdcBatchIntent::clear(data_dir)?;
+    let persisted_lsn = Lsn(Checkpoint::load(data_dir)?.applied_lsn);
+    Ok(batch.commit_lsn.max(persisted_lsn))
+}
+
+async fn finish_persisted_cdc_batch(
+    cfg: &ReplicationConfig,
+    data_dir: &Path,
+    commit_lsn: Lsn,
+) -> Result<()> {
+    advance_cdc_slot(cfg, commit_lsn).await?;
+    CdcBatchIntent::clear(data_dir)
 }
 
 fn kind_str(k: ChunkKind) -> &'static str {
@@ -1110,6 +1215,22 @@ impl Engine {
         Ok(())
     }
 
+    fn persist_cdc_batch(
+        &mut self,
+        data_dir: &Path,
+        commit_lsn: Lsn,
+        dead_letters: u64,
+    ) -> Result<()> {
+        self.persist(data_dir, commit_lsn)?;
+        CdcBatchIntent {
+            schema_version: 1,
+            commit_lsn: commit_lsn.0,
+            phase: CdcIntentPhase::Persisted,
+        }
+        .save(data_dir)?;
+        CdcRebuildState::record_dead_letters(data_dir, commit_lsn, dead_letters)
+    }
+
     /// 是否存在未完成的 CDC 跨存储批次。存在或文件损坏时调用方必须阻断 dependency
     /// readiness，直到同一 slot 批次重放成功或执行从真源重建。
     pub fn cdc_recovery_pending(data_dir: &Path) -> Result<bool> {
@@ -1128,6 +1249,11 @@ impl Engine {
             )));
         }
         Ok(true)
+    }
+
+    /// 已持久化的确定性 CDC 死信累计；非零表示派生索引可能漂移，需全量重建。
+    pub fn cdc_dead_letter_count(data_dir: &Path) -> Result<u64> {
+        Ok(CdcRebuildState::load(data_dir)?.dead_letters_total)
     }
 
     /// **初始快照 bootstrap**：把已有 PG 行（`(collection, chunk)`）整批准备并发布
@@ -1153,6 +1279,7 @@ impl Engine {
         self.apply_prepared_cdc_batch(prepared)
             .map_err(|error| EngineError::Cdc(format!("bootstrap apply: {error}")))?;
         self.persist(data_dir, lsn)?;
+        CdcRebuildState::clear(data_dir)?;
         Ok(rows.len())
     }
 
@@ -1224,32 +1351,17 @@ impl Engine {
     ) -> Result<usize> {
         let batch = peek_cdc_batch(cfg).await?;
         if batch.events.is_empty() {
-            if batch.commit_lsn > Lsn(0) {
-                advance_cdc_slot(cfg, batch.commit_lsn).await?;
-            }
-            CdcBatchIntent::clear(data_dir)?;
+            finish_empty_cdc_batch(cfg, data_dir, &batch).await?;
             return Ok(0);
         }
         let applied = batch.events.len();
         let changes: Vec<_> = batch.events.into_iter().map(|event| event.change).collect();
-        CdcBatchIntent {
-            schema_version: 1,
-            commit_lsn: batch.commit_lsn.0,
-            phase: CdcIntentPhase::Applying,
-        }
-        .save(data_dir)?;
+        CdcBatchIntent::start(data_dir, batch.commit_lsn)?;
         IndexSink::apply_changes(self, &changes)
             .map_err(|e| EngineError::Cdc(format!("apply: {e}")))?;
         // 先落盘（索引 + 检查点=slot 高水位，含 Commit），后推进 slot —— 崩溃安全铁律。
-        self.persist(data_dir, batch.commit_lsn)?;
-        CdcBatchIntent {
-            schema_version: 1,
-            commit_lsn: batch.commit_lsn.0,
-            phase: CdcIntentPhase::Persisted,
-        }
-        .save(data_dir)?;
-        advance_cdc_slot(cfg, batch.commit_lsn).await?;
-        CdcBatchIntent::clear(data_dir)?;
+        self.persist_cdc_batch(data_dir, batch.commit_lsn, batch.dead_letters)?;
+        finish_persisted_cdc_batch(cfg, data_dir, batch.commit_lsn).await?;
         Ok(applied)
     }
 
@@ -1262,13 +1374,9 @@ impl Engine {
     ) -> Result<CdcConsumeStats> {
         let batch = peek_cdc_batch(cfg).await?;
         if batch.events.is_empty() {
-            if batch.commit_lsn > Lsn(0) {
-                advance_cdc_slot(cfg, batch.commit_lsn).await?;
-            }
-            CdcBatchIntent::clear(data_dir)?;
-            let persisted_lsn = Lsn(Checkpoint::load(data_dir)?.applied_lsn);
+            let last_applied_lsn = finish_empty_cdc_batch(cfg, data_dir, &batch).await?;
             return Ok(CdcConsumeStats {
-                last_applied_lsn: batch.commit_lsn.max(persisted_lsn),
+                last_applied_lsn,
                 slot_lag_bytes: batch.slot_lag_bytes,
                 dead_letters: batch.dead_letters,
                 ..CdcConsumeStats::default()
@@ -1288,12 +1396,7 @@ impl Engine {
             .map_err(|error| EngineError::Cdc(format!("prepare: {error}")))?;
         let prepare_micros = prepare_started.elapsed().as_micros() as u64;
 
-        CdcBatchIntent {
-            schema_version: 1,
-            commit_lsn: batch.commit_lsn.0,
-            phase: CdcIntentPhase::Applying,
-        }
-        .save(data_dir)?;
+        CdcBatchIntent::start(data_dir, batch.commit_lsn)?;
 
         let lock_started = std::time::Instant::now();
         let mut locked = engine.lock().await;
@@ -1306,18 +1409,11 @@ impl Engine {
         locked
             .apply_prepared_cdc_batch(prepared)
             .map_err(|error| EngineError::Cdc(format!("apply prepared: {error}")))?;
-        locked.persist(data_dir, batch.commit_lsn)?;
-        CdcBatchIntent {
-            schema_version: 1,
-            commit_lsn: batch.commit_lsn.0,
-            phase: CdcIntentPhase::Persisted,
-        }
-        .save(data_dir)?;
+        locked.persist_cdc_batch(data_dir, batch.commit_lsn, batch.dead_letters)?;
         let lock_hold_micros = hold_started.elapsed().as_micros() as u64;
         drop(locked);
 
-        advance_cdc_slot(cfg, batch.commit_lsn).await?;
-        CdcBatchIntent::clear(data_dir)?;
+        finish_persisted_cdc_batch(cfg, data_dir, batch.commit_lsn).await?;
         Ok(CdcConsumeStats {
             applied,
             prepare_micros,
@@ -4285,6 +4381,24 @@ mod tests {
         // 文本也在（keyword 路）
         let kw = e2.search(&req("beta"), None).unwrap();
         assert_eq!(kw[0].id.chunk_id, 2);
+    }
+
+    #[test]
+    fn cdc_dead_letter_rebuild_state_survives_restart_and_accumulates() {
+        let data = tempfile::tempdir().unwrap();
+        assert_eq!(Engine::cdc_dead_letter_count(data.path()).unwrap(), 0);
+        CdcRebuildState::record_dead_letters(data.path(), Lsn(10), 2).unwrap();
+        assert_eq!(Engine::cdc_dead_letter_count(data.path()).unwrap(), 2);
+        CdcRebuildState::record_dead_letters(data.path(), Lsn(10), 2).unwrap();
+        assert_eq!(
+            Engine::cdc_dead_letter_count(data.path()).unwrap(),
+            2,
+            "retrying an unadvanced batch must not count the same poison twice"
+        );
+        CdcRebuildState::record_dead_letters(data.path(), Lsn(11), 3).unwrap();
+        assert_eq!(Engine::cdc_dead_letter_count(data.path()).unwrap(), 5);
+        CdcRebuildState::clear(data.path()).unwrap();
+        assert_eq!(Engine::cdc_dead_letter_count(data.path()).unwrap(), 0);
     }
 
     #[test]

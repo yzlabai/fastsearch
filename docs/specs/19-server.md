@@ -113,6 +113,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - [x] v2.5（2026-08-31，FS-002）：OpenAPI SearchRequest 补齐 `fusion`/`embedder`/`explain`，Hit 补齐 `time`/`media`/`sources`；REST/OpenAPI 字段集与共享矩阵做精确集合断言。`explain=true` 的 server 路由测试证明来源明细可见，默认响应继续省略该字段。
 - [x] v2.6（2026-08-31，FS-003）：`/readyz` 改为结构化进程级就绪响应，明确不检查 PG/CDC/embedder；单测、OpenAPI 与真二进制 MCP↔server e2e 共同钉住语义。
 - [x] v2.7（2026-08-31，FS-103）：CDC 启用后 `/readyz` 升级为真实依赖探针；后台轮询共享 slot lag、最后 commit LSN、最后成功时间、死信累计和 rebuild-needed，Prometheus 同步暴露七项 CDC 指标。未启用 CDC 的进程级契约保持兼容。
+  显式启用 CDC 但缺 `DATABASE_URL` 时拒绝启动；死信/rebuild 状态持久化，不能靠重启恢复 ready。真实 server + curl 已验证 PG 停止时 200→503、恢复后 503→200。
 - [x] v2.4（2026-08-24，**fail-closed 默认 + 运行档如实标注**）：上游决策
   [职责边界：不承担身份与控制面](../governance/2026-08-24-职责边界-不承担身份与控制面.md)——
   身份归调用方，**正因 100% 依赖调用方接对，才不能在他没接对时替他猜**。两处"替他猜"已断根：

@@ -101,6 +101,7 @@ impl Applier {
   - [x] FS-101（2026-08-31，Docker pgvector:pg17 真机）：`map` 升级为零到多变更；PK UPDATE 输出有序 Delete+Upsert 复合事件；TRUNCATE 输出 Clear 并清 text/vector；Relation 改为 `ReplicationConfig.source_table` 精确限定表名 + 列形状双守卫。环境门禁现为 PG/CDC 21/21 executed。
   - [x] FS-102（2026-08-31，Docker pgvector:pg17 真机）：`apply_changes` 建立整批接缝，Engine 全批准备后发布；一次 `embed_multi`、PG 事务写穿、嵌入锁外等待与故障重试闭环落地。PG 写穿至本地发布期间由 Engine 锁阻断搜索；跨 PG/本地文件的进程崩溃恢复边界明确转入 FS-103。PG/CDC 显式门禁增至 24 项。
   - [x] FS-103（2026-08-31，Docker pgvector:pg17 真机）：并发 `ensure_slot` 捕获 PG duplicate-object，8 副本首建全成功；生产路径移除 `Applier` 水位并统一为 commit LSN；PG 写穿/本地发布前原子落 `cdc-batch-intent.json`，persist 后更新阶段，slot advance 后清除。任何中途错误或崩溃均阻断 readiness，常规轮询按 GlobalId 幂等重放；不宣称跨 PG/本地文件 2PC。peek/apply/persist/advance 四边界恢复、恢复标记和状态指标均有实库回归。PG/CDC 显式门禁增至 28 项。
+    - 确定性死信累计另存 `cdc-rebuild-state.json`，重启后继续阻断 readiness，成功全量 bootstrap 后清除。已有 slot + 本地 checkpoint=0 只有存在未完成 intent 时允许重放，否则拒绝启动，避免漏掉 slot 已确认历史。
 
 **复测配方（Docker）：**
 ```bash
