@@ -17,6 +17,7 @@ ACL 由服务端按 API Key 强制，客户端无法越权。对接 docparse：�
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 import urllib.error
@@ -113,9 +114,10 @@ class FastsearchClient:
         query_image: Optional[list[int]] = None,
         embedder: Optional[str] = None,
         candidates: Optional[int] = None,
-        rerank: Optional[bool] = None,
+        ef_search: Optional[int] = None,
+        rerank: Optional[dict] = None,
         auto_merge: Optional[bool] = None,
-        collapse: Optional[str] = None,
+        collapse: Optional[dict] = None,
         search_after: Optional[str] = None,
         include_text: bool = False,
         include_metadata: bool = False,
@@ -131,11 +133,17 @@ class FastsearchClient:
         if vector is not None:
             body["vector"] = vector
         if query_image is not None:
-            body["query_image"] = query_image
+            try:
+                image_bytes = bytes(query_image)
+            except (TypeError, ValueError) as e:
+                raise ValueError("query_image must contain bytes in [0,255]") from e
+            body["query_image_base64"] = base64.b64encode(image_bytes).decode("ascii")
         if embedder is not None:
             body["embedder"] = embedder
         if candidates is not None:
             body["candidates"] = candidates
+        if ef_search is not None:
+            body["ef_search"] = ef_search
         if rerank is not None:
             body["rerank"] = rerank
         if auto_merge is not None:
@@ -170,9 +178,10 @@ class FastsearchClient:
         query_image: Optional[list[int]] = None,
         embedder: Optional[str] = None,
         candidates: Optional[int] = None,
-        rerank: Optional[bool] = None,
+        ef_search: Optional[int] = None,
+        rerank: Optional[dict] = None,
         auto_merge: Optional[bool] = None,
-        collapse: Optional[str] = None,
+        collapse: Optional[dict] = None,
         search_after: Optional[str] = None,
         include_text: bool = False,
         include_metadata: bool = False,
@@ -198,6 +207,7 @@ class FastsearchClient:
             query_image=query_image,
             embedder=embedder,
             candidates=candidates,
+            ef_search=ef_search,
             rerank=rerank,
             auto_merge=auto_merge,
             collapse=collapse,

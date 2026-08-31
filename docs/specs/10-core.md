@@ -87,6 +87,7 @@ pub struct SearchRequest {
     pub query_image: Option<Vec<u8>>, // 以图搜图查询图字节（MM9）；vector=None 时用支持图像的后端嵌成查询向量
     pub embedder: Option<String>,
     pub candidates: usize,        // 宽召回数，默认 150
+    pub ef_search: Option<usize>, // HNSW 逐查询探索宽度；非 HNSW 后端忽略
     pub top_k: usize,             // 最终返回数，默认 20
     pub rerank: Option<RerankSpec>,
     pub auto_merge: bool,
@@ -103,7 +104,7 @@ pub struct RerankSpec { pub model: String, pub top_k: usize /* 默认 20 */ }
 pub struct Collapse  { pub field: String /* doc_id / section_id */, pub max_per_group: usize /* 默认 1，validate 要求 >0 */ }
 ```
 - 默认值：mode=Hybrid，fusion=RRF{60}，candidates=150，top_k=20。
-- `validate() -> Result<(), CoreError>`：top_k>0、candidates>=top_k、semantic_ratio∈[0,1]、rank_constant>0。
+- `validate() -> Result<(), CoreError>`：top_k>0、candidates>=top_k、semantic_ratio/alpha∈[0,1]、rank_constant>0；具名权重及默认权重必须有限且非负。
 
 ### 2.3 过滤 AST
 
@@ -131,13 +132,18 @@ pub enum Fusion {
     Rrf { rank_constant: f64 },                 // 默认 60
     Normalized { semantic_ratio: f64 },         // min-max 归一化后加权
     Weighted { alpha: f64 },                     // alpha*dense + (1-alpha)*sparse（已归一化）
+    Weights { weights: BTreeMap<String, f64>, default_weight: f64 }, // 具名 N 路权重
 }
 pub struct Scored { pub id: GlobalId, pub score: f64 }
+pub struct RecallList { pub source: String, pub weight: f64, pub items: Vec<Scored> }
+pub struct SourceHit { pub source: String, pub rank: usize, pub score: f64, pub contribution: f64 }
 ```
 - `fuse(keyword: &[Scored], semantic: &[Scored], fusion: &Fusion) -> Vec<Scored>`：合并两路、按融合分降序、稳定 tie-break（同分按 id 升序，保证确定性）。
+- `fuse_n` / `fuse_n_with_sources`：按 `source` 字典序稳定累加 N 路；后一接口同时返回路内 rank、原始分和实际贡献。
 - RRF：`Σ 1/(k+rank)`，rank 从 1 起。
 - Normalized：各路 min-max 到 [0,1]（单元素或全同值时归 1.0），`semantic_ratio*sem + (1-ratio)*kw`。
 - 一路为空时退化为另一路。
+- `Normalized`/`Weighted` 旧 JSON 与 Rust 枚举成员保留；`Weights` 是加法兼容的新成员，未列来源默认权重 1.0。
 
 ### 2.5 引用
 
@@ -208,3 +214,4 @@ pub enum CoreError { InvalidRequest(String), InvalidCitation(String), InvalidFil
 - 2026-06-27 回写多模态（MM1，代码已实现）：`ChunkKind` 加 `Audio`/`Video` + `ChunkKind::modality()`；新增 `Modality`/`TimeSpan`/`AssetPointer`/`MediaRef`（§2.1b）；`Chunk.image_meta`→`media`（MM2b，`ImageMeta` 降级为迁移用 `to_media`）；`text` 语义放宽为"可空串的可检索文本表示"；`Citation` 加 `time`/`media`（§2.5）。设计见 [多模态功能设计与开发计划](../plans/2026-06-25-多模态功能设计与开发计划.md)；单测覆盖 modality 派生/serde/citation 回环。
 - 2026-06-28 回写 spec 漂移（代码已实现，spec 落后）：`Chunk` 加 `media_bytes`（MM2c-bytes，inline 字节，serde skip）；`SearchRequest` 加 `query_image`（MM9 以图搜图）、`collapse`（分组折叠）、`search_after`（深分页游标）、`facets`（请求分面字段）；补 `RerankSpec`/`Collapse` 类型定义（§2.2）。均为补文档、无代码改动。
 - 2026-07-23 通用 chunk 协议：`Chunk` 新增不透明 `metadata` 与 `searchable`；`SearchRequest` 新增 opt-in `include_text`/`include_metadata`。字段均有向后兼容默认值，metadata 受统一资源边界约束。
+- 2026-08-31 FS-002：`Fusion::Weights`、`fuse_n_with_sources`/`SourceHit` 与权重校验落地；共享字段矩阵钉住 `SearchRequest` 的 19 个内部字段。现有两路可解释接线在 engine，实际第三路待 FS-201/FS-202。

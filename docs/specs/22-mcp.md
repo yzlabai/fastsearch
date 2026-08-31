@@ -165,10 +165,9 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
   另：`tool_search` 检测 `mode` 是否**显式给出**，未给则强制走 `SearchMode::Keyword`——因为
   `SearchRequest` 的 serde 默认是 `Hybrid`（`crates/fastsearch-core/src/query.rs`）而 schema
   宣称的默认是 `keyword`，两个 default 不对齐的话省略 `mode` 仍会掉回静默退化。
-- **反向（KB-0.2 补，当前是缺口）**：见 §4.7。`tool_search` 现在把整个 `arguments`
-  `serde_json::from_value::<SearchRequest>` 一把梭，于是 `query_image`、`collapse`、`facets`、
-  `auto_merge`、`rerank`、`explain`、`candidates`、`ef_search`、`embedder`、`fusion`、
-  `include_text`、`include_metadata`、`search_after` **全都能硬传且从未被宣称**。
+- **反向（已落地）**：`tool_search` 只从 schema 同源允许清单投影参数；未宣称字段在反序列化前
+  逐项拒绝并点名。FS-002 又把允许集接入共享字段矩阵，并遍历 REST 的矩阵外字段证明均明确拒绝，
+  不再存在 `explain`/`fusion`/`query_image_base64` 等暗门。
 - **C1 适用于整张工具表，不只是 `mode`**：某种能力（如 KB-0.3 的写入工具）只有远端模式具备时，
   本地模式的 `tools/list` 里**不得出现该工具**——不是"出现了但会报错"。
 
@@ -519,8 +518,7 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
    自带 `vector`，要么走 REST，要么等远端档。
 2. **本地档 ACL 是进程级常量**：一个进程一个租户，多租户场景用不了；且**未设 tenant 时
    `acl=None` 全库可见**（fail-open，§4.3-4 待 KB-0.2 收紧）。
-3. **C1 反向缺口**：未宣称的 `SearchRequest` 字段今天全能硬传（`query_image`/`include_text`/
-   `collapse`/…），`query_image` + 默认 keyword 更是**必然静默无效**。§4.7 是解法，未实施。
+3. **C1 反向已闭合**：schema、允许清单和共享字段矩阵一致；未宣称的 REST 搜索字段均显式拒绝。
 4. **远端档的 `hybrid` 只诚实到"server 会算查询向量"这一层**：`server_vector_info` 不吐
    `caps().semantic`/`image`/`cross_modal` ⇒ 无法证明它是语义的、能收图。等 **KB-2.4**。
 5. **继承 server 的一处静默退化**：`filter_targets_image` 命中且后端 `caps.cross_modal==false`

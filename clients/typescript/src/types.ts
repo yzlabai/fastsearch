@@ -42,12 +42,25 @@ export interface Hit {
   metadata?: Record<string, unknown>;
   /** auto-merge 命中时被合并进来的兄弟 chunk_id。 */
   merged_chunk_ids: number[];
+  /** 仅 `explain: true` 时返回的具名召回路贡献。 */
+  sources?: HitSource[];
   /** 时间锚点（字幕/音视频 chunk 的时间区间，秒）；无则 null。 */
   time?: unknown;
   /** 媒资引用；无则 null。 */
   media?: Media | null;
   /** 不透明深分页游标：把上一页末条命中的此值作为下次 `searchAfter` 即续取下一页。 */
   cursor: string;
+}
+
+/** 某条召回路对最终命中的贡献。 */
+export interface HitSource {
+  source: string;
+  /** 该路内名次，1 起。 */
+  rank: number;
+  /** 归一化前的该路原始分。 */
+  score: number;
+  /** 对融合分的实际加数。 */
+  contribution: number;
 }
 
 /** 一个分面字段的取值分布。 */
@@ -139,7 +152,12 @@ export type SearchMode = "keyword" | "vector" | "hybrid";
 export type Fusion =
   | { method: "rrf"; rank_constant?: number }
   | { method: "normalized"; semantic_ratio?: number }
-  | { method: "weighted"; alpha?: number };
+  | { method: "weighted"; alpha?: number }
+  | {
+      method: "weights";
+      weights?: Record<string, number>;
+      default_weight?: number;
+    };
 
 /** rerank 配置。 */
 export interface RerankSpec {
@@ -194,6 +212,8 @@ export interface SearchOptions {
   embedder?: string;
   /** 召回候选窗口（深分页/折叠的上界），默认 150，须 ≥ topK。 */
   candidates?: number;
+  /** HNSW 逐查询探索宽度；其它向量后端忽略。 */
+  efSearch?: number;
   /** 返回条数，默认 20。 */
   topK?: number;
   /** rerank 配置（默认不 rerank）。 */

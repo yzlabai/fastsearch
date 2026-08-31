@@ -10,8 +10,8 @@
 
 - 持有派生索引（当前 text；P2 加 vector）。
 - 实现 `sync::IndexSink`（适配器）：CDC 变更落到 text 索引，避免 text 反依赖 sync。
-- `search(req, acl)`：执行排序管线（ACL 强制注入 → keyword∥semantic 召回 → 融合 → 组装命中）。当前 keyword 全量可用；vector/hybrid 在 vector 后端落地前回退到 keyword（显式标注）。
-- 命中结构 `SearchHit`：id + citation + 融合分 + 各路分。
+- `search(req, acl)`：执行排序管线（ACL 强制注入 → keyword∥semantic 召回 → 具名融合 → 组装命中）。现有真实召回路命名为 `keyword:user_text`、`vector:user_text`。
+- 命中结构 `SearchHit`：id + citation + 融合分 + 各路分；`explain=true` 时另带 `sources` 的 rank、原始分和贡献。
 
 **不做**：REST/MCP（server）、向量后端实现（vector）、PG 连接（pg/sync 集成层）。
 
@@ -27,6 +27,7 @@ pub struct SearchHit {
     pub vector: Option<f64>,
     pub text: Option<String>,
     pub metadata: Option<Metadata>,
+    pub sources: Option<Vec<SourceHit>>,
     ...
 }
 
@@ -47,12 +48,13 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 3. **召回**：
    - mode=Keyword：text.search(query, filter, acl, candidates) → bm25 候选。
    - mode=Vector/Hybrid：vector 后端未接入前**回退到 keyword**（返回结果但标注 vector=None；spec 记为已知限制，P2 补真混合）。
-4. **融合**：keyword 单路时直接按 bm25 降序；hybrid 时用 core::fuse（待 vector）。
+4. **融合**：把现有 keyword/vector 候选包装成具名 `RecallList`，经 `core::fuse_n_with_sources` 稳定融合；旧 `Normalized`/`Weighted` 权重语义保持不变，新 `Weights` 按来源名取权重。
 5. **组装**：取 top_k，产出 SearchHit（citation 来自 text 命中）；完整正文和 metadata 仅在 `include_text`/`include_metadata` 为 true 时附带。
 6. 确定性：同库同请求结果一致（继承 text/core 的 tie-break）。
 7. `searchable=false` 的 upsert/CDC 事件从全文和向量索引删除该 gid；PG 真源行不受影响。
 8. text-only chunk upsert 必须删除同 GlobalId 的旧向量，防止 chunk 级更新留下过期向量；批量删除在
    单次 commit 前同步移除全文与向量派生项。
+9. `explain=false` 时 `SearchHit.sources=None`；`explain=true` 时按 source 字典序附上所有命中路。当前只有 user_text 两路，多表示第三路待 `chunk_signal` 接入。
 
 ## 4. 测试用例
 
@@ -67,6 +69,7 @@ impl fastsearch_sync::IndexSink for Engine { ... }   // CDC 落地
 
 - [x] v1 完成：Engine + `IndexSink` 适配 + 全文/向量/**真混合**排序管线 + 9 端到端测试绿（含 CDC→索引→检索、ACL 强制、doc 级替换、过滤、real_hybrid 融合、vector_only、校验失败）。clippy 净、fmt 净。
 - [x] v1.1：接入 fastsearch-vector，mode=Hybrid 走 keyword∥vector → core::fuse；mode=Vector 纯向量；过滤/ACL 两路各自真预过滤。
+- [x] v2.5（2026-08-31，FS-002）：现有 keyword/vector 召回改用具名 N 路融合内核；`Fusion::Weights` 与 `explain` 真正生效，默认响应不增加字段。真实 `keyword:user_text` + `vector:user_text` 测试覆盖权重改序、来源 rank/原始分/贡献；第三路及 model/version 待 FS-201/FS-202。
 - [x] v1.2：`engine::golden::run(set, cfg, mode, k)` —— 把 eval `GoldenSet` 语料灌入内存引擎、对每个查询跑真实检索、用判定算 `Metrics`，承接 eval 的"跑检索"那步（eval 不反依赖 engine，分层不破）。配套 `tests/relevance_gate.rs` 回归门禁（见 [eval spec §6 v2](18-eval.md)）。
 - [x] v1.7（**派生索引持久化 + 崩溃安全 CDC 检查点，Docker PG 验证 done**，2026-06-25）：`open(data_dir)→(Engine, applied_lsn)` / `persist(data_dir, lsn)`（text.commit + 向量原子落盘 + `checkpoint.json`）/ `consume_once(cfg, applier, data_dir)`（**peek 不推进 → 应用 → persist → 落盘后才 advance_slot**，崩溃任意点不丢/不重）。集成测试 `cdc_consume_persist_crashsafe`：消费→落盘→重启→检查点续传、向量不重嵌、slot 不重发、幂等。详见 [计划](../plans/2026-06-25-派生索引持久化与崩溃安全.md)。
 - [x] v1.6（**完整产品主循环，PG+Ollama 双 env 验证 done**，2026-06-25）：`set_embedder` —— 设置后 **CDC 落地路径 `IndexSink::apply_upsert` 自动嵌入 chunk 正文 → 写向量索引**。至此 `PG 写 → 逻辑复制 → pgoutput 解码 → 嵌入 → 派生 BM25+向量 → 混合检索` 主循环完整成立。env-gated 全链路测试 `cdc_embed_hybrid_full_loop`（写 PG → CDC → 嵌入 → 语义 vector 检索词面不重叠查询命中）；两 CDC 集成测试经静态 `tokio::Mutex` 串行（共享 publication/表）。

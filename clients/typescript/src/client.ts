@@ -57,6 +57,17 @@ export interface IndexOptions {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+function bytesToBase64(bytes: number[]): string {
+  if (bytes.some((b) => !Number.isInteger(b) || b < 0 || b > 255)) {
+    throw new FastsearchError("queryImage must contain bytes in [0,255]");
+  }
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.slice(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
 /** fastsearch server 的 REST 客户端。线程安全、可复用单例。 */
 export class FastsearchClient {
   private readonly baseUrl: string;
@@ -190,9 +201,12 @@ export class FastsearchClient {
     body.filter =
       opts.filter !== undefined ? { and: [collFilter, opts.filter] } : collFilter;
     if (opts.vector !== undefined) body.vector = opts.vector;
-    if (opts.queryImage !== undefined) body.query_image = opts.queryImage;
+    if (opts.queryImage !== undefined) {
+      body.query_image_base64 = bytesToBase64(opts.queryImage);
+    }
     if (opts.embedder !== undefined) body.embedder = opts.embedder;
     if (opts.candidates !== undefined) body.candidates = opts.candidates;
+    if (opts.efSearch !== undefined) body.ef_search = opts.efSearch;
     if (opts.rerank !== undefined) body.rerank = opts.rerank;
     if (opts.autoMerge !== undefined) body.auto_merge = opts.autoMerge;
     if (opts.collapse !== undefined) body.collapse = opts.collapse;

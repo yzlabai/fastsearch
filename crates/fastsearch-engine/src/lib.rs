@@ -10,8 +10,9 @@
 //! **分组折叠**（req.collapse 每 doc/section 限 N 条）均已接入。
 
 use fastsearch_core::{
-    fuse, AclFilter, AssetPointer, BBox, Chunk, ChunkKind, Citation, FieldValue, Filter, GlobalId,
-    Metadata, Scored, SearchMode, SearchRequest, TimeSpan,
+    fuse_n_with_sources, AclFilter, AssetPointer, BBox, Chunk, ChunkKind, Citation, FieldValue,
+    Filter, Fusion, GlobalId, Metadata, RecallList, Scored, SearchMode, SearchRequest, SourceHit,
+    TimeSpan,
 };
 use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
@@ -179,6 +180,8 @@ pub struct SearchHit {
     /// auto-merge 时被并入本代表命中的同 section 兄弟 chunk_id（升序）；未归并为空。
     /// 答案层可据此解析整段的全部引用。
     pub merged_chunk_ids: Vec<u64>,
+    /// 具名召回路的名次、原始分与融合贡献；仅 `explain=true` 时有值。
+    pub sources: Option<Vec<SourceHit>>,
 }
 
 impl SearchHit {
@@ -1671,7 +1674,8 @@ impl Engine {
             });
         }
 
-        // 融合（一路空自动退化）
+        // 融合（一路空自动退化）。引擎当前仍只产出 user_text 的 keyword/vector
+        // 两路；具名 N 路内核为后续 chunk_signal 接线留出公开、可解释的语义。
         let kw_list: Vec<Scored> = kw_hits
             .iter()
             .map(|h| Scored {
@@ -1679,7 +1683,26 @@ impl Engine {
                 score: h.score as f64,
             })
             .collect();
-        let fused = fuse(&kw_list, &vec_scored, &req.fusion);
+        let semantic_weight = match &req.fusion {
+            Fusion::Normalized { semantic_ratio } => *semantic_ratio,
+            Fusion::Weighted { alpha } => *alpha,
+            Fusion::Rrf { .. } | Fusion::Weights { .. } => 1.0,
+        };
+        let (fused, source_hits) = fuse_n_with_sources(
+            &[
+                RecallList::new(
+                    "keyword:user_text",
+                    if matches!(&req.fusion, Fusion::Rrf { .. } | Fusion::Weights { .. }) {
+                        1.0
+                    } else {
+                        1.0 - semantic_weight
+                    },
+                    kw_list,
+                ),
+                RecallList::new("vector:user_text", semantic_weight, vec_scored.clone()),
+            ],
+            &req.fusion,
+        );
 
         let mut hits: Vec<SearchHit> = fused
             .into_iter()
@@ -1712,6 +1735,9 @@ impl Engine {
                         None
                     },
                     merged_chunk_ids: Vec::new(),
+                    sources: req
+                        .explain
+                        .then(|| source_hits.get(&s.id).cloned().unwrap_or_default()),
                 })
             })
             .collect();
@@ -3313,10 +3339,39 @@ mod tests {
         let hits = e.search(&r, None).unwrap();
         // 两路都召回：c1（keyword 命中）+ c2（vector 命中）
         assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.sources.is_none()));
         let c1 = hits.iter().find(|h| h.id.chunk_id == 1).unwrap();
         let c2 = hits.iter().find(|h| h.id.chunk_id == 2).unwrap();
         assert!(c1.bm25.is_some()); // c1 有 keyword 分
         assert!(c2.vector.is_some()); // c2 有 vector 分
+
+        r.explain = true;
+        let explained = e.search(&r, None).unwrap();
+        let c1 = explained.iter().find(|h| h.id.chunk_id == 1).unwrap();
+        let sources = c1.sources.as_ref().unwrap();
+        assert_eq!(
+            sources
+                .iter()
+                .map(|s| s.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keyword:user_text", "vector:user_text"]
+        );
+        assert_eq!(sources[0].rank, 1);
+        assert_eq!(sources[0].score, c1.bm25.unwrap() as f64);
+        assert_eq!(
+            sources.iter().map(|s| s.contribution).sum::<f64>(),
+            c1.score
+        );
+
+        r.fusion = serde_json::from_str(
+            r#"{"method":"weights","weights":{"keyword:user_text":0.0,"vector:user_text":1.0}}"#,
+        )
+        .unwrap();
+        let weighted = e.search(&r, None).unwrap();
+        assert_eq!(
+            weighted[0].id.chunk_id, 2,
+            "具名权重只保留 vector:user_text 时，向量最相似的 c2 应居首"
+        );
     }
 
     #[test]

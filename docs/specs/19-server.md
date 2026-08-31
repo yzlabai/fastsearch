@@ -31,7 +31,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 ```
 
 请求/响应：
-- `POST /v1/search` body = `SearchRequest`（core，serde）。注意：**body 里若带 ACL 字段会被忽略**——ACL 只来自认证身份。`include_text`/`include_metadata` 默认 false；开启后命中分别附带完整 `text`/不透明 `metadata`，未开启时字段直接省略。
+- `POST /v1/search` body 经 REST 外部契约解码为 `SearchRequest`。图片字节只接受 `query_image_base64`（或图片上传接口），内部字段 `query_image` 明确 400。ACL 只来自认证身份。`include_text`/`include_metadata` 默认 false；`explain=false` 时省略 `sources`，开启后每条命中附来源、rank、原始分和融合贡献。
 - `POST /v1/index` body = `{collection, doc_id, chunks:[Chunk]}` → ingest+commit，返回 `{indexed:n}`。Chunk 支持默认 `{}` 的 `metadata` 和默认 true 的 `searchable`；metadata 在副作用前校验。
 - chunk 管理端点以现有 `GlobalId=(collection,doc_id,chunk_id)` 寻址；batch 上限 1000。
   Batch get 保持请求顺序并用 `chunk:null` 合并不可见/不存在；batch delete 同理返回
@@ -107,6 +107,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   去掉写穿即红：0 命中）。**活服务验证**：实跑 server（pgvector 档、**CDC 未开**）→ `psql` 直查真源确认
   两行 `embedding IS NOT NULL` / `embed_model=api-precomputed` → 立即检索命中 → 重复 index 后仍命中。
   详见 [plan §6.1](../plans/2026-08-24-index写穿pgvector对齐chunks.md)。
+- [x] v2.5（2026-08-31，FS-002）：OpenAPI SearchRequest 补齐 `fusion`/`embedder`/`explain`，Hit 补齐 `time`/`media`/`sources`；REST/OpenAPI 字段集与共享矩阵做精确集合断言。`explain=true` 的 server 路由测试证明来源明细可见，默认响应继续省略该字段。
 - [x] v2.4（2026-08-24，**fail-closed 默认 + 运行档如实标注**）：上游决策
   [职责边界：不承担身份与控制面](../governance/2026-08-24-职责边界-不承担身份与控制面.md)——
   身份归调用方，**正因 100% 依赖调用方接对，才不能在他没接对时替他猜**。两处"替他猜"已断根：

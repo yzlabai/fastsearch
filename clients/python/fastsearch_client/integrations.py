@@ -66,6 +66,7 @@ _METADATA_KEYS = (
     "heading_path",
     "section_id",
     "merged_chunk_ids",
+    "sources",
     "time",
     "media",
 )

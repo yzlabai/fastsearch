@@ -227,6 +227,7 @@ const METADATA_KEYS = [
   "merged_chunk_ids",
   "time",
   "media",
+  "sources",
 ] as const;
 
 /** 单条命中 → LangChain.js 风格 `Document`（pageContent 取高亮片段）。 */

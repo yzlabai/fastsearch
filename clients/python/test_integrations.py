@@ -4,6 +4,8 @@
 校验 Document/Node 的 page_content/metadata/score 映射正确，且 ACL 参数透传不被改写。
 """
 
+import json
+import pathlib
 import sys
 
 from fastsearch_client.integrations import (
@@ -28,6 +30,14 @@ SAMPLE_HITS = [
         "section_id": 17,
         "highlight": "本季度<b>毛利率</b>提升至 42%",
         "merged_chunk_ids": [4, 5],
+        "sources": [
+            {
+                "source": "keyword:user_text",
+                "rank": 1,
+                "score": 0.9,
+                "contribution": 0.5,
+            }
+        ],
         "time": None,
         "media": None,
     },
@@ -49,6 +59,7 @@ def test_hit_to_document():
     doc = hit_to_document(SAMPLE_HITS[0])
     assert doc.page_content == "本季度<b>毛利率</b>提升至 42%", doc.page_content
     assert doc.metadata["citation_id"] == "kb:rep.pdf:3"
+    assert doc.metadata["sources"][0]["source"] == "keyword:user_text"
     assert doc.metadata["page"] == 7
     assert doc.metadata["bbox"]["x1"] == 3.0
     assert doc.metadata["score"] == 1.42
@@ -197,12 +208,19 @@ def test_search_full_options_body():
         "毛利率",
         mode="hybrid",
         top_k=5,
-        fusion={"rrf": {"k": 60}},
+        fusion={
+            "method": "weights",
+            "weights": {"keyword:user_text": 1.0, "vector:user_text": 2.0},
+            "default_weight": 1.0,
+        },
+        vector=[1.0, 0.0],
+        query_image=[255, 0, 16],
         embedder="bge",
         candidates=100,
-        rerank=True,
+        ef_search=64,
+        rerank={"model": "lexical", "top_k": 20},
         auto_merge=True,
-        collapse="doc_id",
+        collapse={"field": "doc_id", "max_per_group": 1},
         search_after="cur-1",
         highlight=True,
         include_text=True,
@@ -212,18 +230,25 @@ def test_search_full_options_body():
     )
     body = calls[-1]["body"]
     assert body["top_k"] == 5
-    assert body["fusion"] == {"rrf": {"k": 60}}
+    assert body["fusion"]["method"] == "weights"
+    assert body["query_image_base64"] == "/wAQ"
+    assert "query_image" not in body
     assert body["embedder"] == "bge"
     assert body["candidates"] == 100
-    assert body["rerank"] is True
+    assert body["ef_search"] == 64
+    assert body["rerank"] == {"model": "lexical", "top_k": 20}
     assert body["auto_merge"] is True
-    assert body["collapse"] == "doc_id"
+    assert body["collapse"] == {"field": "doc_id", "max_per_group": 1}
     assert body["search_after"] == "cur-1"
     assert body["highlight"] is True
     assert body["include_text"] is True
     assert body["include_metadata"] is True
     assert body["facets"] == ["doc_id"]
     assert body["explain"] is True
+    matrix = json.loads(
+        (pathlib.Path(__file__).resolve().parents[2] / "docs/contracts/search-fields.json").read_text()
+    )
+    assert sorted(body) == sorted(matrix["rest_search_request"])
     # 未显式给的可选参数不进请求体（服务端走默认）
     c.search("kb", "q")
     assert "rerank" not in calls[-1]["body"]

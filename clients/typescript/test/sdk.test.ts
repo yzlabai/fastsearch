@@ -2,6 +2,7 @@
 // 跑：npm test（编译到 .testbuild 后 node --test）。
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 import {
@@ -154,8 +155,45 @@ test("search maps queryImage and embedder", async () => {
     embedder: "clip",
   });
   const body = calls[0]!.body as Record<string, unknown>;
-  assert.deepEqual(body.query_image, [255, 0, 16]);
+  assert.equal(body.query_image_base64, "/wAQ");
+  assert.equal(body.query_image, undefined);
   assert.equal(body.embedder, "clip");
+});
+
+test("search wire fields match the shared contract matrix", async () => {
+  const matrix = JSON.parse(
+    readFileSync("../../docs/contracts/search-fields.json", "utf8"),
+  ) as { rest_search_request: string[] };
+  const { fetch, calls } = stub(() => ({ json: { hits: [], facets: {} } }));
+  const c = new FastsearchClient({ baseUrl: "http://x", apiKey: "dev", fetch });
+  await c.search("kb", "q", {
+    mode: "hybrid",
+    fusion: {
+      method: "weights",
+      weights: { "keyword:user_text": 1, "vector:user_text": 2 },
+      default_weight: 1,
+    },
+    filter: f.eq("kind", "table"),
+    vector: [1, 0],
+    queryImage: [255, 0, 16],
+    embedder: "clip",
+    candidates: 100,
+    efSearch: 64,
+    topK: 5,
+    rerank: { model: "lexical", top_k: 20 },
+    autoMerge: true,
+    collapse: { field: "doc_id", max_per_group: 1 },
+    searchAfter: "cursor",
+    highlight: true,
+    includeText: true,
+    includeMetadata: true,
+    facets: ["doc_id"],
+    explain: true,
+  });
+  const body = calls[0]!.body as Record<string, unknown>;
+  assert.deepEqual(Object.keys(body).sort(), [...matrix.rest_search_request].sort());
+  assert.equal(body.query_image_base64, "/wAQ");
+  assert.equal(body.query_image, undefined);
 });
 
 test("searchHits returns just the array", async () => {
@@ -389,10 +427,25 @@ test("makeSearchTool returns friendly message on empty query and no hits", async
 });
 
 test("hitToDocument maps highlight to pageContent and rest to metadata", () => {
-  const doc = hitToDocument(makeHit());
+  const doc = hitToDocument(
+    makeHit({
+      sources: [
+        {
+          source: "keyword:user_text",
+          rank: 1,
+          score: 0.9,
+          contribution: 0.5,
+        },
+      ],
+    }),
+  );
   assert.equal(doc.pageContent, "毛利率下降的原因是…");
   assert.equal(doc.metadata.citation_id, "kb:report.pdf:3");
   assert.equal(doc.metadata.page, 7);
+  assert.equal(
+    (doc.metadata.sources as Array<{ source: string }>)[0]!.source,
+    "keyword:user_text",
+  );
   assert.equal("highlight" in doc.metadata, false);
 });
 

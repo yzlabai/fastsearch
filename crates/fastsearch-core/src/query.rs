@@ -167,6 +167,17 @@ impl SearchRequest {
             Fusion::Weighted { alpha } if !(0.0..=1.0).contains(alpha) => {
                 return Err(CoreError::InvalidRequest("alpha must be in [0,1]".into()));
             }
+            Fusion::Weights {
+                weights,
+                default_weight,
+            } if !default_weight.is_finite()
+                || *default_weight < 0.0
+                || weights.values().any(|w| !w.is_finite() || *w < 0.0) =>
+            {
+                return Err(CoreError::InvalidRequest(
+                    "fusion weights must be finite and >= 0".into(),
+                ));
+            }
             _ => {}
         }
         if let Some(r) = &self.rerank {
@@ -188,6 +199,7 @@ impl SearchRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn defaults_are_sane() {
@@ -260,5 +272,48 @@ mod tests {
         assert_eq!(r.query, "毛利率");
         assert_eq!(r.mode, SearchMode::Hybrid);
         assert_eq!(r.top_k, 20);
+    }
+
+    #[test]
+    fn search_request_fields_match_contract_matrix() {
+        let matrix: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/search-fields.json"))
+                .unwrap();
+        let expected: BTreeSet<String> = matrix["rust_search_request"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        let req: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "q",
+            "mode": "hybrid",
+            "fusion": {"method": "rrf", "rank_constant": 60},
+            "filter": null,
+            "vector": [1.0, 0.0],
+            "query_image": [1, 2, 3],
+            "embedder": "clip",
+            "candidates": 150,
+            "ef_search": 64,
+            "top_k": 20,
+            "rerank": {"model": "lexical", "top_k": 20},
+            "auto_merge": true,
+            "collapse": {"field": "doc_id", "max_per_group": 1},
+            "search_after": "cursor",
+            "highlight": true,
+            "include_text": true,
+            "include_metadata": true,
+            "facets": ["doc_id"],
+            "explain": true
+        }))
+        .unwrap();
+        let actual: BTreeSet<String> = serde_json::to_value(req)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(actual, expected);
     }
 }

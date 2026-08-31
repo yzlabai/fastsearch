@@ -6,7 +6,7 @@
 
 use crate::model::GlobalId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// 一条带分的候选。
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +34,15 @@ pub enum Fusion {
         #[serde(default = "default_alpha")]
         alpha: f64,
     },
+    /// 各路 min-max 归一化后按具名来源加权。未列出来源用 `default_weight`。
+    ///
+    /// 这是 N 路加权的公开表达；`Normalized` / `Weighted` 保留为两路兼容形状。
+    Weights {
+        #[serde(default)]
+        weights: BTreeMap<String, f64>,
+        #[serde(default = "default_weight")]
+        default_weight: f64,
+    },
 }
 
 fn default_rank_constant() -> f64 {
@@ -44,6 +53,9 @@ fn default_semantic_ratio() -> f64 {
 }
 fn default_alpha() -> f64 {
     0.5
+}
+fn default_weight() -> f64 {
+    1.0
 }
 
 impl Default for Fusion {
@@ -76,6 +88,19 @@ impl RecallList {
     }
 }
 
+/// 某条召回路对一条最终命中的可解释贡献。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceHit {
+    /// 具名来源，如 `keyword:user_text` / `vector:image_caption`。
+    pub source: String,
+    /// 该路内名次，1 起。
+    pub rank: usize,
+    /// 该路原始分（归一化前）。
+    pub score: f64,
+    /// 该路对最终融合分的实际加数。
+    pub contribution: f64,
+}
+
 /// **N 路**具名融合（KB-2.2 第一步）。[`fuse`] 是它的两路特例。
 ///
 /// 与两路版的关系：
@@ -89,30 +114,63 @@ impl RecallList {
 /// 用输入顺序累加会让"同一组召回、不同拼装顺序"产生不同的浮点尾数——
 /// 两路时只有两个加数看不出来，N 路化正是这个坑冒头的地方。
 pub fn fuse_n(lists: &[RecallList], fusion: &Fusion) -> Vec<Scored> {
+    fuse_n_with_sources(lists, fusion).0
+}
+
+/// N 路具名融合，同时返回每条命中的来源、路内名次、原始分和贡献。
+///
+/// `BTreeMap` 仅用于给调用方稳定访问；每条的 `Vec<SourceHit>` 按 `source`
+/// 字典序排列，与浮点累加顺序相同。
+pub fn fuse_n_with_sources(
+    lists: &[RecallList],
+    fusion: &Fusion,
+) -> (Vec<Scored>, BTreeMap<GlobalId, Vec<SourceHit>>) {
     // 借用排序：不克隆 items（各路可能很大）。
     let mut order: Vec<&RecallList> = lists.iter().collect();
     order.sort_by(|a, b| a.source.cmp(&b.source));
 
     let mut acc: HashMap<GlobalId, f64> = HashMap::new();
+    let mut sources: BTreeMap<GlobalId, Vec<SourceHit>> = BTreeMap::new();
     match fusion {
         Fusion::Rrf { rank_constant } => {
             for l in order {
                 for (rank, s) in rank_desc(&l.items).iter().enumerate() {
                     let contrib = 1.0 / (rank_constant + (rank as f64 + 1.0));
                     *acc.entry(s.id.clone()).or_insert(0.0) += contrib;
+                    sources.entry(s.id.clone()).or_default().push(SourceHit {
+                        source: l.source.clone(),
+                        rank: rank + 1,
+                        score: s.score,
+                        contribution: contrib,
+                    });
                 }
             }
         }
         // 两个加权档数学等价（旧账，见上）⇒ 共用一份实现，权重来自每路的 `weight`。
-        Fusion::Normalized { .. } | Fusion::Weighted { .. } => {
+        Fusion::Normalized { .. } | Fusion::Weighted { .. } | Fusion::Weights { .. } => {
             for l in order {
-                for s in normalize(&l.items) {
-                    *acc.entry(s.id.clone()).or_insert(0.0) += l.weight * s.score;
+                let weight = match fusion {
+                    Fusion::Weights {
+                        weights,
+                        default_weight,
+                    } => weights.get(&l.source).copied().unwrap_or(*default_weight),
+                    _ => l.weight,
+                };
+                let ranked = rank_desc(&l.items);
+                for (rank, (raw, normalized)) in ranked.iter().zip(normalize(&ranked)).enumerate() {
+                    let contribution = weight * normalized.score;
+                    *acc.entry(raw.id.clone()).or_insert(0.0) += contribution;
+                    sources.entry(raw.id.clone()).or_default().push(SourceHit {
+                        source: l.source.clone(),
+                        rank: rank + 1,
+                        score: raw.score,
+                        contribution,
+                    });
                 }
             }
         }
     }
-    sort_scored(acc)
+    (sort_scored(acc), sources)
 }
 
 /// 融合 keyword 与 semantic 两路候选，返回按融合分降序、确定性 tie-break 的结果。
@@ -128,6 +186,7 @@ pub fn fuse(keyword: &[Scored], semantic: &[Scored], fusion: &Fusion) -> Vec<Sco
         Fusion::Rrf { .. } => 0.0, // RRF 忽略权重
         Fusion::Normalized { semantic_ratio } => *semantic_ratio,
         Fusion::Weighted { alpha } => *alpha,
+        Fusion::Weights { .. } => 0.0, // 权重由具名表直接提供
     };
     fuse_n(
         &[
@@ -233,6 +292,7 @@ mod tests {
                 Fusion::Rrf { .. } => 0.0,
                 Fusion::Normalized { semantic_ratio } => *semantic_ratio,
                 Fusion::Weighted { alpha } => *alpha,
+                Fusion::Weights { .. } => 0.0,
             };
             let n = fuse_n(
                 &[
@@ -433,6 +493,56 @@ mod tests {
             f2,
             Fusion::Normalized {
                 semantic_ratio: 0.5
+            }
+        );
+        let old_weighted: Fusion =
+            serde_json::from_str(r#"{"method":"weighted","alpha":0.25}"#).unwrap();
+        assert_eq!(old_weighted, Fusion::Weighted { alpha: 0.25 });
+        let named: Fusion =
+            serde_json::from_str(r#"{"method":"weights","weights":{"keyword:user_text":2.0}}"#)
+                .unwrap();
+        assert_eq!(
+            named,
+            Fusion::Weights {
+                weights: BTreeMap::from([("keyword:user_text".into(), 2.0)]),
+                default_weight: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn named_weights_explain_rank_raw_score_and_contribution() {
+        let fusion: Fusion = serde_json::from_str(
+            r#"{"method":"weights","weights":{"keyword:user_text":0.25,"vector:user_text":2.0},"default_weight":0.5}"#,
+        )
+        .unwrap();
+        let (out, sources) = fuse_n_with_sources(
+            &[
+                RecallList::new("keyword:user_text", 99.0, vec![s(1, 10.0), s(2, 5.0)]),
+                RecallList::new("vector:user_text", 99.0, vec![s(2, 0.9), s(3, 0.8)]),
+            ],
+            &fusion,
+        );
+
+        assert_eq!(out[0].id, id(2));
+        assert_eq!(out[0].score, 2.0);
+        assert_eq!(sources[&id(2)].len(), 2);
+        assert_eq!(
+            sources[&id(2)][0],
+            SourceHit {
+                source: "keyword:user_text".into(),
+                rank: 2,
+                score: 5.0,
+                contribution: 0.0,
+            }
+        );
+        assert_eq!(
+            sources[&id(2)][1],
+            SourceHit {
+                source: "vector:user_text".into(),
+                rank: 1,
+                score: 0.9,
+                contribution: 2.0,
             }
         );
     }

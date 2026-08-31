@@ -1394,6 +1394,53 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(props, allow, "schema properties 与允许清单必须一致");
+
+        let matrix: Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/search-fields.json"))
+                .unwrap();
+        let matrix_args = matrix["mcp_search_args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(allow, matrix_args, "MCP 入参必须与共享字段矩阵一致");
+    }
+
+    #[test]
+    fn rest_fields_outside_mcp_matrix_are_explicitly_rejected() {
+        let s = server();
+        let matrix: Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/search-fields.json"))
+                .unwrap();
+        let allowed: std::collections::BTreeSet<&str> = matrix["mcp_search_args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for field in matrix["rest_search_request"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .filter(|field| !allowed.contains(field))
+        {
+            let r = s
+                .handle(&json!({
+                    "jsonrpc":"2.0","id":31,"method":"tools/call",
+                    "params": { "name": "search", "arguments": { "query": "q", field: null } }
+                }))
+                .unwrap();
+            assert_eq!(r["result"]["isError"], true, "{field} 应显式拒绝");
+            assert!(
+                r["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(field),
+                "错误必须点名 {field}"
+            );
+        }
     }
 
     /// 未宣称的入参一律**拒绝**，不是静默丢弃。

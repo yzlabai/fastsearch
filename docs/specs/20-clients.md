@@ -14,7 +14,7 @@
 ## 2. 接口（两端一致，2026-07-08 M24 补齐后成立）
 
 - `index(collection, doc_id, chunks) -> indexed_count`：docparse chunk（`id`）→ 自动映射 `chunk_id`、注入 `doc_id`、默认 `acl=[public]`。
-- `search(collection, query, {mode,top_k,filter,vector,highlight,include_text,include_metadata,fusion,query_image,embedder,candidates,rerank,auto_merge,collapse,search_after,facets,explain})`：Python 回 `hits[]`（分面用 `search_with_facets` 回 `{hits,facets}`）；TS 使用 camelCase `includeText`/`includeMetadata` 并回 `{hits,facets}`（`searchHits` 只要数组）。完整正文与 metadata 默认不返回。**collection 作用域强制注入**为 Eq 过滤、与用户 filter `and` 合并（M23）。
+- `search(collection, query, {mode,top_k,filter,vector,highlight,include_text,include_metadata,fusion,query_image,embedder,candidates,ef_search,rerank,auto_merge,collapse,search_after,facets,explain})`：Python 回 `hits[]`（分面用 `search_with_facets` 回 `{hits,facets}`）；TS 使用 camelCase（含 `efSearch`、`queryImage`）并回 `{hits,facets}`（`searchHits` 只要数组）。SDK 将图片字节数组编码为 REST 的 `query_image_base64`，绝不发送内部 `query_image`。完整正文、metadata、`sources` 默认不返回；`sources` 仅 `explain=true` 时有值。**collection 作用域强制注入**为 Eq 过滤、与用户 filter `and` 合并（M23）。
 - `similar(citation_id, {top_k}) -> hits[]`：more_like_this。
 - `paginate(collection, query, {max_pages,...}) -> 页迭代器`：cursor 深分页，末条无游标/游标未推进即停（防死循环）。
 - `resolve_assets(citation_ids) -> assets[]` / `fetch_asset_bytes(citation_id) -> (bytes, content_type) | None`：None=404 或 DocRender（JSON）。
@@ -47,4 +47,5 @@
 - [x] **A14（2026-07-23）：通用管理协议**——Python/TypeScript 同步增加 batch chunk
   get/upsert/delete、document list 与 collection delete；TS 暴露 GlobalId/Chunk/response 类型。
   零网络协议测试分别为 Python 15/15、TypeScript 18/18。
+- [x] **A15（2026-08-31，FS-002）：搜索契约矩阵与 explain**——两端搜索请求精确对齐共享 REST 字段矩阵，补 `ef_search`/`efSearch`，图片参数统一编码为 `query_image_base64`；TS `HitSource` 类型及 TS/Python agent 适配器保留 `sources`。Python 15 个协议测试 + 5 个 ingest 测试、TS 24 个测试通过。
 - 下一迭代：Python SDK 发布 PyPI；TS 0.3.0 发 npm。

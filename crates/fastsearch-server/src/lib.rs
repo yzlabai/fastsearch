@@ -663,6 +663,16 @@ fn openapi_spec() -> Value {
             "metadata": {"type": "object", "additionalProperties": true,
                 "description": "仅 include_metadata=true 时返回调用方透传元数据"},
             "merged_chunk_ids": {"type": "array", "items": {"type": "integer"}},
+            "time": {"type": ["object", "null"], "description": "音视频时间锚点 {start_ms,end_ms}"},
+            "media": {"type": ["object", "null"], "description": "已脱敏的媒资引用"},
+            "sources": {"type": "array", "description": "仅 explain=true 时返回；按 source 字典序",
+                "items": {"type": "object", "required": ["source", "rank", "score", "contribution"],
+                    "properties": {
+                        "source": {"type": "string"},
+                        "rank": {"type": "integer", "minimum": 1},
+                        "score": {"type": "number", "description": "该路原始分"},
+                        "contribution": {"type": "number", "description": "对融合分的实际加数"}
+                    }}},
             "cursor": {"type": "string", "description": "深分页游标；作下次 search_after 续取下一页"}
         }
     });
@@ -683,9 +693,12 @@ fn openapi_spec() -> Value {
                     "properties": {
                         "query": {"type": "string"},
                         "mode": {"type": "string", "enum": ["keyword", "vector", "hybrid"], "default": "hybrid"},
+                        "fusion": {"type": "object", "description":
+                            "融合策略：rrf / normalized / weighted / weights；weights 接受具名来源权重表"},
                         "filter": {"type": ["object", "null"], "description": "core::Filter AST"},
                         "vector": {"type": ["array", "null"], "items": {"type": "number"}},
                         "query_image_base64": {"type": ["string", "null"], "description": "图片 query 的 base64 字节；服务端解码为内部 query_image"},
+                        "embedder": {"type": ["string", "null"], "description": "可选嵌入后端名"},
                         "candidates": {"type": "integer", "default": 150},
                         "ef_search": {"type": ["integer", "null"], "description":
                             "HNSW 检索期探索宽度逐查询覆盖（越大召回越高越慢；暴力/pgvector 档忽略）"},
@@ -700,7 +713,9 @@ fn openapi_spec() -> Value {
                         "highlight": {"type": "boolean", "default": false},
                         "include_text": {"type": "boolean", "default": false},
                         "include_metadata": {"type": "boolean", "default": false},
-                        "facets": {"type": "array", "items": {"type": "string"}}
+                        "facets": {"type": "array", "items": {"type": "string"}},
+                        "explain": {"type": "boolean", "default": false,
+                            "description": "为每条命中附带 sources 的来源名次、原始分与贡献"}
                     }
                 },
                 "Hit": hit,
@@ -1307,6 +1322,12 @@ fn hits_json(
                 hit.as_object_mut()
                     .unwrap()
                     .insert("metadata".into(), Value::Object(metadata.clone()));
+            }
+            if let Some(sources) = &h.sources {
+                hit.as_object_mut().unwrap().insert(
+                    "sources".into(),
+                    serde_json::to_value(sources).unwrap_or(Value::Null),
+                );
             }
             hit
         })
@@ -4656,6 +4677,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4674,6 +4696,26 @@ mod tests {
         assert_eq!(hits[0]["chunk_id"], 1);
         assert_eq!(hits[0]["text"], "hello visible");
         assert_eq!(hits[0]["metadata"]["source"], "visible");
+        assert!(hits[0].get("sources").is_none());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(r#"{"query":"hello","top_k":5,"explain":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let explained = body_json(resp).await;
+        let source = &explained["hits"][0]["sources"][0];
+        assert_eq!(source["source"], "keyword:user_text");
+        assert_eq!(source["rank"], 1);
+        assert!(source["score"].is_number());
+        assert!(source["contribution"].is_number());
     }
 
     #[tokio::test]
@@ -5583,6 +5625,54 @@ mod tests {
         assert!(v["paths"]["/v1/assets/resolve"]["post"].is_object());
         assert!(v["paths"]["/v1/asset/{citation_id}/bytes"]["get"].is_object());
         assert!(v["components"]["schemas"]["SearchRequest"].is_object());
+        let matrix: Value =
+            serde_json::from_str(include_str!("../../../docs/contracts/search-fields.json"))
+                .unwrap();
+        let expected_request: std::collections::BTreeSet<&str> = matrix["rest_search_request"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        let actual_request: std::collections::BTreeSet<&str> = v["components"]["schemas"]
+            ["SearchRequest"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(actual_request, expected_request);
+        let expected_hit: std::collections::BTreeSet<&str> = [
+            "citation_id",
+            "score",
+            "bm25",
+            "vector",
+            "rerank",
+            "doc_id",
+            "chunk_id",
+            "page",
+            "bbox",
+            "heading_path",
+            "section_id",
+            "highlight",
+            "text",
+            "metadata",
+            "merged_chunk_ids",
+            "time",
+            "media",
+            "cursor",
+            "sources",
+        ]
+        .into_iter()
+        .collect();
+        let actual_hit: std::collections::BTreeSet<&str> = v["components"]["schemas"]["Hit"]
+            ["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(actual_hit, expected_hit);
         assert!(
             v["components"]["schemas"]["SearchRequest"]["properties"]["query_image_base64"]
                 .is_object()
@@ -5706,6 +5796,7 @@ mod tests {
             text: None,
             metadata: None,
             merged_chunk_ids: vec![],
+            sources: None,
         };
         let signer = AssetSigner::new(b"k".to_vec(), 300);
         let default_json = hits_json(
@@ -5721,13 +5812,24 @@ mod tests {
         assert!(!s.contains("secret/key.png"));
         assert!(default_json[0].get("text").is_none());
         assert!(default_json[0].get("metadata").is_none());
+        assert!(default_json[0].get("sources").is_none());
 
         hit.text = Some("complete text".into());
         hit.metadata =
             Some(serde_json::from_value(serde_json::json!({"source": "external"})).unwrap());
+        hit.sources = Some(vec![fastsearch_core::SourceHit {
+            source: "vector:user_text".into(),
+            rank: 1,
+            score: 0.9,
+            contribution: 1.0 / 61.0,
+        }]);
         let included = hits_json(&[hit], None, None);
         assert_eq!(included[0]["text"], "complete text");
         assert_eq!(included[0]["metadata"]["source"], "external");
+        assert_eq!(included[0]["sources"][0]["source"], "vector:user_text");
+        assert_eq!(included[0]["sources"][0]["rank"], 1);
+        assert_eq!(included[0]["sources"][0]["score"], 0.9);
+        assert!(included[0]["sources"][0]["contribution"].is_number());
     }
 
     #[test]

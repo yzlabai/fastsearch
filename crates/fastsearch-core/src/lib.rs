@@ -12,7 +12,7 @@ mod query;
 
 pub use error::{CoreError, Result};
 pub use filter::{AclFilter, FieldSource, FieldValue, Filter};
-pub use fusion::{fuse, fuse_n, Fusion, RecallList, Scored};
+pub use fusion::{fuse, fuse_n, fuse_n_with_sources, Fusion, RecallList, Scored, SourceHit};
 pub use model::{
     AssetPointer, BBox, Chunk, ChunkKind, Citation, GlobalId, ImageMeta, ImageVectorStatus,
     MediaRef, Metadata, Modality, PublicAssetPointer, PublicMediaRef, TimeSpan, MAX_METADATA_BYTES,

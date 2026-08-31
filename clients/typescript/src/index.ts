@@ -55,6 +55,7 @@ export type {
   Fusion,
   GlobalId,
   Hit,
+  HitSource,
   Media,
   RerankSpec,
   ResolvedAsset,
