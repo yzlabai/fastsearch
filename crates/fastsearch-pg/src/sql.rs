@@ -36,6 +36,15 @@ impl VectorType {
 /// `chunk_signal` 等任何旁表不得加入，如需 CDC 必须新建 publication。
 pub const PUBLICATION: &str = "fastsearch_pub";
 
+/// Serialize every writer that can establish or replace one global document coordinate.
+///
+/// `GlobalId` and the chunks primary key deliberately omit tenant, so all PG write paths must
+/// acquire this exact lock before checking the existing owner. Keeping the SQL in one place makes
+/// it difficult for a new write path to accidentally use a weaker tenant-scoped lock.
+pub(crate) fn lock_document_coordinate_sql() -> &'static str {
+    "SELECT pg_advisory_xact_lock(hashtextextended($1::text || E'\\x1f' || $2::text, 0))"
+}
+
 /// Additive DDL for the ingestion work ledger. It is intentionally a normal table: no
 /// extension, trigger, queue extension, or logical-replication publication is involved.
 pub(crate) fn job_ddl(table: &str) -> Vec<String> {
@@ -122,6 +131,13 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
             "CREATE UNIQUE INDEX IF NOT EXISTS {table}_doc ON {table} \
              (COALESCE(tenant, ''), collection, doc_id);"
         ),
+        // GlobalId/citation identity does not carry tenant. Keep the legacy tenant-scoped index
+        // for additive compatibility, but make the actual document coordinate globally unique.
+        // An upgrade with historical duplicates fails closed here and requires explicit cleanup.
+        format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {table}_global_doc ON {table} \
+             (collection, doc_id);"
+        ),
         format!(
             "CREATE INDEX IF NOT EXISTS {table}_claim ON {table} (next_attempt_at, created_at) \
              WHERE state <> 'indexed';"
@@ -137,7 +153,7 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
     ]
 }
 
-const JOB_RETURN_COLUMNS: &str = "job_id, collection, doc_id, tenant, acl, source_uri, \
+pub(crate) const JOB_RETURN_COLUMNS: &str = "job_id, collection, doc_id, tenant, acl, source_uri, \
 content_sha256, content_bytes, media_type, filename, parse_profile::text AS parse_profile, state, \
 stage_detail::text AS stage_detail, chunk_count, lease_owner, lease_epoch, \
 (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, \
@@ -159,6 +175,25 @@ pub(crate) fn enqueue_job_sql(table: &str) -> String {
 
 pub(crate) fn get_job_sql(table: &str) -> String {
     format!("SELECT {JOB_RETURN_COLUMNS} FROM {table} WHERE job_id = $1")
+}
+
+pub(crate) fn lock_job_document_sql(table: &str) -> String {
+    format!(
+        "SELECT {JOB_RETURN_COLUMNS}, COALESCE(lease_until >= clock_timestamp(), false) AS lease_active FROM {table} \
+         WHERE collection = $1 AND doc_id = $2 FOR UPDATE"
+    )
+}
+
+pub(crate) fn reset_upload_job_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET acl = $2, source_uri = $3, content_sha256 = $4, \
+         content_bytes = $5, media_type = $6, filename = $7, parse_profile = $8::text::jsonb, \
+         max_retries = $9, state = 'queued', stage_detail = '{{}}'::jsonb, chunk_count = 0, \
+         lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL, retry_count = 0, \
+         next_attempt_at = clock_timestamp(), error = NULL, error_stage = NULL, \
+         updated_at = clock_timestamp(), started_at = NULL, finished_at = NULL \
+         WHERE job_id = $1 RETURNING {JOB_RETURN_COLUMNS}"
+    )
 }
 
 pub(crate) fn claim_jobs_sql(table: &str) -> String {
@@ -837,6 +872,10 @@ pub fn delete_doc_sql(table: &str) -> String {
     format!("DELETE FROM {table} WHERE collection = $1 AND doc_id = $2")
 }
 
+pub(crate) fn lock_doc_ownership_sql(table: &str) -> String {
+    format!("SELECT tenant FROM {table} WHERE collection = $1 AND doc_id = $2 FOR UPDATE")
+}
+
 /// 读取某 doc 全部 chunk（jsonb 列读成文本）。
 pub fn fetch_doc_sql(table: &str) -> String {
     format!(
@@ -1060,6 +1099,7 @@ mod tests {
             "retry_count integer NOT NULL DEFAULT 0",
             "CHECK (state IN ('queued','parsing','chunking','embedding','indexed','failed'))",
             "fastsearch_ingest_jobs_doc",
+            "fastsearch_ingest_jobs_global_doc",
             "fastsearch_ingest_jobs_claim",
             "fastsearch_ingest_jobs_list",
             "fastsearch_ingest_jobs_hash",
@@ -1089,6 +1129,16 @@ mod tests {
                 "forbidden identity/product column {forbidden_column:?} in {ddl}"
             );
         }
+    }
+
+    #[test]
+    fn document_coordinate_lock_is_global_and_shared_by_all_writers() {
+        let sql = lock_document_coordinate_sql();
+        assert!(sql.contains("pg_advisory_xact_lock"));
+        assert!(sql.contains("hashtextextended"));
+        assert!(sql.contains("$1::text"));
+        assert!(sql.contains("$2::text"));
+        assert!(!sql.contains("tenant"));
     }
 
     #[test]

@@ -21,6 +21,8 @@ The example deliberately uses the repository-local TypeScript 0.3.0 package so i
 ## Architecture
 
 ```
+raw document → REST upload → ObjectStore + Postgres ingest job → independent worker
+                                                        ↓ job-scoped chunks
 docparse chunks / text files → Postgres (source of truth: chunk + metadata + ACL + pgvector)
                        │ logical-replication CDC (pgoutput, idempotent, LSN resumable)
                        ▼
@@ -47,6 +49,17 @@ FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-s
 
 For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs/在Agent中使用fastsearch.md).
 
+With `DATABASE_URL` and an object store configured, raw documents can enter the asynchronous job surface directly:
+
+```bash
+curl -sS -X POST http://localhost:8642/v1/documents -H 'X-API-Key: dev' \
+  -F 'collection=kb' -F 'wait=auto' -F 'file=@README.md;type=text/markdown'
+```
+
+The default document limit is 32MiB (`FASTSEARCH_MAX_DOCUMENT_BYTES`); larger sources should use the
+`source_uri` form field. Worker credentials are configured separately with `FASTSEARCH_WORKER_KEYS`.
+The independent worker is not bundled yet (FS-303); without an external compatible worker, uploaded jobs remain `queued`.
+
 ## Modules (workspace crates)
 
 | crate | Responsibility |
@@ -59,7 +72,7 @@ For docparse / PDF / REST / MCP / Python usage, see the [Agent usage guide](docs
 | `fastsearch-sync` | CDC apply: pgoutput decode + idempotency + LSN checkpoint + replace semantics |
 | `fastsearch-engine` | Orchestration: ingest→CDC→index→**full-text / vector / hybrid** search→citations + deep pagination + rebuild + media resolution |
 | `fastsearch-eval` | Relevance evaluation: golden set + nDCG/recall/MRR + CI regression gate |
-| `fastsearch-server` | REST (axum) + API-key auth + **ACL cannot be bypassed** + metrics/rate-limit/audit + media gateway + CDC lifecycle |
+| `fastsearch-server` | REST (axum) + API-key auth + **ACL cannot be bypassed** + upload/job/worker protocol + metrics/rate-limit/audit + media gateway + CDC lifecycle |
 | `fastsearch-mcp` | The fourth face: MCP (stdio + JSON-RPC) exposing the `search` / `resolve_citation` tools |
 | `fastsearch-cli` | `fastsearch` binary: **thin REST client of the server** (no embedded engine). index / index-dir (feed a folder) / search / similar / **ingest (client-side multi-format parse: PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/image + OCR + table recognition)** / eval — see [Ingestion & parsing](docs/ingestion-and-parsing.md) |
 | `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters. Registry and source-install details are recorded above and in the [TypeScript](clients/typescript/README.md) / [Python](clients/python/README.md) READMEs. |

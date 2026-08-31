@@ -1,8 +1,8 @@
 # spec · fastsearch-server
 
 > 模块 #10，依赖：core、engine。阶段 P4。上游：[产品设计 §3.6/§3.8/§4](../plans/2026-06-24-产品设计文档.md)、需求 F43–F46/F50/F54。
-> 状态：**已完成 v2.8**（认证/ACL 不可绕过 + 指标/限流/审计 + 嵌入 + CDC 生命周期 +
-> 媒资网关 + 签名 URL + inline Range + 深分页 + 多向量后端 env）。MCP 第四张脸已独立成 `fastsearch-mcp` crate。
+> 状态：**已完成 v3.0**（认证/ACL 不可绕过 + 指标/限流/审计 + 嵌入 + CDC 生命周期 +
+> 媒资网关 + 文档上传/job 状态与 worker fencing）。MCP 第四张脸已独立成 `fastsearch-mcp` crate。
 
 ## 1. 目的与范围
 
@@ -10,7 +10,8 @@ REST 服务（四张脸之一）+ 安全 + 基础可观测。
 
 - 端点：健康/契约、search/similar/index/assets，以及通用管理端点
   `POST /v1/chunks/batch-get|batch-upsert|batch-delete`、`GET /v1/chunks`、
-  `DELETE /v1/collections/{name}`。
+  `DELETE /v1/collections/{name}`；FS-302 增加 `POST|GET /v1/documents`、`GET /v1/jobs/{id}`
+  及 worker-only `POST /v1/jobs/{id}/status|chunks`。
 - **认证（F43）**：API Key（`Authorization: Bearer <k>` 或 `X-API-Key`）→ Principal{tenant, tags}；缺/错 → 401。
 - **逐文档 ACL（F44，安全核心）**：Principal → `AclFilter`，**服务端注入**给 engine.search/resolve_citation；**客户端无法在请求里传 ACL/越权**（含 /v1/asset：越权/不存在均 404，不泄漏存在性）。
 - 可观测（F50）：counters + 延迟直方图 `/metrics`（Prometheus 文本）；限流（令牌桶 429）；审计（可插拔 sink）。
@@ -24,7 +25,7 @@ REST 服务（四张脸之一）+ 安全 + 基础可观测。
 ```rust
 pub struct Principal { pub tenant: Option<String>, pub tags: Vec<String> }
 // 现状：engine 用 Arc<Mutex<Engine>>；CDC 嵌入准备锁外，PG 写穿/本地发布/持久化与检索串行。
-pub struct ServerState { engine: Arc<Mutex<Engine>>, keys, metrics, rate_limiter, audit, embedder }
+pub struct ServerState { engine: Arc<Mutex<Engine>>, keys, jobs, worker_keys, metrics, rate_limiter, audit, embedder }
 pub fn router(state) -> axum::Router;
 pub fn principal_from_headers(headers, keys) -> Option<Principal>;  // 纯, 可测
 pub fn acl_for(principal) -> AclFilter;                              // 纯, 可测
@@ -33,7 +34,17 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 请求/响应：
 - `GET /healthz` 始终是进程存活探针。未启用 CDC 时，`GET /readyz` 返回进程级就绪；启用 CDC 后切换为依赖级探针，首轮源轮询成功且无恢复意图/死信漂移才返回 200，否则返回 503，并公开 commit LSN、slot lag、最近成功轮询、死信累计和 rebuild-needed。
 - `POST /v1/search` body 经 REST 外部契约解码为 `SearchRequest`。图片字节只接受 `query_image_base64`（或图片上传接口），内部字段 `query_image` 明确 400。当前嵌入后端是服务端级配置，`embedder != null` 的逐请求选择明确 400。ACL 只来自认证身份。`include_text`/`include_metadata` 默认 false；`explain=false` 时省略 `sources`，开启后每条命中附来源、rank、原始分和融合贡献。
-- `POST /v1/index` body = `{collection, doc_id, chunks:[Chunk]}` → ingest+commit，返回 `{indexed:n}`。Chunk 支持默认 `{}` 的 `metadata` 和默认 true 的 `searchable`；metadata 在副作用前校验。
+- `POST /v1/index` body = `{collection, doc_id, chunks:[Chunk]}` → ingest+commit，返回 `{indexed:n}`；`chunks` 至少一项，删除文档走专用 DELETE 端点，避免空数组在有/无 PG 档产生不同语义。Chunk 支持默认 `{}` 的 `metadata` 和默认 true 的 `searchable`；metadata 在副作用前校验。
+- `POST /v1/documents` 接收 multipart：`collection`、可选 `doc_id/media_type/parse_profile/wait`，以及
+  `file` 或 `source_uri` 二选一。服务端读取真实字节计算 SHA-256，先落 ObjectStore，再以 PG 事务裁定
+  新建/合流/去重/重开/覆盖；返回同构 `IngestJobResponse`（排队 202，已 indexed 200）。
+- `GET /v1/jobs/{id}` 对不可见与不存在统一 404；`GET /v1/documents` 从 PG jobs/chunks 派生，
+  支持 collection/state/keyset/limit/counts，返回字段白名单，不暴露身份和原始对象位置。
+- worker-only `/status` 用 serde 枚举表达 heartbeat/阶段/failed，并要求 worker 回传 claim 得到的
+  `lease_job_id + lease_owner + lease_epoch`；`/chunks` 复用
+  `/v1/index` 写入内核；专用 `WorkerIndexChunk` 线缆 DTO 不含 tenant/ACL/collection/doc_id，夹带这些字段
+  直接 400，服务端再从 job 恢复身份与坐标。只有 PG chunks 与派生索引
+  全部写成功后才将 job 置 indexed。
 - chunk 管理端点以现有 `GlobalId=(collection,doc_id,chunk_id)` 寻址；batch 上限 1000。
   Batch get 保持请求顺序并用 `chunk:null` 合并不可见/不存在；batch delete 同理返回
   `deleted:false`；文档列表按 `chunk_id` 游标分页（默认 100、上限 500）。
@@ -49,6 +60,16 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - **真源约束**：REST 收到 `searchable=false` 时必须已配置 PostgreSQL source store，否则返回 400；避免把“需持久化但不可检索”的 row 静默丢失。普通 `searchable=true` 兼容既有无 PG 模式。
 - **身份覆盖**：batch upsert 与 doc index 一样，由 Principal 强制覆盖 tenant/acl；跨 tenant
   GlobalId 冲突返回 409，不允许覆盖。
+- **摄取拒绝顺序**：认证 → 限流 → PG/job capability → body 解析；无 PG 的五个作业路由均 503，
+  无效 key 仍先返回 401，worker key 缺 capability 返回 403。worker JSON 身份字段即使被夹带也不采用。
+- **上传边界**：默认最大 32MiB，`FASTSEARCH_MAX_DOCUMENT_BYTES` 同时约束 multipart、`source_uri`
+  读取和 ObjectStore；只为 `/v1/documents` 放宽 body layer，其他 REST 路由仍保持 20MiB。超限 413
+  提示改用 `source_uri`。`wait=auto|never`；auto 只轮询独立 worker，server 不解析。
+- **作业防竞争**：worker chunks 发布期间 PG job 行保持锁定，租约过期也不能被第二 worker 中途重领；
+  chunks/派生写失败时不标 indexed。所有状态与列表 ACL 在 SQL 内过滤，防 job id 枚举。
+- **全局文档坐标**：因 `GlobalId=(collection,doc_id,chunk_id)` 不含 tenant，同一
+  `(collection,doc_id)` 只能由一个 tenant 持有；上传和 PG doc replace 双重检查，冲突返回 409 且不删除旧行。
+  在途内容冲突的 409 返回可轮询的 `IngestJobResponse`；跨 tenant 所有权冲突只返回脱敏纯文本。
 - **删除幂等**：chunk 删除、collection 删除重复调用均返回 200；collection 删除按 tenant owner
   scope 清真源，再按 PG 返回的实际 GlobalId/对象列表清派生状态。
 - 确定性、无敏感信息泄漏到错误体。
@@ -70,6 +91,12 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 9. 真实 PostgreSQL 路由级生命周期覆盖顺序、metadata/searchable、ACL、跨 tenant 409、分页、
    context-only 不召回、chunk/collection 重复删除及其他 tenant 保留。
 10. 管理读取不暴露 `media_bytes` 或 Object 原始定位信息。
+11. 五个作业路由在无 PG 时 fail-closed，且认证/限流发生在 body 消费前。
+12. 上传覆盖 202 排队、200 同 hash 去重、异 hash 冲突/终态覆盖、413、对象清理及 200/202 字段同构。
+13. job 查询与文档列表跨 tenant/tag 返回 404/空集，列表字段与 OpenAPI 精确一致。
+14. worker 普通 key 403、错误 job/owner/旧 epoch 409、夹带身份无效；真实 PG chunks 写入和派生索引成功后才 indexed。
+15. `/metrics` 暴露 upload/dedup/failure/sync hit/timeout counter、六状态 job gauge 与 dead-letter gauge；
+    PG gauge 按需刷新并缓存 1 秒，避免每次 scrape 串行查询 job 真源。
 
 ## 6. 验收标准与状态
 
@@ -129,6 +156,10 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   产生"默认取哪个"的两难。+3 测试（契约单测、三条写路径 403 且无副作用、local-only 如实报告）。
   文档同步：README×2 / CLAUDE.md / example×2 / 集成指南×2 / benchmarks×2 的 `dev=:` → `dev=:public`。
   详见 [plan](../plans/2026-08-24-fail-closed默认与运行档如实标注.md)。
+- [x] v3.0（2026-09-01，FS-302）：接入 ObjectStore + `JobStore` 的原始文档上传、ACL-safe job/
+  document 查询、worker capability 与 owner/epoch fencing；worker chunks 复用索引内核，并以 PG job 行锁
+  覆盖完整发布窗口。OpenAPI 精确声明四条新 path 和请求/响应 schema；摄取 counters、状态及死信 gauges
+  已纳入 `/metrics`。Docker pgvector:pg17 路由测试与真实 server+本地 ObjectStore 活服务验证通过。
 
 **已知限制 / 下一迭代：** 写穿是**每 chunk 一条 UPDATE、顺序 await**（`/v1/chunks` 同此形态），
 `/v1/index` 又不像 batch 端点那样有 `MAX_CHUNK_BATCH` 上限——大文档会产生成百上千次往返。

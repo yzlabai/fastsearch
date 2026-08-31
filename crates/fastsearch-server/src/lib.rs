@@ -5,6 +5,8 @@
 //!
 //! 安全核心（需求 F44）：ACL 只来自认证身份，客户端无法在请求体里传 ACL 或越权。
 
+#![recursion_limit = "256"]
+
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
@@ -27,10 +29,10 @@ use fastsearch_engine::{AssetFetch, CdcConsumeStats, ObjectSigner};
 use fastsearch_sync::replication::ReplicationConfig;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +48,11 @@ const OBJECT_TOKEN_MAX_ENCODED_BYTES: usize = b64url_unpadded_len(OBJECT_TOKEN_M
 const MAX_CHUNK_BATCH: usize = 1_000;
 const DEFAULT_CHUNK_PAGE_SIZE: usize = 100;
 const MAX_CHUNK_PAGE_SIZE: usize = 500;
+const DEFAULT_MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_SYNC_DOCUMENT_BYTES: usize = 1024 * 1024;
+const DEFAULT_SYNC_WAIT_MS: u64 = 3_000;
+const DEFAULT_SYNC_WAITERS: usize = 32;
+const DEFAULT_API_BODY_BYTES: usize = 20 * 1024 * 1024;
 
 const fn b64url_unpadded_len(decoded_len: usize) -> usize {
     let full = (decoded_len / 3) * 4;
@@ -276,6 +283,11 @@ struct Metrics {
     errors: AtomicU64,
     unauthorized: AtomicU64,
     rate_limited: AtomicU64,
+    ingest_uploads: AtomicU64,
+    ingest_deduplicated: AtomicU64,
+    ingest_failures: AtomicU64,
+    ingest_sync_hits: AtomicU64,
+    ingest_sync_timeouts: AtomicU64,
     /// 累积桶计数：`lat_buckets[i]` = 延迟 ≤ `LAT_BUCKETS[i]` 的检索数。
     lat_buckets: [AtomicU64; LAT_BUCKETS.len()],
     lat_sum_micros: AtomicU64,
@@ -437,6 +449,13 @@ pub struct ServerState {
     /// collection 注册时先校验，避免延迟到写入数据库才失败。
     vector_dim: Option<usize>,
     cdc_health: Arc<std::sync::RwLock<CdcHealthSnapshot>>,
+    jobs: Option<Arc<fastsearch_pg::JobStore>>,
+    ingest_metrics_cache: Arc<Mutex<Option<(std::time::Instant, fastsearch_pg::IngestMetrics)>>>,
+    worker_keys: Arc<HashSet<String>>,
+    max_document_bytes: usize,
+    sync_document_bytes: usize,
+    sync_wait_ms: u64,
+    sync_waiters: Arc<Semaphore>,
 }
 
 /// 集合注册表：`(所有者 tenant, 集合名) → 配置`。按租户隔离（M22）。
@@ -468,7 +487,38 @@ impl ServerState {
             collections: Arc::new(Mutex::new(HashMap::new())),
             vector_dim: None,
             cdc_health: Arc::new(std::sync::RwLock::new(CdcHealthSnapshot::default())),
+            jobs: None,
+            ingest_metrics_cache: Arc::new(Mutex::new(None)),
+            worker_keys: Arc::new(HashSet::new()),
+            max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
+            sync_document_bytes: DEFAULT_SYNC_DOCUMENT_BYTES,
+            sync_wait_ms: DEFAULT_SYNC_WAIT_MS,
+            sync_waiters: Arc::new(Semaphore::new(DEFAULT_SYNC_WAITERS)),
         }
+    }
+
+    pub fn with_job_store(mut self, jobs: Arc<fastsearch_pg::JobStore>) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    pub fn with_worker_keys(mut self, keys: HashSet<String>) -> Self {
+        self.worker_keys = Arc::new(keys);
+        self
+    }
+
+    pub fn with_document_limits(
+        mut self,
+        max_bytes: usize,
+        sync_bytes: usize,
+        wait_ms: u64,
+        waiters: usize,
+    ) -> Self {
+        self.max_document_bytes = max_bytes.max(1);
+        self.sync_document_bytes = sync_bytes.min(self.max_document_bytes);
+        self.sync_wait_ms = wait_ms.max(1);
+        self.sync_waiters = Arc::new(Semaphore::new(waiters.max(1)));
+        self
     }
 
     fn initialize_cdc_tracking(&self, recovery_pending: bool, dead_letter_count: u64) {
@@ -697,13 +747,18 @@ impl ServerState {
 
 /// 从请求头取原始 key 字符串（用于限流分桶；无则 `"anon"`）。
 fn rate_key(headers: &HeaderMap) -> String {
+    api_key_from_headers(headers)
+        .map(str::to_string)
+        .unwrap_or_else(|| "anon".to_string())
+}
+
+fn api_key_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "anon".to_string())
+        .map(str::trim)
 }
 
 /// 从请求头解析 Principal：`Authorization: Bearer <k>` 或 `X-API-Key: <k>`。纯函数。
@@ -711,18 +766,7 @@ pub fn principal_from_headers(
     headers: &HeaderMap,
     keys: &HashMap<String, Principal>,
 ) -> Option<Principal> {
-    let key = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-        .or_else(|| {
-            headers
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })?;
-    keys.get(key.trim()).cloned()
+    keys.get(api_key_from_headers(headers)?).cloned()
 }
 
 /// 鉴权门：解析 Principal，失败则记 `unauthorized` 指标并返回 401。供无 ACL 注入需求的端点
@@ -740,6 +784,32 @@ fn require_principal(
     })
 }
 
+fn require_authenticated_key<'a>(
+    s: &ServerState,
+    headers: &'a HeaderMap,
+) -> Result<&'a str, (StatusCode, String)> {
+    let Some(key) = api_key_from_headers(headers) else {
+        s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
+        return Err((StatusCode::UNAUTHORIZED, "missing API key".into()));
+    };
+    if s.worker_keys.contains(key) || s.keys.contains_key(key) {
+        return Ok(key);
+    }
+    s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
+    Err((StatusCode::UNAUTHORIZED, "invalid API key".into()))
+}
+
+fn require_worker_capability(s: &ServerState, key: &str) -> Result<(), (StatusCode, String)> {
+    if s.worker_keys.contains(key) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "this API key does not have worker capability".into(),
+        ))
+    }
+}
+
 /// Principal → 强制 ACL 过滤（服务端注入，客户端不可绕过）。纯函数。
 pub fn acl_for(p: &Principal) -> AclFilter {
     AclFilter {
@@ -750,6 +820,12 @@ pub fn acl_for(p: &Principal) -> AclFilter {
 
 /// 构建 router。
 pub fn router(state: ServerState) -> Router {
+    // Multipart framing adds a small amount above the file itself; the handler enforces the exact
+    // document byte limit after parsing.
+    let body_limit = state.max_document_bytes.saturating_add(1024 * 1024);
+    let document_routes = post(upload_document)
+        .get(list_documents)
+        .layer(DefaultBodyLimit::max(body_limit));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(process_ready))
@@ -762,6 +838,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/object/{opaque}/bytes", get(object_bytes))
         .route("/v1/assets/resolve", post(assets_resolve))
         .route("/v1/index", post(index))
+        .route("/v1/documents", document_routes)
+        .route("/v1/jobs/{id}", get(get_ingest_job))
+        .route("/v1/jobs/{id}/status", post(update_ingest_job_status))
+        .route("/v1/jobs/{id}/chunks", post(write_ingest_job_chunks))
         .route("/v1/chunks/batch-get", post(batch_get_chunks))
         .route("/v1/chunks/batch-upsert", post(batch_upsert_chunks))
         .route("/v1/chunks/batch-delete", post(batch_delete_chunks))
@@ -776,7 +856,7 @@ pub fn router(state: ServerState) -> Router {
             "/v1/collections/{name}",
             get(get_collection).delete(delete_collection),
         )
-        .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(DEFAULT_API_BODY_BYTES))
         .with_state(state)
 }
 
@@ -964,7 +1044,7 @@ fn openapi_spec() -> Value {
                         "doc_id": {"type": "string"},
                         "store_media": {"type": ["string", "null"], "enum": ["inline", "auto", "object", "reference", null],
                             "description": "媒资存储策略：object/auto 上传 media_bytes 到对象存储；reference 校验已有 Object 引用"},
-                        "chunks": {"type": "array", "items": {"$ref": "#/components/schemas/IndexChunk"},
+                        "chunks": {"type": "array", "minItems": 1, "items": {"$ref": "#/components/schemas/IndexChunk"},
                             "description": "core::Chunk 字段；可附 `vector`(number[]) 携带预计算向量，\
                                 则跳过服务端嵌入直接入向量索引（benchmark/外部 ETL 用）"}
                     }
@@ -1047,6 +1127,112 @@ fn openapi_spec() -> Value {
                         "registered_removed": {"type": "boolean"},
                         "objects_deleted": {"type": "integer", "minimum": 0},
                         "object_errors": {"type": "array", "items": {"type": "string"}}
+                    }
+                },
+                "IngestJobResponse": {
+                    "type": "object",
+                    "required": [
+                        "job_id", "collection", "doc_id", "state", "searchable", "chunk_count",
+                        "content_sha256", "deduplicated", "dead_letter", "retry_count",
+                        "poll_after_ms", "job_url", "error", "stage", "stage_detail",
+                        "parse_profile", "created_at", "updated_at", "finished_at"
+                    ],
+                    "properties": {
+                        "job_id": {"type": "string"},
+                        "collection": {"type": "string"},
+                        "doc_id": {"type": "string"},
+                        "state": {"type": "string", "enum": ["queued", "parsing", "chunking", "embedding", "indexed", "failed"]},
+                        "searchable": {"type": "boolean"},
+                        "chunk_count": {"type": "integer"},
+                        "content_sha256": {"type": "string", "minLength": 64, "maxLength": 64},
+                        "deduplicated": {"type": "boolean"},
+                        "dead_letter": {"type": "boolean"},
+                        "retry_count": {"type": "integer"},
+                        "poll_after_ms": {"type": "integer"},
+                        "job_url": {"type": "string"},
+                        "error": {"type": ["string", "null"]},
+                        "stage": {"type": "string"},
+                        "stage_detail": {"type": "object"},
+                        "parse_profile": {"type": "object"},
+                        "created_at": {"type": "integer", "format": "int64", "description": "Unix epoch milliseconds"},
+                        "updated_at": {"type": "integer", "format": "int64", "description": "Unix epoch milliseconds"},
+                        "finished_at": {"type": ["integer", "null"], "format": "int64", "description": "Unix epoch milliseconds"}
+                    }
+                },
+                "DocumentSummary": {
+                    "type": "object",
+                    "required": [
+                        "collection", "doc_id", "state", "searchable", "chunk_count", "job_id",
+                        "content_sha256", "media_type", "filename", "created_at", "updated_at",
+                        "finished_at", "retry_count", "dead_letter", "error"
+                    ],
+                    "properties": {
+                        "collection": {"type": "string"}, "doc_id": {"type": "string"},
+                        "state": {"type": "string", "enum": ["queued", "parsing", "chunking", "embedding", "indexed", "failed"]},
+                        "searchable": {"type": "boolean"}, "chunk_count": {"type": "integer"},
+                        "job_id": {"type": ["string", "null"]}, "content_sha256": {"type": ["string", "null"]},
+                        "media_type": {"type": ["string", "null"]}, "filename": {"type": ["string", "null"]},
+                        "created_at": {"type": "integer", "format": "int64"},
+                        "updated_at": {"type": "integer", "format": "int64"},
+                        "finished_at": {"type": ["integer", "null"], "format": "int64"},
+                        "retry_count": {"type": "integer"}, "dead_letter": {"type": "boolean"},
+                        "error": {"type": ["string", "null"]}
+                    }
+                },
+                "DocumentListResponse": {
+                    "type": "object", "required": ["documents", "next"],
+                    "properties": {
+                        "documents": {"type": "array", "items": {"$ref": "#/components/schemas/DocumentSummary"}},
+                        "next": {"type": ["object", "null"]}
+                    }
+                },
+                "WorkerStatusRequest": {
+                    "type": "object", "required": ["lease_job_id", "lease_owner", "lease_epoch", "state"],
+                    "properties": {
+                        "lease_job_id": {"type": "string"},
+                        "lease_owner": {"type": "string"},
+                        "lease_epoch": {"type": "integer", "format": "int64"},
+                        "state": {"type": "string", "enum": ["heartbeat", "chunking", "embedding", "failed"]},
+                        "stage_detail": {"type": "object"}, "lease_for_ms": {"type": "integer"},
+                        "error": {"type": "string"}, "error_stage": {"type": "string"},
+                        "next_attempt_at_ms": {"type": "integer", "format": "int64"}
+                    }
+                },
+                "WorkerChunksRequest": {
+                    "type": "object", "required": ["lease_job_id", "lease_owner", "lease_epoch", "chunks"],
+                    "properties": {
+                        "lease_job_id": {"type": "string"},
+                        "lease_owner": {"type": "string"},
+                        "lease_epoch": {"type": "integer", "format": "int64"},
+                        "chunks": {"type": "array", "minItems": 1, "maxItems": MAX_CHUNK_BATCH,
+                            "items": {"$ref": "#/components/schemas/WorkerIndexChunk"}}
+                    }
+                },
+                "WorkerIndexChunk": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["chunk_id", "kind", "text", "page", "bbox", "char_len"],
+                    "properties": {
+                        "chunk_id": {"type": "integer", "format": "int64", "minimum": 0},
+                        "kind": {"type": "string", "enum": [
+                            "heading", "paragraph", "table", "code", "list_item",
+                            "image", "audio", "video"
+                        ]},
+                        "text": {"type": "string"},
+                        "page": {"type": "integer", "minimum": 0},
+                        "bbox": {"type": "object", "required": ["x0", "y0", "x1", "y1"],
+                            "properties": {
+                                "x0": {"type": "number"}, "y0": {"type": "number"},
+                                "x1": {"type": "number"}, "y1": {"type": "number"}
+                            }},
+                        "heading_path": {"type": "array", "items": {"type": "string"}, "default": []},
+                        "section_id": {"type": "integer", "format": "int64", "minimum": 0, "default": 0},
+                        "char_len": {"type": "integer", "minimum": 0},
+                        "media": {"type": ["object", "null"], "additionalProperties": true},
+                        "media_bytes": {"type": ["array", "null"], "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+                        "image_vector_status": {"type": ["string", "null"]},
+                        "metadata": {"type": "object", "additionalProperties": true, "default": {}},
+                        "searchable": {"type": "boolean", "default": true},
+                        "vector": {"type": ["array", "null"], "items": {"type": "number"}}
                     }
                 }
             }
@@ -1167,6 +1353,72 @@ fn openapi_spec() -> Value {
                     "responses": {"200": {"description": "{indexed: 1}"},
                         "400": {"description": "缺少字段或 multipart 非法"},
                         "401": {"description": "认证失败"}}
+                }
+            },
+            "/v1/documents": {
+                "post": {
+                    "summary": "上传原始文档并创建或复用摄取任务",
+                    "description": "multipart：collection 必填；file/source_uri 二选一；doc_id、parse_profile、wait 可选。服务端计算完整 SHA-256，响应在同步完成和异步排队时保持同一结构。",
+                    "requestBody": {"required": true, "content": {"multipart/form-data": {
+                        "schema": {"type": "object", "required": ["collection"], "properties": {
+                            "collection": {"type": "string"},
+                            "doc_id": {"type": "string"},
+                            "file": {"type": "string", "format": "binary"},
+                            "source_uri": {"type": "string"},
+                            "media_type": {"type": "string"},
+                            "parse_profile": {"type": "string", "description": "JSON object"},
+                            "wait": {"type": "string", "enum": ["auto", "never"], "default": "auto"}
+                        }}
+                    }}},
+                    "responses": {
+                        "200": {"description": "已可检索", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}}}},
+                        "202": {"description": "已排队，按 job_url 轮询", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}}}},
+                        "409": {"description": "同一文档的另一内容正在处理，或全局文档坐标由其他 tenant 持有", "content": {
+                            "application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}},
+                            "text/plain": {"schema": {"type": "string"}}
+                        }},
+                        "400": {"description": "字段或 multipart 非法"},
+                        "401": {"description": "认证失败"},
+                        "403": {"description": "写入身份没有 ACL 标签"},
+                        "413": {"description": "超过服务端文档字节上限，请改用 source_uri"},
+                        "422": {"description": "任务已进入死信", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}}}},
+                        "429": {"description": "限流"},
+                        "503": {"description": "PostgreSQL job store 或对象存储未配置"}
+                    }
+                },
+                "get": {
+                    "summary": "从 ACL 可见的任务与 chunks 真源派生文档列表",
+                    "parameters": [
+                        {"name": "collection", "in": "query", "schema": {"type": "string"}},
+                        {"name": "state", "in": "query", "schema": {"type": "string", "enum": ["queued", "parsing", "chunking", "embedding", "indexed", "failed"]}},
+                        {"name": "after_collection", "in": "query", "schema": {"type": "string"}},
+                        {"name": "after_doc_id", "in": "query", "schema": {"type": "string"}},
+                        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 500}},
+                        {"name": "counts", "in": "query", "schema": {"type": "boolean", "default": false}}
+                    ],
+                    "responses": {"200": {"description": "稳定文档页", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DocumentListResponse"}}}}, "400": {"description": "查询字段非法"}, "401": {"description": "认证失败"}, "429": {"description": "限流"}, "503": {"description": "job store 未配置"}}
+                }
+            },
+            "/v1/jobs/{id}": {
+                "get": {
+                    "summary": "读取 ACL 可见的摄取任务；不可见与不存在均为 404",
+                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "任务状态", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}}}}, "401": {"description": "认证失败"}, "404": {"description": "不可见或不存在"}, "429": {"description": "限流"}, "503": {"description": "job store 未配置"}}
+                }
+            },
+            "/v1/jobs/{id}/status": {
+                "post": {
+                    "summary": "worker 专用：带 lease_job_id + lease_owner + lease_epoch 的心跳、阶段推进或失败上报",
+                    "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WorkerStatusRequest"}}}},
+                    "responses": {"200": {"description": "更新后的任务", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}}}}, "400": {"description": "请求体非法"}, "401": {"description": "认证失败"}, "403": {"description": "普通 API key 无 worker capability"}, "404": {"description": "任务不存在"}, "409": {"description": "过期 lease/epoch 或非法阶段"}, "429": {"description": "限流"}, "503": {"description": "job store 未配置"}}
+                }
+            },
+            "/v1/jobs/{id}/chunks": {
+                "post": {
+                    "summary": "worker 专用：按任务身份写 chunks，成功后原子栅栏发布 indexed 状态",
+                    "description": "tenant、ACL、collection、doc_id 全部取自任务行；请求内同名字段会被覆盖。",
+                    "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WorkerChunksRequest"}}}},
+                    "responses": {"200": {"description": "indexed 任务", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}}}}, "400": {"description": "请求体或 chunks 非法"}, "401": {"description": "认证失败"}, "403": {"description": "普通 API key 无 worker capability"}, "404": {"description": "任务不存在"}, "409": {"description": "过期 lease/epoch"}, "429": {"description": "限流"}, "503": {"description": "job 或 chunks PostgreSQL 真源未配置"}}
                 }
             },
             "/v1/docs/{collection}/{doc_id}": {
@@ -1347,6 +1599,75 @@ async fn metrics(State(s): State<ServerState>) -> String {
         "Total requests rejected by rate limit.",
         g(&m.rate_limited),
     );
+    counter(
+        &mut out,
+        "fastsearch_ingest_uploads_total",
+        "Document upload submissions resolved by the job store.",
+        g(&m.ingest_uploads),
+    );
+    counter(
+        &mut out,
+        "fastsearch_ingest_deduplicated_total",
+        "Document uploads deduplicated or coalesced with existing work.",
+        g(&m.ingest_deduplicated),
+    );
+    counter(
+        &mut out,
+        "fastsearch_ingest_failures_total",
+        "Worker failures accepted by the fenced job state machine.",
+        g(&m.ingest_failures),
+    );
+    counter(
+        &mut out,
+        "fastsearch_ingest_sync_hit_total",
+        "Synchronous upload waits that observed an indexed terminal state.",
+        g(&m.ingest_sync_hits),
+    );
+    counter(
+        &mut out,
+        "fastsearch_ingest_sync_timeout_total",
+        "Synchronous upload waits that degraded to asynchronous polling.",
+        g(&m.ingest_sync_timeouts),
+    );
+
+    if let Some(jobs) = &s.jobs {
+        let ingest = {
+            let mut cache = s.ingest_metrics_cache.lock().await;
+            let fresh = cache
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(1))
+                .map(|(_, snapshot)| snapshot.clone());
+            if fresh.is_some() {
+                fresh
+            } else {
+                match jobs.ingest_metrics().await {
+                    Ok(snapshot) => {
+                        *cache = Some((std::time::Instant::now(), snapshot.clone()));
+                        Some(snapshot)
+                    }
+                    Err(_) => cache.as_ref().map(|(_, snapshot)| snapshot.clone()),
+                }
+            }
+        };
+        if let Some(ingest) = ingest {
+            out.push_str(
+                "# HELP fastsearch_ingest_jobs_total Current ingest jobs by authoritative state.\n\
+                 # TYPE fastsearch_ingest_jobs_total gauge\n",
+            );
+            for (state, count) in ingest.state_counts {
+                out.push_str(&format!(
+                    "fastsearch_ingest_jobs_total{{state=\"{}\"}} {count}\n",
+                    state.as_str()
+                ));
+            }
+            out.push_str(&format!(
+                "# HELP fastsearch_ingest_dead_letter_total Current failed ingest jobs whose retry budget is exhausted.\n\
+                 # TYPE fastsearch_ingest_dead_letter_total gauge\n\
+                 fastsearch_ingest_dead_letter_total {}\n",
+                ingest.dead_letter_count.max(0)
+            ));
+        }
+    }
 
     let cdc = s.cdc_health_snapshot();
     let gauge = |out: &mut String, name: &str, help: &str, value: u64| {
@@ -2205,6 +2526,937 @@ async fn assets_resolve(
     Ok(Json(json!({ "assets": out })))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadWait {
+    Auto,
+    Never,
+}
+
+#[derive(Deserialize)]
+struct DocumentsQuery {
+    #[serde(default)]
+    collection: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    after_collection: Option<String>,
+    #[serde(default)]
+    after_doc_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    counts: bool,
+}
+
+#[derive(Deserialize)]
+struct WorkerStatusBody {
+    lease_job_id: String,
+    lease_owner: String,
+    lease_epoch: i64,
+    #[serde(rename = "state")]
+    command: WorkerStatusCommand,
+    #[serde(default)]
+    stage_detail: Value,
+    #[serde(default)]
+    lease_for_ms: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_stage: Option<String>,
+    #[serde(default)]
+    next_attempt_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkerStatusCommand {
+    Heartbeat,
+    Chunking,
+    Embedding,
+    Failed,
+}
+
+#[derive(Deserialize)]
+struct WorkerChunksBody {
+    lease_job_id: String,
+    lease_owner: String,
+    lease_epoch: i64,
+    chunks: Vec<WorkerIndexChunk>,
+}
+
+/// Worker wire DTO deliberately excludes every identity/document-coordinate field. The server
+/// reconstructs those fields from the fenced job row before entering the shared index pipeline.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerIndexChunk {
+    chunk_id: u64,
+    kind: ChunkKind,
+    text: String,
+    page: u32,
+    bbox: BBox,
+    #[serde(default)]
+    heading_path: Vec<String>,
+    #[serde(default)]
+    section_id: u64,
+    char_len: u32,
+    #[serde(default)]
+    media: Option<MediaRef>,
+    #[serde(default)]
+    media_bytes: Option<Vec<u8>>,
+    #[serde(default)]
+    image_vector_status: Option<fastsearch_core::ImageVectorStatus>,
+    #[serde(default)]
+    metadata: fastsearch_core::Metadata,
+    #[serde(default = "worker_chunk_searchable_default")]
+    searchable: bool,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+fn worker_chunk_searchable_default() -> bool {
+    true
+}
+
+impl WorkerIndexChunk {
+    fn into_index_chunk(self, doc_id: &str, principal: &Principal) -> IndexChunk {
+        IndexChunk {
+            chunk: Chunk {
+                doc_id: doc_id.to_string(),
+                chunk_id: self.chunk_id,
+                kind: self.kind,
+                text: self.text,
+                page: self.page,
+                bbox: self.bbox,
+                heading_path: self.heading_path,
+                section_id: self.section_id,
+                char_len: self.char_len,
+                media: self.media,
+                media_bytes: self.media_bytes,
+                image_vector_status: self.image_vector_status,
+                tenant: principal.tenant.clone(),
+                acl: principal.tags.clone(),
+                metadata: self.metadata,
+                searchable: self.searchable,
+            },
+            vector: self.vector,
+        }
+    }
+}
+
+fn jobs_for(s: &ServerState) -> Result<Arc<fastsearch_pg::JobStore>, (StatusCode, String)> {
+    s.jobs.clone().ok_or_else(|| {
+        s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "document ingestion requires a configured PostgreSQL job store".into(),
+        )
+    })
+}
+
+fn ingest_internal_err(
+    s: &ServerState,
+    context: &str,
+    detail: impl std::fmt::Display,
+) -> (StatusCode, String) {
+    s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+    internal_err(context, detail)
+}
+
+fn full_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn new_job_id() -> String {
+    let mut bytes = [0_u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        bytes.copy_from_slice(&object_token_nonce());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+fn filename_extension(filename: Option<&str>, media_type: Option<&str>) -> String {
+    let from_name = filename
+        .and_then(|name| name.rsplit('/').next())
+        .and_then(|name| name.rsplit_once('.').map(|(_, ext)| ext))
+        .filter(|ext| {
+            !ext.is_empty() && ext.len() <= 12 && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+    from_name
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_else(|| ext_for_media_type(media_type).to_string())
+}
+
+fn profile_needs_heavy_worker(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            (matches!(key.as_str(), "ocr" | "vlm" | "tables")
+                && !matches!(value, Value::Null | Value::Bool(false)))
+                || profile_needs_heavy_worker(value)
+        }),
+        Value::Array(values) => values.iter().any(profile_needs_heavy_worker),
+        _ => false,
+    }
+}
+
+fn job_response(job: &fastsearch_pg::IngestJob, deduplicated: bool) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "collection": job.collection,
+        "doc_id": job.doc_id,
+        "state": job.state.as_str(),
+        "searchable": job.state == fastsearch_pg::IngestState::Indexed && job.chunk_count > 0,
+        "chunk_count": job.chunk_count,
+        "content_sha256": job.content_sha256,
+        "deduplicated": deduplicated,
+        "dead_letter": job.is_dead_letter(),
+        "retry_count": job.retry_count,
+        "poll_after_ms": if matches!(job.state, fastsearch_pg::IngestState::Indexed | fastsearch_pg::IngestState::Failed) { 0 } else { 2_000 },
+        "job_url": format!("/v1/jobs/{}", job.job_id),
+        "error": job.error,
+        "stage": job.error_stage.as_deref().unwrap_or(job.state.as_str()),
+        "stage_detail": job.stage_detail,
+        "parse_profile": job.parse_profile,
+        "created_at": job.created_at_ms,
+        "updated_at": job.updated_at_ms,
+        "finished_at": job.finished_at_ms,
+    })
+}
+
+fn current_job_lease(
+    job: fastsearch_pg::IngestJob,
+    owner: &str,
+    epoch: i64,
+) -> Result<fastsearch_pg::JobLease, (StatusCode, String)> {
+    let current_owner = job.lease_owner.clone().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "job does not have an active worker lease".into(),
+        )
+    })?;
+    if current_owner != owner || job.lease_epoch != epoch {
+        return Err((StatusCode::CONFLICT, "stale or foreign worker lease".into()));
+    }
+    Ok(fastsearch_pg::JobLease {
+        job,
+        owner: current_owner,
+        epoch,
+    })
+}
+
+async fn update_ingest_job_status(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    req: Request<Body>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let key = require_authenticated_key(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let jobs = jobs_for(&s)?;
+    require_worker_capability(&s, key)?;
+    let Json(body) = Json::<WorkerStatusBody>::from_request(req, &s)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
+    if body.lease_job_id != job_id {
+        return Err((StatusCode::CONFLICT, "lease belongs to another job".into()));
+    }
+    let current = jobs
+        .get(&job_id)
+        .await
+        .map_err(|error| ingest_internal_err(&s, "get worker job", error))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "job not found".into()))?;
+    let expected = current.state;
+    let lease = current_job_lease(current, &body.lease_owner, body.lease_epoch)?;
+    let lease_for_ms = body.lease_for_ms.unwrap_or(60_000);
+    let accepted = match body.command {
+        WorkerStatusCommand::Heartbeat => jobs
+            .heartbeat(&lease, lease_for_ms)
+            .await
+            .map_err(|error| ingest_internal_err(&s, "heartbeat ingest job", error))?,
+        WorkerStatusCommand::Chunking => jobs
+            .advance(
+                &lease,
+                expected,
+                fastsearch_pg::IngestState::Chunking,
+                &body.stage_detail,
+                lease_for_ms,
+            )
+            .await
+            .map_err(|error| match error {
+                fastsearch_pg::PgError::Conflict(message) => (StatusCode::CONFLICT, message),
+                other => ingest_internal_err(&s, "advance ingest job", other),
+            })?,
+        WorkerStatusCommand::Embedding => jobs
+            .advance(
+                &lease,
+                expected,
+                fastsearch_pg::IngestState::Embedding,
+                &body.stage_detail,
+                lease_for_ms,
+            )
+            .await
+            .map_err(|error| match error {
+                fastsearch_pg::PgError::Conflict(message) => (StatusCode::CONFLICT, message),
+                other => ingest_internal_err(&s, "advance ingest job", other),
+            })?,
+        WorkerStatusCommand::Failed => {
+            let next_attempt = body.next_attempt_at_ms.unwrap_or_else(|| {
+                (unix_now() as i64)
+                    .saturating_mul(1_000)
+                    .saturating_add(1_000)
+            });
+            jobs.fail(
+                &lease,
+                body.error.as_deref().unwrap_or("worker reported failure"),
+                body.error_stage.as_deref().unwrap_or(expected.as_str()),
+                next_attempt,
+            )
+            .await
+            .map_err(|error| ingest_internal_err(&s, "fail ingest job", error))?
+            .is_some()
+        }
+    };
+    if !accepted {
+        return Err((
+            StatusCode::CONFLICT,
+            "worker lease expired or job state changed".into(),
+        ));
+    }
+    if body.command == WorkerStatusCommand::Failed {
+        s.metrics.ingest_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    let current = jobs
+        .get(&job_id)
+        .await
+        .map_err(|error| ingest_internal_err(&s, "reload worker job", error))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "job not found".into()))?;
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/jobs/{id}/status",
+        tenant: current.tenant.clone(),
+        tags: current.acl.clone(),
+        query: None,
+        collection: Some(current.collection.clone()),
+        doc_id: Some(current.doc_id.clone()),
+        hits: None,
+        status: 200,
+    });
+    Ok(Json(job_response(&current, false)))
+}
+
+async fn write_ingest_job_chunks(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    req: Request<Body>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let key = require_authenticated_key(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let jobs = jobs_for(&s)?;
+    require_worker_capability(&s, key)?;
+    // A job row without the chunks source-of-truth is not a usable ingest plane: never publish
+    // `indexed` for data that only reached the derived in-process indexes.
+    if let Err(error) = management_source(&s).await {
+        if error.0.is_server_error() {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        return Err(error);
+    }
+    let Json(body) = Json::<WorkerChunksBody>::from_request(req, &s)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
+    if body.lease_job_id != job_id {
+        return Err((StatusCode::CONFLICT, "lease belongs to another job".into()));
+    }
+    if body.chunks.is_empty() || body.chunks.len() > MAX_CHUNK_BATCH {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("chunks must contain 1..={MAX_CHUNK_BATCH} items"),
+        ));
+    }
+    let current = jobs
+        .get(&job_id)
+        .await
+        .map_err(|error| ingest_internal_err(&s, "get worker job", error))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "job not found".into()))?;
+    let principal = Principal {
+        tenant: current.tenant.clone(),
+        tags: current.acl.clone(),
+    };
+    let collection = current.collection.clone();
+    let doc_id = current.doc_id.clone();
+    let state = current.state;
+    let lease = current_job_lease(current, &body.lease_owner, body.lease_epoch)?;
+    let fenced = match state {
+        fastsearch_pg::IngestState::Chunking => jobs
+            .advance(
+                &lease,
+                fastsearch_pg::IngestState::Chunking,
+                fastsearch_pg::IngestState::Embedding,
+                &json!({"chunk_count": body.chunks.len()}),
+                60_000,
+            )
+            .await
+            .map_err(|error| ingest_internal_err(&s, "enter embedding stage", error))?,
+        fastsearch_pg::IngestState::Embedding => jobs
+            .heartbeat(&lease, 60_000)
+            .await
+            .map_err(|error| ingest_internal_err(&s, "refresh embedding lease", error))?,
+        _ => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "job must be chunking or embedding, currently {}",
+                    state.as_str()
+                ),
+            ))
+        }
+    };
+    if !fenced {
+        return Err((
+            StatusCode::CONFLICT,
+            "worker lease expired or epoch changed".into(),
+        ));
+    }
+    let expected_chunk_count = i32::try_from(body.chunks.len())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "too many chunks".into()))?;
+    let index_body = IndexBody {
+        collection: collection.clone(),
+        doc_id: doc_id.clone(),
+        store_media: StoreMedia::Inline,
+        chunks: body
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.into_index_chunk(&doc_id, &principal))
+            .collect(),
+    };
+    let state_ref = &s;
+    let principal_ref = &principal;
+    let publication = jobs
+        .publish_indexed(&lease, expected_chunk_count, move || {
+            index_document_body(state_ref, principal_ref, index_body)
+        })
+        .await
+        .map_err(|error| ingest_internal_err(&s, "publish indexed job", error))?;
+    let chunk_count = match publication {
+        fastsearch_pg::PublicationResult::Published(chunk_count) => chunk_count,
+        fastsearch_pg::PublicationResult::WriteFailed(error) => return Err(error),
+        fastsearch_pg::PublicationResult::FencedOut => {
+            return Err((
+                StatusCode::CONFLICT,
+                "worker lease expired before source writes began".into(),
+            ))
+        }
+    };
+    let indexed = jobs
+        .get(&job_id)
+        .await
+        .map_err(|error| ingest_internal_err(&s, "reload indexed job", error))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "job not found".into()))?;
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/jobs/{id}/chunks",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: Some(collection),
+        doc_id: Some(doc_id),
+        hits: Some(chunk_count),
+        status: 200,
+    });
+    Ok(Json(job_response(&indexed, false)))
+}
+
+async fn upload_document(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    req: Request<Body>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let jobs = jobs_for(&s)?;
+    let acl = ingest_acl_for(&principal)?;
+    if !s.engine.lock().await.has_object_store() {
+        s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "document ingestion requires a configured object store".into(),
+        ));
+    }
+    let mut multipart = Multipart::from_request(req, &s).await.map_err(|error| {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            document_too_large(s.max_document_bytes)
+        } else {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid multipart body: {error}"),
+            )
+        }
+    })?;
+    let mut collection = None;
+    let mut doc_id = None;
+    let mut source_uri = None;
+    let mut file = None;
+    let mut media_type = None;
+    let mut filename = None;
+    let mut parse_profile = json!({});
+    let mut wait = UploadWait::Auto;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| bad_multipart_field(error, s.max_document_bytes))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "collection" => {
+                collection = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|error| bad_multipart_field(error, s.max_document_bytes))?,
+                )
+            }
+            "doc_id" => {
+                doc_id = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|error| bad_multipart_field(error, s.max_document_bytes))?,
+                )
+            }
+            "source_uri" => {
+                source_uri = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|error| bad_multipart_field(error, s.max_document_bytes))?,
+                )
+            }
+            "media_type" => {
+                media_type = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|error| bad_multipart_field(error, s.max_document_bytes))?,
+                )
+            }
+            "parse_profile" => {
+                let raw = field
+                    .text()
+                    .await
+                    .map_err(|error| bad_multipart_field(error, s.max_document_bytes))?;
+                parse_profile = serde_json::from_str(&raw).map_err(|error| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid parse_profile: {error}"),
+                    )
+                })?;
+                if !parse_profile.is_object() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "parse_profile must be an object".into(),
+                    ));
+                }
+            }
+            "wait" => {
+                wait = match field
+                    .text()
+                    .await
+                    .map_err(|error| bad_multipart_field(error, s.max_document_bytes))?
+                    .as_str()
+                {
+                    "auto" => UploadWait::Auto,
+                    "never" => UploadWait::Never,
+                    _ => {
+                        return Err((StatusCode::BAD_REQUEST, "wait must be auto or never".into()))
+                    }
+                };
+            }
+            "file" => {
+                filename = field.file_name().map(str::to_string);
+                if media_type.is_none() {
+                    media_type = field.content_type().map(str::to_string);
+                }
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|error| bad_multipart_field(error, s.max_document_bytes))?;
+                if bytes.len() > s.max_document_bytes {
+                    return Err(document_too_large(s.max_document_bytes));
+                }
+                file = Some(bytes.to_vec());
+            }
+            _ => {}
+        }
+    }
+    let collection = collection
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "collection is required".into()))?;
+    if file.is_some() == source_uri.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "provide exactly one of file or source_uri".into(),
+        ));
+    }
+    let proposed_job_id = new_job_id();
+    let doc_id = doc_id
+        .filter(|value| !value.is_empty())
+        .or_else(|| filename.clone())
+        .unwrap_or_else(|| proposed_job_id.clone());
+    let namespace = object_namespace(principal.tenant.as_deref())?;
+    let (bytes, authoritative_uri, staged_by_server) = if let Some(bytes) = file {
+        let sha = full_sha256(&bytes);
+        let extension = filename_extension(filename.as_deref(), media_type.as_deref());
+        let key = format!(
+            "{}/{}/{}/raw-{}.{}",
+            namespace,
+            pct(&collection),
+            pct(&doc_id),
+            sha,
+            extension
+        );
+        let object = s
+            .engine
+            .lock()
+            .await
+            .put_object(
+                &key,
+                &bytes,
+                media_type.as_deref().unwrap_or("application/octet-stream"),
+            )
+            .map_err(|error| ingest_internal_err(&s, "store uploaded document", error))?;
+        (bytes, object.uri, true)
+    } else {
+        let uri = source_uri.expect("exclusive source checked");
+        let object = {
+            let engine = s.engine.lock().await;
+            engine
+                .validate_object_ref(&uri, principal.tenant.as_deref())
+                .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+            engine
+                .fetch_object_bytes(&uri, s.max_document_bytes)
+                .map_err(|error| {
+                    if error.to_string().contains("exceeds") {
+                        (StatusCode::PAYLOAD_TOO_LARGE, error.to_string())
+                    } else {
+                        ingest_internal_err(&s, "fetch source_uri", error)
+                    }
+                })?
+                .ok_or_else(|| (StatusCode::NOT_FOUND, "source_uri was not found".into()))?
+        };
+        if media_type.is_none() {
+            media_type = object.content_type;
+        }
+        (object.bytes, uri, false)
+    };
+    let content_sha256 = full_sha256(&bytes);
+    let content_bytes = i64::try_from(bytes.len()).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "document is too large".into(),
+        )
+    })?;
+    let submission = jobs
+        .submit_upload(&fastsearch_pg::NewIngestJob {
+            job_id: proposed_job_id,
+            collection: collection.clone(),
+            doc_id: doc_id.clone(),
+            tenant: principal.tenant.clone(),
+            acl,
+            source_uri: authoritative_uri.clone(),
+            content_sha256,
+            content_bytes,
+            media_type,
+            filename,
+            parse_profile: parse_profile.clone(),
+            max_retries: 3,
+        })
+        .await;
+    let resolution = match submission {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            if staged_by_server {
+                if let Err(cleanup_error) = s.engine.lock().await.delete_object(&authoritative_uri)
+                {
+                    eprintln!(
+                        "raw document cleanup after job submission failure failed: {cleanup_error}"
+                    );
+                }
+            }
+            return Err(match error {
+                fastsearch_pg::PgError::Conflict(_) => (
+                    StatusCode::CONFLICT,
+                    "document coordinate is already owned by another tenant".into(),
+                ),
+                other => ingest_internal_err(&s, "submit upload", other),
+            });
+        }
+    };
+    s.metrics.ingest_uploads.fetch_add(1, Ordering::Relaxed);
+
+    if staged_by_server
+        && resolution
+            .unused_source_uri
+            .as_deref()
+            .is_some_and(|uri| uri != resolution.job.source_uri)
+    {
+        let _ = s.engine.lock().await.delete_object(&authoritative_uri);
+    }
+    if let Some(old_uri) = resolution.replaced_source_uri.as_deref() {
+        if old_uri != resolution.job.source_uri {
+            if let Err(error) = s.engine.lock().await.delete_object(old_uri) {
+                eprintln!("old raw document cleanup failed: {error}");
+            }
+        }
+    }
+
+    let deduplicated = matches!(
+        resolution.disposition,
+        fastsearch_pg::UploadDisposition::Deduplicated
+            | fastsearch_pg::UploadDisposition::Coalesced
+    );
+    if deduplicated {
+        s.metrics
+            .ingest_deduplicated
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if resolution.disposition == fastsearch_pg::UploadDisposition::InFlightConflict {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(job_response(&resolution.job, false)),
+        ));
+    }
+    let should_wait = match wait {
+        UploadWait::Never => false,
+        UploadWait::Auto => {
+            bytes.len() <= s.sync_document_bytes && !profile_needs_heavy_worker(&parse_profile)
+        }
+    };
+    let mut job = resolution.job;
+    let entered_sync_window = should_wait
+        && !matches!(
+            job.state,
+            fastsearch_pg::IngestState::Indexed | fastsearch_pg::IngestState::Failed
+        );
+    if should_wait
+        && !matches!(
+            job.state,
+            fastsearch_pg::IngestState::Indexed | fastsearch_pg::IngestState::Failed
+        )
+    {
+        if let Ok(_permit) = s.sync_waiters.clone().try_acquire_owned() {
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(s.sync_wait_ms);
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if let Some(current) = jobs
+                    .get(&job.job_id)
+                    .await
+                    .map_err(|error| ingest_internal_err(&s, "poll ingest job", error))?
+                {
+                    job = current;
+                }
+                if matches!(
+                    job.state,
+                    fastsearch_pg::IngestState::Indexed | fastsearch_pg::IngestState::Failed
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+    if should_wait && job.state == fastsearch_pg::IngestState::Indexed {
+        s.metrics.ingest_sync_hits.fetch_add(1, Ordering::Relaxed);
+    } else if entered_sync_window
+        && !matches!(
+            job.state,
+            fastsearch_pg::IngestState::Indexed | fastsearch_pg::IngestState::Failed
+        )
+    {
+        s.metrics
+            .ingest_sync_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    let status = match job.state {
+        fastsearch_pg::IngestState::Indexed => StatusCode::OK,
+        fastsearch_pg::IngestState::Failed if job.is_dead_letter() => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        _ => StatusCode::ACCEPTED,
+    };
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/documents",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: Some(collection),
+        doc_id: Some(doc_id),
+        hits: None,
+        status: status.as_u16(),
+    });
+    Ok((status, Json(job_response(&job, deduplicated))))
+}
+
+fn bad_multipart_field(
+    error: axum::extract::multipart::MultipartError,
+    max_bytes: usize,
+) -> (StatusCode, String) {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        document_too_large(max_bytes)
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid multipart field: {error}"),
+        )
+    }
+}
+
+fn document_too_large(max_bytes: usize) -> (StatusCode, String) {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "document exceeds {max_bytes} bytes; upload it to the configured object store and submit source_uri"
+        ),
+    )
+}
+
+async fn get_ingest_job(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let jobs = jobs_for(&s)?;
+    let job = jobs
+        .get_visible(&job_id, &acl_for(&principal))
+        .await
+        .map_err(|error| ingest_internal_err(&s, "get ingest job", error))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "job not found".into()))?;
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/jobs/{id}",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: Some(job.collection.clone()),
+        doc_id: Some(job.doc_id.clone()),
+        hits: None,
+        status: 200,
+    });
+    Ok(Json(job_response(&job, false)))
+}
+
+async fn list_documents(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Query(query): Query<DocumentsQuery>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let jobs = jobs_for(&s)?;
+    let state = query.state.as_deref().map(parse_ingest_state).transpose()?;
+    let limit = query.limit.unwrap_or(100);
+    let documents = jobs
+        .list_documents(
+            &acl_for(&principal),
+            &fastsearch_pg::DocumentListOptions {
+                collection: query.collection.clone(),
+                state,
+                after_collection: query.after_collection,
+                after_doc_id: query.after_doc_id,
+                limit,
+                counts: query.counts,
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            fastsearch_pg::PgError::Config(message) => (StatusCode::BAD_REQUEST, message),
+            other => ingest_internal_err(&s, "list documents", other),
+        })?;
+    let next = (documents.len() == limit)
+        .then(|| {
+            documents.last().map(|document| {
+                json!({
+                    "after_collection": document.collection,
+                    "after_doc_id": document.doc_id,
+                })
+            })
+        })
+        .flatten();
+    let values = documents
+        .iter()
+        .map(|document| {
+            json!({
+                "collection": document.collection,
+                "doc_id": document.doc_id,
+                "state": document.state.as_str(),
+                "searchable": document.searchable,
+                "chunk_count": document.chunk_count,
+                "job_id": document.job_id,
+                "content_sha256": document.content_sha256,
+                "media_type": document.media_type,
+                "filename": document.filename,
+                "created_at": document.created_at_ms,
+                "updated_at": document.updated_at_ms,
+                "finished_at": document.finished_at_ms,
+                "retry_count": document.retry_count,
+                "dead_letter": document.dead_letter,
+                "error": document.error,
+            })
+        })
+        .collect::<Vec<_>>();
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/documents",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: query.collection,
+        doc_id: None,
+        hits: Some(values.len()),
+        status: 200,
+    });
+    Ok(Json(json!({ "documents": values, "next": next })))
+}
+
+fn parse_ingest_state(value: &str) -> Result<fastsearch_pg::IngestState, (StatusCode, String)> {
+    use fastsearch_pg::IngestState;
+    match value {
+        "queued" => Ok(IngestState::Queued),
+        "parsing" => Ok(IngestState::Parsing),
+        "chunking" => Ok(IngestState::Chunking),
+        "embedding" => Ok(IngestState::Embedding),
+        "indexed" => Ok(IngestState::Indexed),
+        "failed" => Ok(IngestState::Failed),
+        _ => Err((StatusCode::BAD_REQUEST, "invalid ingest state".into())),
+    }
+}
+
 /// 单个待索引 chunk：正常 chunk 字段（flatten）+ 可选**预计算向量**旁路。
 /// 携带 `vector` 时直接入向量索引、**跳过服务端嵌入**（benchmark / 外部 ETL 已自带向量；
 /// 见 [docs/benchmark-strategy.md]）；不带则照旧走嵌入后端（无后端→纯全文）。
@@ -2563,25 +3815,45 @@ fn initial_image_vector_status(ic: &IndexChunk) -> Option<fastsearch_core::Image
 async fn index(
     State(s): State<ServerState>,
     headers: HeaderMap,
-    Json(mut body): Json<IndexBody>,
+    Json(body): Json<IndexBody>,
 ) -> ApiResult {
     s.metrics.requests.fetch_add(1, Ordering::Relaxed);
-    let principal = principal_from_headers(&headers, &s.keys).ok_or_else(|| {
-        s.metrics.unauthorized.fetch_add(1, Ordering::Relaxed);
-        (
-            StatusCode::UNAUTHORIZED,
-            "missing or invalid API key".into(),
-        )
-    })?;
-    // 限流在鉴权之后（M21）：见 search_request。
+    let principal = require_principal(&s, &headers)?;
     if !s.allow(&rate_key(&headers)) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
     }
+    let collection = body.collection.clone();
+    let doc_id = body.doc_id.clone();
+    let n = index_document_body(&s, &principal, body).await?;
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/index",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: Some(collection),
+        doc_id: Some(doc_id),
+        hits: Some(n),
+        status: 200,
+    });
+    Ok(Json(json!({ "indexed": n })))
+}
+
+async fn index_document_body(
+    s: &ServerState,
+    principal: &Principal,
+    mut body: IndexBody,
+) -> Result<usize, (StatusCode, String)> {
     let err500 = |e: fastsearch_engine::EngineError| {
         s.metrics.errors.fetch_add(1, Ordering::Relaxed);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     };
-    apply_ingest_identity(&mut body, &principal)?;
+    apply_ingest_identity(&mut body, principal)?;
+    if body.chunks.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "chunks must contain at least one item; use the document delete endpoint to remove a document".into(),
+        ));
+    }
     for ic in &body.chunks {
         ic.chunk
             .validate_metadata()
@@ -2815,20 +4087,24 @@ async fn index(
     if let Some(pg_arc) = pg {
         let raw_chunks: Vec<fastsearch_core::Chunk> =
             body.chunks.iter().map(|ic| ic.chunk.clone()).collect();
-        let upsert_err = pg_arc
+        let upsert_error = pg_arc
             .upsert_doc(&body.collection, &body.doc_id, &raw_chunks)
             .await
-            .err()
-            .map(|e| format!("{e}"));
-        if let Some(e) = upsert_err {
-            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            .err();
+        if let Some(error) = upsert_error {
             let engine = s.engine.lock().await;
             for uri in &new_object_uris {
                 if let Err(cleanup_err) = engine.delete_object(uri) {
                     eprintln!("object cleanup after pg upsert failure failed: {cleanup_err}");
                 }
             }
-            return Err(internal_err("pg upsert", e));
+            return match error {
+                fastsearch_pg::PgError::Conflict(message) => Err((StatusCode::CONFLICT, message)),
+                other => {
+                    s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                    Err(internal_err("pg upsert", other))
+                }
+            };
         }
 
         // B6 写穿：pgvector 直查档的**读路径是 PG `embedding` 列**，不是引擎侧派生向量。而
@@ -2889,17 +4165,7 @@ async fn index(
     }
     let n = body.chunks.len();
     s.metrics.indexed.fetch_add(n as u64, Ordering::Relaxed);
-    s.emit_audit(AuditEvent {
-        endpoint: "/v1/index",
-        tenant: principal.tenant.clone(),
-        tags: principal.tags.clone(),
-        query: None,
-        collection: Some(body.collection.clone()),
-        doc_id: Some(body.doc_id.clone()),
-        hits: Some(n),
-        status: 200,
-    });
-    Ok(Json(json!({ "indexed": n })))
+    Ok(n)
 }
 
 async fn batch_get_chunks(
@@ -3629,6 +4895,952 @@ mod tests {
             },
         );
         m
+    }
+
+    #[tokio::test]
+    async fn fs302_all_job_routes_fail_closed_without_postgres_before_body_or_capability() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+        let app = router(ServerState::new(engine, keys()));
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/documents")
+                    .header("content-type", "application/json")
+                    .body(Body::from("body must not be consumed before auth"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let cases = [
+            ("GET", "/v1/jobs/missing", Body::empty()),
+            ("GET", "/v1/documents", Body::empty()),
+            (
+                "POST",
+                "/v1/documents",
+                Body::from("this is deliberately not multipart"),
+            ),
+            (
+                "POST",
+                "/v1/jobs/missing/status",
+                Body::from(r#"{"lease_epoch":1,"state":"heartbeat"}"#),
+            ),
+            (
+                "POST",
+                "/v1/jobs/missing/chunks",
+                Body::from(r#"{"lease_epoch":1,"chunks":[]}"#),
+            ),
+        ];
+        for (method, uri, body) in cases {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("x-api-key", "k-team-a")
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+        let metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(String::from_utf8_lossy(&metrics).contains("fastsearch_errors_total 5"));
+
+        let rate_cases = [
+            ("GET", "/v1/jobs/missing", ""),
+            ("GET", "/v1/documents", ""),
+            ("POST", "/v1/documents", "not multipart"),
+            (
+                "POST",
+                "/v1/jobs/missing/status",
+                r#"{"lease_job_id":"missing","lease_owner":"worker","lease_epoch":1,"state":"heartbeat"}"#,
+            ),
+            (
+                "POST",
+                "/v1/jobs/missing/chunks",
+                r#"{"lease_job_id":"missing","lease_owner":"worker","lease_epoch":1,"chunks":[]}"#,
+            ),
+        ];
+        for (method, uri, body) in rate_cases {
+            let limited = router(
+                ServerState::new(
+                    Engine::create_in_ram(TextIndexConfig::default()).expect("limited engine"),
+                    keys(),
+                )
+                .with_rate_limit(1.0, 0.0),
+            );
+            for (attempt, expected) in [
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::TOO_MANY_REQUESTS,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let response = limited
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("x-api-key", "k-team-a")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{uri} attempt {attempt}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fs302_document_upload_status_and_listing_share_acl_safe_job_state() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs302_document_upload_status_and_listing_share_acl_safe_job_state: DATABASE_URL not set"
+            );
+            return;
+        };
+        let suffix = std::process::id();
+        let jobs_table = format!("fs302_http_jobs_{suffix}");
+        let chunks_table = format!("fs302_http_chunks_{suffix}");
+        let jobs = Arc::new(
+            fastsearch_pg::JobStore::connect_with_chunks_table(&url, &jobs_table, &chunks_table)
+                .await
+                .expect("job store"),
+        );
+        let cleanup_client = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("cleanup connect");
+        let (client, connection) = cleanup_client;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {jobs_table} CASCADE; DROP TABLE IF EXISTS {chunks_table} CASCADE; \
+                 CREATE TABLE {chunks_table} (collection text NOT NULL, doc_id text NOT NULL, \
+                 tenant text, acl text[] NOT NULL, searchable boolean NOT NULL, \
+                 updated_at timestamptz NOT NULL DEFAULT now());"
+            ))
+            .await
+            .expect("chunks schema");
+        jobs.ensure_schema().await.expect("job schema");
+
+        let objects = tempfile::tempdir().expect("objects");
+        let store = Arc::new(
+            fastsearch_engine::LocalObjectStore::new(objects.path(), "documents")
+                .with_max_bytes(32 * 1024 * 1024),
+        );
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+        engine.set_object_store(store);
+        let mut api_keys = keys();
+        api_keys.insert(
+            "k-untagged".into(),
+            Principal {
+                tenant: Some("acme".into()),
+                tags: vec![],
+            },
+        );
+        let audit_events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = audit_events.clone();
+        let audit: AuditSink = Arc::new(move |event| captured.lock().unwrap().push(event));
+        let app = router(
+            ServerState::new(engine, api_keys)
+                .with_job_store(jobs.clone())
+                .with_audit(audit),
+        );
+
+        let boundary = "fs302-boundary";
+        let upload_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nkb\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"doc_id\"\r\n\r\nreport.md\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"wait\"\r\n\r\nnever\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"report.md\"\r\n\
+             Content-Type: text/markdown\r\n\r\nhello FS-302\r\n--{boundary}--\r\n"
+        );
+        let untagged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/documents")
+                    .header("x-api-key", "k-untagged")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(upload_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(untagged.status(), StatusCode::FORBIDDEN);
+        let uploaded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/documents")
+                    .header("x-api-key", "k-team-a")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(upload_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .expect("upload response");
+        assert_eq!(uploaded.status(), StatusCode::ACCEPTED);
+        let uploaded = body_json(uploaded).await;
+        assert_eq!(uploaded["collection"], "kb");
+        assert_eq!(uploaded["doc_id"], "report.md");
+        assert_eq!(uploaded["state"], "queued");
+        assert_eq!(uploaded["content_sha256"].as_str().unwrap().len(), 64);
+        let upload_keys = uploaded
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let job_url = uploaded["job_url"].as_str().unwrap().to_string();
+
+        let visible = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&job_url)
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible.status(), StatusCode::OK);
+        let hidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&job_url)
+                    .header("x-api-key", "k-team-b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/documents?collection=kb&counts=true")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = body_json(listed).await;
+        assert_eq!(listed["documents"][0]["doc_id"], "report.md");
+        let document_keys = listed["documents"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            document_keys,
+            std::collections::BTreeSet::from([
+                "collection",
+                "doc_id",
+                "state",
+                "searchable",
+                "chunk_count",
+                "job_id",
+                "content_sha256",
+                "media_type",
+                "filename",
+                "created_at",
+                "updated_at",
+                "finished_at",
+                "retry_count",
+                "dead_letter",
+                "error",
+            ])
+        );
+
+        let lease = jobs
+            .claim("test-worker", 1, 60_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(jobs
+            .advance(
+                &lease,
+                fastsearch_pg::IngestState::Parsing,
+                fastsearch_pg::IngestState::Chunking,
+                &json!({}),
+                60_000,
+            )
+            .await
+            .unwrap());
+        assert!(jobs
+            .advance(
+                &lease,
+                fastsearch_pg::IngestState::Chunking,
+                fastsearch_pg::IngestState::Embedding,
+                &json!({}),
+                60_000,
+            )
+            .await
+            .unwrap());
+        assert!(jobs.finish(&lease, 0).await.unwrap());
+        let deduplicated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/documents")
+                    .header("x-api-key", "k-team-a")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(upload_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deduplicated.status(), StatusCode::OK);
+        let deduplicated = body_json(deduplicated).await;
+        assert_eq!(deduplicated["deduplicated"], true);
+        assert_eq!(
+            deduplicated
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            upload_keys,
+            "200 and 202 upload responses must be isomorphic"
+        );
+
+        let worker_jobs =
+            fastsearch_pg::JobStore::connect_with_chunks_table(&url, &jobs_table, &chunks_table)
+                .await
+                .expect("sync worker job store");
+        let sync_worker = tokio::spawn(async move {
+            for _ in 0..100 {
+                if let Some(lease) = worker_jobs
+                    .claim("sync-worker", 1, 60_000)
+                    .await
+                    .expect("sync claim")
+                    .pop()
+                {
+                    worker_jobs
+                        .advance(
+                            &lease,
+                            fastsearch_pg::IngestState::Parsing,
+                            fastsearch_pg::IngestState::Chunking,
+                            &json!({}),
+                            60_000,
+                        )
+                        .await
+                        .expect("sync chunking");
+                    worker_jobs
+                        .advance(
+                            &lease,
+                            fastsearch_pg::IngestState::Chunking,
+                            fastsearch_pg::IngestState::Embedding,
+                            &json!({}),
+                            60_000,
+                        )
+                        .await
+                        .expect("sync embedding");
+                    assert!(worker_jobs.finish(&lease, 0).await.expect("sync finish"));
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("sync worker did not observe upload");
+        });
+        let sync_body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nkb\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"doc_id\"\r\n\r\nsync.md\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"wait\"\r\n\r\nauto\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sync.md\"\r\n\r\nsync me\r\n--{boundary}--\r\n"
+        );
+        let sync_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/documents")
+                    .header("x-api-key", "k-team-a")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(sync_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sync_response.status(), StatusCode::OK);
+        assert_eq!(body_json(sync_response).await["state"], "indexed");
+        sync_worker.await.expect("sync worker join");
+
+        let metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics = String::from_utf8(
+            metrics
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(metrics.contains("fastsearch_ingest_uploads_total 3"));
+        assert!(metrics.contains("fastsearch_ingest_deduplicated_total 1"));
+        assert!(metrics.contains("fastsearch_ingest_jobs_total{state=\"indexed\"} 2"));
+        assert!(metrics.contains("fastsearch_ingest_dead_letter_total 0"));
+        assert!(metrics.contains("fastsearch_ingest_sync_hit_total 1"));
+        assert!(metrics.contains("fastsearch_ingest_sync_timeout_total 0"));
+
+        // The upload MethodRouter overrides axum's 20MiB global default without weakening every
+        // other endpoint. This payload is intentionally just above 20MiB and below 32MiB.
+        let prefix = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nkb\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"doc_id\"\r\n\r\nroute-limit.md\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"wait\"\r\n\r\nnever\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"route-limit.md\"\r\n\r\n"
+        );
+        let suffix = format!("\r\n--{boundary}--\r\n");
+        let mut above_global_limit =
+            Vec::with_capacity(prefix.len() + 20 * 1024 * 1024 + 1024 + suffix.len());
+        above_global_limit.extend_from_slice(prefix.as_bytes());
+        above_global_limit.resize(above_global_limit.len() + 20 * 1024 * 1024 + 1024, b'x');
+        above_global_limit.extend_from_slice(suffix.as_bytes());
+        let route_limited = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/documents")
+                    .header("x-api-key", "k-team-a")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(above_global_limit))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(route_limited.status(), StatusCode::ACCEPTED);
+
+        let small_objects = tempfile::tempdir().unwrap();
+        let small_store = Arc::new(
+            fastsearch_engine::LocalObjectStore::new(small_objects.path(), "documents")
+                .with_max_bytes(4),
+        );
+        let mut small_engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        small_engine.set_object_store(small_store);
+        let limited = router(
+            ServerState::new(small_engine, keys())
+                .with_job_store(jobs.clone())
+                .with_document_limits(4, 4, 10, 1),
+        );
+        let too_large = limited
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/documents")
+                    .header("x-api-key", "k-team-a")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nkb\r\n\
+                         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large.md\"\r\n\r\n12345\r\n--{boundary}--\r\n"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let error = too_large.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&error).contains("source_uri"));
+
+        {
+            let audited = audit_events.lock().unwrap();
+            assert!(
+                audited
+                    .iter()
+                    .filter(|event| event.endpoint == "/v1/documents")
+                    .count()
+                    >= 4,
+                "upload and list document routes must emit audit events"
+            );
+            assert!(
+                audited
+                    .iter()
+                    .any(|event| event.endpoint == "/v1/jobs/{id}"),
+                "job status reads must emit an audit event"
+            );
+        }
+
+        client
+            .batch_execute(&format!("DROP TABLE {jobs_table} CASCADE;"))
+            .await
+            .expect("inject job-store read failure");
+        let failed_read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jobs/missing")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed_read.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(String::from_utf8_lossy(&metrics).contains("fastsearch_errors_total 1"));
+
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {jobs_table} CASCADE; DROP TABLE {chunks_table} CASCADE;"
+            ))
+            .await
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn fs302_worker_writes_require_capability_and_current_lease_epoch() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs302_worker_writes_require_capability_and_current_lease_epoch: DATABASE_URL not set"
+            );
+            return;
+        };
+        let suffix = std::process::id();
+        let jobs_table = format!("fs302_worker_jobs_{suffix}");
+        let chunks_table = format!("fs302_worker_chunks_{suffix}");
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("setup connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {jobs_table} CASCADE; DROP TABLE IF EXISTS {chunks_table} CASCADE;"
+            ))
+            .await
+            .expect("clean");
+        let mut pg_config = fastsearch_pg::PgConfig::new(url.clone());
+        pg_config.table = chunks_table.clone();
+        let pg = Arc::new(
+            fastsearch_pg::PgStore::connect(pg_config)
+                .await
+                .expect("chunks store"),
+        );
+        pg.ensure_schema().await.expect("chunks schema");
+        let jobs = Arc::new(
+            fastsearch_pg::JobStore::connect_with_chunks_table(&url, &jobs_table, &chunks_table)
+                .await
+                .expect("job store"),
+        );
+        jobs.ensure_schema().await.expect("job schema");
+        jobs.submit_upload(&fastsearch_pg::NewIngestJob {
+            job_id: "worker-job".into(),
+            collection: "kb".into(),
+            doc_id: "worker.md".into(),
+            tenant: Some("acme".into()),
+            acl: vec!["team-a".into()],
+            source_uri: "s3://documents/acme/kb/worker.md".into(),
+            content_sha256: "a".repeat(64),
+            content_bytes: 12,
+            media_type: Some("text/markdown".into()),
+            filename: Some("worker.md".into()),
+            parse_profile: json!({}),
+            max_retries: 3,
+        })
+        .await
+        .expect("submit");
+        jobs.submit_upload(&fastsearch_pg::NewIngestJob {
+            job_id: "worker-job-b".into(),
+            collection: "kb".into(),
+            doc_id: "worker-b.md".into(),
+            tenant: Some("acme".into()),
+            acl: vec!["team-a".into()],
+            source_uri: "s3://documents/acme/kb/worker-b.md".into(),
+            content_sha256: "b".repeat(64),
+            content_bytes: 12,
+            media_type: Some("text/markdown".into()),
+            filename: Some("worker-b.md".into()),
+            parse_profile: json!({}),
+            max_retries: 3,
+        })
+        .await
+        .expect("submit B");
+        let leases = jobs.claim("worker-a", 2, 60_000).await.expect("claim");
+        let lease = leases
+            .iter()
+            .find(|lease| lease.job.job_id == "worker-job")
+            .cloned()
+            .expect("lease A");
+        let lease_b = leases
+            .iter()
+            .find(|lease| lease.job.job_id == "worker-job-b")
+            .cloned()
+            .expect("lease B");
+        assert_eq!(lease.owner, lease_b.owner);
+        assert_eq!(lease.epoch, lease_b.epoch);
+
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+        engine.set_source_store(pg.clone());
+        let audit_events: Arc<std::sync::Mutex<Vec<AuditEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = audit_events.clone();
+        let audit: AuditSink = Arc::new(move |event| captured.lock().unwrap().push(event));
+        let app = router(
+            ServerState::new(engine, keys())
+                .with_job_store(jobs.clone())
+                .with_worker_keys(HashSet::from(["worker-secret".into()]))
+                .with_audit(audit),
+        );
+        let status_body = json!({
+            "lease_job_id": lease.job.job_id.clone(),
+            "lease_owner": lease.owner.clone(),
+            "lease_epoch": lease.epoch,
+            "state": "chunking",
+            "stage_detail": {"parsed": 1}
+        });
+        let normal_key = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job/status")
+                    .header("x-api-key", "k-team-a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(status_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(normal_key.status(), StatusCode::FORBIDDEN);
+        let advanced = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job/status")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(status_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advanced.status(), StatusCode::OK);
+
+        let chunks_body = |lease_job_id: &str, owner: &str, epoch| {
+            json!({
+                "lease_job_id": lease_job_id,
+                "lease_owner": owner,
+                "lease_epoch": epoch,
+                "chunks": [{
+                    "chunk_id": 1,
+                    "kind": "paragraph",
+                    "text": "worker indexed text",
+                    "page": 1,
+                    "bbox": {"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},
+                    "heading_path": [],
+                    "section_id": 0,
+                    "char_len": 19,
+                    "metadata": {},
+                    "searchable": true
+                }]
+            })
+            .to_string()
+        };
+        let smuggled_identity = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job/chunks")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lease_job_id": &lease.job.job_id,
+                            "lease_owner": &lease.owner,
+                            "lease_epoch": lease.epoch,
+                            "chunks": [{
+                                "doc_id": "smuggled.md",
+                                "chunk_id": 1,
+                                "kind": "paragraph",
+                                "text": "must be rejected",
+                                "page": 1,
+                                "bbox": {"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},
+                                "char_len": 16,
+                                "tenant": "evil",
+                                "acl": ["public"]
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(smuggled_identity.status(), StatusCode::BAD_REQUEST);
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job/chunks")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(chunks_body(
+                        &lease.job.job_id,
+                        &lease.owner,
+                        lease.epoch + 1,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let foreign = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job/chunks")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(chunks_body(
+                        &lease.job.job_id,
+                        "worker-b",
+                        lease.epoch,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::CONFLICT);
+
+        let cross_job = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job-b/chunks")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(chunks_body(
+                        &lease.job.job_id,
+                        &lease.owner,
+                        lease.epoch,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_job.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            jobs.get("worker-job-b").await.unwrap().unwrap().state,
+            fastsearch_pg::IngestState::Parsing
+        );
+        assert!(pg.fetch_doc("kb", "worker-b.md").await.unwrap().is_empty());
+
+        let mut occupied = chunk(1, "foreign tenant data", vec!["team-b"]);
+        occupied.doc_id = "worker.md".into();
+        occupied.tenant = Some("other-tenant".into());
+        pg.upsert_doc("kb", "worker.md", std::slice::from_ref(&occupied))
+            .await
+            .expect("foreign owner seed");
+        let collision = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job/chunks")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(chunks_body(
+                        &lease.job.job_id,
+                        &lease.owner,
+                        lease.epoch,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(collision.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            jobs.get("worker-job").await.unwrap().unwrap().state,
+            fastsearch_pg::IngestState::Embedding
+        );
+        assert_eq!(
+            pg.fetch_doc("kb", "worker.md").await.unwrap(),
+            vec![occupied]
+        );
+        let metrics_after_conflict = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(
+            String::from_utf8_lossy(&metrics_after_conflict).contains("fastsearch_errors_total 0")
+        );
+        pg.delete_doc("kb", "worker.md")
+            .await
+            .expect("remove foreign owner seed");
+        let written = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job/chunks")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(chunks_body(
+                        &lease.job.job_id,
+                        &lease.owner,
+                        lease.epoch,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.status(), StatusCode::OK);
+        let persisted = jobs.get("worker-job").await.unwrap().unwrap();
+        assert_eq!(persisted.state, fastsearch_pg::IngestState::Indexed);
+        assert_eq!(persisted.chunk_count, 1);
+        let source_rows = pg.fetch_doc("kb", "worker.md").await.unwrap();
+        assert_eq!(source_rows.len(), 1);
+        assert_eq!(source_rows[0].tenant.as_deref(), Some("acme"));
+        assert_eq!(source_rows[0].acl, vec!["team-a"]);
+
+        let visible = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/search")
+                    .method("POST")
+                    .header("x-api-key", "k-team-a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"worker indexed","top_k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible.status(), StatusCode::OK);
+        let visible = body_json(visible).await;
+        assert_eq!(visible["hits"][0]["doc_id"], "worker.md");
+        let hidden = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/search")
+                    .method("POST")
+                    .header("x-api-key", "k-team-b")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"worker indexed","top_k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), StatusCode::OK);
+        assert!(body_json(hidden).await["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        {
+            let audited = audit_events.lock().unwrap();
+            assert!(audited
+                .iter()
+                .any(|event| event.endpoint == "/v1/jobs/{id}/status"));
+            assert!(audited
+                .iter()
+                .any(|event| event.endpoint == "/v1/jobs/{id}/chunks"));
+        }
+
+        client
+            .batch_execute(&format!(
+                "DROP TABLE {jobs_table} CASCADE; DROP TABLE {chunks_table} CASCADE;"
+            ))
+            .await
+            .expect("cleanup");
     }
 
     #[test]
@@ -5833,6 +8045,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_index_replace_is_rejected_consistently_without_source_configuration() {
+        let app = router(ServerState::new(
+            Engine::create_in_ram(TextIndexConfig::default()).unwrap(),
+            keys(),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "k-team-a")
+                    .body(Body::from(
+                        r#"{"collection":"kb","doc_id":"empty.md","chunks":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .contains("document delete endpoint")
+        );
+    }
+
+    #[tokio::test]
     async fn metrics_expose_counters_and_histogram() {
         let app = app_with_data().await;
         // 一次成功检索
@@ -6013,11 +8252,146 @@ mod tests {
         assert!(v["paths"]["/v1/chunks/batch-upsert"]["post"].is_object());
         assert!(v["paths"]["/v1/chunks/batch-delete"]["post"].is_object());
         assert!(v["paths"]["/v1/chunks"]["get"].is_object());
+        assert!(v["paths"]["/v1/documents"]["post"].is_object());
+        assert!(v["paths"]["/v1/documents"]["get"].is_object());
+        assert!(v["paths"]["/v1/jobs/{id}"]["get"].is_object());
+        assert!(v["paths"]["/v1/jobs/{id}/status"]["post"].is_object());
+        assert!(v["paths"]["/v1/jobs/{id}/chunks"]["post"].is_object());
         assert!(v["paths"]["/v1/collections/{name}"]["delete"].is_object());
         // MM6-signer 两端点入契约（四张脸契约一致）。
         assert!(v["paths"]["/v1/assets/resolve"]["post"].is_object());
         assert!(v["paths"]["/v1/asset/{citation_id}/bytes"]["get"].is_object());
         assert!(v["components"]["schemas"]["SearchRequest"].is_object());
+        let ingest_fields = v["components"]["schemas"]["IngestJobResponse"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ingest_fields,
+            std::collections::BTreeSet::from([
+                "job_id",
+                "collection",
+                "doc_id",
+                "state",
+                "searchable",
+                "chunk_count",
+                "content_sha256",
+                "deduplicated",
+                "dead_letter",
+                "retry_count",
+                "poll_after_ms",
+                "job_url",
+                "error",
+                "stage",
+                "stage_detail",
+                "parse_profile",
+                "created_at",
+                "updated_at",
+                "finished_at",
+            ])
+        );
+        let document_fields = v["components"]["schemas"]["DocumentSummary"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            document_fields,
+            std::collections::BTreeSet::from([
+                "collection",
+                "doc_id",
+                "state",
+                "searchable",
+                "chunk_count",
+                "job_id",
+                "content_sha256",
+                "media_type",
+                "filename",
+                "created_at",
+                "updated_at",
+                "finished_at",
+                "retry_count",
+                "dead_letter",
+                "error",
+            ])
+        );
+        assert_eq!(
+            v["paths"]["/v1/jobs/{id}/status"]["post"]["requestBody"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/WorkerStatusRequest"
+        );
+        assert_eq!(
+            v["paths"]["/v1/documents"]["post"]["responses"]["422"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/IngestJobResponse"
+        );
+        assert_eq!(
+            v["paths"]["/v1/documents"]["post"]["responses"]["409"]["content"]["text/plain"]
+                ["schema"]["type"],
+            "string"
+        );
+        for (path, method) in [
+            ("/v1/documents", "post"),
+            ("/v1/documents", "get"),
+            ("/v1/jobs/{id}", "get"),
+            ("/v1/jobs/{id}/status", "post"),
+            ("/v1/jobs/{id}/chunks", "post"),
+        ] {
+            for status in ["401", "429", "503"] {
+                assert!(
+                    v["paths"][path][method]["responses"][status].is_object(),
+                    "{method} {path} must document {status}"
+                );
+            }
+        }
+        assert_eq!(
+            v["components"]["schemas"]["IndexRequest"]["properties"]["chunks"]["minItems"],
+            1
+        );
+        assert!(
+            v["components"]["schemas"]["WorkerStatusRequest"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "lease_owner")
+        );
+        assert!(
+            v["components"]["schemas"]["WorkerStatusRequest"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "lease_job_id")
+        );
+        assert!(
+            v["components"]["schemas"]["WorkerChunksRequest"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "lease_owner")
+        );
+        assert!(
+            v["components"]["schemas"]["WorkerChunksRequest"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "lease_job_id")
+        );
+        let worker_chunk_properties = v["components"]["schemas"]["WorkerIndexChunk"]["properties"]
+            .as_object()
+            .unwrap();
+        for forbidden in ["collection", "doc_id", "tenant", "acl"] {
+            assert!(
+                !worker_chunk_properties.contains_key(forbidden),
+                "worker chunk must not expose {forbidden}"
+            );
+        }
+        assert_eq!(
+            v["components"]["schemas"]["WorkerIndexChunk"]["additionalProperties"],
+            false
+        );
         let matrix: Value =
             serde_json::from_str(include_str!("../../../docs/contracts/search-fields.json"))
                 .unwrap();
@@ -6561,9 +8935,9 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        let make_chunk = |chunk_id: u64, text: &str, searchable: bool| {
+        let make_chunk = |doc_id: &str, chunk_id: u64, text: &str, searchable: bool| {
             json!({
-                "doc_id": "doc-a",
+                "doc_id": doc_id,
                 "chunk_id": chunk_id,
                 "kind": "paragraph",
                 "text": text,
@@ -6582,8 +8956,8 @@ mod tests {
             "/v1/chunks/batch-upsert",
             "k-team-a",
             Some(json!({"items": [
-                {"collection": collection, "chunk": make_chunk(1, "visible alpha", true)},
-                {"collection": collection, "chunk": make_chunk(2, "contextsecret", false)}
+                {"collection": collection, "chunk": make_chunk("doc-a", 1, "visible alpha", true)},
+                {"collection": collection, "chunk": make_chunk("doc-a", 2, "contextsecret", false)}
             ]})),
         )
         .await;
@@ -6596,7 +8970,7 @@ mod tests {
             "/v1/chunks/batch-upsert",
             "k-team-b",
             Some(json!({"items": [
-                {"collection": collection, "chunk": make_chunk(3, "team beta", true)}
+                {"collection": collection, "chunk": make_chunk("doc-a", 3, "team beta", true)}
             ]})),
         )
         .await;
@@ -6608,7 +8982,7 @@ mod tests {
             "/v1/chunks/batch-upsert",
             "k-other",
             Some(json!({"items": [
-                {"collection": collection, "chunk": make_chunk(4, "other tenant", true)}
+                {"collection": collection, "chunk": make_chunk("doc-other", 4, "other tenant", true)}
             ]})),
         )
         .await;
@@ -6621,7 +8995,7 @@ mod tests {
             "/v1/chunks/batch-upsert",
             "k-other",
             Some(json!({"items": [
-                {"collection": collection, "chunk": make_chunk(1, "overwrite", true)}
+                {"collection": collection, "chunk": make_chunk("doc-a", 1, "overwrite", true)}
             ]})),
         )
         .await;
@@ -6729,7 +9103,7 @@ mod tests {
             "/v1/chunks/batch-get",
             "k-other",
             Some(json!({"ids": [
-                {"collection": collection, "doc_id": "doc-a", "chunk_id": 4}
+                {"collection": collection, "doc_id": "doc-other", "chunk_id": 4}
             ]})),
         )
         .await;

@@ -13,7 +13,11 @@
 //!   真实 S3/MinIO 对象存储（SigV4）。设了 endpoint 时优先使用。
 //! - `FASTSEARCH_OBJECT_DIR`：本地对象存储根目录（S3-compatible URI 的 bucket/key 映射到此目录）。
 //! - `FASTSEARCH_OBJECT_BUCKET`：本地对象存储默认 bucket（默认 `fastsearch-assets`）。
-//! - `FASTSEARCH_S3_MAX_IMAGE_BYTES`：对象读写最大字节数（默认 20MiB）。
+//! - `FASTSEARCH_MAX_DOCUMENT_BYTES`：文档上传、`source_uri` 读取与对象写入上限（默认 32MiB）；
+//!   未设时兼容读取旧的 `FASTSEARCH_S3_MAX_IMAGE_BYTES`。
+//! - `FASTSEARCH_WORKER_KEYS`：逗号或分号分隔的 worker capability keys；仅它们可调用 job 写接口。
+//! - `FASTSEARCH_INGEST_SYNC_MAX_BYTES` / `_WAIT_MS` / `_MAX_INFLIGHT`：小文档同步轮询阈值
+//!   （默认 1MiB / 3000ms / 32）；server 只等待 worker，不在请求线程解析。
 //! - `FASTSEARCH_EMBEDDER` = `hash`|`ollama`|`openai`（+ `FASTSEARCH_EMBED_*`）：真语义嵌入后端。
 //! - `FASTSEARCH_EMBED_PROBE` = `require`：启动时的能力探测（KB-2.4）未达配置声明即**拒绝启动**。
 //!   默认（不设）为 `auto`：降级到实测能力 + 吵一嗓子，但仍启动——能力宣称错只让检索退化，
@@ -31,7 +35,7 @@
 use fastsearch_engine::Engine;
 use fastsearch_server::{router, AuditSink, Principal, ServerState};
 use fastsearch_text::{TextIndexConfig, TokenizerKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -79,6 +83,11 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8642);
+    let max_document_bytes = std::env::var("FASTSEARCH_MAX_DOCUMENT_BYTES")
+        .or_else(|_| std::env::var("FASTSEARCH_S3_MAX_IMAGE_BYTES"))
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32 * 1024 * 1024);
     // fail-closed：**身份归调用方**（见 governance/2026-08-24-职责边界），正因为 100% 依赖调用方
     // 接对，才绝不能在他没接对时替他编一个。此前未配置即自造 `dev` 密钥且 `tenant: None`——
     // 而 `AclFilter::visible` 对无 tenant 的调用者直接放行租户维度，等于自造一把能读**所有租户**
@@ -213,24 +222,16 @@ async fn main() -> anyhow::Result<()> {
                 "FASTSEARCH_S3_SECRET_KEY is required when FASTSEARCH_S3_ENDPOINT is set"
             )
         })?;
-        let max_bytes = std::env::var("FASTSEARCH_S3_MAX_IMAGE_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20 * 1024 * 1024);
         let store =
             fastsearch_engine::S3ObjectStore::new(endpoint, region, bucket, access_key, secret_key)
-                .with_max_bytes(max_bytes);
+                .with_max_bytes(max_document_bytes);
         engine.set_object_store(Arc::new(store));
         eprintln!("object store on: S3-compatible endpoint");
     } else if let Ok(root) = std::env::var("FASTSEARCH_OBJECT_DIR") {
         let bucket = std::env::var("FASTSEARCH_OBJECT_BUCKET")
             .unwrap_or_else(|_| "fastsearch-assets".into());
-        let max_bytes = std::env::var("FASTSEARCH_S3_MAX_IMAGE_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20 * 1024 * 1024);
-        let store =
-            fastsearch_engine::LocalObjectStore::new(root, bucket).with_max_bytes(max_bytes);
+        let store = fastsearch_engine::LocalObjectStore::new(root, bucket)
+            .with_max_bytes(max_document_bytes);
         engine.set_object_store(Arc::new(store));
         eprintln!("object store on: local S3-compatible directory");
     }
@@ -300,7 +301,63 @@ async fn main() -> anyhow::Result<()> {
 
     // 真源是否就位（诚实记账用）：须在 engine 交给 ServerState 之前取。
     let has_source_store = engine.source_pg_clone().is_some();
-    let mut state = ServerState::new(engine, keys).with_vector_dim(embed_dim);
+    let job_store = if let Ok(url) = std::env::var("DATABASE_URL") {
+        let jobs_table = std::env::var("FASTSEARCH_INGEST_JOBS_TABLE")
+            .unwrap_or_else(|_| "fastsearch_ingest_jobs".into());
+        let chunks_table =
+            std::env::var("FASTSEARCH_PG_TABLE").unwrap_or_else(|_| "fastsearch_chunks".into());
+        match fastsearch_pg::JobStore::connect_with_chunks_table(&url, jobs_table, chunks_table)
+            .await
+        {
+            Ok(store) => match store.ensure_schema().await {
+                Ok(()) => {
+                    eprintln!("ingest job store: ready");
+                    Some(Arc::new(store))
+                }
+                Err(error) => {
+                    eprintln!("warn: ingest job schema unavailable: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!("warn: ingest job store unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let worker_keys: HashSet<String> = std::env::var("FASTSEARCH_WORKER_KEYS")
+        .unwrap_or_default()
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect();
+    let sync_document_bytes = std::env::var("FASTSEARCH_INGEST_SYNC_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024 * 1024);
+    let sync_wait_ms = std::env::var("FASTSEARCH_INGEST_SYNC_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3_000);
+    let sync_waiters = std::env::var("FASTSEARCH_INGEST_SYNC_MAX_INFLIGHT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32);
+    let mut state = ServerState::new(engine, keys)
+        .with_vector_dim(embed_dim)
+        .with_worker_keys(worker_keys)
+        .with_document_limits(
+            max_document_bytes,
+            sync_document_bytes,
+            sync_wait_ms,
+            sync_waiters,
+        );
+    if let Some(store) = job_store {
+        state = state.with_job_store(store);
+    }
 
     // 限流：FASTSEARCH_RATE_LIMIT="capacity,refill_per_sec"
     if let Ok(spec) = std::env::var("FASTSEARCH_RATE_LIMIT") {

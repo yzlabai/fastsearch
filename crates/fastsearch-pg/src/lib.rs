@@ -10,7 +10,9 @@ mod sql;
 
 pub use error::{PgError, Result};
 pub use jobs::{
-    retry_backoff_ms, FailureDisposition, IngestJob, IngestState, JobLease, JobStore, NewIngestJob,
+    retry_backoff_ms, DocumentListOptions, DocumentSummary, FailureDisposition, IngestJob,
+    IngestMetrics, IngestState, JobLease, JobStore, NewIngestJob, PublicationResult,
+    UploadDisposition, UploadResolution,
 };
 pub use sql::{
     ann_index_sql, pgvector_search_sql, ChunkRow, SignalRow, SqlParam, VectorType, COLUMNS,
@@ -18,7 +20,7 @@ pub use sql::{
 };
 
 use fastsearch_core::{AclFilter, AssetPointer, Chunk, GlobalId, MediaRef, Signal, SignalType};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use tokio::sync::Mutex;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{Client, NoTls, Row, Transaction};
@@ -205,10 +207,45 @@ impl PgStore {
         doc_id: &str,
         chunks: &[Chunk],
     ) -> Result<u64> {
+        let first = chunks.first().ok_or_else(|| {
+            PgError::Config(
+                "upsert_doc requires at least one chunk; use delete_doc to remove a document"
+                    .into(),
+            )
+        })?;
+        if chunks
+            .iter()
+            .any(|chunk| chunk.doc_id != doc_id || chunk.tenant != first.tenant)
+        {
+            return Err(PgError::Config(
+                "all chunks must match doc_id and tenant for an atomic document replace".into(),
+            ));
+        }
         let del = sql::delete_doc_sql(&self.cfg.table);
         let ins = sql::insert_sql(&self.cfg.table);
         let mut client = self.client.lock().await;
         let tx = client.transaction().await?;
+        // GlobalId deliberately excludes tenant. Serialize every replacement for this coordinate,
+        // then reject a different owner before DELETE so one tenant can never replace another's
+        // same-named document.
+        tx.query_one(sql::lock_document_coordinate_sql(), &[&collection, &doc_id])
+            .await?;
+        let owners = tx
+            .query(
+                &sql::lock_doc_ownership_sql(&self.cfg.table),
+                &[&collection, &doc_id],
+            )
+            .await?;
+        if owners.iter().any(|row| {
+            row.try_get::<_, Option<String>>("tenant")
+                .map(|tenant| tenant != first.tenant)
+                .unwrap_or(true)
+        }) {
+            tx.rollback().await?;
+            return Err(PgError::Conflict(format!(
+                "document {collection}/{doc_id} is owned by another tenant"
+            )));
+        }
         tx.execute(&del, &[&collection, &doc_id]).await?;
         let mut n = 0u64;
         for c in chunks {
@@ -414,12 +451,49 @@ impl PgStore {
     ///
     /// 冲突行 tenant 不同则整批失败，避免调用方覆盖其他租户的同 GlobalId。
     pub async fn upsert_chunks(&self, rows: &[(String, Chunk)]) -> Result<u64> {
+        let mut document_owners = BTreeMap::<(String, String), Option<String>>::new();
         for (_, chunk) in rows {
             chunk.validate_metadata()?;
+        }
+        for (collection, chunk) in rows {
+            let coordinate = (collection.clone(), chunk.doc_id.clone());
+            if let Some(owner) = document_owners.get(&coordinate) {
+                if owner != &chunk.tenant {
+                    return Err(PgError::Conflict(format!(
+                        "document {}/{} has multiple tenants in one batch",
+                        collection, chunk.doc_id
+                    )));
+                }
+            } else {
+                document_owners.insert(coordinate, chunk.tenant.clone());
+            }
         }
         let sql = sql::upsert_chunk_sql(&self.cfg.table);
         let mut client = self.client.lock().await;
         let tx = client.transaction().await?;
+        // Acquire the same globally ordered document locks as `upsert_doc`. Sorting prevents two
+        // multi-document batches from deadlocking, and checking all existing chunks prevents a
+        // different tenant from inserting a new chunk_id into another tenant's document.
+        for ((collection, doc_id), owner) in &document_owners {
+            tx.query_one(sql::lock_document_coordinate_sql(), &[collection, doc_id])
+                .await?;
+            let existing = tx
+                .query(
+                    &sql::lock_doc_ownership_sql(&self.cfg.table),
+                    &[collection, doc_id],
+                )
+                .await?;
+            if existing.iter().any(|row| {
+                row.try_get::<_, Option<String>>("tenant")
+                    .map(|tenant| &tenant != owner)
+                    .unwrap_or(true)
+            }) {
+                tx.rollback().await?;
+                return Err(PgError::Conflict(format!(
+                    "document {collection}/{doc_id} is owned by another tenant"
+                )));
+            }
+        }
         let mut count = 0u64;
         let mut touched_docs = HashSet::new();
         for (collection, chunk) in rows {
@@ -1334,6 +1408,81 @@ mod tests {
             .expect("cleanup");
     }
 
+    #[tokio::test]
+    async fn fs302_doc_replace_rejects_cross_tenant_global_id_collision() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs302_doc_replace_rejects_cross_tenant_global_id_collision: DATABASE_URL not set"
+            );
+            return;
+        };
+        let table = format!("fs302_owner_chunks_{}", std::process::id());
+        let mut cfg = PgConfig::new(url.clone());
+        cfg.table = table.clone();
+        let store = PgStore::connect(cfg).await.expect("connect");
+        store.ensure_schema().await.expect("schema");
+
+        let mut owned = sample("same.md", 1);
+        owned.tenant = Some("tenant-a".into());
+        owned.acl = vec!["team-a".into()];
+        store
+            .upsert_doc("kb", "same.md", std::slice::from_ref(&owned))
+            .await
+            .expect("initial owner");
+
+        let mut foreign = sample("same.md", 1);
+        foreign.tenant = Some("tenant-b".into());
+        foreign.acl = vec!["team-b".into()];
+        let error = store
+            .upsert_doc("kb", "same.md", &[foreign])
+            .await
+            .expect_err("foreign tenant must not replace global id");
+        assert!(matches!(error, PgError::Conflict(_)));
+        let rows = store.fetch_doc("kb", "same.md").await.expect("fetch owner");
+        assert_eq!(rows, vec![owned]);
+
+        let mut foreign_new_chunk = sample("same.md", 2);
+        foreign_new_chunk.tenant = Some("tenant-b".into());
+        foreign_new_chunk.acl = vec!["team-b".into()];
+        let error = store
+            .upsert_chunks(&[("kb".into(), foreign_new_chunk)])
+            .await
+            .expect_err("a new chunk id must not bypass document ownership");
+        assert!(matches!(error, PgError::Conflict(_)));
+
+        let mut peer_cfg = PgConfig::new(url);
+        peer_cfg.table = table.clone();
+        let peer = PgStore::connect(peer_cfg).await.expect("peer connect");
+        let mut race_a = sample("race.md", 1);
+        race_a.tenant = Some("tenant-a".into());
+        race_a.acl = vec!["team-a".into()];
+        let mut race_b = sample("race.md", 2);
+        race_b.tenant = Some("tenant-b".into());
+        race_b.acl = vec!["team-b".into()];
+        let replace_rows = vec![race_a];
+        let chunk_rows = vec![("kb".into(), race_b)];
+        let (replace, chunk_upsert) = tokio::join!(
+            store.upsert_doc("kb", "race.md", &replace_rows),
+            peer.upsert_chunks(&chunk_rows)
+        );
+        assert_ne!(replace.is_ok(), chunk_upsert.is_ok());
+        let race_rows = store.fetch_doc("kb", "race.md").await.expect("race rows");
+        assert!(!race_rows.is_empty());
+        assert!(race_rows
+            .iter()
+            .all(|row| row.tenant == race_rows[0].tenant));
+
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table} CASCADE; DROP TABLE IF EXISTS {table}_signal CASCADE;"
+            ))
+            .await
+            .expect("cleanup");
+    }
+
     /// 集成测试：仅当 `DATABASE_URL` 设置时运行；否则跳过（不算失败）。
     #[tokio::test]
     async fn integration_roundtrip() {
@@ -1988,7 +2137,7 @@ mod tests {
         second.tenant = Some("tenant-a".into());
         second.acl = vec!["public".into()];
         second.searchable = false;
-        let mut private = sample("doc-a", 3);
+        let mut private = sample("doc-b", 3);
         private.tenant = Some("tenant-b".into());
         private.acl = vec!["team-b".into()];
 
@@ -2465,7 +2614,14 @@ mod tests {
 
         let mut chunks: Vec<(String, Chunk)> = (1..=6)
             .map(|id| {
-                let mut chunk = sample("signals.pdf", id);
+                let mut chunk = sample(
+                    if id == 5 {
+                        "forbidden.pdf"
+                    } else {
+                        "signals.pdf"
+                    },
+                    id,
+                );
                 chunk.tenant = Some(if id == 5 { "other" } else { "acme" }.into());
                 chunk.acl = vec![if id == 5 { "secret" } else { "team-a" }.into()];
                 if id == 6 {
@@ -2504,7 +2660,11 @@ mod tests {
                 .upsert_signal(&Signal {
                     gid: GlobalId {
                         collection: "kb".into(),
-                        doc_id: "signals.pdf".into(),
+                        doc_id: if chunk_id == 5 {
+                            "forbidden.pdf".into()
+                        } else {
+                            "signals.pdf".into()
+                        },
                         chunk_id,
                     },
                     signal_type: SignalType::VlmCaption,

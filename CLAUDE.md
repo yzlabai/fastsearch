@@ -54,6 +54,9 @@ FASTSEARCH_OCR_MODELS=…/models/ppocr-v5 FASTSEARCH_OCR_TEST_IMAGE=…/page.png
 > **docparse 已 subtree 并入本仓 `vendor/docparse/`**（融合 Option B，2026-06-27）：它保留**自有 workspace**（含 vendored tract + OCR/VLM/raster 重 ONNX），经根 `exclude` 与 fastsearch 精简构建隔离；`fastsearch-cli` 的 **`parse` feature** path-依赖其 `docparse-core`/`-pdf`（轻、无 ONNX），`fastsearch ingest <file>` 即可进程内解析→适配→索引。**搜索热路径零 docparse 依赖**（`cargo tree` 校验）。见 [融合方案评估](docs/plans/2026-06-26-docparse融合方案评估.md)。
 
 ```
+原始文档 → POST /v1/documents → ObjectStore + Postgres ingest_job（状态/身份真源）
+                                      │ 独立 worker 领取、解析、job-scoped 写入（FS-303，尚未内置）
+                                      ▼
 docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(真源: chunks 表 + 元数据 + ACL + pgvector 向量列)
                        │ 逻辑复制 CDC（pgoutput, 幂等, LSN 续传）   ← fastsearch-sync
                        ▼
@@ -76,7 +79,7 @@ docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(
 | `sync` | CDC apply 编排：幂等 + LSN 水位续传 + 替换语义 | `IndexSink` trait；pgoutput 解码器已落地（UnchangedToast→真源重取 H3、批量上限 M16）；仅 `START_REPLICATION` 流式为后续（现走轮询式 `pg_logical_slot_get`，正确、崩溃安全） |
 | `engine` | 整合 text+vector+rerank+sync sink → 端到端排序管线 | `run()` 是管线主体；`search`/`search_with_facets`；实现 `sync::IndexSink`（适配器，避免 text 反依赖 sync） |
 | `eval` | 相关性评测：nDCG/recall/MRR + `assert_no_regression`(CI 门禁) | 纯函数 |
-| `server` | REST(axum) + API-Key 认证 + **ACL 服务端注入不可绕过** + /metrics | `principal_from_headers`→`acl_for`→`engine.search(req, Some(acl))`；客户端无法传/绕过 ACL |
+| `server` | REST(axum) + API-Key 认证 + **ACL 服务端注入不可绕过** + 上传/job 查询与 worker 写协议 + /metrics | `POST /v1/documents` 只保存原始对象并建立 job；worker 写入时 tenant/ACL/文档坐标只从 job 恢复；检索仍由 `principal_from_headers`→`acl_for` 强制过滤 |
 | `cli` | `fastsearch` 二进制：**server 的纯 REST 客户端**（不嵌引擎）。`search`/`similar`/`index`/`index-dir`(喂文件夹)/`eval` 走 server REST；`ingest`(多格式解析) 在**客户端**解析→POST `/v1/index` | 逻辑在 lib，main 是壳；`ureq` HTTP，`--server`/`--key`(env `FASTSEARCH_SERVER`/`_KEY`)。仅依赖 `core`(纯类型)+`eval`(纯指标)，**无 engine/text 依赖**。`ingest` 走 `--features parse`（docparse 注册表分发 9 格式+图片）/`parse-ocr`/`parse-tables`（env 指模型目录）/`parse-vlm`（env 指 VLM 服务）；解析在客户端→守搜索热路径零 docparse。检索/嵌入/落盘全归 server，CLI 因此白嫖全套混合检索 |
 | `mcp` | 第四张脸：MCP（stdio+JSON-RPC）暴露 `search`/`resolve_citation` 工具 | 逻辑在 lib（`McpServer::handle` 纯函数可单测），main 是 stdio 壳；**ACL 服务端注入不可绕过** |
 | `clients/{python,ts}` | 零依赖 SDK（封装 REST）+ LangChain/LlamaIndex 适配 | — |
@@ -93,5 +96,5 @@ docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(
 ## 数据模型锚点
 
 - `core::Chunk` 字段与 docparse chunk schema 对齐（kind/page/bbox/heading_path/section_id/char_len），外加 `tenant`/`acl`。
-- `GlobalId = (collection, doc_id, chunk_id)`；`citation_id` = `"{collection}:{doc_id}:{chunk_id}"`（doc_id 可含 `:`，反解取首段/末段）。
+- `GlobalId = (collection, doc_id, chunk_id)`；`citation_id` = `"{collection}:{doc_id}:{chunk_id}"`（doc_id 可含 `:`，反解取首段/末段）。因为身份中不含 tenant，`(collection, doc_id)` 是系统全局文档坐标且只能由一个 tenant 持有；客户端需自行命名空间化，见 [ADR-0001](docs/adr/0001-文档坐标采用全局命名空间.md)。
 - PG 表结构、INSERT/DELETE、行↔Chunk 映射全在 [`crates/fastsearch-pg/src/sql.rs`](crates/fastsearch-pg/src/sql.rs)（纯函数，可单测）；改 schema 改这里并更新 DDL 测试。

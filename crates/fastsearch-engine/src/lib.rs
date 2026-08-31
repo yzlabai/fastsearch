@@ -1595,6 +1595,10 @@ impl Engine {
         self.object_store = Some(store);
     }
 
+    pub fn has_object_store(&self) -> bool {
+        self.object_store.is_some()
+    }
+
     /// 已授权的 Object 字节读取。调用方必须已通过 ACL 或 token 验证。
     pub fn fetch_object_bytes(&self, uri: &str, max_bytes: usize) -> Result<Option<ObjectBytes>> {
         match &self.object_store {

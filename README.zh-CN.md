@@ -21,6 +21,8 @@
 ## 架构
 
 ```
+原始文档 → REST 上传 → ObjectStore + Postgres ingest job → 独立 worker
+                                                    ↓ job-scoped chunks
 docparse chunks / 文本文件 → Postgres(真源: chunk+元数据+ACL+pgvector)
                        │ 逻辑复制 CDC（pgoutput, 幂等, LSN 续传）
                        ▼
@@ -47,6 +49,17 @@ FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-s
 
 接 docparse / PDF / REST / MCP / Python 的用法见 [Agent 使用指南](docs/在Agent中使用fastsearch.md)。
 
+配置 `DATABASE_URL` 与对象存储后，可直接进入异步文档作业面：
+
+```bash
+curl -sS -X POST http://localhost:8642/v1/documents -H 'X-API-Key: dev' \
+  -F 'collection=kb' -F 'wait=auto' -F 'file=@README.md;type=text/markdown'
+```
+
+默认文档上限为 32MiB（`FASTSEARCH_MAX_DOCUMENT_BYTES`）；更大来源使用 `source_uri` 字段。
+worker 凭据与用户 key 分开，通过 `FASTSEARCH_WORKER_KEYS` 配置。独立 worker 尚未随仓库交付（FS-303）；
+未部署兼容外部 worker 时，上传作业会保持 `queued`。
+
 ## 模块（workspace crates）
 
 | crate | 职责 |
@@ -59,7 +72,7 @@ FASTSEARCH_DATA=./data FASTSEARCH_KEYS="dev=:public" ./target/debug/fastsearch-s
 | `fastsearch-sync` | CDC apply：pgoutput 解码 + 幂等 + LSN 检查点 + 替换语义 |
 | `fastsearch-engine` | 整合：ingest→CDC→索引→**全文/向量/混合**检索→引用 + 深分页 + 重建 + 媒资解析 |
 | `fastsearch-eval` | 相关性评测：golden 集 + nDCG/recall/MRR + CI 回归门禁 |
-| `fastsearch-server` | REST(axum) + API-Key 认证 + **ACL 不可绕过** + 指标/限流/审计 + 媒资网关 + CDC 生命周期 |
+| `fastsearch-server` | REST(axum) + API-Key 认证 + **ACL 不可绕过** + 上传/job/worker 协议 + 指标/限流/审计 + 媒资网关 + CDC 生命周期 |
 | `fastsearch-mcp` | 第四张脸：MCP(stdio+JSON-RPC) 暴露 `search`/`resolve_citation` 工具 |
 | `fastsearch-cli` | `fastsearch` 二进制：index / index-dir / search / **ingest（多格式：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/图片 + OCR + 表格识别）** / eval —— 见[文件解析与摄取](docs/文件解析与摄取.md) |
 | `clients/{python,ts}` | 零依赖 SDK + LangChain/LlamaIndex 适配；registry 与源码安装状态见上表及各 SDK README |

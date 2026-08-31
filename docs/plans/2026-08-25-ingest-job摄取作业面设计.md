@@ -1,12 +1,13 @@
 # KB-3.1：PG `ingest_job` 摄取作业面设计
 
-> 日期：2026-08-25 · 类型：设计文档 · 状态：**FS-301 存储与状态机已实施并完成 PG 验证；FS-302–304 未实施**
+> 日期：2026-08-25 · 类型：设计文档 · 状态：**FS-301、FS-302 已实施并完成 PG/活服务验证；FS-303–304 未实施**
 > 授权来源与边界：[职责边界修订：把「文档摄取作业面」收回引擎](../governance/2026-08-24-职责边界修订-摄取作业面收回引擎.md)（下称**修订文**）
 > 仍然有效的上位 ADR：[职责边界：不承担生产身份与知识库控制面](../governance/2026-08-24-职责边界-不承担身份与控制面.md)
 > 上游计划：[知识库引擎迭代计划 §5（KB-3）](2026-08-24-知识库引擎迭代计划.md) · 缺口来源：[文档摄取现状与差距 §3（G1–G7）](2026-08-24-作为知识库使用-文档摄取现状与差距.md)
 > 并行编排：迭代计划 §11.2 作业 **A3**（通道 C4）。**本文只产出设计与验收，不改 `crates/` 下任何代码。**
 >
-> 2026-08-31 回写：FS-301 的 T15/T16/T18/T25 已在 Docker pgvector:pg17 实跑通过；其余 server/worker/MCP 用例仍待后续迭代。
+> 2026-09-01 回写：FS-302 已交付 server API 与 worker 安全写协议；独立 worker/MCP 闭环仍待 FS-303。
+> 文档坐标作用域经 [ADR-0001](../adr/0001-文档坐标采用全局命名空间.md) 修正为与既有 GlobalId/chunks 主键一致的全局命名空间。
 
 ---
 
@@ -14,11 +15,11 @@
 
 | 维度 | 结论 |
 |---|---|
-| 新增 PG 表 | **一张**：`fastsearch_ingest_jobs`（无身份列，不进 publication，**同一 (tenant, collection, doc_id) 恒定一行**） |
+| 新增 PG 表 | **一张**：`fastsearch_ingest_jobs`（无身份列，不进 publication，**同一 (collection, doc_id) 恒定一行**） |
 | 新增 REST 端点 | `POST /v1/documents`（上传，**按大小分档 200/202**）、`GET /v1/jobs/{job_id}`、`GET /v1/documents`（派生只读视图）、`POST /v1/jobs/{job_id}/chunks` + `POST /v1/jobs/{job_id}/status`（**worker 专用**，见 §6.3 的 ACL 论证） |
 | 新增 crate | `fastsearch-ingest-worker`（**独立二进制**，唯一持有 docparse 的进程） |
 | 领任务 | `SELECT … FOR UPDATE SKIP LOCKED`（PG 9.5+ **核心**特性，零扩展） |
-| 幂等键 | `content_sha256`，作用域 `(tenant, collection, doc_id)`；同 hash 已 `indexed` → **跳过**；hash 变化 → **覆盖**（doc 级 delete+insert）；**不做版本** |
+| 幂等键 | `content_sha256`，作用域全局 `(collection, doc_id)`；同 hash 已 `indexed` → **跳过**；hash 变化 → **覆盖**（doc 级 delete+insert）；**不做版本** |
 | 无 `DATABASE_URL` | 作业面**全部端点 503**，与既有 `management_source` 一字不差 |
 | 对 A2 的依赖 | `ALTER PUBLICATION … SET TABLE` 的**替换语义归属 KB-2.1（作业 A2）**；本文只**声明依赖**并给出两种结论下各自的做法，**不自行定夺** |
 | 最需要评审的一处 | §6.3：worker 回写 chunk 时 ACL 从**哪里**来（不能来自 worker 自己的 key）——这是本设计唯一触到不变量 #3 表面的地方 |
@@ -56,12 +57,12 @@
 | # | 红线（修订文 §4 原文口径） | 本设计如何落成 | 验收项 |
 |---|---|---|---|
 | **R1** | `ingest_job` **无身份列**（无 owner/role/member/group/继承），只有 `tenant` + `acl`，与 chunk 行同构 | §4 表结构只有 `tenant text` + `acl text[]`，与 `sql.rs::ddl` 的 chunk 表同名同型；`lease_owner` 是 **worker 进程标识**（主机名+pid+随机），**不参与任何可见性判断**，且带 `NOT NULL` 注释钉死 | **T1**（DDL 字符串黑名单）、**T1b**（`lease_owner` 不出现在任何可见性 SQL 里） |
-| **R2** | **不进 publication**；且须先解决 `SET TABLE` 替换语义（归 KB-2.1） | 本表 DDL **一条 publication 语句都没有**（§4.4）；替换语义问题**声明依赖 A2，不自行定夺**（§5） | **T2**（DDL 不含 `PUBLICATION`）、**T18**（`pg_publication_rel` 不含本表，`待运行验证`） |
-| **R3** | 托管 PG 可移植不破：普通表 + `FOR UPDATE SKIP LOCKED`，零原生扩展 | §4.5 领任务 SQL；DDL 里**无 `CREATE EXTENSION`**（`vector` 扩展由既有 chunk 表 DDL 负责，作业表不碰）；不用 `pg_cron`/`pgmq`/`LISTEN` 依赖 | **T3**（DDL 无 `CREATE EXTENSION`/无扩展函数）、**T4**（claim SQL 含 `FOR UPDATE SKIP LOCKED`）、**T15**（并发领取不重复，`待运行验证`） |
+| **R2** | **不进 publication**；且须先解决 `SET TABLE` 替换语义（归 KB-2.1） | 本表 DDL **一条 publication 语句都没有**（§4.4）；替换语义问题**声明依赖 A2，不自行定夺**（§5） | **T2**（DDL 不含 `PUBLICATION`）、**T18**（`pg_publication_rel` 不含本表，Docker PG 已验证） |
+| **R3** | 托管 PG 可移植不破：普通表 + `FOR UPDATE SKIP LOCKED`，零原生扩展 | §4.5 领任务 SQL；DDL 里**无 `CREATE EXTENSION`**（`vector` 扩展由既有 chunk 表 DDL 负责，作业表不碰）；不用 `pg_cron`/`pgmq`/`LISTEN` 依赖 | **T3**（DDL 无 `CREATE EXTENSION`/无扩展函数）、**T4**（claim SQL 含 `FOR UPDATE SKIP LOCKED`）、**T15**（并发领取不重复，Docker PG 已验证） |
 | **R4** | 热路径隔离不破：解析只在独立 worker 二进制 | §6 新 crate；server **零 docparse 依赖不变**；CI 名单不变 + **新增一条反向断言**（server 不得依赖 worker） | **T23**（`hot-path-isolation` 仍绿）、**T24**（`cargo tree -p fastsearch-server` 不含 `fastsearch-ingest-worker`） |
 | **R5** | 无 `DATABASE_URL` → 作业面一律 **503**，不造第二个内存真源 | §7 四个新端点全部先过 PG 可用性判据再做任何事（**先于读取 body**）；无内存 job map、无 SQLite、无本地文件台账 | **T10/T11**（无 PG 时上传/查询/列表全 503）、**T11b**（源码不含任何 job 的内存/文件回退容器） |
-| **R6** | **不新增产品对象**：无 dataset/source/version 表，无层级，无回滚 | 只有一张作业表；**同一 (tenant, collection, doc_id) 恒定一行**（唯一索引强制），旧作业行被 UPDATE 覆盖 ⇒ **结构上不可能长出版本历史**；`GET /v1/documents` 响应字段走**白名单** | **T5**（响应 key ⊆ 白名单，且显式断言不含 `owner`/`dataset_id`/`version`/`parent_id`）、**T5b**（DDL 只新增一张表） |
-| **R7** | ACL 服务端注入不可绕过：每个新入口都要有"越权用例进测试" | 上传走 `ingest_acl_for` + `apply_ingest_identity` 同款注入（§7.1）；查询/列表两端都带 ACL 谓词（§7.3/§7.4）；worker 回写的 ACL 来自 **job 行**而非 worker 身份（§6.3） | **T12/T13/T14**（未授权/无标签/请求体自带 acl 被忽略）、**T19**（跨租户不可见，`待运行验证`）、**T21**（worker 不能替别的 job 写，`待运行验证`） |
+| **R6** | **不新增产品对象**：无 dataset/source/version 表，无层级，无回滚 | 只有一张作业表；**同一全局 (collection, doc_id) 恒定一行**（ADR-0001，全局唯一索引强制），旧作业行被 UPDATE 覆盖 ⇒ **结构上不可能长出版本历史**；`GET /v1/documents` 响应字段走**白名单** | **T5**（响应 key ⊆ 白名单，且显式断言不含 `owner`/`dataset_id`/`version`/`parent_id`）、**T5b**（DDL 只新增一张表） |
+| **R7** | ACL 服务端注入不可绕过：每个新入口都要有"越权用例进测试" | 上传走 `ingest_acl_for` + `apply_ingest_identity` 同款注入（§7.1）；查询/列表两端都带 ACL 谓词（§7.3/§7.4）；worker 回写的 ACL 来自 **job 行**而非 worker 身份（§6.3） | **T12/T13/T14**（未授权/无标签/请求体自带 acl 被忽略）、**T19/T21**（跨租户不可见且 worker 不能替别的 job 写，Docker PG 已验证） |
 
 > **红线 R6 的结构性保证值得单独强调**：把"一文档一行"做成**唯一索引**，比写一句"我们不做版本"强得多——
 > 想加版本就必须先删这个索引，那是一次显眼的、必然被评审看到的改动。修订文 §5 的回滚触发因此可观测。
@@ -114,8 +115,9 @@
 ### 4.3 索引与约束
 
 ```sql
--- 一文档一行（红线 R6 的结构性保证；tenant 可空 ⇒ 用 coalesce 表达式，避免 NULL 不参与唯一性）
-CREATE UNIQUE INDEX IF NOT EXISTS {jobs}_doc  ON {jobs} (coalesce(tenant,''), collection, doc_id);
+-- 旧 tenant-scoped 索引保留用于 additive 兼容；实际文档坐标按 ADR-0001 全局唯一。
+CREATE UNIQUE INDEX IF NOT EXISTS {jobs}_doc ON {jobs} (coalesce(tenant,''), collection, doc_id);
+CREATE UNIQUE INDEX IF NOT EXISTS {jobs}_global_doc ON {jobs} (collection, doc_id);
 -- 领取扫描（部分索引：终态行不参与）
 CREATE INDEX IF NOT EXISTS {jobs}_claim ON {jobs} (next_attempt_at, created_at) WHERE state <> 'indexed';
 -- 列表视图排序/过滤
@@ -124,9 +126,9 @@ CREATE INDEX IF NOT EXISTS {jobs}_list  ON {jobs} (coalesce(tenant,''), collecti
 CREATE INDEX IF NOT EXISTS {jobs}_hash  ON {jobs} (coalesce(tenant,''), collection, content_sha256);
 ```
 
-`[待运行验证]` `coalesce(tenant,'')` 作为索引表达式在 RDS/Supabase/Neon 上均需 `IMMUTABLE` 判定通过——
-本机无 PG，未实跑。若某托管 PG 拒绝，退路是把 `tenant` 改为 `NOT NULL DEFAULT ''`（**但那会与 chunk 行不同构**，
-属需要重新评审的改动，不得在实施期擅自决定）。
+上述两类索引已在 Docker `pgvector:pg17` 实跑；`coalesce(text,'')` 可用于索引表达式。新增全局唯一索引时若旧库
+已有跨 tenant 重名坐标，事务化 `ensure_schema` 会失败并完整回滚，保留旧行且不留下半成品索引；运维必须先显式
+消歧，不能由启动过程静默删改数据。托管厂商兼容性仍按部署环境验证。
 
 **向后兼容**：沿用既有 DDL 的写法（`CREATE TABLE IF NOT EXISTS` + 逐列 `ALTER TABLE … ADD COLUMN IF NOT EXISTS`，
 见 `sql.rs::ddl` 里对 `metadata`/`searchable` 的处理），并同样跑在 `PgStore::ensure_schema` 的
@@ -136,7 +138,7 @@ CREATE INDEX IF NOT EXISTS {jobs}_hash  ON {jobs} (coalesce(tenant,''), collecti
 ### 4.4 DDL **不碰 publication**（红线 R2 的本文侧动作）
 
 `job_ddl()` 生成的语句里**不得出现 `PUBLICATION` 字样**——不 CREATE、不 ALTER、不 ADD、不 SET。
-这条可以直接单测（T2），且**在 A2 的两种可能结论下都成立**（见 §5）。
+这条可以直接单测（T2），并与 A2 已采用的 chunks-only 单表 publication 结论一致（见 §5）。
 理由（不变量 #2 侧）：作业状态是**摄取过程的记账**，进了复制流就会被 CDC 解码器当成源变更再喂回引擎——
 既无意义又制造反馈环。chunk 表通过"publication 列清单排除派生列"断环（`sql.rs::ddl` 的注释），
 作业表则用更彻底的办法：**整张表不发布**。
@@ -171,8 +173,8 @@ RETURNING j.job_id, j.lease_epoch, j.collection, j.doc_id, j.tenant, j.acl,
 - `FOR UPDATE SKIP LOCKED` 是 **PG 9.5+ 核心特性**，不需要 `shared_preload_libraries`、不需要任何扩展 ⇒ **不变量 #1 不破**（红线 R3）。
 - **不引入 `LISTEN/NOTIFY` 依赖**：某些托管 PG 的连接池（pgbouncer transaction 模式）下 `LISTEN` 不可靠。
   worker 用固定间隔轮询（默认 500ms，空转时指数退避到 5s）——慢一点，但可移植性零风险。
-- `[待运行验证]` 事务内 `now()` 是**事务开始时刻**而非语句时刻；租约到期判定用 `now()` 在毫秒级租约上会有偏差，
-  但租约按**秒级**（默认 60s）设置，偏差可忽略。若实跑发现问题，改用 `clock_timestamp()`。
+- 实施时已统一改用 `clock_timestamp()` 判断和续租，避免长事务里的 `now()` 快照让租约判定滞后；过期重领与
+  旧 epoch 拒写已在 Docker PG 实测。
 - **单进程内的并发限制**：`fastsearch_pg::PgStore` 是 `client: Mutex<Client>` 的**单连接**（该结构体的文档注释
   已说明原因与后续演进方向）。因此 worker 侧若要真并发领取多条作业，需要**每个并发槽一条连接**
   （`JobStore::connect` 建多个），而不是共享一个 `PgStore`。见 §6.4。
@@ -199,10 +201,10 @@ UPDATE {jobs} SET state='failed', error=$3, error_stage=$4, retry_count = retry_
 
 ---
 
-## 5. 对 A2（KB-2.1）的依赖声明——**本文不定夺**
+## 5. A2（KB-2.1）已采用结论：chunks-only 单表 publication
 
-迭代计划 §11.1 写明：*"KB-2.1 与 KB-3.1 都要回答 `ALTER PUBLICATION … SET TABLE` 是替换语义、新表怎么办
-（§10 待决策 #5）。**归属：C4 的 KB-2.1**。KB-3.1 只能在 spec 里声明依赖，不得自行定夺。"* 本节即那份声明。
+原设计阶段把 `ALTER PUBLICATION … SET TABLE` 的裁定归给 A2。A2 已完成并采用
+**publication 永远只发布 chunks 主表**的方案；`chunk_signal` 和 `ingest_job` 都不进入复制流。
 
 **现状（已读代码，`crates/fastsearch-pg/src/sql.rs::ddl`）**：publication 段是一个 `DO $$` 块，
 ① 无 `fastsearch_pub` → `CREATE PUBLICATION … FOR TABLE {table} ({collist})`（带 `EXCEPTION` 防并发首建）；
@@ -210,15 +212,9 @@ UPDATE {jobs} SET state='failed', error=$3, error_stage=$4, retry_count = retry_
 ③ publication 属于别的表 → **不动**（注释写明"避免并发实例互抢同名 publication"）。
 `SET TABLE` 是**替换**语义：分支 ② 触发时，publication 里除 `{table}` 外的任何表都会被**静默移除**。
 
-**两种可能结论下，本设计各自怎么办**：
-
-| A2 可能结论 | `ingest_job` 侧动作 | 验收怎么写 |
-|---|---|---|
-| **X · publication 永远单表**（保留 `SET TABLE`） | **零动作**。作业表本就不发布；分支 ② 每次 boot 反而会把"被谁误加进来的作业表"清掉，是一层免费的自愈 | **T18**：连上 PG 后查 `pg_publication_rel` 断言不含作业表（`待运行验证`） |
-| **Y · DDL 改为精确 `ADD/DROP` 收敛**（为 `chunk_signal` 之类的第二张表让路） | 仍**零动作**，但多两条硬约束：(a) 作业表**不得**出现在 A2 的 `ADD TABLE` 清单里；(b) A2 的收敛逻辑必须是"把清单内的表 ADD、把**清单内应删的**表 DROP"，而**不能**是"DROP 一切不在清单里的表"——后者行为上等价，但会让作业表的缺席变成一条需要维护的负向清单 | **T18** 不变，另加 **T22**：跑一次 A2 的收敛 DDL 后，作业表仍不在 publication（`待运行验证`） |
-
-**顺序依赖（给主循环）**：结论 Y 下，KB-3 的实施必须排在 A2 合并**之后**，否则 T22 无对象可测。
-结论 X 下无顺序要求，但 `sql.rs` 的文件冲突仍要求 C4 通道内串行。
+`ingest_job` 侧因此不生成任何 publication DDL；chunks schema 每次收敛时会把误加入的其他表移出
+`fastsearch_pub`。T18 已在 Docker `pgvector:pg17` 验证 publication 只含 chunks 表；原条件分支 Y
+未采用，T22 不再是待运行项。若未来要发布第二张表，必须新建独立 publication 并重新评审 CDC 解码契约。
 
 ---
 
@@ -269,7 +265,7 @@ docparse 会顺着这条边爬进 server ——现有门禁会抓到，但报错
 
 - `POST /v1/jobs/{job_id}/chunks`：worker 提交解析产物。server 端：
   1. 认证 worker key（必须在 `FASTSEARCH_WORKER_KEYS` 声明的那一类 key 里）；
-  2. 按 `job_id` + `lease_epoch` 取作业行（**epoch 不匹配 → 409，直接丢弃**）；
+  2. 校验 claim 返回的 `lease_job_id + lease_owner + lease_epoch`（任一不匹配 → 409，直接丢弃）；
   3. **`tenant`/`acl` 从作业行读取并强制注入 chunk**，请求体里带的 `tenant`/`acl` 一律**忽略**；
   4. `collection`/`doc_id` 同样**只**取自作业行，请求体不得指定；
   5. 之后复用与 `index` handler **完全同一段**写入内核（对象存储归一 → 维度校验 → 嵌入 → `upsert_doc` → `set_embedding` 写穿 → 引擎 `remove_doc`+`ingest`+`commit`）。实施时把该段抽成内部函数，两个入口共用，**不允许出现第二份实现**。
@@ -301,7 +297,7 @@ loop {
   bytes  = object_store.get(job.source_uri, max_bytes)          // 阶段 parsing
   doc    = parsers().find(supports).parse(bytes)                 // + apply_ocr/apply_vlm/apply_tables（feature+env 门控）
   chunks = chunk_document(doc).map(from_docparse_chunk)          // 阶段 chunking
-  POST /v1/jobs/{id}/chunks {lease_epoch, chunks}                // 阶段 embedding（嵌入在 server，worker 不做）
+  POST /v1/jobs/{id}/chunks {lease_job_id, lease_owner, lease_epoch, chunks} // 阶段 embedding（嵌入在 server，worker 不做）
   //   ↑ 200 之后，由 **server** 在同一请求内把 job 置 indexed（排序铁律，见 §8）
   失败 → POST /v1/jobs/{id}/status {state:"failed", error, error_stage, next_attempt_at}
 }
@@ -409,7 +405,7 @@ loop {
 
 ### 7.2 幂等与替换语义（G5；迭代计划 §5.5 要求"定死"）
 
-**定死如下**（作用域 `(tenant, collection, doc_id)`，因为唯一索引就是这三元组）：
+**定死如下**（作用域为 ADR-0001 的全局 `(collection, doc_id)`；tenant 是 owner，不是坐标组成）：
 
 | 情形 | 语义 | 说明 |
 |---|---|---|
@@ -418,7 +414,7 @@ loop {
 | 同 `doc_id` + 同 hash + 现有行 `failed` | **重开** | 同一行 UPDATE：`state='queued'`、`retry_count=0`、`next_attempt_at=now()` |
 | 同 `doc_id` + **不同 hash**，现有行终态 | **覆盖** | 同一行 UPDATE 换 hash/uri/profile，`state='queued'`。索引侧是 **doc 级替换**（`PgStore::upsert_doc` 事务内 delete+insert；引擎侧 `remove_doc` + 重 ingest）——**既有语义，不新增机制** |
 | 同 `doc_id` + 不同 hash，现有行**在途** | **409 `job_in_flight`** + 既有 `job_id` | 不静默丢弃前一次上传的意图；调用方可轮询后重试 |
-| **新版本** | **不做**（红线 R6） | 唯一索引在结构上就不允许第二行 |
+| **新版本** | **不做**（红线 R6） | 全局唯一索引在结构上就不允许第二行；另一 tenant 同坐标返回脱敏 409 |
 
 **旧内容的原始字节**：覆盖时旧 `source_uri` 与新的不同（key 含 hash）⇒ 需要删除旧对象，
 复用 `index` handler 已有的"新旧 object uri 差集清理"套路（`engine.delete_object`）。
@@ -464,6 +460,9 @@ loop {
 ---
 
 ## 8. 失败注入与收敛（迭代计划 §5 的验收原文）
+
+> 本节定义整体作业面的 FS-304 故障注入验收；FS-302 只落实其中的发布顺序、持锁与失败不提前
+> `indexed` 基础保证，不以四个跨进程崩溃场景全部完成作为本迭代门槛。
 
 **先立一条排序铁律（贯穿全部四个注入点）**：
 
@@ -537,7 +536,7 @@ loop {
 | T21b | 普通用户 key 调 `POST /v1/jobs/{id}/chunks` → **403** | R7 |
 | T7b | 上传超过 `FASTSEARCH_MAX_DOCUMENT_BYTES` → **413**，错误消息包含 `source_uri` 出路 | G1 |
 
-### 10.3 PG 集成（`DATABASE_URL` env-gated，**全部 `待运行验证`**）
+### 10.3 PG 集成（`DATABASE_URL` env-gated；FS-301/FS-302 对应项已在 Docker PG 验证）
 
 | 编号 | 断言 | 守哪条 |
 |---|---|---|
@@ -545,10 +544,10 @@ loop {
 | T16 | 租约过期后作业可被重领，且 `lease_epoch` 递增；旧 epoch 的回写返回 0 行 | 恢复性 |
 | T17 | 同 hash 重复上传 → 跳过（不新建行、`deduplicated:true`）；hash 变化 → 覆盖（chunk 集合被替换，无残留旧 chunk） | G5 |
 | T18 | `SELECT … FROM pg_publication_rel …` 断言 `fastsearch_pub` **不含**作业表 | R2 |
-| T22 | （仅 A2 结论 Y）跑一次 A2 的 publication 收敛 DDL 后，T18 仍成立 | R2 / 依赖 A2 |
+| T22 | 不适用：A2 已采用 chunks-only 单表 publication，第二张表必须使用独立 publication | R2 / A2 已裁定 |
 | T19 | 跨租户：租户 B 的 key `GET /v1/jobs/{A 的 job}` → **404**；`GET /v1/documents` 不含 A 的文档 | R7 |
-| T21 | worker key 拿 job A 的 `lease_epoch` 往 job B 写 → **409/403**，且 B 的 chunk 未被改动 | R7 |
-| T20a–d | §8 四个注入点的收敛（含 F3 的"崩溃瞬间状态 ≠ indexed"断言） | 不变量 #2 |
+| T21 | worker key 拿 job A 的 `lease_job_id + lease_owner + lease_epoch` 往 job B 写 → **409/403**，且 B 的 chunk 未被改动 | R7 |
+| T20a–d | §8 四个跨进程崩溃注入点的完整收敛；归 FS-304。本轮 FS-302 只完成发布锁、写失败不 indexed 与过期不可穿透的基础断言 | 不变量 #2 / FS-304 |
 | T25 | schema 迁移可向后兼容：对**已有旧版作业表**跑新 `job_ddl()` 幂等无损（只加列） | 修订文 §5 回滚触发 |
 
 ### 10.4 CI 门禁
@@ -564,7 +563,8 @@ loop {
 
 **七条红线各自至少有一个红/绿可判的自动化断言**（R1→T1/T1b、R2→T2/T18、R3→T3/T4/T15、R4→T23/T24、
 R5→T10/T11/T11b、R6→T5/T5b、R7→T12/T13/T14/T19/T21），
-**外加** §8 四个注入点全部收敛到 PG 真值，**外加** 迭代计划 §7 的八条不变量对照清单逐条过。
+FS-301/FS-302 的完成还要求各自聚焦计划的门槛全过；**整体作业面**完成则另须 FS-304 把 §8 四个
+跨进程注入点全部收敛到 PG 真值，并逐条核对迭代计划 §7 的八条不变量。
 任一红线的断言缺席 ⇒ 本阶段不算完成（修订文 §4 的原话是"违反即回滚"，没有断言＝无法判定是否违反）。
 
 ---
@@ -612,7 +612,7 @@ cargo run -p fastsearch-cli --features parse --bin fastsearch -- ingest \
 
 ## 12. 影响面（实施期需同步更新的文档）
 
-- `docs/specs/19-server.md`：新增四个端点、503 判据、body 上限分层、worker key 能力位。
+- `docs/specs/19-server.md`：新增五个端点、503 判据、body 上限分层、worker key 能力位。
 - `docs/specs/00-模块拆分.md`：新增 `fastsearch-ingest-worker` 一行（并给它一个 spec 号）。
 - `docs/specs/` 新增 `fastsearch-ingest-worker` 的 spec（本文是 plan，不替代模块 spec）。
 - `CLAUDE.md`：架构大图补一条 `POST /v1/documents → ingest_job → worker → /v1/jobs/{id}/chunks` 的支线；
@@ -625,27 +625,20 @@ cargo run -p fastsearch-cli --features parse --bin fastsearch -- ingest \
 
 ## 13. 状态、待决策与待验证（诚实记账）
 
-**状态（2026-08-31 回写）**：FS-301 已完成：一表 DDL、状态机、独立 `JobStore`、claim/heartbeat/advance/finish/fail
-及 fencing 已落地；T15/T16/T18/T25 在 Docker pgvector:pg17 通过。FS-302 上传/查询 API、FS-303 worker、
-FS-304 MCP 仍未实施，因此本文整体作业面尚未完成。
+**状态（2026-09-01 回写）**：FS-301、FS-302 已完成：一表 DDL、状态机、独立 `JobStore`、租约 fencing、
+上传/查询 API、worker job-scoped 安全写协议均已落地；对应 PG/路由/活服务用例在 Docker
+`pgvector:pg17` 通过。FS-303 独立 worker/MCP 闭环、FS-304 故障注入仍未实施，因此整体作业面尚未完成。
 
 **`[待决策]`（需评审拍板，不得在实施期擅自决定）**
-1. **§6.3 worker 写入口的 ACL 来源**（本文最重要的一条）：采纳 `POST /v1/jobs/{id}/chunks` + worker key 能力位？
-   —— 它是本设计唯一触到不变量 #3 表面的地方，必须评审。**照迭代计划 §5.4 字面用 `/v1/index` 会静默错配 ACL。**
-2. **§6.2 适配器复用方式**：推荐下沉新 crate `fastsearch-ingest-adapter`（会动 `fastsearch-cli/src/ingest.rs`，
+1. **§6.2 适配器复用方式**：推荐下沉新 crate `fastsearch-ingest-adapter`（会动 `fastsearch-cli/src/ingest.rs`，
    **必须排在 C2 通道的 KB-1.1/1.2 之后**）；备选是 worker 直依赖 `fastsearch-cli/parse`（不推荐）。
-3. **§6.2 `ObjectStore` 是否下沉独立 crate**：本文默认"worker 直接依赖 `fastsearch-engine`"（零 API 变动）。
-4. **§7.1 `source_uri` 直传时的 hash 来源**：server 整块读取算 hash，还是信任调用方声明、由 worker 校验。
-5. **§7.1 `workers_seen_recently` 字段**：本轮给还是留到 KB-3.3。
-6. **§7.2 覆盖时旧原始字节是否保留**：默认**不保留**（保留像"版本"，逼近红线 R6）。
-7. **同步档默认阈值**：`SYNC_MAX_BYTES=1MiB` / `SYNC_WAIT_MS=3000` / `MAX_INFLIGHT=32` 是拍的数，
+2. **§6.2 `ObjectStore` 是否下沉独立 crate**：本文默认"worker 直接依赖 `fastsearch-engine`"（零 API 变动）。
+3. **§7.1 `workers_seen_recently` 字段**：本轮给还是留到 KB-3.3。
+4. **同步档默认阈值**：`SYNC_MAX_BYTES=1MiB` / `SYNC_WAIT_MS=3000` / `MAX_INFLIGHT=32` 是拍的数，
    需要真实 agent 用例校准（观测指标已在 §7.5 备好）。
 
 **`[待验证]` / `待运行验证`**
-- 全部 §10.3 的 PG 集成用例（T15–T25）。
-- `coalesce(tenant,'')` 作为唯一索引表达式在 RDS/Supabase/Neon 的可用性（§4.3）。
-- axum 0.8 per-route `DefaultBodyLimit` 覆盖 router 级 layer 的顺序语义（§7.1）。
-- `PgStore::set_embedding` 的幂等守卫具体实现（本文只读到 `sql.rs::ddl` 注释里对它的**描述**，未读实现）。
+- 托管 RDS/Supabase/Neon 对两类唯一索引及逻辑复制权限的逐环境兼容性（Docker PG 已通过）。
 - 独立 `JobStore` 连接对检索延迟的实际影响（§7 的性能论证基于 `PgStore` 的 `Mutex<Client>` 结构，未实测）。
 - 两个 worker 用不同 `parse_profile` 交错时的最终态（§8 末）。
 - `cargo tree -p fastsearch-cli`（默认档）在 workspace 里存在一个开着 `parse` 的 worker 时，
