@@ -630,6 +630,31 @@ async fn cdc_failed_write_through_marks_recovery_until_replay_completes() {
         .expect("replay consume");
     assert_eq!(stats.applied, 2);
     assert!(!Engine::cdc_recovery_pending(data.path()).unwrap());
+    let query_vector = fastsearch_embed::Embedder::embed(
+        &fastsearch_embed::HashEmbedder::new(8),
+        &["recovery marker one".into()],
+        fastsearch_embed::EmbedKind::Passage,
+    )
+    .expect("recovery query embedding")
+    .remove(0);
+    let hits = engine
+        .lock()
+        .await
+        .search(
+            &SearchRequest {
+                query: String::new(),
+                mode: SearchMode::Vector,
+                vector: Some(query_vector),
+                top_k: 5,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("vector search after replay");
+    assert!(
+        hits.iter().any(|hit| hit.id.doc_id == "recovery.pdf"),
+        "PG embedding committed before derived failure must become searchable after replay"
+    );
 
     drop_slot(&rcfg).await.expect("drop_slot");
 }

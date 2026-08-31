@@ -18,6 +18,39 @@ pub use http::{
 
 use std::hash::{Hash, Hasher};
 
+/// Stable classification for failures produced by an external embedding service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedFailureKind {
+    /// The service returned an HTTP response. Callers decide retryability from the status code.
+    UpstreamStatus(u16),
+    /// The request could not complete because of transport, timeout, or response I/O failure.
+    Transient,
+}
+
+/// Typed external-service failure carried through `anyhow` by [`HttpEmbedder`].
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct EmbedFailure {
+    pub kind: EmbedFailureKind,
+    message: String,
+}
+
+impl EmbedFailure {
+    pub fn upstream(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            kind: EmbedFailureKind::UpstreamStatus(status),
+            message: message.into(),
+        }
+    }
+
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            kind: EmbedFailureKind::Transient,
+            message: message.into(),
+        }
+    }
+}
+
 /// 嵌入用途（e5 风格前缀）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedKind {

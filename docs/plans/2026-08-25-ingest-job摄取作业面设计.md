@@ -1,6 +1,6 @@
 # KB-3.1：PG `ingest_job` 摄取作业面设计
 
-> 日期：2026-08-25 · 类型：设计文档 · 状态：**FS-301–303 已实施并完成 PG/活服务验证；FS-304 待实施**
+> 日期：2026-08-25 · 类型：设计文档 · 状态：**FS-301–304 已实施，M3 摄取作业面完成（2026-09-01）**
 > 授权来源与边界：[职责边界修订：把「文档摄取作业面」收回引擎](../governance/2026-08-24-职责边界修订-摄取作业面收回引擎.md)（下称**修订文**）
 > 仍然有效的上位 ADR：[职责边界：不承担生产身份与知识库控制面](../governance/2026-08-24-职责边界-不承担身份与控制面.md)
 > 上游计划：[知识库引擎迭代计划 §5（KB-3）](2026-08-24-知识库引擎迭代计划.md) · 缺口来源：[文档摄取现状与差距 §3（G1–G7）](2026-08-24-作为知识库使用-文档摄取现状与差距.md)
@@ -541,12 +541,12 @@ loop {
 | 编号 | 断言 | 守哪条 |
 |---|---|---|
 | T15 | 两个并发 claim 事务领到**不相交**的作业（`FOR UPDATE SKIP LOCKED` 生效，无重复、无阻塞） | R3 |
-| T16 | 租约过期后作业可被重领，且 `lease_epoch` 递增；旧 epoch 的回写返回 0 行 | 恢复性 |
+| T16 | 租约过期后作业可被重领，且 `lease_epoch` 递增；旧作业租约的回写返回 0 行 | 恢复性 |
 | T17 | 同 hash 重复上传 → 跳过（不新建行、`deduplicated:true`）；hash 变化 → 覆盖（chunk 集合被替换，无残留旧 chunk） | G5 |
 | T18 | `SELECT … FROM pg_publication_rel …` 断言 `fastsearch_pub` **不含**作业表 | R2 |
 | T22 | 不适用：A2 已采用 chunks-only 单表 publication，第二张表必须使用独立 publication | R2 / A2 已裁定 |
 | T19 | 跨租户：租户 B 的 key `GET /v1/jobs/{A 的 job}` → **404**；`GET /v1/documents` 不含 A 的文档 | R7 |
-| T21 | worker key 拿 job A 的 `lease_job_id + lease_owner + lease_epoch` 往 job B 写 → **409/403**，且 B 的 chunk 未被改动 | R7 |
+| T21 | 具有 `worker` capability 的 API 凭据拿 job A 的 `lease_job_id + lease_owner + lease_epoch` 往 job B 写 → **409/403**，且 B 的 chunk 未被改动 | R7 |
 | T20a–d | §8 四个跨进程崩溃注入点的完整收敛；归 FS-304。本轮 FS-302 只完成发布锁、写失败不 indexed 与过期不可穿透的基础断言 | 不变量 #2 / FS-304 |
 | T25 | schema 迁移可向后兼容：对**已有旧版作业表**跑新 `job_ddl()` 幂等无损（只加列） | 修订文 §5 回滚触发 |
 
@@ -625,21 +625,21 @@ cargo run -p fastsearch-cli --features parse --bin fastsearch -- ingest \
 
 ## 13. 状态、待决策与待验证（诚实记账）
 
-**状态（2026-09-01 回写）**：FS-301–303 已完成：一表 DDL、状态机、独立 `JobStore`、租约 fencing、
-上传/查询 API、worker job-scoped 安全写协议、独立解析 worker 与 MCP 同步/异步摄取均已落地；对应
-PG/路由/活 server-worker-MCP 用例在 Docker `pgvector:pg17` 通过。FS-304 故障注入仍未实施，
-因此 M3 整体作业面尚未完成。
+**状态（2026-09-01 回写）**：FS-301–304 已完成：一表 DDL、状态机、独立 `JobStore`、作业租约 fencing、
+上传/查询 API、worker job-scoped 安全写协议、独立解析 worker、MCP 摄取/死信恢复、故障分类、
+durable raw-byte handoff 与运维指标均已落地。Docker `pgvector:pg17` + logical replication 的
+T20a–T20d 收敛用例、路由故障用例及活 worker PG 断连重连演练通过，M3 整体作业面完成。
 
 **`[已决]`（FS-303）**
 1. 适配器下沉为 `fastsearch-ingest-adapter`，CLI 与 worker 共用一条解析管线。
 2. worker 直接复用 `fastsearch-engine::ObjectStore`，暂不为一个消费者拆新 crate。
-3. `workers_seen_recently` 留给 FS-304 运维指标，不在能力探测里制造不可靠存活真值。
+3. `workers_seen_recently` 已由 FS-304 作为运维 gauge 交付，不在能力探测里制造不可靠存活真值。
 4. server 同步等待阈值保持 FS-302 默认；MCP 另提供显式 `wait` 与 `timeout_ms`，超时如实返回非终态。
 
 **`[待验证]` / `待运行验证`**
 - 托管 RDS/Supabase/Neon 对两类唯一索引及逻辑复制权限的逐环境兼容性（Docker PG 已通过）。
 - 独立 `JobStore` 连接对检索延迟的实际影响（§7 的性能论证基于 `PgStore` 的 `Mutex<Client>` 结构，未实测）。
-- 两个 worker 用不同 `parse_profile` 交错时的完整故障矩阵（§8 末，归 FS-304）。
+- 托管 PG 与实际多 worker 长跑下的容量、延迟和资源曲线（M4 资源门控）。
 
 已验证：默认 `cargo tree -p fastsearch-cli -e normal` 以及七个 hot-path crate 均不含 docparse；worker
 开启 parse/heavy feature 不改变这些包各自默认依赖图。

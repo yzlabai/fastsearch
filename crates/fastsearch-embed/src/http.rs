@@ -6,7 +6,7 @@
 //! 选后端用 [`EmbedderConfig`]/[`build_embedder`]/[`EmbedderConfig::from_env`]。请求体构造、
 //! 响应解析、维度校验是纯逻辑、有单测；实网调用 env-gated。
 
-use crate::{EmbedCaps, EmbedInput, EmbedKind, Embedder, HashEmbedder};
+use crate::{EmbedCaps, EmbedFailure, EmbedInput, EmbedKind, Embedder, HashEmbedder};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde_json::Value;
@@ -323,7 +323,11 @@ impl HttpEmbedder {
                 req = req.set("Authorization", &format!("Bearer {k}"));
             }
             match req.send_string(body) {
-                Ok(resp) => return resp.into_string().context("read embedding response"),
+                Ok(resp) => {
+                    return resp.into_string().map_err(|error| {
+                        EmbedFailure::transient(format!("read embedding response: {error}")).into()
+                    });
+                }
                 Err(e) => {
                     // transient（429/5xx/传输错误）才重试；4xx（如 400/413）是确定性错误、立即失败（M12）。
                     let retriable = match &e {
@@ -338,12 +342,18 @@ impl HttpEmbedder {
                     return match e {
                         ureq::Error::Status(code, resp) => {
                             let detail = resp.into_string().unwrap_or_default();
-                            bail!(
-                                "embedding endpoint {url} returned {code}: {}",
-                                truncate(&detail, 300)
-                            );
+                            Err(EmbedFailure::upstream(
+                                code,
+                                format!(
+                                    "embedding endpoint {url} returned {code}: {}",
+                                    truncate(&detail, 300)
+                                ),
+                            )
+                            .into())
                         }
-                        e => Err(e).with_context(|| format!("POST {url}")),
+                        error => {
+                            Err(EmbedFailure::transient(format!("POST {url}: {error}")).into())
+                        }
                     };
                 }
             }

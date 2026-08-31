@@ -61,11 +61,17 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - **真源约束**：REST 收到 `searchable=false` 时必须已配置 PostgreSQL source store，否则返回 400；避免把“需持久化但不可检索”的 row 静默丢失。普通 `searchable=true` 兼容既有无 PG 模式。
 - **身份覆盖**：batch upsert 与 doc index 一样，由 Principal 强制覆盖 tenant/acl；跨 tenant
   GlobalId 冲突返回 409，不允许覆盖。
-- **摄取拒绝顺序**：认证 → 限流 → PG/job capability → body 解析；无 PG 的五个作业路由均 503，
-  无效 key 仍先返回 401，worker key 缺 capability 返回 403。worker JSON 身份字段即使被夹带也不采用。
+- **摄取拒绝顺序**：认证 → 限流 → PG/job capability → body 解析；无 PG 的全部作业路由均 503，
+  无效 key 仍先返回 401，worker API 凭据缺 capability 返回 403。worker JSON 身份字段即使被夹带也不采用。
 - **上传边界**：默认最大 32MiB，`FASTSEARCH_MAX_DOCUMENT_BYTES` 同时约束 multipart、`source_uri`
   读取和 ObjectStore；只为 `/v1/documents` 放宽 body layer，其他 REST 路由仍保持 20MiB。超限 413
   提示改用 `source_uri`。`wait=auto|never`；auto 只轮询独立 worker，server 不解析。
+- **上传崩溃安全**：文件走 `reserve job(source_ready=false) → put reserved URI → ready`；put 失败
+  返回 503 和“重试同一上传”的动作，pending job 不可领取。同 hash 重试复用原 job 并修复；旧对象
+  删除失败以持久化 cleanup hint 和 gauge 暴露；hint 未处理前第二次异内容替换返回 409。
+- **失败与恢复**：worker failure 接受兼容缺省 `retryable=true`；terminal 一次即 dead-letter。
+  `POST /v1/jobs/{id}/retry` 仅允许原 ACL owner 重排 dead-letter，越权仍 404。job JSON 暴露
+  `error_retryable/source_ready/retry_url/next_action`。
 - **作业防竞争**：worker chunks 发布期间 PG job 行保持锁定，租约过期也不能被第二 worker 中途重领；
   chunks/派生写失败时不标 indexed。所有状态与列表 ACL 在 SQL 内过滤，防 job id 枚举。
 - **能力诚实化**：`GET /v1/collections` 的 `server.document_ingest` 仅在 live jobs、ObjectStore、
@@ -97,9 +103,13 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 11. 五个作业路由在无 PG 时 fail-closed，且认证/限流发生在 body 消费前。
 12. 上传覆盖 202 排队、200 同 hash 去重、异 hash 冲突/终态覆盖、413、对象清理及 200/202 字段同构。
 13. job 查询与文档列表跨 tenant/tag 返回 404/空集，列表字段与 OpenAPI 精确一致。
-14. worker 普通 key 403、错误 job/owner/旧 epoch 409、夹带身份无效；真实 PG chunks 写入和派生索引成功后才 indexed。
-15. `/metrics` 暴露 upload/dedup/failure/sync hit/timeout counter、六状态 job gauge 与 dead-letter gauge；
-    PG gauge 按需刷新并缓存 1 秒，避免每次 scrape 串行查询 job 真源。
+14. worker 普通 API 凭据 403、错误 job/owner/旧作业租约 409、夹带身份无效；真实 PG chunks 写入和派生索引成功后才 indexed。
+15. `/metrics` 暴露 upload/dedup/failure/sync hit/timeout/manual retry counter、
+    `fastsearch_ingest_failures_classified_total{classification=...}`、六状态/dead-letter、
+    source/cleanup pending、active/expired lease、recent worker、oldest-ready gauge；PG gauge 按需刷新并
+    缓存 1 秒，避免每次 scrape 串行查询 job 真源。
+16. 对象首次 PUT 失败后 job 可见但不可领取，同一上传修复后使用同一 job_id 进入可领取状态；
+    dead-letter retry 的 owner 200、非 owner 404，并产生审计与 counter。
 
 ## 6. 验收标准与状态
 

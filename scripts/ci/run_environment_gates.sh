@@ -16,12 +16,13 @@ trap 'rm -f "$log_file"' EXIT
 
 cd "$repo_root"
 set +e
-cargo test --workspace -- --nocapture 2>&1 | tee "$log_file"
+cargo test --workspace -- --nocapture --test-threads=1 2>&1 | tee "$log_file"
 test_status=${PIPESTATUS[0]}
 set -e
 
 pg_gates=(
   ensure_schema_concurrent_no_race
+  fs304_pg_store_reconnects_after_backend_termination
   ensure_schema_rejects_existing_vector_dimension_mismatch
   integration_roundtrip
   integration_chunk_management_lifecycle
@@ -37,6 +38,14 @@ pg_gates=(
   fs301_concurrent_claims_are_disjoint_and_stage_writes_are_fenced
   fs301_expired_lease_is_reclaimed_and_retry_exhaustion_is_dead_letter
   fs301_additive_upgrade_and_chunks_only_publication_hold_in_real_pg
+  fs302_document_upload_status_and_listing_share_acl_safe_job_state
+  fs302_worker_writes_require_capability_and_current_lease_epoch
+  fs302_publication_lock_blocks_reclaim_and_failure_never_marks_indexed
+  fs304_source_handoff_and_terminal_failure_are_durable
+  fs304_job_store_reconnects_after_backend_termination
+  fs304_pg_commit_before_publication_failure_reclaims_to_literal_golden
+  fs304_failed_raw_put_leaves_unclaimable_job_and_same_upload_repairs_it
+  fs304_dead_letter_retry_route_is_owner_scoped_and_requeues
   pgvector_backend_via_engine
   fs202_engine_fuses_three_real_recall_paths
   b6_cdc_write_through_to_pg_embedding
@@ -70,7 +79,11 @@ count_gates() {
   for name in "$@"; do
     if grep -Fq "skip $name" "$log_file"; then
       skipped=$((skipped + 1))
-    elif grep -Eq "test ([[:alnum:]_]+::)*${name} \.\.\. ok" "$log_file"; then
+    # `--nocapture` may splice a test's diagnostic output between the harness
+    # prefix (`test ...`) and its final `ok`. The workspace exit status below
+    # remains the authority for pass/fail, so presence of the harness prefix is
+    # sufficient to prove that a non-skipped gate executed.
+    elif grep -Eq "test ([[:alnum:]_]+::)*${name} \.\.\." "$log_file"; then
       executed=$((executed + 1))
     else
       missing=$((missing + 1))

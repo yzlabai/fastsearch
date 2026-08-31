@@ -100,6 +100,8 @@ pub struct NewIngestJob {
     pub tenant: Option<String>,
     pub acl: Vec<String>,
     pub source_uri: String,
+    /// Whether the authoritative object has been durably written and may be claimed.
+    pub source_ready: bool,
     pub content_sha256: String,
     pub content_bytes: i64,
     pub media_type: Option<String>,
@@ -117,6 +119,8 @@ pub struct IngestJob {
     pub tenant: Option<String>,
     pub acl: Vec<String>,
     pub source_uri: String,
+    pub source_ready: bool,
+    pub cleanup_source_uri: Option<String>,
     pub content_sha256: String,
     pub content_bytes: i64,
     pub media_type: Option<String>,
@@ -134,6 +138,8 @@ pub struct IngestJob {
     pub next_attempt_at_ms: i64,
     pub error: Option<String>,
     pub error_stage: Option<String>,
+    /// Classification of the last failure. `None` means this job has not failed since reset.
+    pub error_retryable: Option<bool>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub started_at_ms: Option<i64>,
@@ -161,6 +167,7 @@ pub struct FailureDisposition {
     pub retry_count: i32,
     pub max_retries: i32,
     pub dead_letter: bool,
+    pub retryable: bool,
 }
 
 /// How an upload submission affected the one authoritative row for a document.
@@ -172,6 +179,7 @@ pub enum UploadDisposition {
     Reopened,
     Replaced,
     InFlightConflict,
+    CleanupPending,
 }
 
 /// Transactional upload resolution plus object-store cleanup hints.
@@ -226,6 +234,13 @@ pub struct DocumentListOptions {
 pub struct IngestMetrics {
     pub state_counts: Vec<(IngestState, i64)>,
     pub dead_letter_count: i64,
+    pub retryable_failed_count: i64,
+    pub source_pending_count: i64,
+    pub cleanup_pending_count: i64,
+    pub active_lease_count: i64,
+    pub expired_lease_count: i64,
+    pub workers_seen_recently: i64,
+    pub oldest_ready_age_seconds: i64,
 }
 
 impl Default for DocumentListOptions {
@@ -248,6 +263,7 @@ impl Default for DocumentListOptions {
 /// connection.
 pub struct JobStore {
     client: Mutex<Client>,
+    database_url: String,
     table: String,
     chunks_table: String,
 }
@@ -274,9 +290,25 @@ impl JobStore {
         });
         Ok(Self {
             client: Mutex::new(client),
+            database_url: url.to_string(),
             table,
             chunks_table,
         })
+    }
+
+    async fn client(&self) -> Result<tokio::sync::MutexGuard<'_, Client>> {
+        let mut client = self.client.lock().await;
+        if client.is_closed() {
+            let (replacement, connection) =
+                tokio_postgres::connect(&self.database_url, NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    eprintln!("fastsearch-pg replacement job connection error: {error}");
+                }
+            });
+            *client = replacement;
+        }
+        Ok(client)
     }
 
     pub fn table(&self) -> &str {
@@ -285,7 +317,7 @@ impl JobStore {
 
     /// Additive, idempotent schema creation serialized with the existing chunks DDL lock.
     pub async fn ensure_schema(&self) -> Result<()> {
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let transaction = client.transaction().await?;
         transaction
             .query_one(
@@ -310,7 +342,7 @@ impl JobStore {
     pub async fn enqueue(&self, new_job: &NewIngestJob) -> Result<IngestJob> {
         validate_new_job(new_job)?;
         let profile = serde_json::to_string(&new_job.parse_profile)?;
-        let params: [&(dyn ToSql + Sync); 12] = [
+        let params: [&(dyn ToSql + Sync); 13] = [
             &new_job.job_id,
             &new_job.collection,
             &new_job.doc_id,
@@ -323,11 +355,11 @@ impl JobStore {
             &new_job.filename,
             &profile,
             &new_job.max_retries,
+            &new_job.source_ready,
         ];
         let result = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query_one(&sql::enqueue_job_sql(&self.table), &params)
             .await;
         match result {
@@ -349,7 +381,7 @@ impl JobStore {
     pub async fn submit_upload(&self, new_job: &NewIngestJob) -> Result<UploadResolution> {
         validate_new_job(new_job)?;
         let profile = serde_json::to_string(&new_job.parse_profile)?;
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let transaction = client.transaction().await?;
         transaction
             .query_one(
@@ -408,10 +440,17 @@ impl JobStore {
                     unused_source_uri: Some(new_job.source_uri.clone()),
                     replaced_source_uri: None,
                 }
+            } else if !same_hash && current.cleanup_source_uri.is_some() {
+                UploadResolution {
+                    job: current,
+                    disposition: UploadDisposition::CleanupPending,
+                    unused_source_uri: Some(new_job.source_uri.clone()),
+                    replaced_source_uri: None,
+                }
             } else {
                 let old_source_uri = (current.source_uri != new_job.source_uri)
                     .then_some(current.source_uri.clone());
-                let params: [&(dyn ToSql + Sync); 9] = [
+                let params: [&(dyn ToSql + Sync); 10] = [
                     &current.job_id,
                     &new_job.acl,
                     &new_job.source_uri,
@@ -421,6 +460,7 @@ impl JobStore {
                     &new_job.filename,
                     &profile,
                     &new_job.max_retries,
+                    &new_job.source_ready,
                 ];
                 let row = transaction
                     .query_one(&sql::reset_upload_job_sql(&self.table), &params)
@@ -437,7 +477,7 @@ impl JobStore {
                 }
             }
         } else {
-            let params: [&(dyn ToSql + Sync); 12] = [
+            let params: [&(dyn ToSql + Sync); 13] = [
                 &new_job.job_id,
                 &new_job.collection,
                 &new_job.doc_id,
@@ -450,6 +490,7 @@ impl JobStore {
                 &new_job.filename,
                 &profile,
                 &new_job.max_retries,
+                &new_job.source_ready,
             ];
             let row = transaction
                 .query_one(&sql::enqueue_job_sql(&self.table), &params)
@@ -467,42 +508,103 @@ impl JobStore {
 
     pub async fn get(&self, job_id: &str) -> Result<Option<IngestJob>> {
         let row = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query_opt(&sql::get_job_sql(&self.table), &[&job_id])
             .await?;
         row.as_ref().map(row_to_job).transpose()
     }
 
+    /// Completes the durable source handoff only if the reserved URI and hash still match.
+    pub async fn mark_source_ready(
+        &self,
+        job_id: &str,
+        source_uri: &str,
+        content_sha256: &str,
+    ) -> Result<Option<IngestJob>> {
+        let row = self
+            .client()
+            .await?
+            .query_opt(
+                &sql::mark_job_source_ready_sql(&self.table),
+                &[&job_id, &source_uri, &content_sha256],
+            )
+            .await?;
+        row.as_ref().map(row_to_job).transpose()
+    }
+
+    /// Acknowledges successful deletion of a superseded raw object without clearing a newer hint.
+    pub async fn clear_cleanup_source(&self, job_id: &str, source_uri: &str) -> Result<bool> {
+        let row = self
+            .client()
+            .await?
+            .query_opt(
+                &sql::clear_job_cleanup_source_sql(&self.table),
+                &[&job_id, &source_uri],
+            )
+            .await?;
+        Ok(row.is_some())
+    }
+
+    fn job_visibility_predicate(acl: &AclFilter) -> &'static str {
+        if acl.tenant.is_some() {
+            "tenant = $2 AND ('public' = ANY(acl) OR acl && $3)"
+        } else {
+            "('public' = ANY(acl) OR acl && $2)"
+        }
+    }
+
+    async fn query_visible_job(
+        &self,
+        query: &str,
+        job_id: &str,
+        acl: &AclFilter,
+    ) -> Result<Option<Row>> {
+        let client = self.client().await?;
+        if let Some(tenant) = &acl.tenant {
+            Ok(client
+                .query_opt(query, &[&job_id, tenant, &acl.allowed_tags])
+                .await?)
+        } else {
+            Ok(client
+                .query_opt(query, &[&job_id, &acl.allowed_tags])
+                .await?)
+        }
+    }
+
     /// Read a job only when the caller can see its tenant and ACL. Invisible and absent rows are
     /// deliberately indistinguishable.
     pub async fn get_visible(&self, job_id: &str, acl: &AclFilter) -> Result<Option<IngestJob>> {
-        let sql = if acl.tenant.is_some() {
-            format!(
-                "SELECT {} FROM {} WHERE job_id = $1 AND tenant = $2 \
-                 AND ('public' = ANY(acl) OR acl && $3)",
-                sql::JOB_RETURN_COLUMNS,
-                self.table
-            )
-        } else {
-            format!(
-                "SELECT {} FROM {} WHERE job_id = $1 \
-                 AND ('public' = ANY(acl) OR acl && $2)",
-                sql::JOB_RETURN_COLUMNS,
-                self.table
-            )
-        };
-        let client = self.client.lock().await;
-        let row = if let Some(tenant) = &acl.tenant {
-            client
-                .query_opt(&sql, &[&job_id, tenant, &acl.allowed_tags])
-                .await?
-        } else {
-            client
-                .query_opt(&sql, &[&job_id, &acl.allowed_tags])
-                .await?
-        };
+        let query = format!(
+            "SELECT {} FROM {} WHERE job_id = $1 AND {}",
+            sql::JOB_RETURN_COLUMNS,
+            self.table,
+            Self::job_visibility_predicate(acl)
+        );
+        let row = self.query_visible_job(&query, job_id, acl).await?;
+        row.as_ref().map(row_to_job).transpose()
+    }
+
+    /// Requeues one visible dead-letter job after an operator has repaired the dependency.
+    /// Invisible, non-dead-letter, and source-pending rows are deliberately indistinguishable.
+    pub async fn retry_dead_letter_visible(
+        &self,
+        job_id: &str,
+        acl: &AclFilter,
+    ) -> Result<Option<IngestJob>> {
+        let query = format!(
+            "UPDATE {} SET state = 'queued', retry_count = 0, \
+             next_attempt_at = clock_timestamp(), error = NULL, error_stage = NULL, \
+             error_retryable = NULL, lease_owner = NULL, lease_until = NULL, \
+             heartbeat_at = NULL, stage_detail = '{{}}'::jsonb, chunk_count = 0, \
+             started_at = NULL, finished_at = NULL, updated_at = clock_timestamp() \
+             WHERE job_id = $1 AND state = 'failed' AND retry_count >= max_retries \
+             AND source_ready AND {} RETURNING {}",
+            self.table,
+            Self::job_visibility_predicate(acl),
+            sql::JOB_RETURN_COLUMNS
+        );
+        let row = self.query_visible_job(&query, job_id, acl).await?;
         row.as_ref().map(row_to_job).transpose()
     }
 
@@ -528,7 +630,7 @@ impl JobStore {
             .map_err(|_| PgError::Config("document list limit is too large".into()))?;
         let tenant_scoped = acl.tenant.is_some();
         let query = document_list_sql(&self.table, &self.chunks_table, tenant_scoped);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = if let Some(tenant) = &acl.tenant {
             client
                 .query(
@@ -565,7 +667,7 @@ impl JobStore {
     }
 
     pub async fn ingest_metrics(&self) -> Result<IngestMetrics> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(
                 &format!(
@@ -596,9 +698,19 @@ impl JobStore {
             )
             .await?
             .try_get("count")?;
+        let operational = client
+            .query_one(&sql::ingest_operational_metrics_sql(&self.table), &[])
+            .await?;
         Ok(IngestMetrics {
             state_counts,
             dead_letter_count,
+            retryable_failed_count: operational.try_get("retryable_failed_count")?,
+            source_pending_count: operational.try_get("source_pending_count")?,
+            cleanup_pending_count: operational.try_get("cleanup_pending_count")?,
+            active_lease_count: operational.try_get("active_lease_count")?,
+            expired_lease_count: operational.try_get("expired_lease_count")?,
+            workers_seen_recently: operational.try_get("workers_seen_recently")?,
+            oldest_ready_age_seconds: operational.try_get("oldest_ready_age_seconds")?,
         })
     }
 
@@ -621,9 +733,8 @@ impl JobStore {
             .map_err(|_| PgError::Config("job claim limit is too large".into()))?;
         let lease_for_ms = checked_duration_ms(lease_for_ms)?;
         let rows = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query(
                 &sql::claim_jobs_sql(&self.table),
                 &[&limit, &owner, &lease_for_ms],
@@ -644,9 +755,8 @@ impl JobStore {
     pub async fn heartbeat(&self, lease: &JobLease, lease_for_ms: u64) -> Result<bool> {
         let lease_for_ms = checked_duration_ms(lease_for_ms)?;
         let row = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query_opt(
                 &sql::heartbeat_job_sql(&self.table),
                 &[&lease.job.job_id, &lease.owner, &lease.epoch, &lease_for_ms],
@@ -674,9 +784,8 @@ impl JobStore {
         let lease_for_ms = checked_duration_ms(lease_for_ms)?;
         let detail = serde_json::to_string(stage_detail)?;
         let row = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query_opt(
                 &sql::advance_job_sql(&self.table),
                 &[
@@ -699,9 +808,8 @@ impl JobStore {
             return Err(PgError::Config("chunk_count must be non-negative".into()));
         }
         let row = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query_opt(
                 &sql::finish_job_sql(&self.table),
                 &[&lease.job.job_id, &lease.owner, &lease.epoch, &chunk_count],
@@ -726,7 +834,7 @@ impl JobStore {
         if chunk_count < 0 {
             return Err(PgError::Config("chunk_count must be non-negative".into()));
         }
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let transaction = client.transaction().await?;
         let fenced = transaction
             .query_opt(
@@ -754,7 +862,7 @@ impl JobStore {
             .query_one(
                 &format!(
                     "UPDATE {} SET state = 'indexed', chunk_count = $4, error = NULL, \
-                     error_stage = NULL, lease_owner = NULL, lease_until = NULL, \
+                     error_stage = NULL, error_retryable = NULL, lease_owner = NULL, lease_until = NULL, \
                      finished_at = clock_timestamp(), updated_at = clock_timestamp() \
                      WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
                      AND state = 'embedding' RETURNING job_id",
@@ -774,11 +882,11 @@ impl JobStore {
         error: &str,
         error_stage: &str,
         next_attempt_at_ms: i64,
+        retryable: bool,
     ) -> Result<Option<FailureDisposition>> {
         let row = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query_opt(
                 &sql::fail_job_sql(&self.table),
                 &[
@@ -788,6 +896,7 @@ impl JobStore {
                     &error,
                     &error_stage,
                     &next_attempt_at_ms,
+                    &retryable,
                 ],
             )
             .await?;
@@ -798,6 +907,7 @@ impl JobStore {
                 retry_count,
                 max_retries,
                 dead_letter: retry_count >= max_retries,
+                retryable: row.get("error_retryable"),
             }
         }))
     }
@@ -991,6 +1101,8 @@ fn row_to_job(row: &Row) -> Result<IngestJob> {
         tenant: row.try_get("tenant")?,
         acl: row.try_get("acl")?,
         source_uri: row.try_get("source_uri")?,
+        source_ready: row.try_get("source_ready")?,
+        cleanup_source_uri: row.try_get("cleanup_source_uri")?,
         content_sha256: row.try_get("content_sha256")?,
         content_bytes: row.try_get("content_bytes")?,
         media_type: row.try_get("media_type")?,
@@ -1008,6 +1120,7 @@ fn row_to_job(row: &Row) -> Result<IngestJob> {
         next_attempt_at_ms: row.try_get("next_attempt_at_ms")?,
         error: row.try_get("error")?,
         error_stage: row.try_get("error_stage")?,
+        error_retryable: row.try_get("error_retryable")?,
         created_at_ms: row.try_get("created_at_ms")?,
         updated_at_ms: row.try_get("updated_at_ms")?,
         started_at_ms: row.try_get("started_at_ms")?,
@@ -1048,6 +1161,7 @@ mod tests {
             tenant: Some("acme".into()),
             acl: vec!["team-a".into()],
             source_uri: format!("local://acme/kb/{doc_id}"),
+            source_ready: true,
             content_sha256: "a".repeat(64),
             content_bytes: 42,
             media_type: Some("text/markdown".into()),
@@ -1329,13 +1443,19 @@ mod tests {
             .expect("current embedding"));
         assert!(!first.finish(&stale, 1).await.expect("stale finish"));
         assert!(first
-            .fail(&stale, "late failure", "embedding", now_ms() - 1)
+            .fail(&stale, "late failure", "embedding", now_ms() - 1, true)
             .await
             .expect("stale fail")
             .is_none());
 
         let failure = second
-            .fail(&current, "embed unavailable", "embedding", now_ms() - 1)
+            .fail(
+                &current,
+                "embed unavailable",
+                "embedding",
+                now_ms() - 1,
+                true,
+            )
             .await
             .expect("fail")
             .expect("current lease accepted");
@@ -1464,10 +1584,27 @@ mod tests {
             .pop()
             .expect("replacement lease");
         assert!(store
-            .fail(&failed_lease, "parse failed", "parsing", now_ms())
+            .fail(&failed_lease, "parse failed", "parsing", now_ms(), true)
             .await
             .expect("fail replacement")
             .is_some());
+        let mut third = changed.clone();
+        third.content_sha256 = "c".repeat(64);
+        third.source_uri = "local://staged/third".into();
+        let cleanup_blocked = store
+            .submit_upload(&third)
+            .await
+            .expect("cleanup-pending result");
+        assert_eq!(
+            cleanup_blocked.disposition,
+            UploadDisposition::CleanupPending
+        );
+        assert_eq!(
+            cleanup_blocked.job.cleanup_source_uri,
+            replaced.job.cleanup_source_uri
+        );
+        assert_eq!(cleanup_blocked.job.source_uri, changed.source_uri);
+
         let reopened = store
             .submit_upload(&changed)
             .await
@@ -1515,6 +1652,176 @@ mod tests {
             .client
             .lock()
             .await
+            .batch_execute(&format!("DROP TABLE {table} CASCADE;"))
+            .await
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn fs304_source_handoff_and_terminal_failure_are_durable() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs304_source_handoff_and_terminal_failure_are_durable: DATABASE_URL not set"
+            );
+            return;
+        };
+        let table = format!("fs304_handoff_{}", std::process::id());
+        let store = JobStore::connect(&url, &table).await.expect("connect");
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table} CASCADE;"))
+            .await
+            .expect("clean");
+        store.ensure_schema().await.expect("schema");
+
+        let mut pending = sample_job("pending-job", "pending.md", 3);
+        pending.source_ready = false;
+        let reserved = store.submit_upload(&pending).await.expect("reserve source");
+        assert!(!reserved.job.source_ready);
+        assert!(store
+            .claim("worker-before-put", 1, 10_000)
+            .await
+            .expect("claim pending")
+            .is_empty());
+        assert!(store
+            .mark_source_ready(&pending.job_id, &pending.source_uri, "wrong-hash")
+            .await
+            .expect("wrong ready fence")
+            .is_none());
+
+        let ready = store
+            .mark_source_ready(
+                &pending.job_id,
+                &pending.source_uri,
+                &pending.content_sha256,
+            )
+            .await
+            .expect("mark ready")
+            .expect("reservation still current");
+        assert!(ready.source_ready);
+        let lease = store
+            .claim("worker-after-put", 1, 10_000)
+            .await
+            .expect("claim ready")
+            .pop()
+            .expect("ready job");
+        let active = store.ingest_metrics().await.expect("active metrics");
+        assert_eq!(active.active_lease_count, 1);
+        assert_eq!(active.workers_seen_recently, 1);
+        assert!(store
+            .advance(
+                &lease,
+                IngestState::Parsing,
+                IngestState::Chunking,
+                &serde_json::json!({"pages_done": 1}),
+                10_000,
+            )
+            .await
+            .expect("advance before terminal failure"));
+        let failure = store
+            .fail(&lease, "unsupported profile", "profile", now_ms(), false)
+            .await
+            .expect("terminal failure")
+            .expect("lease accepted");
+        assert!(!failure.retryable);
+        assert!(failure.dead_letter);
+        assert_eq!(failure.retry_count, 3);
+        let persisted = store.get(&pending.job_id).await.unwrap().unwrap();
+        assert_eq!(persisted.error_retryable, Some(false));
+        assert!(persisted.is_dead_letter());
+        assert_eq!(store.ingest_metrics().await.unwrap().active_lease_count, 0);
+        let hidden = store
+            .retry_dead_letter_visible(
+                &pending.job_id,
+                &AclFilter {
+                    tenant: Some("other".into()),
+                    allowed_tags: vec!["team-a".into()],
+                },
+            )
+            .await
+            .expect("hidden retry");
+        assert!(hidden.is_none());
+        let retried = store
+            .retry_dead_letter_visible(
+                &pending.job_id,
+                &AclFilter {
+                    tenant: Some("acme".into()),
+                    allowed_tags: vec!["team-a".into()],
+                },
+            )
+            .await
+            .expect("owner retry")
+            .expect("dead letter was visible");
+        assert_eq!(retried.state, IngestState::Queued);
+        assert_eq!(retried.retry_count, 0);
+        assert_eq!(retried.error_retryable, None);
+        assert_eq!(retried.stage_detail, serde_json::json!({}));
+        assert_eq!(retried.chunk_count, 0);
+        assert!(retried.started_at_ms.is_none());
+
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(&format!("DROP TABLE {table} CASCADE;"))
+            .await
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn fs304_job_store_reconnects_after_backend_termination() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs304_job_store_reconnects_after_backend_termination: DATABASE_URL not set"
+            );
+            return;
+        };
+        let table = format!("fs304_job_reconnect_{}", std::process::id());
+        let store = JobStore::connect(&url, &table)
+            .await
+            .expect("connect store");
+        store.ensure_schema().await.expect("schema");
+        store
+            .enqueue(&sample_job("reconnect-job", "reconnect.md", 3))
+            .await
+            .expect("enqueue");
+        let backend_pid: i32 = store
+            .client
+            .lock()
+            .await
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("backend pid")
+            .get(0);
+        let (killer, connection) = tokio_postgres::connect(&url, NoTls)
+            .await
+            .expect("killer connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        assert!(killer
+            .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
+            .await
+            .expect("terminate job connection")
+            .get::<_, bool>(0));
+        for _ in 0..50 {
+            if store.client.lock().await.is_closed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(store.client.lock().await.is_closed());
+        assert!(store
+            .get("reconnect-job")
+            .await
+            .expect("same JobStore instance reconnects")
+            .is_some());
+        store
+            .client()
+            .await
+            .unwrap()
             .batch_execute(&format!("DROP TABLE {table} CASCADE;"))
             .await
             .expect("cleanup");
@@ -1862,6 +2169,189 @@ mod tests {
             .lock()
             .await
             .batch_execute(&format!("DROP TABLE {table} CASCADE;"))
+            .await
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn fs304_pg_commit_before_publication_failure_reclaims_to_literal_golden() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs304_pg_commit_before_publication_failure_reclaims_to_literal_golden: DATABASE_URL not set"
+            );
+            return;
+        };
+        let suffix = std::process::id();
+        let jobs_table = format!("fs304_publish_jobs_{suffix}");
+        let chunks_table = format!("fs304_publish_chunks_{suffix}");
+        let mut config = crate::PgConfig::new(url.clone()).with_vector_dim(8);
+        config.table = chunks_table.clone();
+        let source = crate::PgStore::connect(config)
+            .await
+            .expect("source connect");
+        source.ensure_schema().await.expect("source schema");
+        let jobs = JobStore::connect_with_chunks_table(&url, &jobs_table, &chunks_table)
+            .await
+            .expect("jobs connect");
+        jobs.ensure_schema().await.expect("job schema");
+        jobs.submit_upload(&sample_job("t20a", "t20a.md", 3))
+            .await
+            .expect("submit");
+
+        let literal_golden = vec![
+            fastsearch_core::Chunk {
+                doc_id: "t20a.md".into(),
+                chunk_id: 1,
+                kind: fastsearch_core::ChunkKind::Heading,
+                text: "Recovery contract".into(),
+                page: 1,
+                bbox: fastsearch_core::BBox {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 1.0,
+                    y1: 1.0,
+                },
+                heading_path: vec!["Recovery".into()],
+                section_id: 1,
+                char_len: 17,
+                media: None,
+                media_bytes: None,
+                image_vector_status: None,
+                tenant: Some("acme".into()),
+                acl: vec!["team-a".into()],
+                metadata: Default::default(),
+                searchable: true,
+            },
+            fastsearch_core::Chunk {
+                doc_id: "t20a.md".into(),
+                chunk_id: 2,
+                kind: fastsearch_core::ChunkKind::Paragraph,
+                text: "Committed source rows replay idempotently.".into(),
+                page: 1,
+                bbox: fastsearch_core::BBox {
+                    x0: 0.0,
+                    y0: 1.0,
+                    x1: 1.0,
+                    y1: 2.0,
+                },
+                heading_path: vec!["Recovery".into()],
+                section_id: 1,
+                char_len: 42,
+                media: None,
+                media_bytes: None,
+                image_vector_status: None,
+                tenant: Some("acme".into()),
+                acl: vec!["team-a".into()],
+                metadata: Default::default(),
+                searchable: true,
+            },
+        ];
+        let lease = jobs
+            .claim("worker-before-crash", 1, 10_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        jobs.advance(
+            &lease,
+            IngestState::Parsing,
+            IngestState::Chunking,
+            &serde_json::json!({}),
+            10_000,
+        )
+        .await
+        .unwrap();
+        jobs.advance(
+            &lease,
+            IngestState::Chunking,
+            IngestState::Embedding,
+            &serde_json::json!({}),
+            10_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            jobs.publish_indexed(&lease, 2, || async {
+                source
+                    .upsert_doc("kb", "t20a.md", &literal_golden)
+                    .await
+                    .expect("PG source commit before injected crash");
+                Err::<(), _>("injected crash before derived commit")
+            })
+            .await
+            .expect("failed publication"),
+            PublicationResult::WriteFailed("injected crash before derived commit")
+        );
+        assert_eq!(
+            jobs.get("t20a").await.unwrap().unwrap().state,
+            IngestState::Embedding
+        );
+        assert_eq!(
+            source.fetch_doc("kb", "t20a.md").await.unwrap(),
+            literal_golden
+        );
+
+        jobs.client
+            .lock()
+            .await
+            .execute(
+                &format!("UPDATE {jobs_table} SET lease_until = clock_timestamp() - interval '1 second' WHERE job_id = 't20a'"),
+                &[],
+            )
+            .await
+            .expect("expire crashed lease");
+        assert_eq!(jobs.ingest_metrics().await.unwrap().expired_lease_count, 1);
+        let reclaimed = jobs
+            .claim("worker-after-crash", 1, 10_000)
+            .await
+            .unwrap()
+            .pop()
+            .expect("reclaim");
+        assert_eq!(reclaimed.job.lease_epoch, lease.job.lease_epoch + 1);
+        jobs.advance(
+            &reclaimed,
+            IngestState::Parsing,
+            IngestState::Chunking,
+            &serde_json::json!({}),
+            10_000,
+        )
+        .await
+        .unwrap();
+        jobs.advance(
+            &reclaimed,
+            IngestState::Chunking,
+            IngestState::Embedding,
+            &serde_json::json!({}),
+            10_000,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            jobs.publish_indexed(&reclaimed, 2, || async {
+                source
+                    .upsert_doc("kb", "t20a.md", &literal_golden)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            .expect("replay publication"),
+            PublicationResult::Published(())
+        ));
+        assert_eq!(
+            jobs.get("t20a").await.unwrap().unwrap().state,
+            IngestState::Indexed
+        );
+        assert_eq!(
+            source.fetch_doc("kb", "t20a.md").await.unwrap(),
+            literal_golden
+        );
+
+        jobs.client
+            .lock()
+            .await
+            .batch_execute(&format!(
+                "DROP TABLE {jobs_table} CASCADE; DROP TABLE {chunks_table}_signal CASCADE; DROP TABLE {chunks_table} CASCADE;"
+            ))
             .await
             .expect("cleanup");
     }

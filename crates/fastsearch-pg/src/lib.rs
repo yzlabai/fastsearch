@@ -139,6 +139,20 @@ impl PgStore {
         })
     }
 
+    async fn client(&self) -> Result<tokio::sync::MutexGuard<'_, Client>> {
+        let mut client = self.client.lock().await;
+        if client.is_closed() {
+            let (replacement, connection) = tokio_postgres::connect(&self.cfg.url, NoTls).await?;
+            tokio::spawn(async move {
+                if let Err(error) = connection.await {
+                    eprintln!("fastsearch-pg replacement connection error: {error}");
+                }
+            });
+            *client = replacement;
+        }
+        Ok(client)
+    }
+
     /// 幂等建表/扩展/索引/publication。
     pub async fn ensure_schema(&self) -> Result<()> {
         // **并发 boot 安全**：引擎是多副本/无状态（CLAUDE.md），多副本同时 boot 都会跑这段
@@ -156,16 +170,15 @@ impl PgStore {
             batch.push('\n');
         }
         batch.push_str("COMMIT;\n");
-        self.client.lock().await.batch_execute(&batch).await?;
+        self.client().await?.batch_execute(&batch).await?;
         self.ensure_embedding_type().await?;
         Ok(())
     }
 
     async fn ensure_embedding_type(&self) -> Result<()> {
         let actual = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query_opt(
                 "SELECT format_type(a.atttypid, a.atttypmod) AS embedding_type \
                  FROM pg_attribute a \
@@ -223,7 +236,7 @@ impl PgStore {
         }
         let del = sql::delete_doc_sql(&self.cfg.table);
         let ins = sql::insert_sql(&self.cfg.table);
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client.transaction().await?;
         // GlobalId deliberately excludes tenant. Serialize every replacement for this coordinate,
         // then reject a different owner before DELETE so one tenant can never replace another's
@@ -288,7 +301,7 @@ impl PgStore {
     /// 删除某 doc 全部 chunk。
     pub async fn delete_doc(&self, collection: &str, doc_id: &str) -> Result<u64> {
         let del = sql::delete_doc_sql(&self.cfg.table);
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client.transaction().await?;
         tx.execute(
             &sql::delete_doc_signals_sql(&self.signal_table),
@@ -304,9 +317,8 @@ impl PgStore {
     pub async fn fetch_doc(&self, collection: &str, doc_id: &str) -> Result<Vec<Chunk>> {
         let q = sql::fetch_doc_sql(&self.cfg.table);
         let rows = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query(&q, &[&collection, &doc_id])
             .await?;
         rows.iter().map(row_to_chunk).collect()
@@ -333,12 +345,7 @@ impl PgStore {
             &row.embedding,
             &row.error,
         ];
-        let updated = self
-            .client
-            .lock()
-            .await
-            .query_opt(&statement, &params)
-            .await?;
+        let updated = self.client().await?.query_opt(&statement, &params).await?;
         if updated.is_some() {
             return Ok(1);
         }
@@ -361,9 +368,8 @@ impl PgStore {
     pub async fn fetch_signals(&self, gid: &GlobalId) -> Result<Vec<Signal>> {
         let statement = sql::fetch_signals_sql(&self.signal_table);
         let rows = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query(
                 &statement,
                 &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
@@ -388,9 +394,8 @@ impl PgStore {
         let signal_type = signal_type.as_str();
         let embedding = embedding.to_vec();
         Ok(self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .execute(
                 &statement,
                 &[
@@ -411,9 +416,8 @@ impl PgStore {
     /// foreign key and external SQL writers can bypass those paths.
     pub async fn orphan_signal_count(&self) -> Result<usize> {
         let rows = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query(
                 &sql::orphan_signals_sql(&self.signal_table, &self.cfg.table),
                 &[],
@@ -432,9 +436,8 @@ impl PgStore {
         let chunk_ids: Vec<i64> = ids.iter().map(|id| id.chunk_id as i64).collect();
         let q = sql::batch_get_sql(&self.cfg.table);
         let rows = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query(&q, &[&collections, &doc_ids, &chunk_ids])
             .await?;
         rows.iter()
@@ -469,7 +472,7 @@ impl PgStore {
             }
         }
         let sql = sql::upsert_chunk_sql(&self.cfg.table);
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client.transaction().await?;
         // Acquire the same globally ordered document locks as `upsert_doc`. Sorting prevents two
         // multi-document batches from deadlocking, and checking all existing chunks prevents a
@@ -552,7 +555,7 @@ impl PgStore {
         acl: &AclFilter,
     ) -> Result<Vec<bool>> {
         let sql = sql::delete_chunk_visible_sql(&self.cfg.table, acl.tenant.is_some());
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client.transaction().await?;
         let mut deleted = Vec::with_capacity(ids.len());
         for id in ids {
@@ -597,10 +600,9 @@ impl PgStore {
         let q = sql::list_doc_chunks_sql(&self.cfg.table, acl.tenant.is_some());
         let after = after_chunk_id.map_or(-1, |id| id as i64);
         let limit = limit as i64;
+        let client = self.client().await?;
         let rows = if let Some(tenant) = &acl.tenant {
-            self.client
-                .lock()
-                .await
+            client
                 .query(
                     &q,
                     &[
@@ -614,9 +616,7 @@ impl PgStore {
                 )
                 .await?
         } else {
-            self.client
-                .lock()
-                .await
+            client
                 .query(
                     &q,
                     &[&collection, &doc_id, &after, &acl.allowed_tags, &limit],
@@ -633,7 +633,7 @@ impl PgStore {
         owner_tenant: Option<&str>,
     ) -> Result<DeletedCollection> {
         let q = sql::delete_collection_sql(&self.cfg.table, owner_tenant.is_some());
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client.transaction().await?;
         let rows = match owner_tenant {
             Some(tenant) => tx.query(&q, &[&collection, &tenant]).await?,
@@ -673,9 +673,8 @@ impl PgStore {
     ) -> Result<Option<Vec<u8>>> {
         let q = sql::fetch_media_bytes_sql(&self.cfg.table);
         let rows = self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .query(&q, &[&collection, &doc_id, &(chunk_id as i64)])
             .await?;
         match rows.first() {
@@ -687,7 +686,7 @@ impl PgStore {
     /// 全表读取 `(collection, Chunk)`（初始快照 bootstrap 用）。v1 全量；超大表分页为后续。
     pub async fn fetch_all_chunks(&self) -> Result<Vec<(String, Chunk)>> {
         let q = sql::fetch_all_sql(&self.cfg.table);
-        let rows = self.client.lock().await.query(&q, &[]).await?;
+        let rows = self.client().await?.query(&q, &[]).await?;
         rows.iter()
             .map(|r| Ok((r.try_get::<_, String>("collection")?, row_to_chunk(r)?)))
             .collect()
@@ -719,9 +718,8 @@ impl PgStore {
         );
         let v = format_vector(embedding);
         Ok(self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .execute(
                 &sql,
                 &[&v, &collection, &doc_id, &(chunk_id as i64), &model],
@@ -743,9 +741,8 @@ impl PgStore {
             self.cfg.table
         );
         Ok(self
-            .client
-            .lock()
-            .await
+            .client()
+            .await?
             .execute(&sql, &[&collection, &doc_id, &(chunk_id as i64)])
             .await?)
     }
@@ -773,7 +770,7 @@ impl PgStore {
              WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 AND embedding IS NOT NULL",
             self.cfg.table
         );
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client.transaction().await?;
         let mut counts = Vec::with_capacity(writes.len());
         for write in writes {
@@ -836,7 +833,7 @@ impl PgStore {
         let (sql, sparams) =
             pgvector_search_sql(&self.cfg.table, self.cfg.vector_type, limit, acl, filter);
         // filter-aware：iterative scan + 提高 ef_search（会话级，对本直查连接生效）。
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .batch_execute("SET hnsw.iterative_scan = relaxed_order; SET hnsw.ef_search = 100;")
             .await
@@ -930,7 +927,7 @@ impl PgStore {
             .iter()
             .map(|value| &**value as &(dyn ToSql + Sync))
             .collect();
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client.query(&statement, &params).await?;
 
         let mut grouped = std::collections::BTreeMap::<String, Vec<SignalRecallHit>>::new();
@@ -1370,6 +1367,56 @@ mod tests {
         assert!(
             signal_exists,
             "concurrent boot must create the derived signal table"
+        );
+    }
+
+    #[tokio::test]
+    async fn fs304_pg_store_reconnects_after_backend_termination() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs304_pg_store_reconnects_after_backend_termination: DATABASE_URL not set"
+            );
+            return;
+        };
+        let store = PgStore::connect(PgConfig::new(url.clone()))
+            .await
+            .expect("connect store");
+        let backend_pid: i32 = store
+            .client
+            .lock()
+            .await
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("backend pid")
+            .get(0);
+        let (killer, connection) = tokio_postgres::connect(&url, NoTls)
+            .await
+            .expect("killer connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        assert!(killer
+            .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
+            .await
+            .expect("terminate source connection")
+            .get::<_, bool>(0));
+        for _ in 0..50 {
+            if store.client.lock().await.is_closed() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(store.client.lock().await.is_closed());
+        assert_eq!(
+            store
+                .client()
+                .await
+                .expect("same PgStore instance reconnects")
+                .query_one("SELECT 1::integer", &[])
+                .await
+                .expect("query after reconnect")
+                .get::<_, i32>(0),
+            1
         );
     }
 

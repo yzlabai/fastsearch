@@ -2,7 +2,7 @@
 //!
 //! 第四张脸：**MCP（Model Context Protocol）服务**，stdio + JSON-RPC 2.0，把混合检索暴露为
 //! LLM 可直接调用的工具（`search` / `resolve_citation`；远端能力档另有 `index_chunks` /
-//! `ingest_document` / `ingest_status`）。薄适配引擎，逻辑在 lib（纯、可单测），main 只是 stdio 收发壳。
+//! `ingest_document` / `ingest_status` / `retry_ingest`）。薄适配引擎，逻辑在 lib（纯、可单测），main 只是 stdio 收发壳。
 //!
 //! **ACL 不可绕过（守不变量 #3）**：principal/ACL 由**服务端配置**注入 `engine.search`/
 //! `resolve_citation`，MCP 客户端（LLM）的工具入参里**不接受也无法放宽** ACL——与 REST 一致。
@@ -311,6 +311,7 @@ impl McpServer {
             "index_chunks" => self.tool_index_chunks(args),
             "ingest_document" => self.tool_ingest_document(args),
             "ingest_status" => self.tool_ingest_status(args),
+            "retry_ingest" => self.tool_retry_ingest(args),
             other => Err(format!("unknown tool: {other}")),
         };
         match outcome {
@@ -534,6 +535,7 @@ impl McpServer {
         "timeout_ms",
     ];
     const INGEST_STATUS_ARGS: [&'static str; 1] = ["job_id"];
+    const INGEST_RETRY_ARGS: [&'static str; 1] = ["job_id"];
 
     fn tool_ingest_document(&self, args: Value) -> Result<String, String> {
         let Backend::Remote(remote) = &self.backend else {
@@ -653,6 +655,27 @@ impl McpServer {
         reject_unknown_tool_args(object, &Self::INGEST_STATUS_ARGS, "ingest_status")?;
         let job_id = required_tool_string(object, "job_id")?;
         let response = remote.get(&format!("/v1/jobs/{}", pct_segment(job_id)))?;
+        serde_json::to_string(&annotate_ingest_job(response, false))
+            .map_err(|error| error.to_string())
+    }
+
+    fn tool_retry_ingest(&self, args: Value) -> Result<String, String> {
+        let Backend::Remote(remote) = &self.backend else {
+            return Err(
+                "本实例是本地档，不提供死信恢复；请设置 FASTSEARCH_SERVER + FASTSEARCH_KEY。"
+                    .into(),
+            );
+        };
+        if !remote.caps.document_ingest {
+            return Err("远端 server 未报告 document_ingest 能力。".into());
+        }
+        let object = args.as_object().ok_or("arguments 必须是对象")?;
+        reject_unknown_tool_args(object, &Self::INGEST_RETRY_ARGS, "retry_ingest")?;
+        let job_id = required_tool_string(object, "job_id")?;
+        let response = remote.post(
+            &format!("/v1/jobs/{}/retry", pct_segment(job_id)),
+            &json!({}),
+        )?;
         serde_json::to_string(&annotate_ingest_job(response, false))
             .map_err(|error| error.to_string())
     }
@@ -951,6 +974,15 @@ impl McpServer {
                     defs.push(json!({
                         "name": "ingest_status",
                         "description": "读取异步摄取 job 的当前状态。越权与不存在均由 server 返回不可区分的 404；                            非终态响应会给出下一次轮询提示。",
+                        "inputSchema": {
+                            "type":"object",
+                            "properties":{"job_id":{"type":"string"}},
+                            "required":["job_id"]
+                        }
+                    }));
+                    defs.push(json!({
+                        "name": "retry_ingest",
+                        "description": "依赖修复后重新排队一个 dead-letter 摄取 job。只对当前 API key 可见且已死信的 job 生效；越权/不存在均为不可区分的 404。",
                         "inputSchema": {
                             "type":"object",
                             "properties":{"job_id":{"type":"string"}},
@@ -1946,6 +1978,7 @@ mod tests {
         for (name, allow) in [
             ("ingest_document", McpServer::INGEST_ARGS.as_slice()),
             ("ingest_status", McpServer::INGEST_STATUS_ARGS.as_slice()),
+            ("retry_ingest", McpServer::INGEST_RETRY_ARGS.as_slice()),
         ] {
             let tool = defs
                 .as_array()
@@ -1978,6 +2011,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!names.contains(&"ingest_document"));
         assert!(!names.contains(&"ingest_status"));
+        assert!(!names.contains(&"retry_ingest"));
     }
 
     #[test]
@@ -2075,6 +2109,30 @@ mod tests {
         assert_eq!(result["terminal"], false);
         assert_eq!(result["next_tool"], "ingest_status");
         assert_eq!(result["next_arguments"]["job_id"], "j2");
+    }
+
+    #[test]
+    fn remote_retry_ingest_posts_dead_letter_recovery_action() {
+        let queued = r#"{"job_id":"j-dead","state":"queued","dead_letter":false,
+            "retry_count":0,"next_action":"poll"}"#;
+        let (url, rx) = spawn_server(PROBE_INGEST, queued);
+        let backend = RemoteBackend::connect(Some(url), Some("owner-key".into())).unwrap();
+        let server = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let _ = rx.recv().unwrap();
+        let response = server
+            .handle(&json!({
+                "jsonrpc":"2.0","id":74,"method":"tools/call",
+                "params":{"name":"retry_ingest","arguments":{"job_id":"j-dead"}}
+            }))
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        let result: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(result["state"], "queued");
+        let request = String::from_utf8(rx.recv().unwrap()).unwrap();
+        assert!(request.starts_with("POST /v1/jobs/j-dead/retry"));
+        assert!(request.to_ascii_lowercase().contains("bearer owner-key"));
     }
 
     /// chunk 里夹带 tenant/acl → **显式拒绝**，不让 server 静默覆盖。

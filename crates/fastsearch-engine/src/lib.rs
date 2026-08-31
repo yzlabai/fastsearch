@@ -545,6 +545,24 @@ pub struct PresignedUrl {
 
 /// 对象存储后端 trait（P4 地基）。默认构建只编译 trait；S3/MinIO 真实现必须 feature-gated。
 pub trait ObjectStore: Send + Sync {
+    /// Computes the authoritative URI for a key without writing remote state.
+    ///
+    /// The default keeps existing third-party implementations source-compatible. Stores that
+    /// participate in the durable upload handoff must override this method together with
+    /// [`ObjectStore::put_uri`].
+    fn target_uri(&self, _key: &str) -> ObjectResult<String> {
+        Err(ObjectError {
+            kind: ObjectErrorKind::UnsupportedMediaType,
+            message: "object store does not support URI reservation".into(),
+        })
+    }
+    /// Writes bytes to a previously reserved URI. Implementations must reject another bucket.
+    fn put_uri(&self, _uri: &str, _bytes: &[u8], _content_type: &str) -> ObjectResult<ObjectRef> {
+        Err(ObjectError {
+            kind: ObjectErrorKind::UnsupportedMediaType,
+            message: "object store does not support writes to reserved URIs".into(),
+        })
+    }
     fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef>;
     fn get(&self, uri: &str, max_bytes: usize) -> ObjectResult<ObjectBytes>;
     fn presign_get(&self, uri: &str, content_type: Option<&str>) -> ObjectResult<PresignedUrl>;
@@ -698,6 +716,26 @@ fn validate_object_scope(
     Ok(())
 }
 
+fn validate_object_key(key: &str) -> ObjectResult<()> {
+    let tenant_segment = key.split('/').next().unwrap_or_default();
+    if key.is_empty()
+        || key.starts_with('/')
+        || key.contains('\\')
+        || key
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !tenant_segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(ObjectError {
+            kind: ObjectErrorKind::InvalidMetadata,
+            message: "invalid tenant-scoped object key".into(),
+        });
+    }
+    Ok(())
+}
+
 fn content_type_for_key(key: &str) -> &'static str {
     match key
         .rsplit('.')
@@ -716,20 +754,27 @@ fn content_type_for_key(key: &str) -> &'static str {
 }
 
 impl ObjectStore for LocalObjectStore {
-    fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef> {
+    fn target_uri(&self, key: &str) -> ObjectResult<String> {
+        validate_object_key(key)?;
+        Ok(format!("s3://{}/{key}", self.default_bucket))
+    }
+
+    fn put_uri(&self, uri: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef> {
         if bytes.len() > self.max_bytes {
             return Err(ObjectError {
                 kind: ObjectErrorKind::TooLarge,
                 message: format!("object is {} bytes, limit {}", bytes.len(), self.max_bytes),
             });
         }
-        if key.is_empty() || key.split('/').any(|p| p == "..") || key.starts_with('/') {
+        let (provider, bucket, key) = parse_object_uri(uri)?;
+        if !matches!(provider, "s3" | "minio" | "local") || bucket != self.default_bucket {
             return Err(ObjectError {
-                kind: ObjectErrorKind::InvalidMetadata,
-                message: "invalid object key".into(),
+                kind: ObjectErrorKind::Forbidden,
+                message: "reserved object URI belongs to another provider or bucket".into(),
             });
         }
-        let path = self.path_for(&self.default_bucket, key);
+        validate_object_key(key)?;
+        let path = self.path_for(bucket, key);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ObjectError {
                 kind: ObjectErrorKind::Transient,
@@ -741,16 +786,21 @@ impl ObjectStore for LocalObjectStore {
             message: format!("write object: {e}"),
         })?;
         Ok(ObjectRef {
-            uri: format!("s3://{}/{key}", self.default_bucket),
-            bucket: self.default_bucket.clone(),
+            uri: uri.to_string(),
+            bucket: bucket.to_string(),
             key: key.to_string(),
-            provider: "s3".into(),
+            provider: provider.to_string(),
             content_type: content_type.to_string(),
             size: bytes.len() as u64,
             sha256: sha256_hex(bytes),
             etag: None,
             owner_tenant: None,
         })
+    }
+
+    fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef> {
+        let uri = self.target_uri(key)?;
+        self.put_uri(&uri, bytes, content_type)
     }
 
     fn get(&self, uri: &str, max_bytes: usize) -> ObjectResult<ObjectBytes> {
@@ -911,31 +961,43 @@ impl S3ObjectStore {
 }
 
 impl ObjectStore for S3ObjectStore {
-    fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef> {
+    fn target_uri(&self, key: &str) -> ObjectResult<String> {
+        validate_object_key(key)?;
+        Ok(format!("s3://{}/{key}", self.bucket))
+    }
+
+    fn put_uri(&self, uri: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef> {
         if bytes.len() > self.max_bytes {
             return Err(ObjectError {
                 kind: ObjectErrorKind::TooLarge,
                 message: format!("object is {} bytes, limit {}", bytes.len(), self.max_bytes),
             });
         }
-        if key.is_empty() || key.starts_with('/') || key.split('/').any(|p| p == "..") {
+        let (provider, bucket, key) = parse_object_uri(uri)?;
+        if provider != "s3" || bucket != self.bucket {
             return Err(ObjectError {
-                kind: ObjectErrorKind::InvalidMetadata,
-                message: "invalid object key".into(),
+                kind: ObjectErrorKind::Forbidden,
+                message: "reserved object URI belongs to another provider or bucket".into(),
             });
         }
-        self.request("PUT", &self.bucket, key, Some(bytes), Some(content_type))?;
+        validate_object_key(key)?;
+        self.request("PUT", bucket, key, Some(bytes), Some(content_type))?;
         Ok(ObjectRef {
-            uri: format!("s3://{}/{key}", self.bucket),
-            bucket: self.bucket.clone(),
+            uri: uri.to_string(),
+            bucket: bucket.to_string(),
             key: key.to_string(),
-            provider: "s3".into(),
+            provider: provider.to_string(),
             content_type: content_type.to_string(),
             size: bytes.len() as u64,
             sha256: sha256_hex(bytes),
             etag: None,
             owner_tenant: None,
         })
+    }
+
+    fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> ObjectResult<ObjectRef> {
+        let uri = self.target_uri(key)?;
+        self.put_uri(&uri, bytes, content_type)
     }
 
     fn get(&self, uri: &str, max_bytes: usize) -> ObjectResult<ObjectBytes> {
@@ -1119,6 +1181,14 @@ impl NoopObjectStore {
 }
 
 impl ObjectStore for NoopObjectStore {
+    fn target_uri(&self, _key: &str) -> ObjectResult<String> {
+        Err(self.err())
+    }
+
+    fn put_uri(&self, _uri: &str, _bytes: &[u8], _content_type: &str) -> ObjectResult<ObjectRef> {
+        Err(self.err())
+    }
+
     fn put(&self, _key: &str, _bytes: &[u8], _content_type: &str) -> ObjectResult<ObjectRef> {
         Err(self.err())
     }
@@ -1618,6 +1688,24 @@ impl Engine {
         store
             .put(key, bytes, content_type)
             .map_err(|e| EngineError::Vector(format!("put object: {e}")))
+    }
+
+    pub fn object_target_uri(&self, key: &str) -> Result<String> {
+        let Some(store) = &self.object_store else {
+            return Err(EngineError::Vector("object store not configured".into()));
+        };
+        store
+            .target_uri(key)
+            .map_err(|e| EngineError::Vector(format!("reserve object URI: {e}")))
+    }
+
+    pub fn put_object_uri(&self, uri: &str, bytes: &[u8], content_type: &str) -> Result<ObjectRef> {
+        let Some(store) = &self.object_store else {
+            return Err(EngineError::Vector("object store not configured".into()));
+        };
+        store
+            .put_uri(uri, bytes, content_type)
+            .map_err(|e| EngineError::Vector(format!("put reserved object: {e}")))
     }
 
     pub fn validate_object_ref(
@@ -3132,6 +3220,33 @@ mod tests {
             .get("s3://../secret.png", 1024)
             .expect_err("bucket traversal must be rejected");
         assert_eq!(err.kind, ObjectErrorKind::InvalidMetadata);
+    }
+
+    #[test]
+    fn local_object_store_reserves_deterministic_uri_before_put() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(tmp.path(), "documents");
+        assert_eq!(
+            store.target_uri("bad tenant/kb/raw.md").unwrap_err().kind,
+            ObjectErrorKind::InvalidMetadata
+        );
+        let uri = store.target_uri("acme/kb/report/raw-a.md").unwrap();
+        assert_eq!(uri, "s3://documents/acme/kb/report/raw-a.md");
+        assert_eq!(
+            store.validate_ref(&uri, Some("acme")).unwrap_err().kind,
+            ObjectErrorKind::NotFound
+        );
+
+        let object = store.put_uri(&uri, b"ready", "text/markdown").unwrap();
+        assert_eq!(object.uri, uri);
+        assert_eq!(store.get(&uri, 32).unwrap().bytes, b"ready");
+        assert_eq!(
+            store
+                .put_uri("s3://foreign/acme/kb/raw.md", b"bad", "text/plain")
+                .unwrap_err()
+                .kind,
+            ObjectErrorKind::Forbidden
+        );
     }
 
     fn img2_no_bytes() -> Chunk {

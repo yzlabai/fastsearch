@@ -6,7 +6,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use fastsearch_core::{BBox, Chunk, ChunkKind, ImageVectorStatus, MediaRef, Metadata};
-use fastsearch_engine::{LocalObjectStore, ObjectStore, S3ObjectStore};
+use fastsearch_engine::{
+    LocalObjectStore, ObjectError, ObjectErrorKind, ObjectStore, S3ObjectStore,
+};
 use fastsearch_ingest_adapter::{
     chunks_for_file, ChunkProfile, Enhancements, ImageBytes, ParseOptions,
 };
@@ -207,6 +209,7 @@ impl WorkerClient {
         stage: &str,
         message: &str,
         next_attempt_at_ms: i64,
+        retryable: bool,
     ) -> std::result::Result<Value, HttpError> {
         let client = self.clone();
         let path = format!("/v1/jobs/{}/status", lease.job.job_id);
@@ -218,6 +221,7 @@ impl WorkerClient {
             "error": truncate_error(message),
             "error_stage": stage,
             "next_attempt_at_ms": next_attempt_at_ms,
+            "retryable": retryable,
         });
         tokio::task::spawn_blocking(move || client.post(&path, body))
             .await
@@ -429,46 +433,65 @@ async fn run_slot(
     objects: Arc<dyn ObjectStore>,
     owner: String,
 ) -> Result<()> {
-    let jobs = JobStore::connect_with_chunks_table(
-        &config.database_url,
-        config.jobs_table.clone(),
-        config.chunks_table.clone(),
-    )
-    .await
-    .context("connect worker job store")?;
-    jobs.ensure_schema()
-        .await
-        .context("ensure ingest job schema")?;
     let client = WorkerClient::new(&config);
     let mut idle_ms = config.idle_min_ms;
     loop {
-        let mut claimed = jobs
-            .claim(&owner, 1, config.lease_ms)
-            .await
-            .context("claim ingest job")?;
-        let Some(lease) = claimed.pop() else {
+        let jobs = match JobStore::connect_with_chunks_table(
+            &config.database_url,
+            config.jobs_table.clone(),
+            config.chunks_table.clone(),
+        )
+        .await
+        {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                eprintln!("warn: ingest worker PG connect failed; retrying: {error}");
+                tokio::time::sleep(Duration::from_millis(idle_ms)).await;
+                idle_ms = idle_ms.saturating_mul(2).min(config.idle_max_ms);
+                continue;
+            }
+        };
+        if let Err(error) = jobs.ensure_schema().await {
+            eprintln!("warn: ingest worker PG schema check failed; retrying: {error}");
             tokio::time::sleep(Duration::from_millis(idle_ms)).await;
             idle_ms = idle_ms.saturating_mul(2).min(config.idle_max_ms);
             continue;
-        };
-        idle_ms = config.idle_min_ms;
-        match process_lease(&config, &client, &objects, &lease).await {
-            Ok(WorkOutcome::Indexed) => eprintln!(
-                "ingest worker indexed job={} doc={}/{}",
-                lease.job.job_id, lease.job.collection, lease.job.doc_id
-            ),
-            Ok(WorkOutcome::Failed) => eprintln!(
-                "ingest worker recorded failure job={} retry={}/{}",
-                lease.job.job_id,
-                lease.job.retry_count.saturating_add(1),
-                lease.job.max_retries
-            ),
-            Ok(WorkOutcome::LeaseLost) => eprintln!(
-                "ingest worker stopped stale work job={} epoch={}",
-                lease.job.job_id, lease.epoch
-            ),
-            Err(error) => return Err(error),
         }
+        idle_ms = config.idle_min_ms;
+        loop {
+            let mut claimed = match jobs.claim(&owner, 1, config.lease_ms).await {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    eprintln!("warn: ingest worker PG claim failed; reconnecting: {error}");
+                    break;
+                }
+            };
+            let Some(lease) = claimed.pop() else {
+                tokio::time::sleep(Duration::from_millis(idle_ms)).await;
+                idle_ms = idle_ms.saturating_mul(2).min(config.idle_max_ms);
+                continue;
+            };
+            idle_ms = config.idle_min_ms;
+            match process_lease(&config, &client, &objects, &lease).await {
+                Ok(WorkOutcome::Indexed) => eprintln!(
+                    "ingest worker indexed job={} doc={}/{}",
+                    lease.job.job_id, lease.job.collection, lease.job.doc_id
+                ),
+                Ok(WorkOutcome::Failed) => eprintln!(
+                    "ingest worker recorded failure job={} retry={}/{}",
+                    lease.job.job_id,
+                    lease.job.retry_count.saturating_add(1),
+                    lease.job.max_retries
+                ),
+                Ok(WorkOutcome::LeaseLost) => eprintln!(
+                    "ingest worker stopped stale work job={} lease_epoch={}",
+                    lease.job.job_id, lease.epoch
+                ),
+                Err(error) => return Err(error),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(idle_ms)).await;
+        idle_ms = idle_ms.saturating_mul(2).min(config.idle_max_ms);
     }
 }
 
@@ -485,6 +508,10 @@ enum WorkError {
         stage: &'static str,
         message: String,
     },
+    Terminal {
+        stage: &'static str,
+        message: String,
+    },
     LeaseLost,
     Fatal(String),
 }
@@ -492,6 +519,13 @@ enum WorkError {
 impl WorkError {
     fn retryable(stage: &'static str, error: impl std::fmt::Display) -> Self {
         Self::Retryable {
+            stage,
+            message: error.to_string(),
+        }
+    }
+
+    fn terminal(stage: &'static str, error: impl std::fmt::Display) -> Self {
+        Self::Terminal {
             stage,
             message: error.to_string(),
         }
@@ -509,7 +543,9 @@ async fn process_lease(
     let heartbeat_failure = heartbeat.stop().await;
     if let Some(error) = heartbeat_failure {
         if is_auth_error(&error) {
-            return Err(anyhow!("worker key rejected during heartbeat: {error}"));
+            return Err(anyhow!(
+                "worker API credential lacks the worker capability during heartbeat: {error}"
+            ));
         }
         return Ok(WorkOutcome::LeaseLost);
     }
@@ -518,21 +554,34 @@ async fn process_lease(
         Err(WorkError::LeaseLost) => Ok(WorkOutcome::LeaseLost),
         Err(WorkError::Fatal(message)) => Err(anyhow!(message)),
         Err(WorkError::Retryable { stage, message }) => {
-            let next = next_attempt_at_ms(lease);
-            match client.fail(lease, stage, &message, next).await {
-                Ok(_) => Ok(WorkOutcome::Failed),
-                Err(error) if is_fence_error(&error) => Ok(WorkOutcome::LeaseLost),
-                Err(error) if is_auth_error(&error) => Err(anyhow!(
-                    "worker key rejected while reporting failure: {error}"
-                )),
-                Err(error) => {
-                    eprintln!(
-                        "warn: unable to report job={} failure; lease expiry will recover it: {error}",
-                        lease.job.job_id
-                    );
-                    Ok(WorkOutcome::Failed)
-                }
-            }
+            report_work_failure(client, lease, stage, &message, true).await
+        }
+        Err(WorkError::Terminal { stage, message }) => {
+            report_work_failure(client, lease, stage, &message, false).await
+        }
+    }
+}
+
+async fn report_work_failure(
+    client: &WorkerClient,
+    lease: &JobLease,
+    stage: &'static str,
+    message: &str,
+    retryable: bool,
+) -> Result<WorkOutcome> {
+    let next = next_attempt_at_ms(lease);
+    match client.fail(lease, stage, message, next, retryable).await {
+        Ok(_) => Ok(WorkOutcome::Failed),
+        Err(error) if is_fence_error(&error) => Ok(WorkOutcome::LeaseLost),
+        Err(error) if is_auth_error(&error) => Err(anyhow!(
+            "worker API credential lacks the worker capability while reporting failure: {error}"
+        )),
+        Err(error) => {
+            eprintln!(
+                "warn: unable to report job={} failure; lease expiry will recover it: {error}",
+                lease.job.job_id
+            );
+            Ok(WorkOutcome::Failed)
         }
     }
 }
@@ -555,11 +604,11 @@ async fn process_inner(
     })
     .await
     .map_err(|error| WorkError::retryable("fetch", error))?
-    .map_err(|error| WorkError::retryable("fetch", error))?;
+    .map_err(|error| classify_object_error("fetch", error))?;
     heartbeat.check()?;
 
     let settings = parse_settings(&lease.job.parse_profile)
-        .map_err(|error| WorkError::retryable("profile", error))?;
+        .map_err(|error| classify_deterministic_error("profile", error))?;
     let doc_id = lease.job.doc_id.clone();
     let filename = lease.job.filename.clone();
     let media_type = lease.job.media_type.clone();
@@ -574,7 +623,7 @@ async fn process_inner(
     })
     .await
     .map_err(|error| WorkError::retryable("parsing", error))?
-    .map_err(|error| WorkError::retryable("parsing", error))?;
+    .map_err(|error| classify_deterministic_error("parsing", error))?;
     heartbeat.check()?;
 
     let chunks_len = parsed.chunks.len();
@@ -683,9 +732,29 @@ fn map_http_error(stage: &'static str, error: HttpError) -> WorkError {
         WorkError::LeaseLost
     } else if is_auth_error(&error) {
         WorkError::Fatal(error.to_string())
+    } else if matches!(error, HttpError::Status(400..=499, _))
+        && !matches!(error, HttpError::Status(408 | 425 | 429, _))
+    {
+        WorkError::terminal(stage, error)
     } else {
         WorkError::retryable(stage, error)
     }
+}
+
+fn classify_object_error(stage: &'static str, error: ObjectError) -> WorkError {
+    match error.kind {
+        ObjectErrorKind::NotFound | ObjectErrorKind::Transient => {
+            WorkError::retryable(stage, error)
+        }
+        ObjectErrorKind::Forbidden
+        | ObjectErrorKind::InvalidMetadata
+        | ObjectErrorKind::TooLarge
+        | ObjectErrorKind::UnsupportedMediaType => WorkError::terminal(stage, error),
+    }
+}
+
+fn classify_deterministic_error(stage: &'static str, error: impl std::fmt::Display) -> WorkError {
+    WorkError::terminal(stage, error)
 }
 
 fn is_fence_error(error: &HttpError) -> bool {
@@ -869,6 +938,44 @@ mod tests {
         assert!((750..=1_250).contains(&a));
     }
 
+    #[test]
+    fn worker_failure_matrix_classifies_http_and_deterministic_errors() {
+        for error in [
+            HttpError::Status(408, "timeout".into()),
+            HttpError::Status(425, "too early".into()),
+            HttpError::Status(429, "rate limited".into()),
+            HttpError::Status(503, "unavailable".into()),
+            HttpError::Transport("connection reset".into()),
+        ] {
+            assert!(matches!(
+                map_http_error("publish", error),
+                WorkError::Retryable { .. }
+            ));
+        }
+        for code in [400, 405, 413, 415, 422] {
+            assert!(matches!(
+                map_http_error("publish", HttpError::Status(code, "bad request".into())),
+                WorkError::Terminal { .. }
+            ));
+        }
+        for code in [404, 409] {
+            assert!(matches!(
+                map_http_error("publish", HttpError::Status(code, "stale".into())),
+                WorkError::LeaseLost
+            ));
+        }
+        for code in [401, 403] {
+            assert!(matches!(
+                map_http_error("publish", HttpError::Status(code, "denied".into())),
+                WorkError::Fatal(_)
+            ));
+        }
+        assert!(matches!(
+            classify_deterministic_error("profile", anyhow!("invalid profile")),
+            WorkError::Terminal { .. }
+        ));
+    }
+
     fn sample_lease() -> JobLease {
         JobLease {
             owner: "worker".into(),
@@ -880,6 +987,8 @@ mod tests {
                 tenant: Some("acme".into()),
                 acl: vec!["team".into()],
                 source_uri: "s3://objects/acme/kb/d.md".into(),
+                source_ready: true,
+                cleanup_source_uri: None,
                 content_sha256: "0".repeat(64),
                 content_bytes: 1,
                 media_type: Some("text/markdown".into()),
@@ -897,6 +1006,7 @@ mod tests {
                 next_attempt_at_ms: 0,
                 error: None,
                 error_stage: None,
+                error_retryable: None,
                 created_at_ms: 0,
                 updated_at_ms: 0,
                 started_at_ms: None,
@@ -1034,5 +1144,22 @@ mod tests {
             requests.try_recv().is_err(),
             "stale worker must not publish chunks"
         );
+    }
+
+    #[tokio::test]
+    async fn failure_wire_carries_explicit_classification() {
+        let (server, requests) = spawn_worker_server(vec![(200, r#"{"state":"failed"}"#)]);
+        let config = test_config(server);
+        let client = WorkerClient::new(&config);
+        client
+            .fail(&sample_lease(), "profile", "invalid profile", 1234, false)
+            .await
+            .unwrap();
+
+        let request = String::from_utf8(requests.recv().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap_or_default()).unwrap();
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["next_attempt_at_ms"], 1234);
     }
 }

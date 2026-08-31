@@ -286,6 +286,9 @@ struct Metrics {
     ingest_uploads: AtomicU64,
     ingest_deduplicated: AtomicU64,
     ingest_failures: AtomicU64,
+    ingest_retryable_failures: AtomicU64,
+    ingest_terminal_failures: AtomicU64,
+    ingest_manual_retries: AtomicU64,
     ingest_sync_hits: AtomicU64,
     ingest_sync_timeouts: AtomicU64,
     /// 累积桶计数：`lat_buckets[i]` = 延迟 ≤ `LAT_BUCKETS[i]` 的检索数。
@@ -629,28 +632,38 @@ impl ServerState {
     }
 
     /// 在引擎锁外、`spawn_blocking` 里算嵌入（HTTP 阻塞调用不卡 async 运行时、不持锁）。
-    async fn embed(&self, texts: Vec<String>, kind: EmbedKind) -> Result<Vec<Vec<f32>>, String> {
+    async fn embed(
+        &self,
+        texts: Vec<String>,
+        kind: EmbedKind,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingCallError> {
         let Some(emb) = self.embedder.clone() else {
             return Ok(vec![]);
         };
         tokio::task::spawn_blocking(move || emb.embed(&texts, kind))
             .await
-            .map_err(|e| format!("embed task join: {e}"))?
-            .map_err(|e| format!("embed: {e}"))
+            .map_err(|error| EmbeddingCallError {
+                kind: Some(fastsearch_embed::EmbedFailureKind::Transient),
+                message: format!("embed task join: {error}"),
+            })?
+            .map_err(EmbeddingCallError::from_anyhow)
     }
 
     async fn embed_inputs(
         &self,
         inputs: Vec<EmbedInput>,
         kind: EmbedKind,
-    ) -> Result<Vec<Vec<f32>>, String> {
+    ) -> Result<Vec<Vec<f32>>, EmbeddingCallError> {
         let Some(emb) = self.embedder.clone() else {
             return Ok(vec![]);
         };
         tokio::task::spawn_blocking(move || emb.embed_multi(&inputs, kind))
             .await
-            .map_err(|e| format!("embed task join: {e}"))?
-            .map_err(|e| format!("embed: {e}"))
+            .map_err(|error| EmbeddingCallError {
+                kind: Some(fastsearch_embed::EmbedFailureKind::Transient),
+                message: format!("embed task join: {error}"),
+            })?
+            .map_err(EmbeddingCallError::from_anyhow)
     }
 
     /// 开启限流（每 key 令牌桶：容量 + 每秒回填）。
@@ -840,6 +853,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/v1/index", post(index))
         .route("/v1/documents", document_routes)
         .route("/v1/jobs/{id}", get(get_ingest_job))
+        .route("/v1/jobs/{id}/retry", post(retry_ingest_job))
         .route("/v1/jobs/{id}/status", post(update_ingest_job_status))
         .route("/v1/jobs/{id}/chunks", post(write_ingest_job_chunks))
         .route("/v1/chunks/batch-get", post(batch_get_chunks))
@@ -1134,7 +1148,8 @@ fn openapi_spec() -> Value {
                     "required": [
                         "job_id", "collection", "doc_id", "state", "searchable", "chunk_count",
                         "content_sha256", "deduplicated", "dead_letter", "retry_count",
-                        "poll_after_ms", "job_url", "error", "stage", "stage_detail",
+                        "poll_after_ms", "job_url", "error", "error_retryable", "source_ready",
+                        "retry_url", "next_action", "stage", "stage_detail",
                         "parse_profile", "created_at", "updated_at", "finished_at"
                     ],
                     "properties": {
@@ -1151,6 +1166,10 @@ fn openapi_spec() -> Value {
                         "poll_after_ms": {"type": "integer"},
                         "job_url": {"type": "string"},
                         "error": {"type": ["string", "null"]},
+                        "error_retryable": {"type": ["boolean", "null"]},
+                        "source_ready": {"type": "boolean"},
+                        "retry_url": {"type": ["string", "null"]},
+                        "next_action": {"type": "string", "enum": ["retry_same_upload", "repair_dependency_then_retry", "automatic_retry", "search", "poll"]},
                         "stage": {"type": "string"},
                         "stage_detail": {"type": "object"},
                         "parse_profile": {"type": "object"},
@@ -1195,7 +1214,8 @@ fn openapi_spec() -> Value {
                         "state": {"type": "string", "enum": ["heartbeat", "chunking", "embedding", "failed"]},
                         "stage_detail": {"type": "object"}, "lease_for_ms": {"type": "integer"},
                         "error": {"type": "string"}, "error_stage": {"type": "string"},
-                        "next_attempt_at_ms": {"type": "integer", "format": "int64"}
+                        "next_attempt_at_ms": {"type": "integer", "format": "int64"},
+                        "retryable": {"type": "boolean", "default": true}
                     }
                 },
                 "WorkerChunksRequest": {
@@ -1409,6 +1429,13 @@ fn openapi_spec() -> Value {
                     "responses": {"200": {"description": "任务状态", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}}}}, "401": {"description": "认证失败"}, "404": {"description": "不可见或不存在"}, "429": {"description": "限流"}, "503": {"description": "job store 未配置"}}
                 }
             },
+            "/v1/jobs/{id}/retry": {
+                "post": {
+                    "summary": "原任务所有者在修复依赖后重新排队一个 dead-letter 作业",
+                    "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": "已重新排队", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/IngestJobResponse"}}}}, "401": {"description": "认证失败"}, "404": {"description": "不可见或不存在"}, "409": {"description": "任务不是 dead-letter、源未就绪或状态发生变化"}, "429": {"description": "限流"}, "503": {"description": "job store 未配置"}}
+                }
+            },
             "/v1/jobs/{id}/status": {
                 "post": {
                     "summary": "worker 专用：带 lease_job_id + lease_owner + lease_epoch 的心跳、阶段推进或失败上报",
@@ -1566,6 +1593,11 @@ async fn metrics(State(s): State<ServerState>) -> String {
             "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"
         ));
     };
+    let gauge = |out: &mut String, name: &str, help: &str, value: u64| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+        ));
+    };
     counter(
         &mut out,
         "fastsearch_requests_total",
@@ -1620,6 +1652,22 @@ async fn metrics(State(s): State<ServerState>) -> String {
         "Worker failures accepted by the fenced job state machine.",
         g(&m.ingest_failures),
     );
+    out.push_str(
+        "# HELP fastsearch_ingest_failures_classified_total Worker failures by durable classification.\n\
+         # TYPE fastsearch_ingest_failures_classified_total counter\n",
+    );
+    out.push_str(&format!(
+        "fastsearch_ingest_failures_classified_total{{classification=\"retryable\"}} {}\n\
+         fastsearch_ingest_failures_classified_total{{classification=\"terminal\"}} {}\n",
+        g(&m.ingest_retryable_failures),
+        g(&m.ingest_terminal_failures)
+    ));
+    counter(
+        &mut out,
+        "fastsearch_ingest_manual_retries_total",
+        "Dead-letter ingest jobs manually requeued by their owner.",
+        g(&m.ingest_manual_retries),
+    );
     counter(
         &mut out,
         "fastsearch_ingest_sync_hit_total",
@@ -1669,15 +1717,49 @@ async fn metrics(State(s): State<ServerState>) -> String {
                  fastsearch_ingest_dead_letter_total {}\n",
                 ingest.dead_letter_count.max(0)
             ));
+            for (name, help, value) in [
+                (
+                    "fastsearch_ingest_retryable_failed",
+                    "Current failed ingest jobs classified as retryable.",
+                    ingest.retryable_failed_count,
+                ),
+                (
+                    "fastsearch_ingest_jobs_source_pending",
+                    "Current ingest jobs waiting for their reserved raw source.",
+                    ingest.source_pending_count,
+                ),
+                (
+                    "fastsearch_ingest_jobs_cleanup_pending",
+                    "Current ingest jobs retaining a superseded raw object cleanup hint.",
+                    ingest.cleanup_pending_count,
+                ),
+                (
+                    "fastsearch_ingest_leases_active",
+                    "Current unexpired ingest worker leases.",
+                    ingest.active_lease_count,
+                ),
+                (
+                    "fastsearch_ingest_leases_expired",
+                    "Current expired ingest worker leases awaiting reclaim.",
+                    ingest.expired_lease_count,
+                ),
+                (
+                    "fastsearch_ingest_workers_seen_recently",
+                    "Distinct ingest workers heartbeating in the last 120 seconds.",
+                    ingest.workers_seen_recently,
+                ),
+                (
+                    "fastsearch_ingest_oldest_ready_age_seconds",
+                    "Age of the oldest claimable or retryable ready ingest job.",
+                    ingest.oldest_ready_age_seconds,
+                ),
+            ] {
+                gauge(&mut out, name, help, value.max(0) as u64);
+            }
         }
     }
 
     let cdc = s.cdc_health_snapshot();
-    let gauge = |out: &mut String, name: &str, help: &str, value: u64| {
-        out.push_str(&format!(
-            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
-        ));
-    };
     gauge(
         &mut out,
         "fastsearch_cdc_enabled",
@@ -2049,7 +2131,7 @@ async fn search_request(s: ServerState, headers: HeaderMap, req: SearchRequest) 
             Ok(_) => {}
             Err(e) => {
                 s.metrics.errors.fetch_add(1, Ordering::Relaxed);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
             }
         }
     }
@@ -2568,6 +2650,12 @@ struct WorkerStatusBody {
     error_stage: Option<String>,
     #[serde(default)]
     next_attempt_at_ms: Option<i64>,
+    #[serde(default = "worker_failure_retryable_default")]
+    retryable: bool,
+}
+
+fn worker_failure_retryable_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -2733,6 +2821,20 @@ fn job_response(job: &fastsearch_pg::IngestJob, deduplicated: bool) -> Value {
         "poll_after_ms": ingest_poll_after_ms(job.state, job.is_dead_letter()),
         "job_url": format!("/v1/jobs/{}", job.job_id),
         "error": job.error,
+        "error_retryable": job.error_retryable,
+        "source_ready": job.source_ready,
+        "retry_url": job.is_dead_letter().then(|| format!("/v1/jobs/{}/retry", job.job_id)),
+        "next_action": if !job.source_ready {
+            "retry_same_upload"
+        } else if job.is_dead_letter() {
+            "repair_dependency_then_retry"
+        } else if job.state == fastsearch_pg::IngestState::Failed {
+            "automatic_retry"
+        } else if job.state == fastsearch_pg::IngestState::Indexed {
+            "search"
+        } else {
+            "poll"
+        },
         "stage": job.error_stage.as_deref().unwrap_or(job.state.as_str()),
         "stage_detail": job.stage_detail,
         "parse_profile": job.parse_profile,
@@ -2840,6 +2942,7 @@ async fn update_ingest_job_status(
                 body.error.as_deref().unwrap_or("worker reported failure"),
                 body.error_stage.as_deref().unwrap_or(expected.as_str()),
                 next_attempt,
+                body.retryable,
             )
             .await
             .map_err(|error| ingest_internal_err(&s, "fail ingest job", error))?
@@ -2854,6 +2957,15 @@ async fn update_ingest_job_status(
     }
     if body.command == WorkerStatusCommand::Failed {
         s.metrics.ingest_failures.fetch_add(1, Ordering::Relaxed);
+        if body.retryable {
+            s.metrics
+                .ingest_retryable_failures
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            s.metrics
+                .ingest_terminal_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
     let current = jobs
         .get(&job_id)
@@ -3144,7 +3256,7 @@ async fn upload_document(
         .or_else(|| filename.clone())
         .unwrap_or_else(|| proposed_job_id.clone());
     let namespace = object_namespace(principal.tenant.as_deref())?;
-    let (bytes, authoritative_uri, staged_by_server) = if let Some(bytes) = file {
+    let (bytes, authoritative_uri, source_ready, store_after_reserve) = if let Some(bytes) = file {
         let sha = full_sha256(&bytes);
         let extension = filename_extension(filename.as_deref(), media_type.as_deref());
         let key = format!(
@@ -3155,17 +3267,13 @@ async fn upload_document(
             sha,
             extension
         );
-        let object = s
+        let uri = s
             .engine
             .lock()
             .await
-            .put_object(
-                &key,
-                &bytes,
-                media_type.as_deref().unwrap_or("application/octet-stream"),
-            )
-            .map_err(|error| ingest_internal_err(&s, "store uploaded document", error))?;
-        (bytes, object.uri, true)
+            .object_target_uri(&key)
+            .map_err(|error| ingest_internal_err(&s, "reserve uploaded document", error))?;
+        (bytes, uri, false, true)
     } else {
         let uri = source_uri.expect("exclusive source checked");
         let object = {
@@ -3187,7 +3295,7 @@ async fn upload_document(
         if media_type.is_none() {
             media_type = object.content_type;
         }
-        (object.bytes, uri, false)
+        (object.bytes, uri, true, false)
     };
     let content_sha256 = full_sha256(&bytes);
     let content_bytes = i64::try_from(bytes.len()).map_err(|_| {
@@ -3196,33 +3304,25 @@ async fn upload_document(
             "document is too large".into(),
         )
     })?;
-    let submission = jobs
-        .submit_upload(&fastsearch_pg::NewIngestJob {
-            job_id: proposed_job_id,
-            collection: collection.clone(),
-            doc_id: doc_id.clone(),
-            tenant: principal.tenant.clone(),
-            acl,
-            source_uri: authoritative_uri.clone(),
-            content_sha256,
-            content_bytes,
-            media_type,
-            filename,
-            parse_profile: parse_profile.clone(),
-            max_retries: 3,
-        })
-        .await;
-    let resolution = match submission {
+    let new_job = fastsearch_pg::NewIngestJob {
+        job_id: proposed_job_id,
+        collection: collection.clone(),
+        doc_id: doc_id.clone(),
+        tenant: principal.tenant.clone(),
+        acl,
+        source_uri: authoritative_uri.clone(),
+        source_ready,
+        content_sha256,
+        content_bytes,
+        media_type: media_type.clone(),
+        filename,
+        parse_profile: parse_profile.clone(),
+        max_retries: 3,
+    };
+    let submission = jobs.submit_upload(&new_job).await;
+    let mut resolution = match submission {
         Ok(resolution) => resolution,
         Err(error) => {
-            if staged_by_server {
-                if let Err(cleanup_error) = s.engine.lock().await.delete_object(&authoritative_uri)
-                {
-                    eprintln!(
-                        "raw document cleanup after job submission failure failed: {cleanup_error}"
-                    );
-                }
-            }
             return Err(match error {
                 fastsearch_pg::PgError::Conflict(_) => (
                     StatusCode::CONFLICT,
@@ -3234,18 +3334,95 @@ async fn upload_document(
     };
     s.metrics.ingest_uploads.fetch_add(1, Ordering::Relaxed);
 
-    if staged_by_server
-        && resolution
-            .unused_source_uri
-            .as_deref()
-            .is_some_and(|uri| uri != resolution.job.source_uri)
-    {
-        let _ = s.engine.lock().await.delete_object(&authoritative_uri);
+    if resolution.disposition == fastsearch_pg::UploadDisposition::CleanupPending {
+        if let Some(old_uri) = resolution.job.cleanup_source_uri.clone() {
+            match s.engine.lock().await.delete_object(&old_uri) {
+                Ok(()) => {
+                    jobs.clear_cleanup_source(&resolution.job.job_id, &old_uri)
+                        .await
+                        .map_err(|error| {
+                            ingest_internal_err(&s, "acknowledge pending source cleanup", error)
+                        })?;
+                    resolution =
+                        jobs.submit_upload(&new_job)
+                            .await
+                            .map_err(|error| match error {
+                                fastsearch_pg::PgError::Conflict(_) => (
+                                    StatusCode::CONFLICT,
+                                    "document upload changed while source cleanup completed; retry"
+                                        .into(),
+                                ),
+                                other => ingest_internal_err(
+                                    &s,
+                                    "retry upload after source cleanup",
+                                    other,
+                                ),
+                            })?;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "pending raw document cleanup failed for job {}: {error}",
+                        resolution.job.job_id
+                    );
+                }
+            }
+        }
     }
-    if let Some(old_uri) = resolution.replaced_source_uri.as_deref() {
+
+    if matches!(
+        resolution.disposition,
+        fastsearch_pg::UploadDisposition::InFlightConflict
+            | fastsearch_pg::UploadDisposition::CleanupPending
+    ) {
+        let mut response = job_response(&resolution.job, false);
+        if resolution.disposition == fastsearch_pg::UploadDisposition::CleanupPending {
+            response["next_action"] = json!("wait_for_source_cleanup_then_retry");
+        }
+        return Ok((StatusCode::CONFLICT, Json(response)));
+    }
+    if store_after_reserve && !resolution.job.source_ready {
+        if let Err(error) = s.engine.lock().await.put_object_uri(
+            &resolution.job.source_uri,
+            &bytes,
+            media_type.as_deref().unwrap_or("application/octet-stream"),
+        ) {
+            s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "raw source storage failed for reserved ingest job {}: {error}",
+                resolution.job.job_id
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "raw source storage unavailable; retry the same upload to repair job {}",
+                    resolution.job.job_id
+                ),
+            ));
+        }
+        resolution.job = jobs
+            .mark_source_ready(
+                &resolution.job.job_id,
+                &resolution.job.source_uri,
+                &resolution.job.content_sha256,
+            )
+            .await
+            .map_err(|error| ingest_internal_err(&s, "mark uploaded source ready", error))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "upload reservation changed before source became ready; retry upload".into(),
+                )
+            })?;
+    }
+    if let Some(old_uri) = resolution.job.cleanup_source_uri.clone() {
         if old_uri != resolution.job.source_uri {
-            if let Err(error) = s.engine.lock().await.delete_object(old_uri) {
+            if let Err(error) = s.engine.lock().await.delete_object(&old_uri) {
                 eprintln!("old raw document cleanup failed: {error}");
+            } else if let Err(error) = jobs
+                .clear_cleanup_source(&resolution.job.job_id, &old_uri)
+                .await
+            {
+                eprintln!("old raw document cleanup acknowledgement failed: {error}");
             }
         }
     }
@@ -3259,12 +3436,6 @@ async fn upload_document(
         s.metrics
             .ingest_deduplicated
             .fetch_add(1, Ordering::Relaxed);
-    }
-    if resolution.disposition == fastsearch_pg::UploadDisposition::InFlightConflict {
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(job_response(&resolution.job, false)),
-        ));
     }
     let should_wait = match wait {
         UploadWait::Never => false,
@@ -3387,6 +3558,58 @@ async fn get_ingest_job(
         status: 200,
     });
     Ok(Json(job_response(&job, false)))
+}
+
+async fn retry_ingest_job(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> ApiResult {
+    s.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    let principal = require_principal(&s, &headers)?;
+    if !s.allow(&rate_key(&headers)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded".into()));
+    }
+    let jobs = jobs_for(&s)?;
+    let acl = acl_for(&principal);
+    let current = jobs
+        .get_visible(&job_id, &acl)
+        .await
+        .map_err(|error| ingest_internal_err(&s, "get dead-letter job", error))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "job not found".into()))?;
+    if !current.is_dead_letter() {
+        return Err((StatusCode::CONFLICT, "job is not dead-lettered".into()));
+    }
+    if !current.source_ready {
+        return Err((
+            StatusCode::CONFLICT,
+            "raw source is pending; retry the original upload first".into(),
+        ));
+    }
+    let retried = jobs
+        .retry_dead_letter_visible(&job_id, &acl)
+        .await
+        .map_err(|error| ingest_internal_err(&s, "retry dead-letter job", error))?
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                "job state changed before it could be retried".into(),
+            )
+        })?;
+    s.metrics
+        .ingest_manual_retries
+        .fetch_add(1, Ordering::Relaxed);
+    s.emit_audit(AuditEvent {
+        endpoint: "/v1/jobs/{id}/retry",
+        tenant: principal.tenant,
+        tags: principal.tags,
+        query: None,
+        collection: Some(retried.collection.clone()),
+        doc_id: Some(retried.doc_id.clone()),
+        hits: None,
+        status: 200,
+    });
+    Ok(Json(job_response(&retried, false)))
 }
 
 async fn list_documents(
@@ -3858,6 +4081,44 @@ async fn index(
     Ok(Json(json!({ "indexed": n })))
 }
 
+#[derive(Debug)]
+struct EmbeddingCallError {
+    kind: Option<fastsearch_embed::EmbedFailureKind>,
+    message: String,
+}
+
+impl EmbeddingCallError {
+    fn from_anyhow(error: anyhow::Error) -> Self {
+        let kind = error
+            .downcast_ref::<fastsearch_embed::EmbedFailure>()
+            .map(|failure| failure.kind);
+        Self {
+            kind,
+            message: format!("embed: {error}"),
+        }
+    }
+}
+
+impl std::fmt::Display for EmbeddingCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+fn classify_embedding_failure(error: EmbeddingCallError) -> (StatusCode, String) {
+    let status = match error.kind {
+        Some(fastsearch_embed::EmbedFailureKind::UpstreamStatus(429)) => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        Some(fastsearch_embed::EmbedFailureKind::UpstreamStatus(408 | 425 | 500..=599))
+        | Some(fastsearch_embed::EmbedFailureKind::Transient) => StatusCode::SERVICE_UNAVAILABLE,
+        Some(fastsearch_embed::EmbedFailureKind::UpstreamStatus(_)) | None => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+    };
+    (status, error.message)
+}
+
 async fn index_document_body(
     s: &ServerState,
     principal: &Principal,
@@ -4083,8 +4344,11 @@ async fn index_document_body(
                 .embed_inputs(inputs, EmbedKind::Passage)
                 .await
                 .map_err(|e| {
-                    s.metrics.errors.fetch_add(1, Ordering::Relaxed);
-                    (StatusCode::INTERNAL_SERVER_ERROR, e)
+                    let classified = classify_embedding_failure(e);
+                    if classified.0.is_server_error() {
+                        s.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    classified
                 })?;
             for ((i, _, status), v) in need.into_iter().zip(embedded) {
                 vectors[i] = Some(v);
@@ -4315,7 +4579,7 @@ async fn batch_upsert_chunks(
             let texts = pending.iter().map(|(_, text)| text.clone()).collect();
             let embedded = s.embed(texts, EmbedKind::Passage).await.map_err(|e| {
                 s.metrics.errors.fetch_add(1, Ordering::Relaxed);
-                (StatusCode::INTERNAL_SERVER_ERROR, e)
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
             })?;
             if embedded.len() != pending.len() {
                 return Err((
@@ -4857,6 +5121,77 @@ mod tests {
 
     struct PairEmbedder;
 
+    struct FailFirstPutStore {
+        inner: fastsearch_engine::LocalObjectStore,
+        fail_next_put: std::sync::atomic::AtomicBool,
+        fail_next_delete: std::sync::atomic::AtomicBool,
+    }
+
+    impl ObjectStore for FailFirstPutStore {
+        fn target_uri(&self, key: &str) -> fastsearch_engine::ObjectResult<String> {
+            self.inner.target_uri(key)
+        }
+
+        fn put_uri(
+            &self,
+            uri: &str,
+            bytes: &[u8],
+            content_type: &str,
+        ) -> fastsearch_engine::ObjectResult<fastsearch_engine::ObjectRef> {
+            if self.fail_next_put.swap(false, Ordering::AcqRel) {
+                return Err(fastsearch_engine::ObjectError {
+                    kind: fastsearch_engine::ObjectErrorKind::Transient,
+                    message: "injected first object PUT failure".into(),
+                });
+            }
+            self.inner.put_uri(uri, bytes, content_type)
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            bytes: &[u8],
+            content_type: &str,
+        ) -> fastsearch_engine::ObjectResult<fastsearch_engine::ObjectRef> {
+            let uri = self.target_uri(key)?;
+            self.put_uri(&uri, bytes, content_type)
+        }
+
+        fn get(
+            &self,
+            uri: &str,
+            max_bytes: usize,
+        ) -> fastsearch_engine::ObjectResult<fastsearch_engine::ObjectBytes> {
+            self.inner.get(uri, max_bytes)
+        }
+
+        fn presign_get(
+            &self,
+            uri: &str,
+            content_type: Option<&str>,
+        ) -> fastsearch_engine::ObjectResult<fastsearch_engine::PresignedUrl> {
+            self.inner.presign_get(uri, content_type)
+        }
+
+        fn validate_ref(
+            &self,
+            uri: &str,
+            principal_tenant: Option<&str>,
+        ) -> fastsearch_engine::ObjectResult<fastsearch_engine::ObjectRef> {
+            self.inner.validate_ref(uri, principal_tenant)
+        }
+
+        fn delete(&self, uri: &str) -> fastsearch_engine::ObjectResult<()> {
+            if self.fail_next_delete.swap(false, Ordering::AcqRel) {
+                return Err(fastsearch_engine::ObjectError {
+                    kind: fastsearch_engine::ObjectErrorKind::Transient,
+                    message: "injected object DELETE failure".into(),
+                });
+            }
+            self.inner.delete(uri)
+        }
+    }
+
     #[test]
     fn retryable_failed_jobs_keep_a_poll_hint_until_dead_letter() {
         assert_eq!(
@@ -4871,6 +5206,45 @@ mod tests {
             ingest_poll_after_ms(fastsearch_pg::IngestState::Indexed, false),
             0
         );
+    }
+
+    #[test]
+    fn embedding_failures_map_to_worker_retry_semantics() {
+        for error in [
+            fastsearch_embed::EmbedFailure::upstream(429, "busy"),
+            fastsearch_embed::EmbedFailure::upstream(503, "down"),
+            fastsearch_embed::EmbedFailure::transient("connection reset"),
+            fastsearch_embed::EmbedFailure::transient("request timed out"),
+        ] {
+            let (status, _) = classify_embedding_failure(EmbeddingCallError::from_anyhow(
+                anyhow::Error::new(error),
+            ));
+            assert!(matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            ));
+        }
+        for error in [
+            EmbeddingCallError::from_anyhow(anyhow::Error::new(
+                fastsearch_embed::EmbedFailure::upstream(400, "invalid input"),
+            )),
+            EmbeddingCallError::from_anyhow(anyhow::Error::new(
+                fastsearch_embed::EmbedFailure::upstream(401, "model key rejected"),
+            )),
+            EmbeddingCallError {
+                kind: None,
+                message: "embedding dim mismatch".into(),
+            },
+            EmbeddingCallError {
+                kind: None,
+                message: "parse embedding response json".into(),
+            },
+        ] {
+            assert_eq!(
+                classify_embedding_failure(error).0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
     }
 
     impl Embedder for PairEmbedder {
@@ -5510,6 +5884,407 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fs304_failed_raw_put_leaves_unclaimable_job_and_same_upload_repairs_it() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs304_failed_raw_put_leaves_unclaimable_job_and_same_upload_repairs_it: DATABASE_URL not set"
+            );
+            return;
+        };
+        let suffix = std::process::id();
+        let jobs_table = format!("fs304_http_jobs_{suffix}");
+        let chunks_table = format!("fs304_http_chunks_{suffix}");
+        let jobs = Arc::new(
+            fastsearch_pg::JobStore::connect_with_chunks_table(&url, &jobs_table, &chunks_table)
+                .await
+                .expect("job store"),
+        );
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("cleanup connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {jobs_table} CASCADE; \
+                 DROP TABLE IF EXISTS {chunks_table} CASCADE; \
+                 DROP TABLE IF EXISTS {chunks_table}_signal CASCADE;"
+            ))
+            .await
+            .expect("clean schemas");
+        let mut pg_config = fastsearch_pg::PgConfig::new(url.clone());
+        pg_config.table = chunks_table.clone();
+        let pg = Arc::new(
+            fastsearch_pg::PgStore::connect(pg_config)
+                .await
+                .expect("source store"),
+        );
+        pg.ensure_schema().await.expect("chunks schema");
+        jobs.ensure_schema().await.expect("job schema");
+
+        let objects = tempfile::tempdir().expect("objects");
+        let store = Arc::new(FailFirstPutStore {
+            inner: fastsearch_engine::LocalObjectStore::new(objects.path(), "documents"),
+            fail_next_put: std::sync::atomic::AtomicBool::new(true),
+            fail_next_delete: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+        engine.set_object_store(store.clone());
+        engine.set_source_store(pg);
+        let app = router(
+            ServerState::new(engine, keys())
+                .with_job_store(jobs.clone())
+                .with_worker_keys(HashSet::from(["worker-secret".into()])),
+        );
+        let boundary = "fs304-handoff";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"collection\"\r\n\r\nkb\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"doc_id\"\r\n\r\nrepair.md\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"wait\"\r\n\r\nnever\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"repair.md\"\r\n\
+             Content-Type: text/markdown\r\n\r\nrepairable source\r\n--{boundary}--\r\n"
+        );
+        let upload = |body: String| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/documents")
+                .header("x-api-key", "k-team-a")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let failed = app.clone().oneshot(upload(body.clone())).await.unwrap();
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let failure_text = String::from_utf8(
+            failed
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(failure_text.contains("retry the same upload"));
+        assert!(!failure_text.contains("injected"));
+        assert_eq!(jobs.ingest_metrics().await.unwrap().source_pending_count, 1);
+        assert!(jobs.claim("too-early", 1, 10_000).await.unwrap().is_empty());
+        let visible = jobs
+            .list_documents(
+                &AclFilter {
+                    tenant: Some("acme".into()),
+                    allowed_tags: vec!["team-a".into()],
+                },
+                &fastsearch_pg::DocumentListOptions::default(),
+            )
+            .await
+            .unwrap();
+        let reserved_job_id = visible[0].job_id.clone().unwrap();
+
+        let repaired = app.clone().oneshot(upload(body.clone())).await.unwrap();
+        assert_eq!(repaired.status(), StatusCode::ACCEPTED);
+        let repaired = body_json(repaired).await;
+        assert_eq!(repaired["job_id"], reserved_job_id);
+        assert_eq!(repaired["source_ready"], true);
+        assert_eq!(jobs.ingest_metrics().await.unwrap().source_pending_count, 0);
+        let lease = jobs
+            .claim("after-repair", 1, 10_000)
+            .await
+            .unwrap()
+            .pop()
+            .expect("repaired job is claimable");
+        assert_eq!(lease.job.job_id, reserved_job_id);
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/jobs/{reserved_job_id}/status"))
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lease_job_id": &reserved_job_id,
+                            "lease_owner": &lease.owner,
+                            "lease_epoch": lease.job.lease_epoch,
+                            "state": "chunking",
+                            "stage_detail": {"fault_recovered": true}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let published = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/jobs/{reserved_job_id}/chunks"))
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lease_job_id": &reserved_job_id,
+                            "lease_owner": &lease.owner,
+                            "lease_epoch": lease.job.lease_epoch,
+                            "chunks": [{
+                                "chunk_id": 1,
+                                "kind": "paragraph",
+                                "text": "repairable source searchable",
+                                "page": 1,
+                                "bbox": {"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},
+                                "heading_path": [],
+                                "section_id": 0,
+                                "char_len": 28,
+                                "metadata": {},
+                                "searchable": true
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(published.status(), StatusCode::OK);
+        assert_eq!(
+            jobs.get(&reserved_job_id).await.unwrap().unwrap().state,
+            fastsearch_pg::IngestState::Indexed
+        );
+        let search = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("x-api-key", "k-team-a")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"query":"repairable searchable","mode":"keyword","top_k":3})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::OK);
+        assert!(!body_json(search).await["hits"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        store.fail_next_delete.store(true, Ordering::Release);
+        let second_body = body.replace("repairable source", "second source");
+        let second = app
+            .clone()
+            .oneshot(upload(second_body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            jobs.ingest_metrics().await.unwrap().cleanup_pending_count,
+            1
+        );
+        let second_lease = jobs
+            .claim("second-version", 1, 10_000)
+            .await
+            .unwrap()
+            .pop()
+            .expect("second version claim");
+        let second_status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/jobs/{reserved_job_id}/status"))
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lease_job_id": &reserved_job_id,
+                            "lease_owner": &second_lease.owner,
+                            "lease_epoch": second_lease.job.lease_epoch,
+                            "state": "chunking"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_status.status(), StatusCode::OK);
+        let second_published = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/jobs/{reserved_job_id}/chunks"))
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lease_job_id": &reserved_job_id,
+                            "lease_owner": &second_lease.owner,
+                            "lease_epoch": second_lease.job.lease_epoch,
+                            "chunks": [{
+                                "chunk_id": 1, "kind": "paragraph", "text": "second source",
+                                "page": 1, "bbox": {"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0},
+                                "heading_path": [], "section_id": 0, "char_len": 13,
+                                "metadata": {}, "searchable": true
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_published.status(), StatusCode::OK);
+
+        let third = app
+            .clone()
+            .oneshot(upload(second_body.replace("second source", "third source")))
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            jobs.ingest_metrics().await.unwrap().cleanup_pending_count,
+            0
+        );
+
+        client
+            .batch_execute(&format!(
+                "DROP TABLE {jobs_table} CASCADE; DROP TABLE {chunks_table} CASCADE; \
+                 DROP TABLE IF EXISTS {chunks_table}_signal CASCADE;"
+            ))
+            .await
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn fs304_dead_letter_retry_route_is_owner_scoped_and_requeues() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs304_dead_letter_retry_route_is_owner_scoped_and_requeues: DATABASE_URL not set"
+            );
+            return;
+        };
+        let suffix = std::process::id();
+        let jobs_table = format!("fs304_retry_jobs_{suffix}");
+        let chunks_table = format!("fs304_retry_chunks_{suffix}");
+        let jobs = Arc::new(
+            fastsearch_pg::JobStore::connect_with_chunks_table(&url, &jobs_table, &chunks_table)
+                .await
+                .expect("job store"),
+        );
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("cleanup connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {jobs_table} CASCADE; DROP TABLE IF EXISTS {chunks_table} CASCADE; \
+                 CREATE TABLE {chunks_table} (collection text NOT NULL, doc_id text NOT NULL, \
+                 tenant text, acl text[] NOT NULL, searchable boolean NOT NULL, \
+                 updated_at timestamptz NOT NULL DEFAULT now());"
+            ))
+            .await
+            .unwrap();
+        jobs.ensure_schema().await.unwrap();
+        jobs.submit_upload(&fastsearch_pg::NewIngestJob {
+            job_id: "retry-job".into(),
+            collection: "kb".into(),
+            doc_id: "retry.md".into(),
+            tenant: Some("acme".into()),
+            acl: vec!["team-a".into()],
+            source_uri: "s3://documents/acme/kb/retry.md".into(),
+            source_ready: true,
+            content_sha256: "d".repeat(64),
+            content_bytes: 10,
+            media_type: Some("text/markdown".into()),
+            filename: Some("retry.md".into()),
+            parse_profile: json!({}),
+            max_retries: 3,
+        })
+        .await
+        .unwrap();
+        let lease = jobs
+            .claim("worker", 1, 10_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        jobs.fail(&lease, "invalid model response", "embedding", 0, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let app = router(
+            ServerState::new(
+                Engine::create_in_ram(TextIndexConfig::default()).unwrap(),
+                keys(),
+            )
+            .with_job_store(jobs.clone()),
+        );
+        let request = |key: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/jobs/retry-job/retry")
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request("k-team-b"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let retried = app.clone().oneshot(request("k-team-a")).await.unwrap();
+        assert_eq!(retried.status(), StatusCode::OK);
+        let retried = body_json(retried).await;
+        assert_eq!(retried["state"], "queued");
+        assert_eq!(retried["retry_count"], 0);
+        assert_eq!(retried["error"], Value::Null);
+        assert_eq!(retried["next_action"], "poll");
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(
+            String::from_utf8_lossy(&metrics).contains("fastsearch_ingest_manual_retries_total 1")
+        );
+
+        client
+            .batch_execute(&format!(
+                "DROP TABLE {jobs_table} CASCADE; DROP TABLE {chunks_table} CASCADE;"
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn fs302_worker_writes_require_capability_and_current_lease_epoch() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!(
@@ -5553,6 +6328,7 @@ mod tests {
             tenant: Some("acme".into()),
             acl: vec!["team-a".into()],
             source_uri: "s3://documents/acme/kb/worker.md".into(),
+            source_ready: true,
             content_sha256: "a".repeat(64),
             content_bytes: 12,
             media_type: Some("text/markdown".into()),
@@ -5569,6 +6345,7 @@ mod tests {
             tenant: Some("acme".into()),
             acl: vec!["team-a".into()],
             source_uri: "s3://documents/acme/kb/worker-b.md".into(),
+            source_ready: true,
             content_sha256: "b".repeat(64),
             content_bytes: 12,
             media_type: Some("text/markdown".into()),
@@ -5857,6 +6634,62 @@ mod tests {
         assert_eq!(source_rows.len(), 1);
         assert_eq!(source_rows[0].tenant.as_deref(), Some("acme"));
         assert_eq!(source_rows[0].acl, vec!["team-a"]);
+
+        let terminal_failure = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job-b/status")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lease_job_id": &lease_b.job.job_id,
+                            "lease_owner": &lease_b.owner,
+                            "lease_epoch": lease_b.job.lease_epoch,
+                            "state": "failed",
+                            "error": "invalid parse profile",
+                            "error_stage": "profile",
+                            "retryable": false,
+                            "next_attempt_at_ms": 0
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal_failure.status(), StatusCode::OK);
+        let terminal_failure = body_json(terminal_failure).await;
+        assert_eq!(terminal_failure["dead_letter"], true);
+        assert_eq!(terminal_failure["error_retryable"], false);
+        assert_eq!(
+            terminal_failure["next_action"],
+            "repair_dependency_then_retry"
+        );
+        assert_eq!(
+            jobs.get("worker-job-b").await.unwrap().unwrap().retry_count,
+            3
+        );
+        let classified_metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(String::from_utf8_lossy(&classified_metrics).contains(
+            "fastsearch_ingest_failures_classified_total{classification=\"terminal\"} 1"
+        ));
 
         let visible = app
             .clone()
@@ -8322,6 +9155,7 @@ mod tests {
         assert!(v["paths"]["/v1/documents"]["post"].is_object());
         assert!(v["paths"]["/v1/documents"]["get"].is_object());
         assert!(v["paths"]["/v1/jobs/{id}"]["get"].is_object());
+        assert!(v["paths"]["/v1/jobs/{id}/retry"]["post"].is_object());
         assert!(v["paths"]["/v1/jobs/{id}/status"]["post"].is_object());
         assert!(v["paths"]["/v1/jobs/{id}/chunks"]["post"].is_object());
         assert!(v["paths"]["/v1/collections/{name}"]["delete"].is_object());
@@ -8351,6 +9185,10 @@ mod tests {
                 "poll_after_ms",
                 "job_url",
                 "error",
+                "error_retryable",
+                "source_ready",
+                "retry_url",
+                "next_action",
                 "stage",
                 "stage_detail",
                 "parse_profile",
@@ -8404,6 +9242,7 @@ mod tests {
             ("/v1/documents", "post"),
             ("/v1/documents", "get"),
             ("/v1/jobs/{id}", "get"),
+            ("/v1/jobs/{id}/retry", "post"),
             ("/v1/jobs/{id}/status", "post"),
             ("/v1/jobs/{id}/chunks", "post"),
         ] {

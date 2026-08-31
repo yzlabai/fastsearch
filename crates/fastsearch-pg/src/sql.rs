@@ -59,6 +59,8 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
              tenant text,\n\
              acl text[] NOT NULL,\n\
              source_uri text NOT NULL,\n\
+             source_ready boolean NOT NULL DEFAULT true,\n\
+             cleanup_source_uri text,\n\
              content_sha256 text NOT NULL,\n\
              content_bytes bigint NOT NULL,\n\
              media_type text,\n\
@@ -76,6 +78,7 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
              next_attempt_at timestamptz NOT NULL DEFAULT now(),\n\
              error text,\n\
              error_stage text,\n\
+             error_retryable boolean,\n\
              created_at timestamptz NOT NULL DEFAULT now(),\n\
              updated_at timestamptz NOT NULL DEFAULT now(),\n\
              started_at timestamptz,\n\
@@ -95,6 +98,8 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
         format!("ALTER TABLE {table} ALTER COLUMN acl DROP DEFAULT;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS source_uri text NOT NULL DEFAULT '';"),
         format!("ALTER TABLE {table} ALTER COLUMN source_uri DROP DEFAULT;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS source_ready boolean NOT NULL DEFAULT true;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS cleanup_source_uri text;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS content_sha256 text NOT NULL DEFAULT '';"),
         format!("ALTER TABLE {table} ALTER COLUMN content_sha256 DROP DEFAULT;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS content_bytes bigint NOT NULL DEFAULT 0;"),
@@ -113,6 +118,7 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz NOT NULL DEFAULT now();"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS error text;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS error_stage text;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS error_retryable boolean;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS started_at timestamptz;"),
@@ -153,12 +159,12 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
     ]
 }
 
-pub(crate) const JOB_RETURN_COLUMNS: &str = "job_id, collection, doc_id, tenant, acl, source_uri, \
+pub(crate) const JOB_RETURN_COLUMNS: &str = "job_id, collection, doc_id, tenant, acl, source_uri, source_ready, cleanup_source_uri, \
 content_sha256, content_bytes, media_type, filename, parse_profile::text AS parse_profile, state, \
 stage_detail::text AS stage_detail, chunk_count, lease_owner, lease_epoch, \
 (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, \
 (extract(epoch FROM heartbeat_at) * 1000)::bigint AS heartbeat_at_ms, retry_count, max_retries, \
-(extract(epoch FROM next_attempt_at) * 1000)::bigint AS next_attempt_at_ms, error, error_stage, \
+(extract(epoch FROM next_attempt_at) * 1000)::bigint AS next_attempt_at_ms, error, error_stage, error_retryable, \
 (extract(epoch FROM created_at) * 1000)::bigint AS created_at_ms, \
 (extract(epoch FROM updated_at) * 1000)::bigint AS updated_at_ms, \
 (extract(epoch FROM started_at) * 1000)::bigint AS started_at_ms, \
@@ -167,8 +173,8 @@ stage_detail::text AS stage_detail, chunk_count, lease_owner, lease_epoch, \
 pub(crate) fn enqueue_job_sql(table: &str) -> String {
     format!(
         "INSERT INTO {table} (job_id, collection, doc_id, tenant, acl, source_uri, \
-         content_sha256, content_bytes, media_type, filename, parse_profile, max_retries) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::jsonb,$12) \
+         content_sha256, content_bytes, media_type, filename, parse_profile, max_retries, source_ready) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::jsonb,$12,$13) \
          RETURNING {JOB_RETURN_COLUMNS}"
     )
 }
@@ -186,13 +192,29 @@ pub(crate) fn lock_job_document_sql(table: &str) -> String {
 
 pub(crate) fn reset_upload_job_sql(table: &str) -> String {
     format!(
-        "UPDATE {table} SET acl = $2, source_uri = $3, content_sha256 = $4, \
+        "UPDATE {table} SET acl = $2, cleanup_source_uri = CASE WHEN cleanup_source_uri IS NULL AND source_uri <> $3 THEN source_uri ELSE cleanup_source_uri END, \
+         source_uri = $3, source_ready = $10, content_sha256 = $4, \
          content_bytes = $5, media_type = $6, filename = $7, parse_profile = $8::text::jsonb, \
          max_retries = $9, state = 'queued', stage_detail = '{{}}'::jsonb, chunk_count = 0, \
          lease_owner = NULL, lease_until = NULL, heartbeat_at = NULL, retry_count = 0, \
-         next_attempt_at = clock_timestamp(), error = NULL, error_stage = NULL, \
+         next_attempt_at = clock_timestamp(), error = NULL, error_stage = NULL, error_retryable = NULL, \
          updated_at = clock_timestamp(), started_at = NULL, finished_at = NULL \
          WHERE job_id = $1 RETURNING {JOB_RETURN_COLUMNS}"
+    )
+}
+
+pub(crate) fn mark_job_source_ready_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET source_ready = true, updated_at = clock_timestamp() \
+         WHERE job_id = $1 AND source_uri = $2 AND content_sha256 = $3 \
+         RETURNING {JOB_RETURN_COLUMNS}"
+    )
+}
+
+pub(crate) fn clear_job_cleanup_source_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET cleanup_source_uri = NULL, updated_at = clock_timestamp() \
+         WHERE job_id = $1 AND cleanup_source_uri = $2 RETURNING job_id"
     )
 }
 
@@ -201,6 +223,7 @@ pub(crate) fn claim_jobs_sql(table: &str) -> String {
         "WITH cand AS (\
            SELECT job_id FROM {table} \
             WHERE state <> 'indexed' \
+              AND source_ready \
               AND retry_count < max_retries \
               AND next_attempt_at <= clock_timestamp() \
               AND (state IN ('queued','failed') OR lease_until IS NULL \
@@ -243,7 +266,7 @@ pub(crate) fn advance_job_sql(table: &str) -> String {
 pub(crate) fn finish_job_sql(table: &str) -> String {
     format!(
         "UPDATE {table} SET state = 'indexed', chunk_count = $4, error = NULL, \
-         error_stage = NULL, lease_owner = NULL, lease_until = NULL, finished_at = clock_timestamp(), \
+         error_stage = NULL, error_retryable = NULL, lease_owner = NULL, lease_until = NULL, finished_at = clock_timestamp(), \
          updated_at = clock_timestamp() \
          WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
            AND state = 'embedding' AND lease_until >= clock_timestamp() RETURNING job_id"
@@ -252,12 +275,31 @@ pub(crate) fn finish_job_sql(table: &str) -> String {
 
 pub(crate) fn fail_job_sql(table: &str) -> String {
     format!(
-        "UPDATE {table} SET state = 'failed', error = $4, error_stage = $5, \
-         retry_count = retry_count + 1, next_attempt_at = to_timestamp($6::bigint::double precision / 1000.0), \
+        "UPDATE {table} SET state = 'failed', error = $4, error_stage = $5, error_retryable = $7, \
+         retry_count = CASE WHEN $7 THEN retry_count + 1 ELSE max_retries END, \
+         next_attempt_at = to_timestamp($6::bigint::double precision / 1000.0), \
          lease_owner = NULL, lease_until = NULL, updated_at = clock_timestamp() \
          WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
            AND state <> 'indexed' AND lease_until >= clock_timestamp() \
-         RETURNING retry_count, max_retries"
+         RETURNING retry_count, max_retries, error_retryable"
+    )
+}
+
+pub(crate) fn ingest_operational_metrics_sql(table: &str) -> String {
+    format!(
+        "SELECT \
+         count(*) FILTER (WHERE NOT source_ready)::bigint AS source_pending_count, \
+         count(*) FILTER (WHERE cleanup_source_uri IS NOT NULL)::bigint AS cleanup_pending_count, \
+         count(*) FILTER (WHERE lease_owner IS NOT NULL AND lease_until >= clock_timestamp())::bigint AS active_lease_count, \
+         count(*) FILTER (WHERE lease_owner IS NOT NULL AND lease_until < clock_timestamp())::bigint AS expired_lease_count, \
+         count(DISTINCT lease_owner) FILTER (WHERE heartbeat_at >= clock_timestamp() - interval '120 seconds')::bigint AS workers_seen_recently, \
+         COALESCE(floor(max(extract(epoch FROM (clock_timestamp() - created_at))) FILTER (\
+           WHERE source_ready AND state <> 'indexed' AND retry_count < max_retries \
+             AND next_attempt_at <= clock_timestamp() \
+             AND (state IN ('queued', 'failed') OR lease_until IS NULL OR lease_until < clock_timestamp())\
+         )), 0)::bigint AS oldest_ready_age_seconds, \
+         count(*) FILTER (WHERE state = 'failed' AND error_retryable IS true)::bigint AS retryable_failed_count \
+         FROM {table}"
     )
 }
 
@@ -1167,6 +1209,54 @@ mod tests {
         let advance = advance_job_sql("jobs");
         assert!(advance.contains("state = $4"));
         assert!(advance.contains("state = $5"));
+    }
+
+    #[test]
+    fn terminal_failure_is_persisted_and_exhausts_retry_budget() {
+        let ddl = job_ddl("jobs").join("\n");
+        assert!(ddl.contains("error_retryable boolean"));
+
+        let failure = fail_job_sql("jobs");
+        assert!(failure.contains("error_retryable = $7"));
+        assert!(failure.contains("CASE WHEN $7"));
+        assert!(failure.contains("ELSE max_retries"));
+        assert!(failure.contains("RETURNING retry_count, max_retries, error_retryable"));
+    }
+
+    #[test]
+    fn raw_source_handoff_blocks_claim_until_source_is_ready() {
+        let ddl = job_ddl("jobs").join("\n");
+        assert!(ddl.contains("source_ready boolean NOT NULL DEFAULT true"));
+        assert!(ddl.contains("cleanup_source_uri text"));
+
+        let enqueue = enqueue_job_sql("jobs");
+        assert!(enqueue.contains("source_ready"));
+        assert!(enqueue.contains("$13"));
+        assert!(claim_jobs_sql("jobs").contains("source_ready"));
+
+        let ready = mark_job_source_ready_sql("jobs");
+        assert!(ready.contains("source_uri = $2"));
+        assert!(ready.contains("content_sha256 = $3"));
+        assert!(ready.contains("source_ready = true"));
+    }
+
+    #[test]
+    fn ingest_operational_metrics_cover_backlog_leases_and_workers() {
+        let metrics = ingest_operational_metrics_sql("jobs");
+        for required in [
+            "source_pending_count",
+            "cleanup_pending_count",
+            "active_lease_count",
+            "expired_lease_count",
+            "workers_seen_recently",
+            "oldest_ready_age_seconds",
+            "retryable_failed_count",
+            "count(DISTINCT lease_owner)",
+            "next_attempt_at <= clock_timestamp()",
+            "state IN ('queued', 'failed') OR lease_until IS NULL OR lease_until < clock_timestamp()",
+        ] {
+            assert!(metrics.contains(required), "missing {required}: {metrics}");
+        }
     }
 
     fn sample() -> Chunk {

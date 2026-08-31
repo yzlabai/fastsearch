@@ -12,7 +12,7 @@
 > - **远端模式（KB-0.2/0.3）：已完成**（2026-08-25），包含 REST 能力探测、
 >   `search`/`resolve_citation` 和远端档专属 `index_chunks`；2026-08-31 新增常态 CI 真二进制 e2e。
 > - **FS-303 文档摄取：✅ 已完成真实 PG/活服务全链路验收**（2026-09-01）：server 实测
->   `document_ingest=true` 时再宣称 `ingest_document`/`ingest_status`，支持同步轮询与异步提示。
+>   `document_ingest=true` 时再宣称 `ingest_document`/`ingest_status`/`retry_ingest`，支持同步轮询、异步提示和 owner-scoped 死信恢复。
 > - 本 spec 是**补记的**：`fastsearch-mcp` 此前是唯一没有 spec 的模块，KB-0.1 的"回写 spec"
 >   无处可写（只在模块清单留了一行）。本文一并还掉这笔欠账。
 
@@ -27,7 +27,7 @@
 **做**：
 - 协议分派：`initialize` / `ping` / `tools/list` / `tools/call`，`notifications/*` 无响应。
 - 本地档两个工具：`search`、`resolve_citation`；远端档另有 `index_chunks`，且 live server
-  报告摄取依赖齐备时才增加 `ingest_document`、`ingest_status`。
+  报告摄取依赖齐备时才增加 `ingest_document`、`ingest_status`、`retry_ingest`。
 - **tool schema 按本实例真实能力生成**（§4.2，本模块的一等硬契约）。
 - **ACL 服务端注入、不可绕过**（不变量 #3；两种运行模式各自的守法见 §4.3）。
 - 两种运行模式：**本地嵌引擎**（现状）与 **远端 REST 客户端**（KB-0.2，§4.5–§4.9）。
@@ -117,6 +117,7 @@ impl McpServer {
 | `index_chunks`（远端） | `collection/doc_id/chunks`；chunk 禁止 tenant/acl | `{"indexed":n}` |
 | `ingest_document`（能力门控） | `collection`；`file_path/source_uri` 二选一；可选 `doc_id/media_type/parse_profile/wait/timeout_ms` | 完整 job JSON + `terminal`；非终态增 `next_tool:"ingest_status"`/`next_arguments`，超时增 `timed_out:true` |
 | `ingest_status`（能力门控） | `job_id` | ACL-safe job JSON + 下一次轮询提示 |
+| `retry_ingest`（能力门控） | `job_id` | 修复依赖后调用 owner-scoped retry，返回重新 queued 的 job JSON；越权/不存在同为 404 |
 
 **命中形状在两种模式下必须逐字段相同**：远端模式拿到的是 server `hits_json`
 （`crates/fastsearch-server/src/lib.rs`）的富对象（含 `bm25`/`vector`/`rerank`/`bbox`/
