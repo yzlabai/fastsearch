@@ -1,12 +1,12 @@
 # KB-3.1：PG `ingest_job` 摄取作业面设计
 
-> 日期：2026-08-25 · 类型：设计文档 · 状态：**FS-301、FS-302 已实施并完成 PG/活服务验证；FS-303–304 未实施**
+> 日期：2026-08-25 · 类型：设计文档 · 状态：**FS-301–303 已实施并完成 PG/活服务验证；FS-304 待实施**
 > 授权来源与边界：[职责边界修订：把「文档摄取作业面」收回引擎](../governance/2026-08-24-职责边界修订-摄取作业面收回引擎.md)（下称**修订文**）
 > 仍然有效的上位 ADR：[职责边界：不承担生产身份与知识库控制面](../governance/2026-08-24-职责边界-不承担身份与控制面.md)
 > 上游计划：[知识库引擎迭代计划 §5（KB-3）](2026-08-24-知识库引擎迭代计划.md) · 缺口来源：[文档摄取现状与差距 §3（G1–G7）](2026-08-24-作为知识库使用-文档摄取现状与差距.md)
 > 并行编排：迭代计划 §11.2 作业 **A3**（通道 C4）。**本文只产出设计与验收，不改 `crates/` 下任何代码。**
 >
-> 2026-09-01 回写：FS-302 已交付 server API 与 worker 安全写协议；独立 worker/MCP 闭环仍待 FS-303。
+> 2026-09-01 回写：FS-302 已交付 server API 与 worker 安全写协议；FS-303 已交付独立 worker、adapter 与 MCP 闭环。
 > 文档坐标作用域经 [ADR-0001](../adr/0001-文档坐标采用全局命名空间.md) 修正为与既有 GlobalId/chunks 主键一致的全局命名空间。
 
 ---
@@ -625,24 +625,24 @@ cargo run -p fastsearch-cli --features parse --bin fastsearch -- ingest \
 
 ## 13. 状态、待决策与待验证（诚实记账）
 
-**状态（2026-09-01 回写）**：FS-301、FS-302 已完成：一表 DDL、状态机、独立 `JobStore`、租约 fencing、
-上传/查询 API、worker job-scoped 安全写协议均已落地；对应 PG/路由/活服务用例在 Docker
-`pgvector:pg17` 通过。FS-303 独立 worker/MCP 闭环、FS-304 故障注入仍未实施，因此整体作业面尚未完成。
+**状态（2026-09-01 回写）**：FS-301–303 已完成：一表 DDL、状态机、独立 `JobStore`、租约 fencing、
+上传/查询 API、worker job-scoped 安全写协议、独立解析 worker 与 MCP 同步/异步摄取均已落地；对应
+PG/路由/活 server-worker-MCP 用例在 Docker `pgvector:pg17` 通过。FS-304 故障注入仍未实施，
+因此 M3 整体作业面尚未完成。
 
-**`[待决策]`（需评审拍板，不得在实施期擅自决定）**
-1. **§6.2 适配器复用方式**：推荐下沉新 crate `fastsearch-ingest-adapter`（会动 `fastsearch-cli/src/ingest.rs`，
-   **必须排在 C2 通道的 KB-1.1/1.2 之后**）；备选是 worker 直依赖 `fastsearch-cli/parse`（不推荐）。
-2. **§6.2 `ObjectStore` 是否下沉独立 crate**：本文默认"worker 直接依赖 `fastsearch-engine`"（零 API 变动）。
-3. **§7.1 `workers_seen_recently` 字段**：本轮给还是留到 KB-3.3。
-4. **同步档默认阈值**：`SYNC_MAX_BYTES=1MiB` / `SYNC_WAIT_MS=3000` / `MAX_INFLIGHT=32` 是拍的数，
-   需要真实 agent 用例校准（观测指标已在 §7.5 备好）。
+**`[已决]`（FS-303）**
+1. 适配器下沉为 `fastsearch-ingest-adapter`，CLI 与 worker 共用一条解析管线。
+2. worker 直接复用 `fastsearch-engine::ObjectStore`，暂不为一个消费者拆新 crate。
+3. `workers_seen_recently` 留给 FS-304 运维指标，不在能力探测里制造不可靠存活真值。
+4. server 同步等待阈值保持 FS-302 默认；MCP 另提供显式 `wait` 与 `timeout_ms`，超时如实返回非终态。
 
 **`[待验证]` / `待运行验证`**
 - 托管 RDS/Supabase/Neon 对两类唯一索引及逻辑复制权限的逐环境兼容性（Docker PG 已通过）。
 - 独立 `JobStore` 连接对检索延迟的实际影响（§7 的性能论证基于 `PgStore` 的 `Mutex<Client>` 结构，未实测）。
-- 两个 worker 用不同 `parse_profile` 交错时的最终态（§8 末）。
-- `cargo tree -p fastsearch-cli`（默认档）在 workspace 里存在一个开着 `parse` 的 worker 时，
-  是否仍解析为零 docparse（feature unification 行为，§6.2 路线 1 的风险点）。
+- 两个 worker 用不同 `parse_profile` 交错时的完整故障矩阵（§8 末，归 FS-304）。
+
+已验证：默认 `cargo tree -p fastsearch-cli -e normal` 以及七个 hot-path crate 均不含 docparse；worker
+开启 parse/heavy feature 不改变这些包各自默认依赖图。
 
 ---
 

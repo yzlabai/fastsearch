@@ -1,8 +1,8 @@
 //! # fastsearch-mcp
 //!
 //! 第四张脸：**MCP（Model Context Protocol）服务**，stdio + JSON-RPC 2.0，把混合检索暴露为
-//! LLM 可直接调用的工具（`search` / `resolve_citation`）。薄适配引擎，逻辑在 lib（纯、可单测），
-//! main 只是 stdio 收发壳。
+//! LLM 可直接调用的工具（`search` / `resolve_citation`；远端能力档另有 `index_chunks` /
+//! `ingest_document` / `ingest_status`）。薄适配引擎，逻辑在 lib（纯、可单测），main 只是 stdio 收发壳。
 //!
 //! **ACL 不可绕过（守不变量 #3）**：principal/ACL 由**服务端配置**注入 `engine.search`/
 //! `resolve_citation`，MCP 客户端（LLM）的工具入参里**不接受也无法放宽** ACL——与 REST 一致。
@@ -13,6 +13,7 @@
 use fastsearch_core::{AclFilter, SearchMode, SearchRequest};
 use fastsearch_engine::{AssetFetch, Engine};
 use serde_json::{json, Value};
+use std::io::Read as _;
 
 /// 支持的 MCP 协议版本（与主流客户端对齐）。
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -31,6 +32,8 @@ pub struct ServerCaps {
     pub embedded: bool,
     pub vector_backend: String,
     pub source_of_truth: String,
+    /// Live server has both the durable job store and an object store required by `/v1/documents`.
+    pub document_ingest: bool,
     /// 本 key 名下**已注册**的集合名。**咨询性**：server 的 collection registry 是进程内
     /// HashMap、非真源、多副本各持一份（ADR《职责边界》已定为"必须写进对外契约的 caveat"）。
     pub collections: Vec<String>,
@@ -112,6 +115,58 @@ impl RemoteBackend {
             )),
         }
     }
+
+    fn get(&self, path: &str) -> Result<Value, String> {
+        let url = format!("{}{path}", self.base);
+        match self
+            .agent
+            .get(&url)
+            .set("authorization", &format!("Bearer {}", self.key))
+            .call()
+        {
+            Ok(response) => response
+                .into_json::<Value>()
+                .map_err(|error| format!("server 响应不是合法 JSON：{error}")),
+            Err(ureq::Error::Status(401, _)) => {
+                Err("server 拒绝了 API key（401）。请更新 FASTSEARCH_KEY 并重启 MCP。".into())
+            }
+            Err(ureq::Error::Status(code, response)) => Err(format!(
+                "server 返回 {code}: {}",
+                response.into_string().unwrap_or_default()
+            )),
+            Err(error) => Err(format!(
+                "请求 {url} 失败：{error}（server 在运行吗？检查 FASTSEARCH_SERVER）"
+            )),
+        }
+    }
+
+    fn post_multipart(&self, path: &str, boundary: &str, body: Vec<u8>) -> Result<Value, String> {
+        let url = format!("{}{path}", self.base);
+        match self
+            .agent
+            .post(&url)
+            .set("authorization", &format!("Bearer {}", self.key))
+            .set(
+                "content-type",
+                &format!("multipart/form-data; boundary={boundary}"),
+            )
+            .send_bytes(&body)
+        {
+            Ok(response) => response
+                .into_json::<Value>()
+                .map_err(|error| format!("server 响应不是合法 JSON：{error}")),
+            Err(ureq::Error::Status(401, _)) => {
+                Err("server 拒绝了 API key（401）。请更新 FASTSEARCH_KEY 并重启 MCP。".into())
+            }
+            Err(ureq::Error::Status(code, response)) => Err(format!(
+                "server 返回 {code}: {}",
+                response.into_string().unwrap_or_default()
+            )),
+            Err(error) => Err(format!(
+                "请求 {url} 失败：{error}（server 在运行吗？检查 FASTSEARCH_SERVER）"
+            )),
+        }
+    }
 }
 
 /// 能力探测：`GET /v1/collections`。顺带**验 key**——401 在启动期就报，
@@ -152,6 +207,10 @@ fn probe_caps(agent: &ureq::Agent, base: &str, key: &str) -> anyhow::Result<Serv
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string(),
+        document_ingest: srv
+            .get("document_ingest")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         collections: v
             .get("collections")
             .and_then(Value::as_array)
@@ -250,6 +309,8 @@ impl McpServer {
             // 本地档不宣称此工具（C1 全表版）⇒ 它在这里也必须真的不可用，
             // 否则"没宣称但能调"就是又一个暗门。
             "index_chunks" => self.tool_index_chunks(args),
+            "ingest_document" => self.tool_ingest_document(args),
+            "ingest_status" => self.tool_ingest_status(args),
             other => Err(format!("unknown tool: {other}")),
         };
         match outcome {
@@ -462,6 +523,140 @@ impl McpServer {
 
     /// `resolve_citation` 工具：由 citation_id 解析媒资/原文位置（ACL 服务端强制，越权/不存在
     /// 均报"未找到或无权限"，不暴露存在性）。
+    const INGEST_ARGS: [&'static str; 8] = [
+        "collection",
+        "doc_id",
+        "file_path",
+        "source_uri",
+        "media_type",
+        "parse_profile",
+        "wait",
+        "timeout_ms",
+    ];
+    const INGEST_STATUS_ARGS: [&'static str; 1] = ["job_id"];
+
+    fn tool_ingest_document(&self, args: Value) -> Result<String, String> {
+        let Backend::Remote(remote) = &self.backend else {
+            return Err(
+                "本实例是本地档，不提供文档摄取；请设置 FASTSEARCH_SERVER + FASTSEARCH_KEY。"
+                    .into(),
+            );
+        };
+        if !remote.caps.document_ingest {
+            return Err(
+                "远端 server 未报告 document_ingest 能力；请确认它配置了 DATABASE_URL 与对象存储。"
+                    .into(),
+            );
+        }
+        let object = args.as_object().ok_or("arguments 必须是对象")?;
+        reject_unknown_tool_args(object, &Self::INGEST_ARGS, "ingest_document")?;
+        let collection = required_tool_string(object, "collection")?;
+        let file_path = optional_tool_string(object, "file_path")?;
+        let source_uri = optional_tool_string(object, "source_uri")?;
+        if file_path.is_some() == source_uri.is_some() {
+            return Err("file_path 与 source_uri 必须且只能提供一个。".into());
+        }
+        let wait = optional_tool_string(object, "wait")?.unwrap_or("complete");
+        if !matches!(wait, "complete" | "never") {
+            return Err("wait 必须是 complete 或 never。".into());
+        }
+        let timeout_ms = object
+            .get("timeout_ms")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .filter(|value| (100..=300_000).contains(value))
+                    .ok_or_else(|| "timeout_ms 必须是 100..=300000 的整数。".to_string())
+            })
+            .transpose()?
+            .unwrap_or(30_000);
+        if wait == "never" && object.contains_key("timeout_ms") {
+            return Err("wait=never 时 timeout_ms 不会生效，请删掉它。".into());
+        }
+        let parse_profile = object
+            .get("parse_profile")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !parse_profile.is_object() {
+            return Err("parse_profile 必须是对象。".into());
+        }
+        let media_type = optional_tool_string(object, "media_type")?
+            .map(validate_media_type)
+            .transpose()?;
+
+        let boundary = multipart_boundary();
+        let mut body = Vec::new();
+        multipart_text(&mut body, &boundary, "collection", collection);
+        if let Some(doc_id) = optional_tool_string(object, "doc_id")? {
+            multipart_text(&mut body, &boundary, "doc_id", doc_id);
+        }
+        if let Some(media_type) = media_type {
+            multipart_text(&mut body, &boundary, "media_type", media_type);
+        }
+        multipart_text(
+            &mut body,
+            &boundary,
+            "parse_profile",
+            &serde_json::to_string(&parse_profile).map_err(|error| error.to_string())?,
+        );
+        multipart_text(
+            &mut body,
+            &boundary,
+            "wait",
+            if wait == "never" { "never" } else { "auto" },
+        );
+        if let Some(path) = file_path {
+            let path = std::path::Path::new(path);
+            let metadata = std::fs::metadata(path)
+                .map_err(|error| format!("无法读取 file_path {}：{error}", path.display()))?;
+            if !metadata.is_file() {
+                return Err(format!("file_path {} 不是普通文件。", path.display()));
+            }
+            let max_bytes = mcp_max_document_bytes();
+            if metadata.len() > max_bytes as u64 {
+                return Err(format!(
+                    "文件为 {} bytes，超过 MCP 本地读取上限 {max_bytes}；请先放入对象存储并传 source_uri。",
+                    metadata.len()
+                ));
+            }
+            let bytes = read_file_limited(path, max_bytes)?;
+            let filename = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("document.bin");
+            let media_type = media_type.unwrap_or_else(|| media_type_for_path(path));
+            multipart_file(&mut body, &boundary, "file", filename, media_type, &bytes);
+        } else if let Some(uri) = source_uri {
+            multipart_text(&mut body, &boundary, "source_uri", uri);
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let response = remote.post_multipart("/v1/documents", &boundary, body)?;
+        let response = if wait == "complete" {
+            poll_ingest_job(remote, response, timeout_ms)?
+        } else {
+            annotate_ingest_job(response, false)
+        };
+        serde_json::to_string(&response).map_err(|error| error.to_string())
+    }
+
+    fn tool_ingest_status(&self, args: Value) -> Result<String, String> {
+        let Backend::Remote(remote) = &self.backend else {
+            return Err(
+                "本实例是本地档，不提供摄取状态；请设置 FASTSEARCH_SERVER + FASTSEARCH_KEY。"
+                    .into(),
+            );
+        };
+        if !remote.caps.document_ingest {
+            return Err("远端 server 未报告 document_ingest 能力。".into());
+        }
+        let object = args.as_object().ok_or("arguments 必须是对象")?;
+        reject_unknown_tool_args(object, &Self::INGEST_STATUS_ARGS, "ingest_status")?;
+        let job_id = required_tool_string(object, "job_id")?;
+        let response = remote.get(&format!("/v1/jobs/{}", pct_segment(job_id)))?;
+        serde_json::to_string(&annotate_ingest_job(response, false))
+            .map_err(|error| error.to_string())
+    }
+
     /// `index_chunks` 宣称接受的入参 —— 同 `SEARCH_ARGS`，与 schema 逐字一致。
     const INDEX_ARGS: [&'static str; 3] = ["collection", "doc_id", "chunks"];
 
@@ -471,8 +666,8 @@ impl McpServer {
     /// 在它上面开写入口等于让引擎"替调用方猜写入 ACL"——正是 server 用 403 拒绝掉的那件事
     /// （见 22-mcp spec §4.2 的 C1 全表版与"待决策"的裁定）。
     ///
-    /// **解析与分块仍归调用方**：本工具不收原始文件。那是 ADR《职责边界》划定的边界，
-    /// 未被 2026-08-24 的修订推翻（修订只收回"摄取作业面"的状态，不是解析算力）。
+    /// **本工具只接收已有 chunk**：原始文件应走 `ingest_document`，由独立 worker 解析；
+    /// 已有外部 ETL 产物时继续保留这条直写路径，避免重复解析。
     fn tool_index_chunks(&self, args: Value) -> Result<String, String> {
         let Backend::Remote(r) = &self.backend else {
             return Err(
@@ -712,7 +907,7 @@ impl McpServer {
                 .expect("tool_defs 是数组")
                 .push(json!({
                     "name": "index_chunks",
-                    "description": "把**已分块**的内容写入知识库（doc 级替换：同 doc_id 重复调用会                        整篇替换，不会重复堆积）。写入身份来自本实例的 API key，                        **tenant/acl 由服务端强制注入，工具入参不接受也无法放宽**。                        解析与分块归调用方：本工具不接受原始文件——把文件变成 chunk 的做法见                        docs/文件解析与摄取.md。",
+                    "description": "把**已分块**的内容写入知识库（doc 级替换：同 doc_id 重复调用会                        整篇替换，不会重复堆积）。写入身份来自本实例的 API key，                        **tenant/acl 由服务端强制注入，工具入参不接受也无法放宽**。                        已有原始文件时优先使用 ingest_document；只有外部 ETL 已产出 chunk 时才用本工具。",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -727,8 +922,274 @@ impl McpServer {
                         "required": ["collection", "doc_id", "chunks"]
                     }
                 }));
+            if let Backend::Remote(remote) = &self.backend {
+                if remote.caps.document_ingest {
+                    let defs = defs.as_array_mut().expect("tool_defs 是数组");
+                    defs.push(json!({
+                        "name": "ingest_document",
+                        "description": "上传原始文档或提交对象存储 URI，由独立 worker 解析、分块并索引。                            身份和 ACL 只来自本实例 API key。file_path/source_uri 二选一；                            wait=complete 会在预算内轮询终态，超时会明确返回 job_id 与 ingest_status 下一步，                            wait=never 立即返回异步 job。",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "collection": {"type":"string", "description":"目标集合"},
+                                "doc_id": {"type":"string", "description":"可选稳定文档标识；省略时文件名优先"},
+                                "file_path": {"type":"string", "description":"MCP 进程可读取的本地文件路径；与 source_uri 二选一"},
+                                "source_uri": {"type":"string", "description":"已位于 server 配置对象存储中的 URI；与 file_path 二选一"},
+                                "media_type": {"type":"string"},
+                                "parse_profile": {"type":"object", "description":"可选解析/分块 provenance；ocr/tables/vlm 需对应 worker feature 与运行时模型"},
+                                "wait": {"type":"string", "enum":["complete","never"], "default":"complete"},
+                                "timeout_ms": {"type":"integer", "minimum":100, "maximum":300000, "default":30000,
+                                    "description":"仅 wait=complete 使用"}
+                            },
+                            "required": ["collection"],
+                            "oneOf": [
+                                {"required":["file_path"]},
+                                {"required":["source_uri"]}
+                            ]
+                        }
+                    }));
+                    defs.push(json!({
+                        "name": "ingest_status",
+                        "description": "读取异步摄取 job 的当前状态。越权与不存在均由 server 返回不可区分的 404；                            非终态响应会给出下一次轮询提示。",
+                        "inputSchema": {
+                            "type":"object",
+                            "properties":{"job_id":{"type":"string"}},
+                            "required":["job_id"]
+                        }
+                    }));
+                }
+            }
         }
         defs
+    }
+}
+
+fn reject_unknown_tool_args(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    tool: &str,
+) -> Result<(), String> {
+    let unknown = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "不接受的入参：{}。{tool} 只接受 {}。",
+            unknown.join("、"),
+            allowed.join("、")
+        ))
+    }
+}
+
+fn required_tool_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, String> {
+    optional_tool_string(object, key)?.ok_or_else(|| format!("{key} 是必填非空字符串。"))
+}
+
+fn optional_tool_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    object
+        .get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{key} 必须是非空字符串。"))
+        })
+        .transpose()
+}
+
+fn validate_media_type(value: &str) -> Result<&str, String> {
+    let valid_token = |token: &str| {
+        !token.is_empty()
+            && token.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                    )
+            })
+    };
+    let valid_essence = value
+        .split(';')
+        .next()
+        .and_then(|essence| essence.split_once('/'))
+        .is_some_and(|(kind, subtype)| valid_token(kind) && valid_token(subtype));
+    if value.len() > 255 || value.chars().any(char::is_control) || !valid_essence {
+        return Err("media_type 必须是无控制字符的 MIME 类型（例如 application/pdf）。".into());
+    }
+    Ok(value)
+}
+
+fn read_file_limited(path: &std::path::Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("读取 file_path {} 失败：{error}", path.display()))?;
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024 * 1024));
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取 file_path {} 失败：{error}", path.display()))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "文件读取期间增长并超过 MCP 本地读取上限 {max_bytes} bytes；请先放入对象存储并传 source_uri。"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn multipart_boundary() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let count = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("fastsearch-mcp-{}-{nanos:x}-{count:x}", std::process::id())
+}
+
+fn multipart_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(value.as_bytes());
+    body.extend_from_slice(b"\r\n");
+}
+
+fn multipart_file(
+    body: &mut Vec<u8>,
+    boundary: &str,
+    name: &str,
+    filename: &str,
+    media_type: &str,
+    bytes: &[u8],
+) {
+    let filename = filename
+        .chars()
+        .map(|character| match character {
+            '\r' | '\n' | '"' | '\\' => '_',
+            other => other,
+        })
+        .collect::<String>();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n\
+             Content-Type: {media_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+}
+
+fn media_type_for_path(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "html" | "htm" => "text/html",
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        "srt" => "application/x-subrip",
+        "eml" => "message/rfc822",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        _ => "application/octet-stream",
+    }
+}
+
+fn mcp_max_document_bytes() -> usize {
+    std::env::var("FASTSEARCH_MCP_MAX_DOCUMENT_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32 * 1024 * 1024)
+}
+
+fn pct_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn ingest_terminal(job: &Value) -> bool {
+    job.get("state").and_then(Value::as_str) == Some("indexed")
+        || (job.get("state").and_then(Value::as_str) == Some("failed")
+            && job
+                .get("dead_letter")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+}
+
+fn annotate_ingest_job(mut job: Value, timed_out: bool) -> Value {
+    let terminal = ingest_terminal(&job);
+    if let Some(object) = job.as_object_mut() {
+        object.insert("terminal".into(), Value::Bool(terminal));
+        if timed_out {
+            object.insert("timed_out".into(), Value::Bool(true));
+        }
+        if !terminal {
+            object.insert("next_tool".into(), Value::String("ingest_status".into()));
+            if let Some(job_id) = object.get("job_id").cloned() {
+                object.insert("next_arguments".into(), json!({"job_id": job_id}));
+            }
+        }
+    }
+    job
+}
+
+fn poll_ingest_job(
+    remote: &RemoteBackend,
+    mut job: Value,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if ingest_terminal(&job) {
+            return Ok(annotate_ingest_job(job, false));
+        }
+        let Some(job_id) = job.get("job_id").and_then(Value::as_str) else {
+            return Err("server 摄取响应缺少 job_id，无法轮询。".into());
+        };
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Ok(annotate_ingest_job(job, true));
+        }
+        let suggested = job
+            .get("poll_after_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(500)
+            .clamp(100, 2_000);
+        std::thread::sleep(
+            std::time::Duration::from_millis(suggested).min(timeout.saturating_sub(elapsed)),
+        );
+        job = remote.get(&format!("/v1/jobs/{}", pct_segment(job_id)))?;
     }
 }
 
@@ -1256,6 +1717,60 @@ mod tests {
     /// "unknown"（实跑时就这么暴露过一次），故测试里也必须按真名断言。
     const PROBE_EMBEDDED: &str = r#"{"collections":["kb"],"server":{"embedded":true,
         "vector_backend":"brute","source_of_truth":"postgres","rebuildable_from_source":true}}"#;
+    const PROBE_INGEST: &str = r#"{"collections":["kb"],"server":{"embedded":true,
+        "vector_backend":"brute","source_of_truth":"postgres","document_ingest":true}}"#;
+
+    fn spawn_sequence_server(
+        probe: &'static str,
+        responses: Vec<&'static str>,
+    ) -> (String, mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut response_index = 0usize;
+            for stream in listener.incoming().take(responses.len() + 1) {
+                let Ok(mut stream) = stream else { break };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        Err(_) => break,
+                    }
+                    if let Some(split) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..split]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() - (split + 4) >= length {
+                            break;
+                        }
+                    }
+                }
+                let is_probe = String::from_utf8_lossy(&request).starts_with("GET /v1/collections");
+                let body = if is_probe {
+                    probe
+                } else {
+                    let body = responses[response_index.min(responses.len() - 1)];
+                    response_index += 1;
+                    body
+                };
+                let _ = tx.send(request);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.flush();
+            }
+        });
+        (url, rx)
+    }
 
     /// 远端探测把 server 的**实测**运行档映射进 schema：`embedded:true` ⇒ 三档可如实宣称。
     /// 这正是"不在 MCP 里养第二套嵌入配置"的兑现——hybrid 由 server 免费提供。
@@ -1420,6 +1935,146 @@ mod tests {
             body["chunks"][0]["doc_id"], "note-1",
             "每条 chunk 必须带 doc_id"
         );
+    }
+
+    #[test]
+    fn remote_ingest_tools_are_capability_gated_and_schema_matches_allowlists() {
+        let (url, _rx) = spawn_server(PROBE_INGEST, r#"{"state":"indexed"}"#);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let server = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let defs = server.tool_defs();
+        for (name, allow) in [
+            ("ingest_document", McpServer::INGEST_ARGS.as_slice()),
+            ("ingest_status", McpServer::INGEST_STATUS_ARGS.as_slice()),
+        ] {
+            let tool = defs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let properties = tool["inputSchema"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let allow = allow
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(properties, allow, "{name} schema drift");
+        }
+
+        let (url, _rx) = spawn_server(PROBE_EMBEDDED, r#"{"state":"indexed"}"#);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let server = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let defs = server.tool_defs();
+        let names = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"ingest_document"));
+        assert!(!names.contains(&"ingest_status"));
+    }
+
+    #[test]
+    fn remote_ingest_document_uploads_multipart_without_identity_fields() {
+        let terminal = r#"{"job_id":"j1","state":"indexed","dead_letter":false,
+            "chunk_count":1,"poll_after_ms":0}"#;
+        let (url, rx) = spawn_server(PROBE_INGEST, terminal);
+        let backend = RemoteBackend::connect(Some(url), Some("write-key".into())).unwrap();
+        let server = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let _ = rx.recv().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# 收入\n增长 20%\n").unwrap();
+        let response = server
+            .handle(&json!({
+                "jsonrpc":"2.0","id":71,"method":"tools/call",
+                "params":{"name":"ingest_document","arguments":{
+                    "collection":"kb","doc_id":"note-1","file_path":path,
+                    "parse_profile":{"chunking":{"target_chars":400}},"wait":"complete"
+                }}
+            }))
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        let result: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(result["state"], "indexed");
+        assert_eq!(result["terminal"], true);
+        let request = String::from_utf8_lossy(&rx.recv().unwrap()).into_owned();
+        assert!(request.starts_with("POST /v1/documents"));
+        assert!(request.to_ascii_lowercase().contains("bearer write-key"));
+        assert!(request.contains("filename=\"note.md\""));
+        assert!(request.contains("增长 20%"));
+        assert!(!request.contains("\"tenant\""));
+        assert!(!request.contains("\"acl\""));
+    }
+
+    #[test]
+    fn ingest_multipart_rejects_header_injection_and_caps_changed_files() {
+        assert!(validate_media_type("application/pdf").is_ok());
+        assert!(validate_media_type("text/plain; charset=utf-8").is_ok());
+        assert!(validate_media_type("text/plain\r\nx-evil: true").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.md");
+        std::fs::write(&path, b"12345").unwrap();
+        assert!(read_file_limited(&path, 4)
+            .unwrap_err()
+            .contains("超过 MCP 本地读取上限"));
+    }
+
+    #[test]
+    fn complete_ingest_polls_to_terminal_and_async_returns_status_hint() {
+        let queued = r#"{"job_id":"j2","state":"queued","dead_letter":false,
+            "chunk_count":0,"poll_after_ms":1}"#;
+        let indexed = r#"{"job_id":"j2","state":"indexed","dead_letter":false,
+            "chunk_count":2,"poll_after_ms":0}"#;
+        let (url, rx) = spawn_sequence_server(PROBE_INGEST, vec![queued, indexed]);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let server = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let _ = rx.recv().unwrap();
+        let response = server
+            .handle(&json!({
+                "jsonrpc":"2.0","id":72,"method":"tools/call",
+                "params":{"name":"ingest_document","arguments":{
+                    "collection":"kb","source_uri":"s3://objects/acme/note.md",
+                    "wait":"complete","timeout_ms":1000
+                }}
+            }))
+            .unwrap();
+        let result: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(result["state"], "indexed");
+        assert_eq!(result["terminal"], true);
+        let _upload = rx.recv().unwrap();
+        let poll = String::from_utf8(rx.recv().unwrap()).unwrap();
+        assert!(poll.starts_with("GET /v1/jobs/j2"));
+
+        let (url, rx) = spawn_server(PROBE_INGEST, queued);
+        let backend = RemoteBackend::connect(Some(url), Some("k".into())).unwrap();
+        let server = McpServer::with_backend(Backend::Remote(Box::new(backend)));
+        let _ = rx.recv().unwrap();
+        let response = server
+            .handle(&json!({
+                "jsonrpc":"2.0","id":73,"method":"tools/call",
+                "params":{"name":"ingest_document","arguments":{
+                    "collection":"kb","source_uri":"s3://objects/acme/note.md","wait":"never"
+                }}
+            }))
+            .unwrap();
+        let result: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(result["terminal"], false);
+        assert_eq!(result["next_tool"], "ingest_status");
+        assert_eq!(result["next_arguments"]["job_id"], "j2");
     }
 
     /// chunk 里夹带 tenant/acl → **显式拒绝**，不让 server 静默覆盖。

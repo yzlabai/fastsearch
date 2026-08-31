@@ -19,7 +19,7 @@
 | **可溯源引用**（`citation_id → page+bbox`，`resolve_citation` 深链） | LLM 答案能**带出处**、点回原文页/坐标——grounding 不只是"找到段落"，而是"指到位置" |
 | **混合检索**（keyword∥vector→RRF 融合） | agentic-RAG 的召回层：精确词面 + 语义理解，先召回准候选，再做校正/验证循环 |
 | **ACL 不可绕过**（按 API Key 服务端注入） | 多租户 Agent 天然隔离——客户端/LLM **无法**在请求里传或放宽权限 |
-| **MCP 原生**（第四张脸） | LLM 直接把 `search`/`resolve_citation` 当工具调，无需自己写 HTTP 胶水 |
+| **MCP 原生**（第四张脸） | LLM 直接调用检索/引用；远端档还能原始文档摄取与查 job 状态，无需 HTTP 胶水 |
 | **过滤 filter-aware** | 选择性强的过滤**不掉召回**（超越 pgvector 后过滤坑），适合 corrective retrieval |
 | **高亮片段** | 只回命中片段，**省 token**（对位 Exa highlights） |
 | **PG 真源、不锁定** | 数据在你自己的托管 PG（RDS/Supabase/Neon），引擎索引可重建；无专有存储 |
@@ -123,7 +123,7 @@ MCP 客户端配置（stdio server）：
 }
 ```
 
-暴露两个工具：
+本地档暴露两个只读工具；远端档另按 live server 能力增加写入/摄取工具：
 
 - **`search`**：入参 `{query, mode?, top_k?, filter?, highlight?, vector?, include_text?, max_context_chars?}`
   → 带引用命中（citation_id/page/heading_path/snippet[/text]）。
@@ -135,6 +135,11 @@ MCP 客户端配置（stdio server）：
   把已分块内容写入知识库（doc 级替换）。**写入身份来自 API key，chunk 里夹带 `tenant`/`acl` 会被拒绝**
   （而不是被静默覆盖）。解析与分块仍归调用方——见[文件解析与摄取](文件解析与摄取.md)。
   本地档**不宣称也不可调**：它没有每请求身份，开写入口等于让引擎替调用方猜写入 ACL。
+- **`ingest_document`**（**远端 + `server.document_ingest=true`**）：入参
+  `{collection, file_path|source_uri, doc_id?, media_type?, parse_profile?, wait?, timeout_ms?}`。
+  上传原始文档后由独立 worker 解析；`wait=complete` 在预算内轮询 indexed/dead-letter，超时明确返回
+  `job_id + next_tool:"ingest_status"`，`wait=never` 立即返回异步 job。
+- **`ingest_status`**（同一能力门）：入参 `{job_id}`，读取 ACL-safe 状态并给下一次轮询提示。
 
 #### 两个运行档（2026-08-25，KB-0.2）
 
@@ -152,7 +157,8 @@ MCP 客户端配置（stdio server）：
 ```
 
 > **schema 按实例真实能力生成**：远端档启动时探一次 `GET /v1/collections`（顺带验 key），
-> 按 server 实测的 `embedded` 决定 `mode` 的 enum；探测失败**拒绝启动**，不猜、不静默回退本地档。
+> 按 server 实测的 `embedded` 决定 `mode`，并仅在 jobs+ObjectStore+PG 真源齐备时宣称文档摄取；
+> 探测失败**拒绝启动**，不猜、不静默回退本地档。
 > 本地档只宣称 `keyword`——MCP 直连引擎，而引擎**从不嵌入文本 query**（那一步在 server 的
 > `/v1/search` 里）。显式传给不出的档会**报错并给出改法**，不静默退化（KB-0.1）。
 >
@@ -160,7 +166,7 @@ MCP 客户端配置（stdio server）：
 > `FASTSEARCH_MCP_ACL=all`）→ **拒绝启动**（此前静默"全库可见"，是替调用方猜身份）；
 > ② 同时配 `FASTSEARCH_SERVER` 与 `FASTSEARCH_MCP_TENANT/_TAGS` → **拒绝启动**（二选一）。
 >
-> `search` 只接受宣称过的入参（`query`/`mode`/`top_k`/`filter`/`highlight`/`vector`），
+> `search` 只接受宣称过的入参（`query`/`mode`/`top_k`/`filter`/`highlight`/`vector`/`include_text`/`max_context_chars`），
 > 其余一律拒绝并列出可用字段——**未宣称的能力不得作为暗门存在**。以图搜图请走 REST 的
 > `query_image_base64`（本面尚未宣称，需先有 server 实测的 image/cross_modal caps，等 KB-2.4）。
 
@@ -324,7 +330,7 @@ FASTSEARCH_KEYS="alice=acme:team-a,public; bob=acme:team-b; admin=:public"
 | 检索 | keyword+向量**混合**(RRF) | keyword+向量混合 | 向量为主(+部分 BM25) | 向量 | keyword+向量 |
 | **可溯源引用→深链** | ✅ page+bbox + `resolve_citation` | 高亮/属性 | 元数据 | 自理 | 高亮 |
 | **ACL 不可绕过** | ✅ 服务端注入、多租户 | 应用层/multi-tenancy | 应用层 | 自理 | 文档级安全(商业) |
-| **MCP 原生工具** | ✅ search/resolve_citation | ✅(近期) | 经第三方 | — | 经第三方 |
+| **MCP 原生工具** | ✅ search/resolve_citation + 远端 ingest/status | ✅(近期) | 经第三方 | — | 经第三方 |
 | 真源/锁定 | **托管 PG 真源、可重建** | 专有存储 | 专有存储 | 就是 PG | 专有存储 |
 | filter-aware 召回 | ✅ 超集+精确后过滤 | ✅ | 视实现 | **后过滤易掉召回** | ✅ |
 | 部署 | 单二进制 + 任意托管 PG | 单二进制 | 集群 | PG 内 | 集群 |

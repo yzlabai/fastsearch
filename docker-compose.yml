@@ -1,4 +1,4 @@
-# 一键起 fastsearch 全栈：pgvector（真源，逻辑复制）+ fastsearch-server（CDC 同步）。
+# 一键起 fastsearch 全栈：pgvector + server + 独立 ingest worker。
 #   docker compose up --build
 #   curl -s localhost:8642/healthz
 # PG 侧只用 pgvector + 逻辑复制，不装任何需 shared_preload_libraries 的原生扩展（守可移植 N1b）。
@@ -35,8 +35,10 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      FASTSEARCH_KEYS: "dev=:public"
+      FASTSEARCH_KEYS: "dev=:public;worker=:public"
+      FASTSEARCH_WORKER_KEYS: "worker"
       DATABASE_URL: "postgres://fastsearch:fastsearch@postgres:5432/fastsearch"
+      FASTSEARCH_OBJECT_DIR: "/objects"
       # 开启后台 CDC 同步（PG 真源 → 引擎派生索引）。需先在 PG 建 chunks 表 + publication
       # （引擎首次 ensure_slot/bootstrap 会处理；schema 见 fastsearch-pg/sql.rs DDL）。
       FASTSEARCH_CDC: "1"
@@ -46,7 +48,33 @@ services:
       - "8642:8642"
     volumes:
       - fsdata:/data
+      - objects:/objects
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8642/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  ingest-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgres://fastsearch:fastsearch@postgres:5432/fastsearch"
+      FASTSEARCH_SERVER: "http://server:8642"
+      FASTSEARCH_WORKER_KEY: "worker"
+      FASTSEARCH_OBJECT_DIR: "/objects"
+      FASTSEARCH_WORKER_CONCURRENCY: "1"
+    volumes:
+      - objects:/objects
 
 volumes:
   pgdata:
   fsdata:
+  objects:

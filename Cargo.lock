@@ -1246,22 +1246,9 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
- "docparse-core",
- "docparse-csv",
- "docparse-docx",
- "docparse-eml",
- "docparse-html",
- "docparse-img",
- "docparse-md",
- "docparse-ocr",
- "docparse-pdf",
- "docparse-pptx",
- "docparse-raster",
- "docparse-srt",
- "docparse-vlm",
- "docparse-xlsx",
  "fastsearch-core",
  "fastsearch-eval",
+ "fastsearch-ingest-adapter",
  "serde",
  "serde_json",
  "tempfile",
@@ -1322,6 +1309,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastsearch-ingest-adapter"
+version = "0.2.0-rc.1"
+dependencies = [
+ "anyhow",
+ "base64",
+ "docparse-core",
+ "docparse-csv",
+ "docparse-docx",
+ "docparse-eml",
+ "docparse-html",
+ "docparse-img",
+ "docparse-md",
+ "docparse-ocr",
+ "docparse-pdf",
+ "docparse-pptx",
+ "docparse-raster",
+ "docparse-srt",
+ "docparse-vlm",
+ "docparse-xlsx",
+ "fastsearch-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "fastsearch-ingest-worker"
+version = "0.2.0-rc.1"
+dependencies = [
+ "anyhow",
+ "fastsearch-core",
+ "fastsearch-engine",
+ "fastsearch-ingest-adapter",
+ "fastsearch-pg",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "fastsearch-mcp"
 version = "0.2.0-rc.1"
 dependencies = [
@@ -1331,6 +1359,7 @@ dependencies = [
  "fastsearch-text",
  "serde",
  "serde_json",
+ "tempfile",
  "ureq",
 ]
 

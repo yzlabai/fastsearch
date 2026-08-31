@@ -1,0 +1,46 @@
+# fastsearch-ingest-worker image. Parser dependencies live only in this image, never in server.
+# Build: docker build -f Dockerfile.worker -t fastsearch-ingest-worker .
+
+ARG USE_CN_MIRRORS=false
+ARG WORKER_FEATURES=parse
+ARG CN_MIRRORS_ENABLED=${USE_CN_MIRRORS/false/}
+ARG CN_IMAGE_PREFIX=${CN_MIRRORS_ENABLED:+docker.m.daocloud.io/library/}
+
+FROM ${CN_IMAGE_PREFIX}rust:1.88-slim AS builder
+ARG USE_CN_MIRRORS
+ARG WORKER_FEATURES
+RUN case "$USE_CN_MIRRORS" in \
+      false) ;; \
+      true) \
+        mkdir -p /usr/local/cargo \
+        && printf '%s\n' \
+          '[source.crates-io]' \
+          'replace-with = "mirror"' \
+          '[source.mirror]' \
+          'registry = "sparse+https://rsproxy.cn/index/"' \
+          > /usr/local/cargo/config.toml \
+        ;; \
+      *) echo "USE_CN_MIRRORS must be 'true' or 'false'" >&2; exit 2 ;; \
+    esac
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY vendor ./vendor
+RUN cargo build --release -p fastsearch-ingest-worker --bin fastsearch-ingest-worker \
+    --no-default-features --features "$WORKER_FEATURES"
+
+FROM ${CN_IMAGE_PREFIX}debian:bookworm-slim AS runtime
+ARG USE_CN_MIRRORS
+RUN if [ "$USE_CN_MIRRORS" = "true" ]; then \
+      sed -i \
+        -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
+        -e 's|http://security.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
+        /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 fastsearch \
+    && mkdir -p /objects && chown fastsearch /objects
+COPY --from=builder /build/target/release/fastsearch-ingest-worker /usr/local/bin/fastsearch-ingest-worker
+USER fastsearch
+ENTRYPOINT ["/usr/local/bin/fastsearch-ingest-worker"]

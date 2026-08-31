@@ -11,6 +11,8 @@
 >   2026-08-24 活服务验证 done）。
 > - **远端模式（KB-0.2/0.3）：已完成**（2026-08-25），包含 REST 能力探测、
 >   `search`/`resolve_citation` 和远端档专属 `index_chunks`；2026-08-31 新增常态 CI 真二进制 e2e。
+> - **FS-303 文档摄取：✅ 已完成真实 PG/活服务全链路验收**（2026-09-01）：server 实测
+>   `document_ingest=true` 时再宣称 `ingest_document`/`ingest_status`，支持同步轮询与异步提示。
 > - 本 spec 是**补记的**：`fastsearch-mcp` 此前是唯一没有 spec 的模块，KB-0.1 的"回写 spec"
 >   无处可写（只在模块清单留了一行）。本文一并还掉这笔欠账。
 
@@ -24,7 +26,8 @@
 
 **做**：
 - 协议分派：`initialize` / `ping` / `tools/list` / `tools/call`，`notifications/*` 无响应。
-- 两个工具：`search`、`resolve_citation`（下方 §4.4）。
+- 本地档两个工具：`search`、`resolve_citation`；远端档另有 `index_chunks`，且 live server
+  报告摄取依赖齐备时才增加 `ingest_document`、`ingest_status`。
 - **tool schema 按本实例真实能力生成**（§4.2，本模块的一等硬契约）。
 - **ACL 服务端注入、不可绕过**（不变量 #3；两种运行模式各自的守法见 §4.3）。
 - 两种运行模式：**本地嵌引擎**（现状）与 **远端 REST 客户端**（KB-0.2，§4.5–§4.9）。
@@ -34,7 +37,7 @@
   远端 server；本地档如实宣称自己只有 keyword。
 - 不做身份/租户控制面（ADR《职责边界》第 1 类）。远端模式下身份 = 一把 API key，交给 server 翻译。
 - 不做 SSE / HTTP streamable transport（当前只有 stdio）。
-- 不做原始文件写入工具 `ingest_document`（结构化的 `index_chunks` 已在 KB-0.3 落地）。
+- 不在 MCP 进程内解析文档；`ingest_document` 只组 multipart/轮询 durable job，解析由独立 worker 完成。
 - 不做 token 精确预算；当前以 `max_context_chars` 做字符级上下文限制与 per-hit 截断。
 
 ---
@@ -52,7 +55,7 @@ impl McpServer {
     pub fn new(engine: Engine, acl: Option<AclFilter>) -> Self;
     /// 一条 JSON-RPC 消息 → 请求返回 Some(响应)，通知（无 id）返回 None。纯函数，可单测。
     pub fn handle(&self, msg: &Value) -> Option<Value>;
-    /// 两个工具的定义（名称/描述/inputSchema），**按实例真实能力生成**。
+    /// 工具定义（名称/描述/inputSchema），**按实例真实能力生成**。
     pub fn tool_defs(&self) -> Value;
 }
 ```
@@ -111,6 +114,9 @@ impl McpServer {
 |---|---|---|
 | `search` | `query`(必填, string)、`mode`(enum 由 §4.2 推导)、`top_k`(int, 默认 20)、`filter`(core::Filter AST)、`highlight`(bool)、`vector`(number[]，调用方自带查询向量)、`include_text`(bool)、`max_context_chars`(非负 int) | 基础形状 `{"hits":[{citation_id, score, page, heading_path, snippet}]}`；`include_text=true` 时 hit 增 `text`；设预算时顶层增 `dropped`/`truncated`/`context_chars`，截断 hit 增 `text_truncated` |
 | `resolve_citation` | `citation_id`(必填, `"collection:doc_id:chunk_id"`) | `{"found":false,"reason":…}` 或 `{"found":true, media_type, time, fetch:{kind:"doc_render"\|"signed_url"\|"inline_ref", …}}` |
+| `index_chunks`（远端） | `collection/doc_id/chunks`；chunk 禁止 tenant/acl | `{"indexed":n}` |
+| `ingest_document`（能力门控） | `collection`；`file_path/source_uri` 二选一；可选 `doc_id/media_type/parse_profile/wait/timeout_ms` | 完整 job JSON + `terminal`；非终态增 `next_tool:"ingest_status"`/`next_arguments`，超时增 `timed_out:true` |
+| `ingest_status`（能力门控） | `job_id` | ACL-safe job JSON + 下一次轮询提示 |
 
 **命中形状在两种模式下必须逐字段相同**：远端模式拿到的是 server `hits_json`
 （`crates/fastsearch-server/src/lib.rs`）的富对象（含 `bm25`/`vector`/`rerank`/`bbox`/
@@ -129,6 +135,8 @@ pub struct ServerCaps {
     pub vector_dim: Option<usize>,
     pub source_of_truth: String,  // "postgres" | "none"
     pub rebuildable_from_source: bool,
+    /// jobs + ObjectStore + PG source store 三者同时可用时才为 true。
+    pub document_ingest: bool,
     /// 本 key 名下已注册的集合名（**咨询性、内存态、可能不全**，见 §4.6 caveat）。
     pub collections: Vec<String>,
 }

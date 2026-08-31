@@ -1199,11 +1199,14 @@ fn openapi_spec() -> Value {
                     }
                 },
                 "WorkerChunksRequest": {
-                    "type": "object", "required": ["lease_job_id", "lease_owner", "lease_epoch", "chunks"],
+                    "type": "object", "additionalProperties": false,
+                    "required": ["lease_job_id", "lease_owner", "lease_epoch", "chunks"],
                     "properties": {
                         "lease_job_id": {"type": "string"},
                         "lease_owner": {"type": "string"},
                         "lease_epoch": {"type": "integer", "format": "int64"},
+                        "store_media": {"type": "string", "enum": ["inline", "object"], "default": "inline",
+                            "description": "worker 解析出的媒资字节去向；旧调用方省略时保持 inline"},
                         "chunks": {"type": "array", "minItems": 1, "maxItems": MAX_CHUNK_BATCH,
                             "items": {"$ref": "#/components/schemas/WorkerIndexChunk"}}
                     }
@@ -2577,10 +2580,13 @@ enum WorkerStatusCommand {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerChunksBody {
     lease_job_id: String,
     lease_owner: String,
     lease_epoch: i64,
+    #[serde(default)]
+    store_media: StoreMedia,
     chunks: Vec<WorkerIndexChunk>,
 }
 
@@ -2724,7 +2730,7 @@ fn job_response(job: &fastsearch_pg::IngestJob, deduplicated: bool) -> Value {
         "deduplicated": deduplicated,
         "dead_letter": job.is_dead_letter(),
         "retry_count": job.retry_count,
-        "poll_after_ms": if matches!(job.state, fastsearch_pg::IngestState::Indexed | fastsearch_pg::IngestState::Failed) { 0 } else { 2_000 },
+        "poll_after_ms": ingest_poll_after_ms(job.state, job.is_dead_letter()),
         "job_url": format!("/v1/jobs/{}", job.job_id),
         "error": job.error,
         "stage": job.error_stage.as_deref().unwrap_or(job.state.as_str()),
@@ -2734,6 +2740,14 @@ fn job_response(job: &fastsearch_pg::IngestJob, deduplicated: bool) -> Value {
         "updated_at": job.updated_at_ms,
         "finished_at": job.finished_at_ms,
     })
+}
+
+fn ingest_poll_after_ms(state: fastsearch_pg::IngestState, dead_letter: bool) -> u64 {
+    if state == fastsearch_pg::IngestState::Indexed || dead_letter {
+        0
+    } else {
+        2_000
+    }
 }
 
 fn current_job_lease(
@@ -2886,6 +2900,12 @@ async fn write_ingest_job_chunks(
     if body.lease_job_id != job_id {
         return Err((StatusCode::CONFLICT, "lease belongs to another job".into()));
     }
+    if !matches!(body.store_media, StoreMedia::Inline | StoreMedia::Object) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "worker store_media must be inline or object".into(),
+        ));
+    }
     if body.chunks.is_empty() || body.chunks.len() > MAX_CHUNK_BATCH {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2941,7 +2961,7 @@ async fn write_ingest_job_chunks(
     let index_body = IndexBody {
         collection: collection.clone(),
         doc_id: doc_id.clone(),
-        store_media: StoreMedia::Inline,
+        store_media: body.store_media,
         chunks: body
             .chunks
             .into_iter()
@@ -4642,6 +4662,11 @@ async fn server_vector_info(s: &ServerState) -> Value {
         // 不让调用方以为崩溃后能从真源恢复。事实由运行时推导，非配置声明。
         "source_of_truth": if engine.source_pg_clone().is_some() { "postgres" } else { "none" },
         "rebuildable_from_source": engine.source_pg_clone().is_some(),
+        // Capability is derived from live dependencies. MCP uses it to avoid advertising an
+        // ingest tool against a server that cannot create durable jobs or store source bytes.
+        "document_ingest": s.jobs.is_some()
+            && engine.has_object_store()
+            && engine.source_pg_clone().is_some(),
         // KB-2.4：**实测**到的嵌入能力（不是配置声明）。调用方据此判断能不能做以图搜图等，
         // 而不是靠猜。`ran:false` = 未探测（Hash 基线），此时 caps 仍是配置值。
         "embed_caps": s.embedder.as_ref().map(|e| {
@@ -4831,6 +4856,22 @@ mod tests {
     use tower::ServiceExt;
 
     struct PairEmbedder;
+
+    #[test]
+    fn retryable_failed_jobs_keep_a_poll_hint_until_dead_letter() {
+        assert_eq!(
+            ingest_poll_after_ms(fastsearch_pg::IngestState::Failed, false),
+            2_000
+        );
+        assert_eq!(
+            ingest_poll_after_ms(fastsearch_pg::IngestState::Failed, true),
+            0
+        );
+        assert_eq!(
+            ingest_poll_after_ms(fastsearch_pg::IngestState::Indexed, false),
+            0
+        );
+    }
 
     impl Embedder for PairEmbedder {
         fn dim(&self) -> usize {
@@ -5619,6 +5660,32 @@ mod tests {
             })
             .to_string()
         };
+        let unsupported_media_mode = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/jobs/worker-job/chunks")
+                    .header("x-api-key", "worker-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "lease_job_id": &lease.job.job_id,
+                            "lease_owner": &lease.owner,
+                            "lease_epoch": lease.epoch,
+                            "store_media": "reference",
+                            "chunks": [{
+                                "chunk_id": 1, "kind": "paragraph", "text": "x", "page": 1,
+                                "bbox": {"x0":0.0,"y0":0.0,"x1":1.0,"y1":1.0}, "char_len": 1
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported_media_mode.status(), StatusCode::BAD_REQUEST);
         let smuggled_identity = app
             .clone()
             .oneshot(
@@ -8378,6 +8445,14 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|field| field == "lease_job_id")
+        );
+        assert_eq!(
+            v["components"]["schemas"]["WorkerChunksRequest"]["properties"]["store_media"]["enum"],
+            json!(["inline", "object"])
+        );
+        assert_eq!(
+            v["components"]["schemas"]["WorkerChunksRequest"]["additionalProperties"],
+            false
         );
         let worker_chunk_properties = v["components"]["schemas"]["WorkerIndexChunk"]["properties"]
             .as_object()

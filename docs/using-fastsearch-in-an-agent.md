@@ -19,7 +19,7 @@ Why pick it for Agent development (vs. a pure vector store / pure keyword index)
 | **Traceable citations** (`citation_id → page+bbox`, `resolve_citation` deep links) | The LLM's answer can **carry its sources** and link back to the original page/coordinates — grounding isn't just "found the passage" but "points to the location" |
 | **Hybrid retrieval** (keyword ∥ vector → RRF fusion) | The recall layer for agentic-RAG: exact lexical + semantic understanding — recall accurate candidates first, then run a correction/verification loop |
 | **ACL cannot be bypassed** (injected server-side per API key) | Multi-tenant Agents are isolated by construction — the client/LLM **cannot** pass or widen permissions in the request |
-| **MCP-native** (the fourth face) | The LLM calls `search` / `resolve_citation` directly as tools — no HTTP glue to write |
+| **MCP-native** (the fourth face) | The LLM calls retrieval/citation tools directly; remote mode also ingests raw documents and checks job state |
 | **Filter-aware** | Highly selective filters **don't lose recall** (avoiding pgvector's post-filter trap) — well-suited to corrective retrieval |
 | **Highlight snippets** | Return only the matched snippet, **saving tokens** (akin to Exa highlights) |
 | **PG source of truth, no lock-in** | Your data lives in your own managed PG (RDS/Supabase/Neon); the engine index is rebuildable — no proprietary storage |
@@ -123,7 +123,8 @@ MCP client config (stdio server):
 }
 ```
 
-It exposes two tools:
+Local mode exposes two read tools; remote mode adds write/ingestion tools only when the live server
+reports the required capability:
 
 - **`search`**: input `{query, mode?, top_k?, filter?, highlight?}` → hits with citations (citation_id/page/heading_path/snippet).
 
@@ -155,6 +156,12 @@ It exposes two tools:
   chunks carrying `tenant`/`acl` are **rejected rather than silently overwritten**. Parsing and
   chunking remain the caller's job. The local mode neither advertises nor accepts this tool — it has
   no per-request identity, so opening a write path there would make the engine guess the write ACL.
+- **`ingest_document`** (**remote mode and `server.document_ingest=true`**): input
+  `{collection, file_path|source_uri, doc_id?, media_type?, parse_profile?, wait?, timeout_ms?}`.
+  The independent worker parses and indexes the raw document. `wait=complete` polls within the
+  requested budget; a timeout or `wait=never` returns the durable `job_id` plus an explicit
+  `ingest_status` next step.
+- **`ingest_status`** (same capability gate): input `{job_id}` → ACL-safe job state and polling hint.
 - **`resolve_citation`**: input `{citation_id}` → media/source location (page+bbox or signed URL).
 
 ACL is injected from server-side env (`FASTSEARCH_MCP_TENANT/TAGS`) — the LLM's tool arguments **cannot** smuggle in or widen permissions.
@@ -294,7 +301,7 @@ Hits carry `media` (a media reference) and `time` (an audio/video interval); `re
 | Retrieval | keyword+vector **hybrid** (RRF) | keyword+vector hybrid | vector-first (+ some BM25) | vector | keyword+vector |
 | **Traceable citation → deep link** | ✅ page+bbox + `resolve_citation` | highlight/attributes | metadata | DIY | highlight |
 | **ACL cannot be bypassed** | ✅ server-side injection, multi-tenant | app layer / multi-tenancy | app layer | DIY | document-level security (commercial) |
-| **MCP-native tools** | ✅ search/resolve_citation | ✅ (recently) | via third party | — | via third party |
+| **MCP-native tools** | ✅ search/resolve_citation + remote ingest/status | ✅ (recently) | via third party | — | via third party |
 | Source of truth / lock-in | **managed PG source of truth, rebuildable** | proprietary storage | proprietary storage | it *is* PG | proprietary storage |
 | Filter-aware recall | ✅ superset + exact post-filter | ✅ | implementation-dependent | **post-filter easily loses recall** | ✅ |
 | Deployment | single binary + any managed PG | single binary | cluster | inside PG | cluster |

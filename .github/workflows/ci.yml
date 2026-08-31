@@ -62,6 +62,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: assert hot-path crates pull zero docparse
         run: |
+          if cargo tree -e normal | grep -qi docparse; then
+            echo "FAIL: 根目录默认构建拉入了 docparse（adapter/worker 必须显式选择）" >&2
+            cargo tree -e normal | grep -i docparse >&2
+            exit 1
+          fi
+          echo "ok: 根目录默认构建无 docparse"
           # 含 mcp（第四张脸检索入口，依赖 engine）与 cli 默认档（CLAUDE.md：默认构建零 docparse，
           # 仅 --features parse 才拉入）。
           for c in fastsearch-server fastsearch-engine fastsearch-core fastsearch-text fastsearch-vector fastsearch-mcp fastsearch-cli; do
@@ -102,6 +108,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: docker build (server image)
         run: docker build -t fastsearch-server:ci .
+      - name: docker build (independent ingest worker image)
+        run: docker build -f Dockerfile.worker -t fastsearch-ingest-worker:ci .
 
   # 解析分档（轻量，无 ONNX）：`parse` feature 对 vendored docparse 编译 + 单测绿。
   # parse-ocr/parse-tables（重 ONNX）需模型目录，CI 仅编译校验、运行测试 env-gated 跳过。
@@ -116,7 +124,7 @@ jobs:
       - name: clippy (parse, zero warnings)
         run: cargo clippy -p fastsearch-cli --features parse --all-targets -- -D warnings
       - name: test (parse multiformat ingest)
-        run: cargo test -p fastsearch-cli --features parse
+        run: cargo test -p fastsearch-cli --features parse && cargo test -p fastsearch-ingest-worker
       # parse-ocr/parse-tables（重 ONNX/tract）：CI 仅**编译校验**防 bit-rot；运行测试需 ONNX
       # 模型目录、env-gated 跳过（见 CLAUDE.md 构建分档）。本机已验证两档 cargo check 均通过。
       - name: check (parse-ocr, compile only)
@@ -125,6 +133,8 @@ jobs:
         run: cargo check -p fastsearch-cli --features parse-tables
       - name: check (parse-vlm, compile only)
         run: cargo check -p fastsearch-cli --features parse-vlm
+      - name: check (worker heavy profiles, compile only)
+        run: cargo check -p fastsearch-ingest-worker --features parse-ocr,parse-tables,parse-vlm
 
   # 依赖许可 + 安全公告 + 来源守门（治理 [C1 §4.3]）+ 产出第三方许可清单。GA 出口判据：
   # 拒绝意外引入 copyleft/share-alike（GPL/CC-BY-SA，如换 lindera 系词典），并把

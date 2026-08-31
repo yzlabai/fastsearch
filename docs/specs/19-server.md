@@ -43,7 +43,8 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - worker-only `/status` 用 serde 枚举表达 heartbeat/阶段/failed，并要求 worker 回传 claim 得到的
   `lease_job_id + lease_owner + lease_epoch`；`/chunks` 复用
   `/v1/index` 写入内核；专用 `WorkerIndexChunk` 线缆 DTO 不含 tenant/ACL/collection/doc_id，夹带这些字段
-  直接 400，服务端再从 job 恢复身份与坐标。只有 PG chunks 与派生索引
+  直接 400；FS-303 增加顶层 `store_media=inline|object`（省略保持旧版 inline），其他值同样 400。
+  服务端再从 job 恢复身份与坐标。只有 PG chunks 与派生索引
   全部写成功后才将 job 置 indexed。
 - chunk 管理端点以现有 `GlobalId=(collection,doc_id,chunk_id)` 寻址；batch 上限 1000。
   Batch get 保持请求顺序并用 `chunk:null` 合并不可见/不存在；batch delete 同理返回
@@ -67,6 +68,8 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   提示改用 `source_uri`。`wait=auto|never`；auto 只轮询独立 worker，server 不解析。
 - **作业防竞争**：worker chunks 发布期间 PG job 行保持锁定，租约过期也不能被第二 worker 中途重领；
   chunks/派生写失败时不标 indexed。所有状态与列表 ACL 在 SQL 内过滤，防 job id 枚举。
+- **能力诚实化**：`GET /v1/collections` 的 `server.document_ingest` 仅在 live jobs、ObjectStore、
+  PG chunk 真源三项同时存在时为 true；retryable failed 的 `poll_after_ms` 非零，只有 indexed/dead-letter 为 0。
 - **全局文档坐标**：因 `GlobalId=(collection,doc_id,chunk_id)` 不含 tenant，同一
   `(collection,doc_id)` 只能由一个 tenant 持有；上传和 PG doc replace 双重检查，冲突返回 409 且不删除旧行。
   在途内容冲突的 409 返回可轮询的 `IngestJobResponse`；跨 tenant 所有权冲突只返回脱敏纯文本。

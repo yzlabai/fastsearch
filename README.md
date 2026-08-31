@@ -58,7 +58,13 @@ curl -sS -X POST http://localhost:8642/v1/documents -H 'X-API-Key: dev' \
 
 The default document limit is 32MiB (`FASTSEARCH_MAX_DOCUMENT_BYTES`); larger sources should use the
 `source_uri` form field. Worker credentials are configured separately with `FASTSEARCH_WORKER_KEYS`.
-The independent worker is not bundled yet (FS-303); without an external compatible worker, uploaded jobs remain `queued`.
+Start the bundled worker as a separate process; it shares the server's database and object-store configuration:
+
+```bash
+DATABASE_URL=postgres://... FASTSEARCH_SERVER=http://localhost:8642 \
+FASTSEARCH_WORKER_KEY=worker FASTSEARCH_OBJECT_DIR=./objects \
+  cargo run -p fastsearch-ingest-worker --bin fastsearch-ingest-worker
+```
 
 ## Modules (workspace crates)
 
@@ -73,7 +79,9 @@ The independent worker is not bundled yet (FS-303); without an external compatib
 | `fastsearch-engine` | Orchestration: ingest→CDC→index→**full-text / vector / hybrid** search→citations + deep pagination + rebuild + media resolution |
 | `fastsearch-eval` | Relevance evaluation: golden set + nDCG/recall/MRR + CI regression gate |
 | `fastsearch-server` | REST (axum) + API-key auth + **ACL cannot be bypassed** + upload/job/worker protocol + metrics/rate-limit/audit + media gateway + CDC lifecycle |
-| `fastsearch-mcp` | The fourth face: MCP (stdio + JSON-RPC) exposing the `search` / `resolve_citation` tools |
+| `fastsearch-ingest-adapter` | Shared feature-gated docparse → core adapter for CLI and worker; default builds keep only lightweight profile types |
+| `fastsearch-ingest-worker` | Independent fenced job consumer: ObjectStore fetch → parse/chunk → job-scoped server publication |
+| `fastsearch-mcp` | The fourth face: MCP exposing search/citation, chunk writes, and capability-gated document ingestion/status tools |
 | `fastsearch-cli` | `fastsearch` binary: **thin REST client of the server** (no embedded engine). index / index-dir (feed a folder) / search / similar / **ingest (client-side multi-format parse: PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/image + OCR + table recognition)** / eval — see [Ingestion & parsing](docs/ingestion-and-parsing.md) |
 | `clients/{python,ts}` | Zero-dependency SDKs + LangChain / LlamaIndex adapters. Registry and source-install details are recorded above and in the [TypeScript](clients/typescript/README.md) / [Python](clients/python/README.md) READMEs. |
 

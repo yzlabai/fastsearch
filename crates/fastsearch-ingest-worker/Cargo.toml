@@ -1,0 +1,38 @@
+[package]
+name = "fastsearch-ingest-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Independent fenced document-ingestion worker for fastsearch."
+
+[[bin]]
+name = "fastsearch-ingest-worker"
+path = "src/main.rs"
+
+[lib]
+name = "fastsearch_ingest_worker"
+path = "src/lib.rs"
+
+[dependencies]
+fastsearch-core.workspace = true
+fastsearch-engine.workspace = true
+fastsearch-ingest-adapter = { workspace = true, features = ["parse"] }
+fastsearch-pg = { path = "../fastsearch-pg" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+ureq.workspace = true
+tempfile.workspace = true
+
+[features]
+default = ["parse"]
+parse = ["fastsearch-ingest-adapter/parse"]
+parse-ocr = ["parse", "fastsearch-ingest-adapter/parse-ocr"]
+parse-tables = ["parse", "fastsearch-ingest-adapter/parse-tables"]
+parse-vlm = ["parse", "fastsearch-ingest-adapter/parse-vlm"]
+
+[lints]
+workspace = true

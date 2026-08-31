@@ -57,8 +57,14 @@ curl -sS -X POST http://localhost:8642/v1/documents -H 'X-API-Key: dev' \
 ```
 
 默认文档上限为 32MiB（`FASTSEARCH_MAX_DOCUMENT_BYTES`）；更大来源使用 `source_uri` 字段。
-worker 凭据与用户 key 分开，通过 `FASTSEARCH_WORKER_KEYS` 配置。独立 worker 尚未随仓库交付（FS-303）；
-未部署兼容外部 worker 时，上传作业会保持 `queued`。
+worker 凭据与用户 key 分开，通过 `FASTSEARCH_WORKER_KEYS` 配置。仓库已交付独立 worker，
+它与 server 共用 PG/ObjectStore 配置但单独扩缩容：
+
+```bash
+DATABASE_URL=postgres://... FASTSEARCH_SERVER=http://localhost:8642 \
+FASTSEARCH_WORKER_KEY=worker FASTSEARCH_OBJECT_DIR=./objects \
+  cargo run -p fastsearch-ingest-worker --bin fastsearch-ingest-worker
+```
 
 ## 模块（workspace crates）
 
@@ -73,7 +79,9 @@ worker 凭据与用户 key 分开，通过 `FASTSEARCH_WORKER_KEYS` 配置。独
 | `fastsearch-engine` | 整合：ingest→CDC→索引→**全文/向量/混合**检索→引用 + 深分页 + 重建 + 媒资解析 |
 | `fastsearch-eval` | 相关性评测：golden 集 + nDCG/recall/MRR + CI 回归门禁 |
 | `fastsearch-server` | REST(axum) + API-Key 认证 + **ACL 不可绕过** + 上传/job/worker 协议 + 指标/限流/审计 + 媒资网关 + CDC 生命周期 |
-| `fastsearch-mcp` | 第四张脸：MCP(stdio+JSON-RPC) 暴露 `search`/`resolve_citation` 工具 |
+| `fastsearch-ingest-adapter` | CLI/worker 共用、feature 门控的 docparse→core 适配；默认构建只有轻量 profile 类型 |
+| `fastsearch-ingest-worker` | 独立 fenced job 消费进程：ObjectStore 读取→解析/分块→job-scoped 发布 |
+| `fastsearch-mcp` | 第四张脸：MCP 暴露检索/引用、chunk 写入和能力门控的文档摄取/状态工具 |
 | `fastsearch-cli` | `fastsearch` 二进制：index / index-dir / search / **ingest（多格式：PDF/DOCX/HTML/MD/CSV/XLSX/PPTX/SRT/EML/图片 + OCR + 表格识别）** / eval —— 见[文件解析与摄取](docs/文件解析与摄取.md) |
 | `clients/{python,ts}` | 零依赖 SDK + LangChain/LlamaIndex 适配；registry 与源码安装状态见上表及各 SDK README |
 

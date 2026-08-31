@@ -13,6 +13,24 @@ members = [
     "crates/fastsearch-vector",
     "crates/fastsearch-embed",
     "crates/fastsearch-cli",
+    "crates/fastsearch-ingest-adapter",
+    "crates/fastsearch-ingest-worker",
+    "crates/fastsearch-eval",
+    "crates/fastsearch-server",
+    "crates/fastsearch-rerank",
+    "crates/fastsearch-mcp",
+]
+# 根目录 `cargo build` 是搜索产品的精简默认档：不直接构建 parser adapter/worker。
+# `--workspace` 仍覆盖所有成员，CI/收口不会漏掉摄取进程。
+default-members = [
+    "crates/fastsearch-core",
+    "crates/fastsearch-text",
+    "crates/fastsearch-pg",
+    "crates/fastsearch-sync",
+    "crates/fastsearch-engine",
+    "crates/fastsearch-vector",
+    "crates/fastsearch-embed",
+    "crates/fastsearch-cli",
     "crates/fastsearch-eval",
     "crates/fastsearch-server",
     "crates/fastsearch-rerank",
@@ -49,6 +67,7 @@ fastsearch-core = { path = "crates/fastsearch-core" }
 fastsearch-text = { path = "crates/fastsearch-text" }
 fastsearch-vector = { path = "crates/fastsearch-vector" }
 fastsearch-engine = { path = "crates/fastsearch-engine" }
+fastsearch-ingest-adapter = { path = "crates/fastsearch-ingest-adapter", default-features = false }
 clap = { version = "4", features = ["derive"] }
 ureq = { version = "2", features = ["json"] }
 hmac = "0.13"

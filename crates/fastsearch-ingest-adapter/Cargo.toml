@@ -1,0 +1,45 @@
+[package]
+name = "fastsearch-ingest-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared docparse-to-fastsearch ingestion adapter for CLI and workers."
+
+[dependencies]
+fastsearch-core.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+docparse-core = { path = "../../vendor/docparse/crates/docparse-core", optional = true }
+docparse-pdf = { path = "../../vendor/docparse/crates/docparse-pdf", optional = true }
+docparse-docx = { path = "../../vendor/docparse/crates/docparse-docx", optional = true }
+docparse-html = { path = "../../vendor/docparse/crates/docparse-html", optional = true }
+docparse-md = { path = "../../vendor/docparse/crates/docparse-md", optional = true }
+docparse-csv = { path = "../../vendor/docparse/crates/docparse-csv", optional = true }
+docparse-xlsx = { path = "../../vendor/docparse/crates/docparse-xlsx", optional = true }
+docparse-pptx = { path = "../../vendor/docparse/crates/docparse-pptx", optional = true }
+docparse-srt = { path = "../../vendor/docparse/crates/docparse-srt", optional = true }
+docparse-eml = { path = "../../vendor/docparse/crates/docparse-eml", optional = true }
+docparse-img = { path = "../../vendor/docparse/crates/docparse-img", optional = true }
+docparse-ocr = { path = "../../vendor/docparse/crates/docparse-ocr", optional = true }
+docparse-raster = { path = "../../vendor/docparse/crates/docparse-raster", optional = true }
+docparse-vlm = { path = "../../vendor/docparse/crates/docparse-vlm", optional = true }
+
+[features]
+default = ["parse"]
+parse = [
+    "dep:docparse-core", "dep:docparse-pdf", "dep:docparse-docx", "dep:docparse-html",
+    "dep:docparse-md", "dep:docparse-csv", "dep:docparse-xlsx", "dep:docparse-pptx",
+    "dep:docparse-srt", "dep:docparse-eml", "dep:docparse-img",
+]
+parse-ocr = ["parse", "dep:docparse-ocr"]
+parse-tables = ["parse", "dep:docparse-ocr", "dep:docparse-raster"]
+parse-vlm = ["parse", "dep:docparse-ocr", "dep:docparse-raster", "dep:docparse-vlm"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

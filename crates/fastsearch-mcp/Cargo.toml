@@ -25,5 +25,8 @@ anyhow.workspace = true
 # 远端档（KB-0.2）：MCP 作为 server 的纯 REST 客户端。与 CLI 同款瘦客户端（ureq + 显式超时）。
 ureq.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

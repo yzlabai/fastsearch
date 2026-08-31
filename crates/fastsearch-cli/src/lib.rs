@@ -20,6 +20,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub use fastsearch_ingest_adapter::ChunkProfile;
+
 // ============================ HTTP 客户端（瘦封装 ureq） ============================
 
 /// server REST 客户端。`base` 末尾无 `/`；`key` 作 `Authorization: Bearer`。
@@ -267,84 +269,6 @@ pub fn parse_chunks(bytes: &[u8], doc_id: &str) -> Result<Vec<Chunk>> {
 
 // ============================ 文本/markdown 分块（客户端侧，纯函数） ============================
 
-/// 一次客户端分块所采用的可追溯 profile。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkProfile {
-    name: String,
-    version: u32,
-    target_chars: usize,
-    overlap_chars: usize,
-    table_markdown: bool,
-}
-
-impl ChunkProfile {
-    pub fn new(
-        name: impl Into<String>,
-        version: u32,
-        target_chars: usize,
-        overlap_chars: usize,
-        table_markdown: bool,
-    ) -> Result<Self> {
-        let name = name.into();
-        if name.trim().is_empty() {
-            return Err(anyhow!("chunk profile name must not be empty"));
-        }
-        if version == 0 {
-            return Err(anyhow!("chunk profile version must be greater than zero"));
-        }
-        if target_chars == 0 {
-            return Err(anyhow!("chunk target must be greater than zero"));
-        }
-        if overlap_chars >= target_chars {
-            return Err(anyhow!(
-                "chunk overlap ({overlap_chars}) must be smaller than target ({target_chars})"
-            ));
-        }
-        Ok(Self {
-            name,
-            version,
-            target_chars,
-            overlap_chars,
-            table_markdown,
-        })
-    }
-
-    pub fn text_default() -> Self {
-        Self::new("fastsearch-text", 1, 900, 0, false).expect("valid built-in text profile")
-    }
-
-    #[cfg(feature = "parse")]
-    pub fn docparse_default() -> Self {
-        Self::new("docparse", 1, 800, 0, false).expect("valid built-in docparse profile")
-    }
-
-    pub fn target_chars(&self) -> usize {
-        self.target_chars
-    }
-
-    pub fn overlap_chars(&self) -> usize {
-        self.overlap_chars
-    }
-
-    pub fn table_markdown(&self) -> bool {
-        self.table_markdown
-    }
-
-    fn attach_to(&self, chunk: &mut Chunk, chunker: &str) {
-        chunk.metadata.insert(
-            "chunking".into(),
-            serde_json::json!({
-                "chunker": chunker,
-                "profile": self.name,
-                "version": self.version,
-                "target_chars": self.target_chars,
-                "overlap_chars": self.overlap_chars,
-                "table_markdown": self.table_markdown,
-            }),
-        );
-    }
-}
-
 /// 解析 markdown 标题行 → `(层级, 标题)`；非标题返回 None。
 fn parse_md_heading(line: &str) -> Option<(usize, String)> {
     let t = line.trim_start();
@@ -450,10 +374,10 @@ impl<'a> TextChunker<'a> {
         if text.is_empty() {
             return;
         }
-        let tail = (carry_overlap && self.profile.overlap_chars > 0).then(|| {
+        let tail = (carry_overlap && self.profile.overlap_chars() > 0).then(|| {
             text.chars()
                 .rev()
-                .take(self.profile.overlap_chars)
+                .take(self.profile.overlap_chars())
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -481,14 +405,14 @@ impl<'a> TextChunker<'a> {
 
     fn line(&mut self, line: &str) {
         if line.trim().is_empty() {
-            if self.buffered_chars() >= self.profile.target_chars {
+            if self.buffered_chars() >= self.profile.target_chars() {
                 self.flush_paragraph(true);
             }
             return;
         }
         self.buf.push(line.to_string());
         self.has_new_content = true;
-        if self.buffered_chars() >= self.profile.target_chars {
+        if self.buffered_chars() >= self.profile.target_chars() {
             self.flush_paragraph(true);
         }
     }

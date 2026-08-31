@@ -12,7 +12,8 @@ fastsearch 部署制品：容器镜像 + 一键 compose + K8s/CloudNativePG 样�
 | 文件 | 用途 |
 |---|---|
 | [`Dockerfile`](../Dockerfile) | 多阶段构建 `fastsearch-server`（release+lto），精简 debian 运行时、非 root、`/data` 卷 |
-| [`docker-compose.yml`](../docker-compose.yml) | 一键起全栈：pgvector（`wal_level=logical`）+ server（CDC 同步） |
+| [`Dockerfile.worker`](../Dockerfile.worker) | 独立 `fastsearch-ingest-worker` 镜像；docparse 只进入此镜像，不污染 server；用 `--build-arg WORKER_FEATURES=parse,parse-ocr` 选择重解析档 |
+| [`docker-compose.yml`](../docker-compose.yml) | 一键起全栈：pgvector + server（CDC）+ worker，共享本地 ObjectStore 卷 |
 | [`deploy/cloudnativepg.yaml`](cloudnativepg.yaml) | K8s：CloudNativePG 托管 PG（HA 3 副本，仅 pgvector+逻辑复制）+ server Deployment/Service（无状态多副本、httpGet 探针） |
 
 ## 快速起（本机）
@@ -30,9 +31,9 @@ server 副本各自从**复制流/快照重建**派生索引（PG 是真源）�
 
 ## 验证状态（诚实记账）
 
-- **Dockerfile / compose / CloudNativePG manifest：已编写**，标准多阶段 + 标准编排，二进制本地
+- **server/worker Dockerfile、compose / CloudNativePG manifest：已编写**，标准多阶段 + 标准编排，二进制本地
   `cargo build --release -p fastsearch-server` 已验证可编译。
-- **Dockerfile 镜像构建：CI 常态验证**（`docker-build` job）。compose 全栈与 K8s manifest
+- **两个 Dockerfile 镜像构建：CI 常态验证**（`docker-build` job）。compose 全栈与 K8s manifest
   仍需可用 registry/集群做环境门禁；顶部 2026-07-01 记录是一次手工 test namespace 部署，
   不代表每次提交都实跑 K8s。资源可用时按上文 `docker compose up --build` 与
   `kubectl apply -f deploy/cloudnativepg.yaml` 复验。

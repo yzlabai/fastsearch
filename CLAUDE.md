@@ -37,6 +37,10 @@ FASTSEARCH_VLM_URL=http://localhost:8000 FASTSEARCH_VLM_MODEL=OvisOCR2 \
 
 # Postgres 集成测试（默认跳过；设 DATABASE_URL 才跑，CI 用 pgvector/pgvector 镜像）
 DATABASE_URL=postgres://user@localhost/db cargo test -p fastsearch-pg
+# 独立摄取 worker（与 server 共用 PG/ObjectStore；key 还须列入 server 的 FASTSEARCH_WORKER_KEYS）
+DATABASE_URL=postgres://user@localhost/db FASTSEARCH_SERVER=http://localhost:8642 \
+FASTSEARCH_WORKER_KEY=worker FASTSEARCH_OBJECT_DIR=./objects \
+  cargo run -p fastsearch-ingest-worker --bin fastsearch-ingest-worker
 # OCR 端到端测试（默认跳过；设模型目录 + 测试图才跑）
 FASTSEARCH_OCR_MODELS=…/models/ppocr-v5 FASTSEARCH_OCR_TEST_IMAGE=…/page.png cargo test -p fastsearch-cli --features parse-ocr ocr_end_to_end
 ```
@@ -51,11 +55,11 @@ FASTSEARCH_OCR_MODELS=…/models/ppocr-v5 FASTSEARCH_OCR_TEST_IMAGE=…/page.png
 
 **一句话**：外部单二进制混合检索引擎，**以托管 Postgres(pgvector) 为真源**；引擎侧索引是**派生、可重建**的。差异化（超越 ParadeDB）= **只需 pgvector + 逻辑复制、不在 PG 装任何原生扩展**，因此能跑在任意托管 PG（RDS/Supabase/Neon）。
 
-> **docparse 已 subtree 并入本仓 `vendor/docparse/`**（融合 Option B，2026-06-27）：它保留**自有 workspace**（含 vendored tract + OCR/VLM/raster 重 ONNX），经根 `exclude` 与 fastsearch 精简构建隔离；`fastsearch-cli` 的 **`parse` feature** path-依赖其 `docparse-core`/`-pdf`（轻、无 ONNX），`fastsearch ingest <file>` 即可进程内解析→适配→索引。**搜索热路径零 docparse 依赖**（`cargo tree` 校验）。见 [融合方案评估](docs/plans/2026-06-26-docparse融合方案评估.md)。
+> **docparse 已 subtree 并入本仓 `vendor/docparse/`**（融合 Option B，2026-06-27）：它保留**自有 workspace**（含 vendored tract + OCR/VLM/raster 重 ONNX），经根 `exclude` 与 fastsearch 精简构建隔离；共享 `fastsearch-ingest-adapter` 的 **`parse` feature** 才 path-依赖 docparse，CLI 与独立 worker 共用这一份实现。默认 CLI 只依赖 adapter 的轻量 profile 类型。**搜索热路径零 docparse 依赖**（`cargo tree` 校验）。见 [融合方案评估](docs/plans/2026-06-26-docparse融合方案评估.md)。
 
 ```
 原始文档 → POST /v1/documents → ObjectStore + Postgres ingest_job（状态/身份真源）
-                                      │ 独立 worker 领取、解析、job-scoped 写入（FS-303，尚未内置）
+                                      │ fastsearch-ingest-worker 领取、解析、heartbeat、job-scoped 写入
                                       ▼
 docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(真源: chunks 表 + 元数据 + ACL + pgvector 向量列)
                        │ 逻辑复制 CDC（pgoutput, 幂等, LSN 续传）   ← fastsearch-sync
@@ -80,8 +84,10 @@ docparse chunks（vendor/docparse 解析 / 或外部 chunks.json）→ Postgres(
 | `engine` | 整合 text+vector+rerank+sync sink → 端到端排序管线 | `run()` 是管线主体；`search`/`search_with_facets`；实现 `sync::IndexSink`（适配器，避免 text 反依赖 sync） |
 | `eval` | 相关性评测：nDCG/recall/MRR + `assert_no_regression`(CI 门禁) | 纯函数 |
 | `server` | REST(axum) + API-Key 认证 + **ACL 服务端注入不可绕过** + 上传/job 查询与 worker 写协议 + /metrics | `POST /v1/documents` 只保存原始对象并建立 job；worker 写入时 tenant/ACL/文档坐标只从 job 恢复；检索仍由 `principal_from_headers`→`acl_for` 强制过滤 |
-| `cli` | `fastsearch` 二进制：**server 的纯 REST 客户端**（不嵌引擎）。`search`/`similar`/`index`/`index-dir`(喂文件夹)/`eval` 走 server REST；`ingest`(多格式解析) 在**客户端**解析→POST `/v1/index` | 逻辑在 lib，main 是壳；`ureq` HTTP，`--server`/`--key`(env `FASTSEARCH_SERVER`/`_KEY`)。仅依赖 `core`(纯类型)+`eval`(纯指标)，**无 engine/text 依赖**。`ingest` 走 `--features parse`（docparse 注册表分发 9 格式+图片）/`parse-ocr`/`parse-tables`（env 指模型目录）/`parse-vlm`（env 指 VLM 服务）；解析在客户端→守搜索热路径零 docparse。检索/嵌入/落盘全归 server，CLI 因此白嫖全套混合检索 |
-| `mcp` | 第四张脸：MCP（stdio+JSON-RPC）暴露 `search`/`resolve_citation` 工具 | 逻辑在 lib（`McpServer::handle` 纯函数可单测），main 是 stdio 壳；**ACL 服务端注入不可绕过** |
+| `ingest-adapter` | CLI/worker 共用的 docparse→core chunk 适配与 `ChunkProfile` | 默认构建只有轻量类型；`parse*` feature 才引入 docparse/OCR/VLM |
+| `ingest-worker` | 独立 claim/heartbeat/ObjectStore fetch/parse/job-scoped publish 进程 | 每并发槽独立 JobStore；wire DTO 不含 collection/doc_id/tenant/acl；不直接写 chunks 真源 |
+| `cli` | `fastsearch` 二进制：**server 的纯 REST 客户端**；`ingest` 调共享 adapter 后 POST `/v1/index` | 默认无 docparse；`parse*` feature 转发给 adapter；检索/嵌入/落盘全归 server |
+| `mcp` | 第四张脸：MCP 暴露检索/引用；远端档还有 chunk 写入与能力门控的文档摄取/状态工具 | `document_ingest` 只从 live server caps 推导；**ACL 服务端注入不可绕过** |
 | `clients/{python,ts}` | 零依赖 SDK（封装 REST）+ LangChain/LlamaIndex 适配 | — |
 
 ## 关键不变量（跨 crate 都要守）
