@@ -153,6 +153,12 @@ impl SearchRequest {
                 "candidates must be >= top_k".into(),
             ));
         }
+        if self.embedder.is_some() {
+            return Err(CoreError::InvalidRequest(
+                "per-request embedder selection is not supported; omit embedder and use the server-configured backend"
+                    .into(),
+            ));
+        }
         match &self.fusion {
             Fusion::Rrf { rank_constant } if *rank_constant <= 0.0 => {
                 return Err(CoreError::InvalidRequest(
@@ -264,6 +270,13 @@ mod tests {
             ..Default::default()
         };
         assert!(at_max.validate().is_ok());
+
+        let named_embedder = SearchRequest {
+            embedder: Some("clip".into()),
+            ..Default::default()
+        };
+        let err = named_embedder.validate().unwrap_err().to_string();
+        assert!(err.contains("per-request embedder selection is not supported"));
     }
 
     #[test]

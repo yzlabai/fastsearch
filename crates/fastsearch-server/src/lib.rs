@@ -698,7 +698,8 @@ fn openapi_spec() -> Value {
                         "filter": {"type": ["object", "null"], "description": "core::Filter AST"},
                         "vector": {"type": ["array", "null"], "items": {"type": "number"}},
                         "query_image_base64": {"type": ["string", "null"], "description": "图片 query 的 base64 字节；服务端解码为内部 query_image"},
-                        "embedder": {"type": ["string", "null"], "description": "可选嵌入后端名"},
+                        "embedder": {"type": ["string", "null"], "description":
+                            "保留字段；当前不支持逐请求选择后端，非 null 明确返回 400，请使用服务端配置的后端"},
                         "candidates": {"type": "integer", "default": 150},
                         "ef_search": {"type": ["integer", "null"], "description":
                             "HNSW 检索期探索宽度逐查询覆盖（越大召回越高越慢；暴力/pgvector 档忽略）"},
@@ -1369,6 +1370,8 @@ fn decode_search_value(mut v: Value) -> Result<SearchRequest, (StatusCode, Strin
         )
     })?;
     req.query_image = query_image;
+    req.validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(req)
 }
 
@@ -5712,6 +5715,14 @@ mod tests {
             .unwrap_err()
             .1;
         assert!(err.contains("query_image is internal"), "got: {err}");
+
+        let err = decode_search_value(json!({"query": "q", "embedder": "clip"}))
+            .unwrap_err()
+            .1;
+        assert!(
+            err.contains("per-request embedder selection is not supported"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -5813,6 +5824,33 @@ mod tests {
         assert!(default_json[0].get("text").is_none());
         assert!(default_json[0].get("metadata").is_none());
         assert!(default_json[0].get("sources").is_none());
+
+        // FS-002 兼容 golden：explain=false 的序列化字节固定，不只断言缺少新字段。
+        let mut stable_hit = hit.clone();
+        stable_hit.citation.media = None;
+        let stable_cursor = stable_hit.cursor();
+        let expected = vec![json!({
+            "citation_id": "kb:img.png:1",
+            "score": 1.0,
+            "bm25": null,
+            "vector": 1.0,
+            "rerank": null,
+            "doc_id": "img.png",
+            "chunk_id": 1,
+            "page": 1,
+            "bbox": {"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0},
+            "heading_path": [],
+            "section_id": 0,
+            "highlight": null,
+            "merged_chunk_ids": [],
+            "time": null,
+            "media": null,
+            "cursor": stable_cursor,
+        })];
+        assert_eq!(
+            serde_json::to_vec(&hits_json(&[stable_hit], None, None)).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
 
         hit.text = Some("complete text".into());
         hit.metadata =

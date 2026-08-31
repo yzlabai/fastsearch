@@ -113,6 +113,7 @@ pub struct SourceHit {
 /// **确定性（不变量 #4）**：按 `source` 字典序遍历各路再累加浮点。
 /// 用输入顺序累加会让"同一组召回、不同拼装顺序"产生不同的浮点尾数——
 /// 两路时只有两个加数看不出来，N 路化正是这个坑冒头的地方。
+/// `source` 是一路的唯一身份；重复 source 属于调用方编排错误，会立即拒绝。
 pub fn fuse_n(lists: &[RecallList], fusion: &Fusion) -> Vec<Scored> {
     fuse_n_with_sources(lists, fusion).0
 }
@@ -128,6 +129,12 @@ pub fn fuse_n_with_sources(
     // 借用排序：不克隆 items（各路可能很大）。
     let mut order: Vec<&RecallList> = lists.iter().collect();
     order.sort_by(|a, b| a.source.cmp(&b.source));
+    assert!(
+        order
+            .windows(2)
+            .all(|pair| pair[0].source != pair[1].source),
+        "duplicate recall source"
+    );
 
     let mut acc: HashMap<GlobalId, f64> = HashMap::new();
     let mut sources: BTreeMap<GlobalId, Vec<SourceHit>> = BTreeMap::new();
@@ -180,7 +187,7 @@ pub fn fuse_n_with_sources(
 pub fn fuse(keyword: &[Scored], semantic: &[Scored], fusion: &Fusion) -> Vec<Scored> {
     // 两路 = N 路的特例。加权档的标量在这里翻译成两路权重：keyword 得 `1-x`、semantic 得 `x`
     // （`Normalized.semantic_ratio` 与 `Weighted.alpha` 扮演的是同一个 `x`——它们数学等价）。
-    // 来源名取 `keyword`/`vector`：`fuse_n` 按 source 字典序累加，`keyword` < `vector`，
+    // 来源名取公开规范的 `keyword:user_text`/`vector:user_text`；前者仍按字典序在前，
     // 与原实现的累加顺序一致 ⇒ 浮点结果逐位不变（由 `n_way_matches_two_way_bitwise` 钉住）。
     let x = match fusion {
         Fusion::Rrf { .. } => 0.0, // RRF 忽略权重
@@ -190,8 +197,8 @@ pub fn fuse(keyword: &[Scored], semantic: &[Scored], fusion: &Fusion) -> Vec<Sco
     };
     fuse_n(
         &[
-            RecallList::new("keyword", 1.0 - x, keyword.to_vec()),
-            RecallList::new("vector", x, semantic.to_vec()),
+            RecallList::new("keyword:user_text", 1.0 - x, keyword.to_vec()),
+            RecallList::new("vector:user_text", x, semantic.to_vec()),
         ],
         fusion,
     )
@@ -263,6 +270,39 @@ mod tests {
         Scored { id: id(n), score }
     }
 
+    /// FS-002 之前公开两路算法的独立参考实现。不能调用 `fuse_n`，否则兼容测试会自证。
+    fn legacy_two_way(keyword: &[Scored], semantic: &[Scored], fusion: &Fusion) -> Vec<Scored> {
+        let mut acc = HashMap::new();
+        match fusion {
+            Fusion::Rrf { rank_constant } => {
+                for path in [keyword, semantic] {
+                    for (rank, scored) in rank_desc(path).iter().enumerate() {
+                        *acc.entry(scored.id.clone()).or_insert(0.0) +=
+                            1.0 / (rank_constant + (rank as f64 + 1.0));
+                    }
+                }
+            }
+            Fusion::Normalized { semantic_ratio } => {
+                for scored in normalize(keyword) {
+                    *acc.entry(scored.id).or_insert(0.0) += (1.0 - semantic_ratio) * scored.score;
+                }
+                for scored in normalize(semantic) {
+                    *acc.entry(scored.id).or_insert(0.0) += semantic_ratio * scored.score;
+                }
+            }
+            Fusion::Weighted { alpha } => {
+                for scored in normalize(keyword) {
+                    *acc.entry(scored.id).or_insert(0.0) += (1.0 - alpha) * scored.score;
+                }
+                for scored in normalize(semantic) {
+                    *acc.entry(scored.id).or_insert(0.0) += alpha * scored.score;
+                }
+            }
+            Fusion::Weights { .. } => unreachable!("新档没有旧两路参考实现"),
+        }
+        sort_scored(acc)
+    }
+
     // ---- KB-2.2 N 路具名融合 ----------------------------------------------
 
     /// **本项最重要的一条**：N 路实现喂两路，必须与旧两路实现**逐位相同**。
@@ -287,7 +327,7 @@ mod tests {
             },
             Fusion::Weighted { alpha: 1.0 },
         ] {
-            let two = fuse(&kw, &sem, &f);
+            let two = legacy_two_way(&kw, &sem, &f);
             let x = match &f {
                 Fusion::Rrf { .. } => 0.0,
                 Fusion::Normalized { semantic_ratio } => *semantic_ratio,
@@ -328,12 +368,28 @@ mod tests {
             Fusion::Normalized {
                 semantic_ratio: 0.5,
             },
+            Fusion::Weights {
+                weights: BTreeMap::from([
+                    ("keyword:user_text".into(), 0.2),
+                    ("vector:user_text".into(), 0.3),
+                    ("vector:image_caption".into(), 0.5),
+                ]),
+                default_weight: 1.0,
+            },
         ] {
             let base = fuse_n(&[a.clone(), b.clone(), c.clone()], &f);
+            let mut a_reversed = a.clone();
+            a_reversed.items.reverse();
+            let mut b_reversed = b.clone();
+            b_reversed.items.reverse();
+            let mut c_reversed = c.clone();
+            c_reversed.items.reverse();
             for perm in [
                 vec![c.clone(), a.clone(), b.clone()],
                 vec![b.clone(), c.clone(), a.clone()],
                 vec![c.clone(), b.clone(), a.clone()],
+                vec![c_reversed.clone(), a_reversed.clone(), b_reversed.clone()],
+                vec![b_reversed.clone(), c_reversed.clone(), a_reversed.clone()],
             ] {
                 let got = fuse_n(&perm, &f);
                 assert_eq!(got.len(), base.len(), "{f:?}");
@@ -347,6 +403,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate recall source")]
+    fn duplicate_source_is_rejected() {
+        fuse_n(
+            &[
+                RecallList::new("vector:user_text", 1.0, vec![s(1, 0.9)]),
+                RecallList::new("vector:user_text", 1.0, vec![s(2, 0.8)]),
+            ],
+            &Fusion::default(),
+        );
+    }
+
+    #[test]
+    fn named_weights_work_through_two_way_compatibility_api() {
+        let out = fuse(
+            &[s(1, 10.0), s(2, 1.0)],
+            &[s(1, 0.1), s(2, 0.9)],
+            &Fusion::Weights {
+                weights: BTreeMap::from([
+                    ("keyword:user_text".into(), 0.0),
+                    ("vector:user_text".into(), 1.0),
+                ]),
+                default_weight: 0.0,
+            },
+        );
+        assert_eq!(out[0].id, id(2));
+        assert_eq!(out[0].score, 1.0);
+    }
+
+    #[test]
+    fn named_weights_single_path_uses_its_named_weight() {
+        let out = fuse_n(
+            &[RecallList::new(
+                "vector:image_caption",
+                99.0,
+                vec![s(2, 0.9), s(1, 0.1)],
+            )],
+            &Fusion::Weights {
+                weights: BTreeMap::from([("vector:image_caption".into(), 0.4)]),
+                default_weight: 1.0,
+            },
+        );
+        assert_eq!(out, vec![s(2, 0.4), s(1, 0.0)]);
     }
 
     /// 三路 RRF：一个候选被两路命中应压过只被一路命中的。

@@ -104,7 +104,7 @@ pub struct RerankSpec { pub model: String, pub top_k: usize /* 默认 20 */ }
 pub struct Collapse  { pub field: String /* doc_id / section_id */, pub max_per_group: usize /* 默认 1，validate 要求 >0 */ }
 ```
 - 默认值：mode=Hybrid，fusion=RRF{60}，candidates=150，top_k=20。
-- `validate() -> Result<(), CoreError>`：top_k>0、candidates>=top_k、semantic_ratio/alpha∈[0,1]、rank_constant>0；具名权重及默认权重必须有限且非负。
+- `validate() -> Result<(), CoreError>`：top_k>0、candidates>=top_k、semantic_ratio/alpha∈[0,1]、rank_constant>0；具名权重及默认权重必须有限且非负。当前只有服务端级嵌入后端，`embedder != null`（逐请求选择）明确拒绝，不能静默忽略。
 
 ### 2.3 过滤 AST
 

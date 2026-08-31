@@ -26,6 +26,7 @@
 - `health() -> bool` / `openapi() -> dict`。
 - 认证：构造时传 api_key → `X-API-Key` 头。ACL 服务端强制。
 - 可选重试：构造参数 `retries`（Python）/`retries`（TS），仅 429/5xx/网络错指数退避，默认 0。
+- `embedder` 为跨版本保留参数；当前 server 只有实例级后端，传非空值会明确 400，不会被静默忽略。
 
 ## 3. 行为规约
 

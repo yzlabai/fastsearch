@@ -209,6 +209,7 @@ export interface SearchOptions {
    */
   queryImage?: number[];
   /** 指定嵌入后端名（服务端配了多个时路由到具体一个）。 */
+  /** 保留字段；当前 server 不支持逐请求选择后端，设置后会明确返回 400。 */
   embedder?: string;
   /** 召回候选窗口（深分页/折叠的上界），默认 150，须 ≥ topK。 */
   candidates?: number;

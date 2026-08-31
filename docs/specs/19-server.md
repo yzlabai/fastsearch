@@ -31,7 +31,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 ```
 
 请求/响应：
-- `POST /v1/search` body 经 REST 外部契约解码为 `SearchRequest`。图片字节只接受 `query_image_base64`（或图片上传接口），内部字段 `query_image` 明确 400。ACL 只来自认证身份。`include_text`/`include_metadata` 默认 false；`explain=false` 时省略 `sources`，开启后每条命中附来源、rank、原始分和融合贡献。
+- `POST /v1/search` body 经 REST 外部契约解码为 `SearchRequest`。图片字节只接受 `query_image_base64`（或图片上传接口），内部字段 `query_image` 明确 400。当前嵌入后端是服务端级配置，`embedder != null` 的逐请求选择明确 400。ACL 只来自认证身份。`include_text`/`include_metadata` 默认 false；`explain=false` 时省略 `sources`，开启后每条命中附来源、rank、原始分和融合贡献。
 - `POST /v1/index` body = `{collection, doc_id, chunks:[Chunk]}` → ingest+commit，返回 `{indexed:n}`。Chunk 支持默认 `{}` 的 `metadata` 和默认 true 的 `searchable`；metadata 在副作用前校验。
 - chunk 管理端点以现有 `GlobalId=(collection,doc_id,chunk_id)` 寻址；batch 上限 1000。
   Batch get 保持请求顺序并用 `chunk:null` 合并不可见/不存在；batch delete 同理返回
