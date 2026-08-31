@@ -94,27 +94,10 @@ impl Applier {
         if ev.lsn <= self.applied_lsn {
             return Ok(false);
         }
-        Self::apply_change(sink, &ev.change)?;
+        sink.apply_changes(std::slice::from_ref(&ev.change))?;
         // 仅在整个 compound change 成功后推进水位（sink 出错则水位不动，可重试）。
         self.applied_lsn = ev.lsn;
         Ok(true)
-    }
-
-    fn apply_change(sink: &mut dyn IndexSink, change: &Change) -> anyhow::Result<()> {
-        match change {
-            Change::Upsert { collection, chunk } => sink.apply_upsert(collection, chunk)?,
-            Change::Delete { gid } => sink.apply_delete(gid)?,
-            Change::DeleteDoc { collection, doc_id } => {
-                sink.apply_delete_doc(collection, doc_id)?
-            }
-            Change::Clear => sink.apply_clear()?,
-            Change::Batch(changes) => {
-                for change in changes {
-                    Self::apply_change(sink, change)?;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// 批量应用（输入按 LSN 升序），末尾 `commit`。返回实际应用条数。
@@ -196,6 +179,38 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct BatchOnlySink {
+        batches: Vec<Vec<Change>>,
+    }
+
+    impl IndexSink for BatchOnlySink {
+        fn apply_upsert(&mut self, _collection: &str, _chunk: &Chunk) -> anyhow::Result<()> {
+            anyhow::bail!("single-item dispatcher must not be used")
+        }
+
+        fn apply_delete(&mut self, _gid: &GlobalId) -> anyhow::Result<()> {
+            anyhow::bail!("single-item dispatcher must not be used")
+        }
+
+        fn apply_delete_doc(&mut self, _collection: &str, _doc_id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("single-item dispatcher must not be used")
+        }
+
+        fn apply_clear(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("single-item dispatcher must not be used")
+        }
+
+        fn apply_changes(&mut self, changes: &[Change]) -> anyhow::Result<()> {
+            self.batches.push(changes.to_vec());
+            Ok(())
+        }
+
+        fn commit(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     fn chunk(doc: &str, id: u64) -> Box<Chunk> {
         Box::new(Chunk {
             doc_id: doc.into(),
@@ -252,6 +267,17 @@ mod tests {
         assert!(!ap.apply(&mut sink, &e).unwrap()); // second skipped (lsn<=watermark)
         assert_eq!(sink.ops, vec![Op::Upsert(gid("a", 1))]);
         assert_eq!(ap.applied_lsn(), Lsn(5));
+    }
+
+    #[test]
+    fn single_event_uses_the_same_batch_dispatch_seam() {
+        let mut sink = BatchOnlySink::default();
+        let mut applier = Applier::new(Lsn(0));
+        let event = ev(Change::Clear, 5);
+
+        assert!(applier.apply(&mut sink, &event).unwrap());
+        assert_eq!(sink.batches, vec![vec![Change::Clear]]);
+        assert_eq!(applier.applied_lsn(), Lsn(5));
     }
 
     #[test]
