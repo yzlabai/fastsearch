@@ -18,6 +18,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: CI workflow contract
+        run: python3 scripts/ci/check_workflow_contract.py
 
       # Postgres 用 docker run（非 services）才能传 `-c wal_level=logical`——CDC 集成测试
       # 需逻辑复制。仍只用 pgvector + 逻辑复制，不装任何需 shared_preload_libraries 的原生
@@ -48,7 +50,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       # 全量测试：含 PG 集成（DATABASE_URL）+ CDC 逻辑复制闭环 + eval 相关性回归门禁。
       - name: test (incl. PG integration + CDC + relevance gate)
-        run: cargo test --workspace
+        run: scripts/ci/run_environment_gates.sh --require-pg
 
   # 搜索热路径**零 docparse 依赖**硬门禁（不变量：解析能力 feature 门控、不进检索热路径）。
   # 故意往 server 加 docparse 依赖会让此 job 变红；移除即绿（守融合 Option B 的隔离约束）。
@@ -90,7 +92,7 @@ jobs:
           python-version: "3.12"
       - name: Python SDK tests
         working-directory: clients/python
-        run: python3 test_integrations.py
+        run: python3 test_integrations.py && python3 test_ingest.py
 
   # Docker 镜像构建校验（此前发布制品从未被 CI 构建过）。验证 Dockerfile + .dockerignore：
   # build context 不含 target/（.dockerignore 生效），多阶段构建成功。
@@ -121,6 +123,8 @@ jobs:
         run: cargo check -p fastsearch-cli --features parse-ocr
       - name: check (parse-tables, compile only)
         run: cargo check -p fastsearch-cli --features parse-tables
+      - name: check (parse-vlm, compile only)
+        run: cargo check -p fastsearch-cli --features parse-vlm
 
   # 依赖许可 + 安全公告 + 来源守门（治理 [C1 §4.3]）+ 产出第三方许可清单。GA 出口判据：
   # 拒绝意外引入 copyleft/share-alike（GPL/CC-BY-SA，如换 lindera 系词典），并把
@@ -185,3 +189,31 @@ jobs:
           ./target/debug/fastsearch eval --server $U --key dev --golden "$DOCS/golden.json" --k 1 | grep -q '"ndcg": 1' \
             || { echo "FAIL: eval 客户端路径未得 nDCG=1" >&2; exit 1; }
           echo "cli-server-e2e OK"
+
+  # MCP↔server 真二进制：启动 server 与两个不同 API key 的远端 MCP stdio 进程，验证
+  # 能力探测、写入、搜索、引用解析、REST 结果一致性及 ACL 隔离。
+  mcp-server-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build server + MCP
+        run: cargo build -p fastsearch-server -p fastsearch-mcp
+      - name: e2e (probe + index + search + resolve + two-key ACL)
+        run: scripts/ci/mcp_server_e2e.sh
+
+  # Agent 示例是公开集成入口；至少守住其单测与完整 TypeScript 类型检查。
+  example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install
+        working-directory: example
+        run: npm ci
+      - name: test + typecheck
+        working-directory: example
+        run: npm test && npm run typecheck

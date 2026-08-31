@@ -9,9 +9,8 @@
 > **状态**：
 > - **本地嵌引擎档：已完成 v1.1**（工具面 + ACL 进程级注入 + **KB-0.1 能力诚实化**，
 >   2026-08-24 活服务验证 done）。
-> - **远端模式（KB-0.2）：本文 §4.5–§4.9 是设计，尚未实施**（`crates/fastsearch-mcp` 当前
->   零 HTTP 依赖，`Cargo.toml` 无 `ureq`）。实施前本文所有远端条目一律读作 `待实施`，
->   实施后未经实跑二进制验证一律标 `待运行验证`。
+> - **远端模式（KB-0.2/0.3）：已完成**（2026-08-25），包含 REST 能力探测、
+>   `search`/`resolve_citation` 和远端档专属 `index_chunks`；2026-08-31 新增常态 CI 真二进制 e2e。
 > - 本 spec 是**补记的**：`fastsearch-mcp` 此前是唯一没有 spec 的模块，KB-0.1 的"回写 spec"
 >   无处可写（只在模块清单留了一行）。本文一并还掉这笔欠账。
 
@@ -35,8 +34,8 @@
   远端 server；本地档如实宣称自己只有 keyword。
 - 不做身份/租户控制面（ADR《职责边界》第 1 类）。远端模式下身份 = 一把 API key，交给 server 翻译。
 - 不做 SSE / HTTP streamable transport（当前只有 stdio）。
-- 不做写入工具（`index_chunks` / `ingest_document` 属 KB-0.3，依赖本文的远端模式落地）。
-- 不做上下文预算与 per-hit 截断（KB-0.4；本文 §4.7 为其预留了入参允许清单的扩展点）。
+- 不做原始文件写入工具 `ingest_document`（结构化的 `index_chunks` 已在 KB-0.3 落地）。
+- 不做 token 精确预算；当前以 `max_context_chars` 做字符级上下文限制与 per-hit 截断。
 
 ---
 
@@ -100,7 +99,7 @@ impl McpServer {
 > `--server/--key` + 同名 env、同样的 `ureq::Agent` + 超时、同样的
 > `PostError::{Status, Transport}` 区分（`Status` 是确定性拒绝不重试，`Transport` 可重试）。
 > **复用其形状，不复用其代码**：CLI 的 `Client` 是私有实现细节，把它提成公共 crate 属于
-> 跨 crate 重构，不在 KB-0.2 范围内（见 §9 需要动别人文件的清单——本项**不需要**动）。
+> 跨 crate 重构，不在 KB-0.2 范围内（见 §9 已完成的跨文件实施清单；本项未抽取公共客户端 crate）。
 
 ---
 
@@ -110,13 +109,14 @@ impl McpServer {
 
 | 工具 | 入参（**允许清单**，见 §4.7） | 出参（单个 text 内容块，内容为 JSON 字符串） |
 |---|---|---|
-| `search` | `query`(必填, string)、`mode`(enum 由 §4.2 推导)、`top_k`(int, 默认 20)、`filter`(core::Filter AST)、`highlight`(bool)、`vector`(number[]，调用方自带查询向量) | `{"hits":[{citation_id, score, page, heading_path, snippet}]}` |
+| `search` | `query`(必填, string)、`mode`(enum 由 §4.2 推导)、`top_k`(int, 默认 20)、`filter`(core::Filter AST)、`highlight`(bool)、`vector`(number[]，调用方自带查询向量)、`include_text`(bool)、`max_context_chars`(int) | 基础形状 `{"hits":[{citation_id, score, page, heading_path, snippet}]}`；`include_text=true` 时 hit 增 `text`；设预算时顶层增 `dropped`/`context_chars`，截断 hit 增 `text_truncated` |
 | `resolve_citation` | `citation_id`(必填, `"collection:doc_id:chunk_id"`) | `{"found":false,"reason":…}` 或 `{"found":true, media_type, time, fetch:{kind:"doc_render"\|"signed_url"\|"inline_ref", …}}` |
 
 **命中形状在两种模式下必须逐字段相同**：远端模式拿到的是 server `hits_json`
 （`crates/fastsearch-server/src/lib.rs`）的富对象（含 `bm25`/`vector`/`rerank`/`bbox`/
-`section_id`/`media`/`cursor` 等），**必须投影回上表这五个字段**（`highlight` → `snippet`），
-否则同一个工具在两种部署下给 agent 两种契约。多出来的字段等 KB-0.4 决定要不要宣称再开。
+`section_id`/`media`/`cursor` 等），**必须投影回上表的五个基础字段**（`highlight` → `snippet`），
+否则同一个工具在两种部署下给 agent 两种契约。只有显式 `include_text` 与预算处理才按上表
+增加可选字段，且两种模式遵循相同形状；其余富字段仍不透传。
 
 ### 3.2 `ServerCaps`（远端能力探测结果，KB-0.2 新增）
 
@@ -195,16 +195,15 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 3. **远端档不得自行做任何 ACL 后过滤**：ACL 已在 server 侧的过滤期落实（text/vector 两端的
    SUPERSET 预过滤 + `AclFilter::visible` 精确后过滤，不变量 #5）。MCP 再补一层只会产生
    "两处判权且可能不一致"的第二真源。
-4. **本地档的 fail-open 缺口（现状事实，KB-0.2 一并收）**：`main.rs` 里 `FASTSEARCH_MCP_TENANT`
+4. **本地档的 fail-open 缺口（历史问题，KB-0.2 已收口）**：修复前 `main.rs` 里 `FASTSEARCH_MCP_TENANT`
    未设 → `acl = None` → `engine.search(&req, None)` ⇒ **不做任何 ACL 判定，全库可见**
    （`AclFilter::visible` 在 `tenant: None` 时也是"放行所有租户的 public 行"，
    `crates/fastsearch-core/src/filter.rs`）。这正是 server v2.4 fail-closed 修掉的那类"替调用方猜"
    （`crates/fastsearch-server/src/main.rs`：`FASTSEARCH_KEYS` 未设 → **拒绝启动** + 可粘贴的修复命令），
    而 ADR《职责边界》§"不豁免" 第 1 条写明：*既然 100% 依赖调用方接对，就绝不能在他没接对时替他编一个*。
-   ⇒ **KB-0.2 一并收紧本地档**：要么显式给 `FASTSEARCH_MCP_TENANT`，要么显式写
+   ⇒ **KB-0.2 已一并收紧本地档**：要么显式给 `FASTSEARCH_MCP_TENANT`，要么显式写
    `FASTSEARCH_MCP_ACL=all`（单机全量，需要写出来），否则拒绝启动。
-   这是对既有本地部署的**破坏性变更**，须写进 README/[Agent 使用指南](../在Agent中使用fastsearch.md) §3.1
-   与 CHANGELOG（见 §9）。
+   这是对既有本地部署的**破坏性变更**，已同步中英文 Agent 使用指南。
 
 ### 4.4 工具契约
 
@@ -213,10 +212,9 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 2. **允许清单校验**（§4.7）→ 不通过即 `isError:true` + 列出本实例接受的字段。
 3. `mode` 未显式给出 → 用 schema 宣称的 default（本地档 `keyword`；远端档见 §4.5）。
 4. 能力守卫 `reject_unavailable_mode`：显式要了给不出的档 → `isError:true` + 三条改法。
-   放行两条真能走通的路：调用方自带 `vector`；或 `query_image` + 引擎有 embedder
-   （后者在 §4.7 收紧后只在本地档且宣称了才成立）。
+   调用方自带 `vector` 时可走向量路；`query_image` 与 `query_image_base64` 在两档均明确拒绝并指路 REST。
 5. 执行：本地档 `engine.search(&req, acl)`；远端档 `POST /v1/search`。
-6. 投影成 §3.1 的五字段命中，序列化成 JSON 字符串放进单个 text 块。
+6. 投影成 §3.1 的基础命中，再按 `include_text`/`max_context_chars` 增加正文与可见的截断记账，序列化成 JSON 字符串放进单个 text 块。
 7. 失败一律 `isError:true`（含反序列化失败、engine 错误、server 非 2xx）。
 
 **`resolve_citation`**
@@ -281,11 +279,8 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
   → `isError:true` + 可自纠文本（"server 未配置资产签名密钥，取字节请走 `GET /v1/asset/{cid}`
   或让运维设置 `FASTSEARCH_ASSET_SIGNING_KEY`"）。
 
-**契约缺口（需要动 server 的文件，见 §9）**：`assets_resolve` 的返回**不含 `time`**，
-而本地档的 `resolve_citation` 出参有 `time`（`ResolvedAsset.time`，音视频定位用），
-`GET /v1/asset/{cid}` 的 `doc_render` 分支也带 `time`。若不补，远端档会丢掉 `time`
-⇒ 两种模式契约不一致（违反 §3.1）。**建议在 `assets_resolve` 的三个分支补 `"time": a.time`**
-（纯增字段、向后兼容），并同步 `openapi_spec()` 与 [19-server](19-server.md)。
+**已收口契约**：`assets_resolve` 的三个分支均返回 `time`，远端档与本地档
+`resolve_citation` 在音视频定位上保持一致；server 单测钉住批量与单资产端点的对齐。
 
 **collection 作用域**：MCP 不设 `collection` 入参，作用域走 `filter` 的 `Eq("collection", …)`
 （与 CLI 的 `build_filter` 同惯例）。远端档可用探测到的 `collections` 名单充实工具
@@ -308,14 +303,15 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 
 **规约**：
 - `search` 只接受**本实例 schema 里宣称的字段**：`query`、`mode`、`top_k`、`filter`、
-  `highlight`、`vector`。其余一律拒绝，`isError:true` + 文本列出接受的字段名。
+  `highlight`、`vector`、`include_text`、`max_context_chars`。其余一律拒绝，`isError:true` +
+  文本列出接受的字段名。
   - **`vector` 必须补进 schema**：它今天真能用（有测试 `caller_supplied_vector_is_not_rejected`
     背书）却没宣称——这是 C1 反向的另一处违例，一并收。
   - 明确落在拒绝侧、并在错误文本里点名的：`query_image`、`search_after`、`facets`、`collapse`、
     `auto_merge`、`rerank`、`explain`、`candidates`、`ef_search`、`embedder`、`fusion`、
-    `include_text`、`include_metadata`。理由各自成立且要写进错误文本，例如
-    `search_after` 无意义（本面命中不吐 `cursor`）、`include_text` 属 KB-0.4（要连同预算与
-    截断一起做，否则直接冲爆 agent 上下文）。
+    `include_metadata`。理由各自成立且要写进错误文本，例如
+    `search_after` 无意义（本面命中不吐 `cursor`）。`include_text` 已与
+    `max_context_chars` 成对落地，避免只开放全文却不给上下文刹车。
 - **`query_image` 两种模式下都明确拒绝**（KB-0.2 的范围内答案）：
   - 远端档：server 本来就 400 拒绝 body 里的 `query_image`；MCP 提前拒绝并给出改法
     （"以图搜图请走 REST `POST /v1/search` 的 `query_image_base64` 或 multipart"）。
@@ -324,7 +320,7 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
     而 `server_vector_info` 今天只吐一个 `embedded` 布尔 ⇒ 依赖 **KB-2.4 Embedder 能力探测**
     把实测 caps 放进 introspection，届时才可以在 schema 里如实加 `query_image_base64`。
     在那之前，"不宣称 + 明确拒绝 + 指路"就是 C1 下唯一诚实的做法。
-- 允许清单是**唯一**扩展点：以后任何新入参（KB-0.4 的 `max_context_tokens`、KB-0.3 的写入工具字段）
+- 允许清单是**唯一**扩展点：以后任何新入参（如 metadata 预算或新写入工具字段）
   都必须**同时**改 schema 与清单，测试用例 19 会盯住"两者一致"。
 
 ### 4.8 确定性与健壮性
@@ -358,15 +354,14 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 
 ## 5. 依赖
 
-- 现状：`fastsearch-core`、`fastsearch-engine`、`fastsearch-text`、`serde`、`serde_json`、`anyhow`。
-- 远端模式新增：**`ureq`（workspace 已有 `ureq = { version = "2", features = ["json"] }`，
-  按"依赖集中管理"用 `ureq.workspace = true` 继承）**；dev 侧无新依赖
+- 现状：`fastsearch-core`、`fastsearch-engine`、`fastsearch-text`、`serde`、`serde_json`、`anyhow`、
+  `ureq.workspace = true`；dev 侧无额外 HTTP 测试依赖
   （mock HTTP 用 `std::net::TcpListener`，照抄 CLI `crates/fastsearch-cli/src/tests.rs` 的
   `spawn_mock` / `spawn_capture` / `drain_request` 形状）。
 - **不新增**：`fastsearch-embed`（KB-0.1 §10 已决不接）、`tokio`/`axum`（stdio 同步循环足够）。
 - **不变量 #7（搜索热路径零 docparse/ONNX）**：`.github/workflows/ci.yml` 的 `hot-path-isolation`
   job 已把 `fastsearch-mcp` 列入断言名单。`ureq` 与 docparse 无关，**该门禁不受影响**——
-  但远端模式落地后必须重跑一次 `cargo tree -p fastsearch-mcp -e normal` 确认。
+  远端模式落地后已重跑 `cargo tree -p fastsearch-mcp -e normal` 并纳入 CI 门禁。
 - 本地档保留 `engine`/`text` 依赖；远端档在同一 crate 内**不使用**它们（编译期仍在——
   拆 feature 会让 `Cargo.toml` 长出两套构建档，收益不抵复杂度，**不做**，理由记在 §8）。
 
@@ -374,7 +369,7 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 
 ## 6. 测试用例
 
-单测在 `crates/fastsearch-mcp/src/lib.rs` 的 `mod tests`（现有 10 个），远端档新增同处。
+单测在 `crates/fastsearch-mcp/src/lib.rs` 的 `mod tests`；本地档与远端档共用同一套协议测试面。
 
 **现状已有（KB-0.1 后）**：
 1. `initialize_and_tools_list` — 握手版本 + 两个工具都在。
@@ -417,11 +412,12 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
     - body 的 JSON **不含** `tenant`/`acl`/`allowed_tags` 任何键（即使 `arguments` 里塞了）；
     - body 不含 `query_image`（§4.7）。
 17. `remote_hit_projection_matches_local_shape`：mock 返回 server 富命中（含 `bm25`/`cursor`/
-    `media`/`bbox`）→ MCP 输出**只有** §3.1 的五个键，且 `snippet` 取自 `highlight`。
+    `media`/`bbox`）→ MCP 默认输出只有 §3.1 的五个基础键，且 `snippet` 取自 `highlight`；
+    `include_text` 与预算测试另行钉住可选字段。
 18. `remote_resolve_maps_empty_to_found_false`：mock `/v1/assets/resolve` 返回 `{"assets":[]}`
     → `{"found":false,"reason":"not found or not authorized"}`；返回 `inline` 且带 `error`
     → `isError:true` + 改法文本。
-19. `unadvertised_arg_is_rejected`（§4.7，**C1 反向**）：`query_image`、`include_text`、
+19. `unadvertised_arg_is_rejected`（§4.7，**C1 反向**）：`query_image`、
     `collapse`、`facets` 各一次 → `isError:true`，文本列出接受字段；
     并断言 **schema 宣称的属性集合 == 允许清单**（一个从 `tool_defs()` 反读 `properties` 的断言，
     防止将来两边漂移）。
@@ -431,11 +427,14 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 因为"两个不同 key 看到不同可见集"只有真 server 才能证：
 
 21. `mcp-server-e2e`：起 `fastsearch-server`
-    （`FASTSEARCH_KEYS="a=acme:team-a; b=acme:team-b"`）→ 经 REST 灌入两条不同 acl 的 chunk →
-    起两个 `fastsearch-mcp --server … --key a` / `--key b`，各自走 stdio JSON-RPC：
+    （`FASTSEARCH_KEYS="a=acme:team-a; b=acme:team-b"`）→
+    起两个以 `FASTSEARCH_SERVER`/`FASTSEARCH_KEY` 连接的 `fastsearch-mcp`，各自经 stdio JSON-RPC
+    `index_chunks` 写入不同 ACL 的 chunk，再验证：
     - 同一 query，两个实例**各自只看到自己那条**；
     - key `a` 的实例 `resolve_citation` key `b` 那条 → `found:false`；
-    - `tools/list` 的 `mode.enum` 与该 server 的 `embedded` 一致（配/不配 embedder 各跑一次）；
+    - key `a` 的实例 `resolve_citation` 自己那条 → `found:true` 且 doc-render 位置正确；
+    - `tools/list` 对真二进制无 embedder server 宣称 `mode.enum=["keyword"]`；
+      `embedded=true` 到三档的映射由用例 14 的 mock 能力探测单测覆盖，不冒充真二进制证据；
     - 同一 query 经 MCP 与经 `curl POST /v1/search` 的 `citation_id` 序列**完全一致**
       （KB-0.2 验收原文："结果与直连 REST 一致"）。
 22. 本地档不回归：现有 1–9 全绿 + 实跑本地 `fastsearch-mcp` 二进制的握手/`tools/list`/检索冒烟
@@ -452,25 +451,30 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
       description 如实说明；显式 `hybrid`/`vector` → `isError:true` + 可自纠文本；keyword 零回归。
 - [x] 收口三绿 + 活服务验证（2026-08-24，见 §8 迭代记录）。
 
-**远端档（KB-0.2，待实施）**
-- [ ] `--server/--key`（env `FASTSEARCH_SERVER`/`FASTSEARCH_KEY`）可用，与本地档并存且**互斥**；
+**远端档（KB-0.2/0.3，已实施并纳入 CI）**
+- [x] `--server/--key`（env `FASTSEARCH_SERVER`/`FASTSEARCH_KEY`）可用，与本地档并存且**互斥**；
       两者同时指定（或远端档下还设了 `FASTSEARCH_MCP_TENANT`）→ 拒绝启动 + 二选一改法。
-- [ ] 启动时探测 `GET /v1/collections`；`embedded:true` ⇒ 三档 + default `hybrid`，
+- [x] 启动时探测 `GET /v1/collections`；`embedded:true` ⇒ 三档 + default `hybrid`，
       `false` ⇒ 单档 keyword；探测失败 ⇒ 拒绝启动，**绝不回退本地档**。
-- [ ] 同一 MCP 客户端配置指向远端 server 时，`search`/`resolve_citation` 结果与直连 REST 一致
-      （用例 21）。
-- [ ] 两个不同 key 的 MCP 实例看到不同可见集（用例 21）；出站请求不含任何 ACL 字段（用例 16）。
-- [ ] 本地档 fail-closed 收紧（用例 12），且破坏性变更已写进 README / Agent 使用指南（中英各一处）。
-- [ ] 未宣称入参一律拒绝，`query_image` 两档都给可自纠错误（用例 19）；schema 属性集 == 允许清单。
-- [ ] 收口三绿（`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] 真二进制中 MCP `search` 的 citation 序列与直连 REST 一致；
+      `resolve_citation` 同时覆盖授权正向与跨 key 拒绝（用例 21）。
+- [x] 两个不同 key 的 MCP 实例看到不同可见集（用例 21）；出站请求不含任何 ACL 字段（用例 16）。
+- [x] 本地档 fail-closed 收紧（用例 12），且破坏性变更已写进中英文 Agent 使用指南。
+- [x] 未宣称入参一律拒绝，`query_image` 两档都给可自纠错误（用例 19）；schema 属性集 == 允许清单。
+- [x] 收口三绿（`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings`
       + `cargo test --workspace`）+ **实跑两个二进制**的活服务验证；未跑前一律标 `待运行验证`。
-- [ ] `cargo tree -p fastsearch-mcp -e normal` 仍零 docparse（不变量 #7）。
+- [x] `cargo tree -p fastsearch-mcp -e normal` 仍零 docparse（不变量 #7）。
 
 ---
 
 ## 8. 状态 / 迭代记录 / 已知限制 / 下一迭代
 
 ### 迭代记录
+
+- **2026-08-31 · FS-003 真二进制 CI 门禁**：新增 `mcp-server-e2e` job，起真
+  `fastsearch-server` 和两个远端档 `fastsearch-mcp` stdio 进程，由 MCP 分别写入两个 ACL 集合，
+  验证 initialize/tools/list、`index_chunks`、`search`、跨 key `resolve_citation` 不可见、两 key 搜索隔离及
+  MCP/REST citation 序列一致。脚本还钉住 `/readyz` 的进程级语义。
 
 - **2026-08-26 · KB-0.4/0.5 已实施 + 活服务验证**：`include_text` + `max_context_chars`
   同时进 schema 与允许清单（只放开前者不给预算 = 把冲爆上下文的开关递给 agent 却不给刹车）；
@@ -514,26 +518,25 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 
 ### 已知限制（现状为准）
 
-1. **本地档只有 keyword**：MCP 直连引擎，而 `Engine::run()` 从不嵌文本 query。语义/混合要么
-   自带 `vector`，要么走 REST，要么等远端档。
-2. **本地档 ACL 是进程级常量**：一个进程一个租户，多租户场景用不了；且**未设 tenant 时
-   `acl=None` 全库可见**（fail-open，§4.3-4 待 KB-0.2 收紧）。
+1. **本地档只有 keyword**：MCP 直连引擎，而 `Engine::run()` 从不嵌文本 query。语义/混合需
+   自带 `vector` 或使用已实施的远端档。
+2. **本地档 ACL 是进程级常量**：一个进程一个租户，多租户场景用不了；启动时必须
+   显式给出 `FASTSEARCH_MCP_TENANT` 或 `FASTSEARCH_MCP_ACL=all`，否则 fail-closed 拒绝启动。
 3. **C1 反向已闭合**：schema、允许清单和共享字段矩阵一致；未宣称的 REST 搜索字段均显式拒绝。
 4. **远端档的 `hybrid` 只诚实到"server 会算查询向量"这一层**：`server_vector_info` 不吐
    `caps().semantic`/`image`/`cross_modal` ⇒ 无法证明它是语义的、能收图。等 **KB-2.4**。
 5. **继承 server 的一处静默退化**：`filter_targets_image` 命中且后端 `caps.cross_modal==false`
    时 server 跳过 query 嵌入 ⇒ 那类查询实际是纯 keyword。修在 server 侧，不在本面。
-6. **`assets_resolve` 不吐 `time`** ⇒ 远端档的 `resolve_citation` 会比本地档少一个字段
-   （§4.6，需改 server，见 §9）。
-7. **schema 在进程启动时定死**：server 能力后来变了要重启 MCP；`tools/list_changed` 通知
+6. **schema 在进程启动时定死**：server 能力后来变了要重启 MCP；`tools/list_changed` 通知
    **`[待验证]`**（本 crate 不发通知，客户端支持度未核实）。
-8. **只有 stdio 传输**；MCP 的 HTTP/SSE 传输未做。
-9. **远端档不拆 feature**：`engine`/`text` 依赖在远端档下也编译进来（二进制偏大）。
+7. **只有 stdio 传输**；MCP 的 HTTP/SSE 传输未做。
+8. **远端档不拆 feature**：`engine`/`text` 依赖在远端档下也编译进来（二进制偏大）。
    拆 feature 会长出两套构建档 + 两条 CI 路径，收益不抵复杂度 ⇒ 明确不做，记在此处。
 
 ### 下一迭代
 
-- **KB-0.2**：按本文 §4.5–§4.9 实施远端模式（C1 通道，Wave 2）。
+- ~~**KB-0.2**：按本文 §4.5–§4.9 实施远端模式（C1 通道，Wave 2）。~~
+  **2026-08-25 已实施，2026-08-31 已纳入真二进制 CI。**
 - ~~**KB-0.3**：写入工具 `index_chunks`~~ —— **2026-08-25 已实施**（见迭代记录）。
   `ingest_document` 仍待 KB-3 上传端点。原条目：**依赖远端档**——本地档没有每请求身份，
   在它上面开写入口等于让引擎"替调用方猜写入 ACL"，正是 server v2.4 用 403 拒绝掉的那件事
@@ -545,9 +548,9 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 
 ### 待决策
 
-- **`[待决策 · 迭代计划 §10 #2]` 远端档做好后，本地嵌引擎档保留还是弃用？**
+- **`[已决 2026-08-25 · 迭代计划 §10 #2]` 保留本地嵌引擎档。**
 
-  **本 spec 的建议：保留，但降级为"必须显式选择的单机档"，并按 §4.3-4 收紧 fail-closed。**
+  **实施结论：保留，但降级为"必须显式选择的单机档"，并按 §4.3-4 收紧 fail-closed。**
 
   理由：
   1. **弃用等于产品失去唯一的离线入口**。CLI 已于 2026-06-28 改成纯 REST 客户端，
@@ -558,15 +561,14 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
      差别只在 `AclFilter` 由谁构造（本地：进程 env；远端：server 的 `acl_for`）。
      不变量 #3 的真正判据是"**工具入参不能影响 ACL**"，这一条对两条路是**同一个测试形状**
      （用例 11 与用例 16/21 是同一个断言的两种落地）。
-  3. **风险是可关闭的**：本地档今天的真问题不是"有两条路"，而是它那条路**fail-open**。
-     §4.3-4 收紧后，两条路都是 fail-closed，风险面收敛。
+  3. **风险已关闭**：本地档历史上的真问题不是"有两条路"，而是它那条路**fail-open**。
+     §4.3-4 收紧后，两条路都是 fail-closed，风险面已收敛。
   4. **弃用的正当理由只有一个**，若成立则应改判：KB-0.3 写入工具落地后，本地档会变成
      "能写但没有身份"的形态。本 spec 的应对是**本地档保持只读**（写入工具不在其 `tools/list` 里）。
      如果将来出现"本地档也必须能写"的真实需求，那时**弃用本地档**优于"给它编一个写入身份"。
 
   ⇒ **决策条件写死**：只要本地档保持 ①fail-closed、②只读、③schema 如实只宣称 keyword，
-  就保留；三条中任何一条破了，就该弃用而不是打补丁。**最终裁定权归 KB-0.2 的实施者**，
-  实施时把结论回写本节。
+  就保留；三条中任何一条破了，就该弃用而不是打补丁。KB-0.2 实施者已将结论回写在下方。
 
   > **`[已决 2026-08-25 · KB-0.2 实施者裁定]` 采纳本 spec 的建议：保留，降级为"必须显式选择的单机档"。**
   > 三条决策条件在本次实施后**均已成立且有测试背书**：
@@ -587,19 +589,12 @@ KB-0.1 修的 bug 是它的反例：`mode` 无条件宣称 `["keyword","vector",
 
 ---
 
-## 9. 需要动"别人的文件"的清单（本作业不改，交主循环/后续迭代）
+## 9. 跨文件实施清单（已完成）
 
-按并行作业硬规则 1（只写自己的独占文件），以下是本 spec 推导出、但落在本文件之外的改动：
+以下是远端档设计推导出的跨文件改动，现均已落地：
 
-1. **`crates/fastsearch-server/src/lib.rs` · `assets_resolve`**：三个分支补 `"time": a.time`
-   （纯增字段、向后兼容），否则远端档 `resolve_citation` 丢 `time`（§4.6）。同步
-   `openapi_spec()` 与 [19-server.md](19-server.md)。
-2. **`docs/specs/00-模块拆分.md` 第 11 行**：spec 列由 `—` 改为指向本文
-   （`22-mcp.md`）——该行现在是本模块唯一的"spec 索引"。
-3. **`docs/在Agent中使用fastsearch.md` §3.1 + `docs/using-fastsearch-in-an-agent.md` §3.1**：
-   远端模式落地后同步（中英各一处）；**本地档 fail-closed 收紧是破坏性变更**，必须在这两处
-   与 README 显式写出。
-4. **`crates/fastsearch-mcp/Cargo.toml`**：加 `ureq.workspace = true`（属本模块独占文件，
-   由 KB-0.2 实施者在 C1 通道内完成，此处只是记账）。
-5. **`.github/workflows/ci.yml`**：新增 `mcp-server-e2e` job（用例 21），形状对标既有
-   `cli-server-e2e`。
+1. [x] `assets_resolve` 三个分支补齐 `time`，并同步 OpenAPI/server spec。
+2. [x] `docs/specs/00-模块拆分.md` 已建立本 spec 索引。
+3. [x] 中英文 Agent 使用指南已写明远端档与本地档 fail-closed 破坏性变更。
+4. [x] `crates/fastsearch-mcp/Cargo.toml` 已使用 `ureq.workspace = true`。
+5. [x] `.github/workflows/ci.yml` 已新增 `mcp-server-e2e` job（用例 21）。

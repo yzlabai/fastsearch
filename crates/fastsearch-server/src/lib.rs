@@ -608,7 +608,7 @@ pub fn acl_for(p: &Principal) -> AclFilter {
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ready" }))
+        .route("/readyz", get(process_ready))
         .route("/metrics", get(metrics))
         .route("/openapi.json", get(openapi))
         .route("/v1/search", post(search))
@@ -634,6 +634,16 @@ pub fn router(state: ServerState) -> Router {
         )
         .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         .with_state(state)
+}
+
+/// 进程级 readiness：只说明 HTTP 路由已可接请求，不冒充 PG/CDC/embedder 依赖健康。
+/// 组件化依赖状态尚未实现前，调用方必须从 introspection/metrics 分别判断运行档。
+async fn process_ready() -> Json<Value> {
+    Json(json!({
+        "ready": true,
+        "scope": "process",
+        "dependencies_checked": false,
+    }))
 }
 
 /// OpenAPI 3.0 契约（手写、随 API 演进维护）。供 SDK 生成 / 文档 / 契约校验（F54）。
@@ -1102,7 +1112,12 @@ fn openapi_spec() -> Value {
                 }
             },
             "/healthz": {"get": {"summary": "存活探针", "security": [], "responses": {"200": {"description": "ok"}}}},
-            "/readyz": {"get": {"summary": "就绪探针", "security": [], "responses": {"200": {"description": "ready"}}}},
+            "/readyz": {"get": {
+                "summary": "进程级就绪探针（不检查 PG/CDC/embedder）",
+                "description": "仅表示 HTTP 进程已开始接收请求；dependencies_checked 固定为 false。组件状态请结合 /v1/collections introspection 与 /metrics。",
+                "security": [],
+                "responses": {"200": {"description": "{ready:true,scope:process,dependencies_checked:false}"}}
+            }},
             "/metrics": {"get": {"summary": "Prometheus 指标", "security": [], "responses": {"200": {"description": "text/plain"}}}}
         }
     })
@@ -4515,6 +4530,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_is_honest_process_readiness_not_dependency_health() {
+        let app = app_with_data().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(resp).await,
+            json!({
+                "ready": true,
+                "scope": "process",
+                "dependencies_checked": false,
+            })
+        );
     }
 
     #[tokio::test]

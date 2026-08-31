@@ -402,7 +402,7 @@ impl McpServer {
         self.reject_unavailable_mode(&req)?;
         // 命中形状**两档必须逐字段相同**，否则同一个工具在两种部署下给 agent 两种契约。
         // 远端拿到的是 server `hits_json` 的富对象（含 bm25/vector/rerank/bbox/media/cursor…），
-        // 必须投影回这五个字段；多出来的等 KB-0.4 决定要不要宣称再开。
+        // 必须投影回五个基础字段；只有显式 include_text 时增加 text，其余富字段不透传。
         let arr: Vec<Value> = match &self.backend {
             Backend::Local { engine, acl } => engine
                 .search(&req, acl.as_ref())
