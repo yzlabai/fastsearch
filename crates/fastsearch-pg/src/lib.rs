@@ -5,9 +5,13 @@
 //! （托管 PG 可移植，见需求 N1b）。详见 [spec](../../docs/specs/12-pg.md)。
 
 mod error;
+mod jobs;
 mod sql;
 
 pub use error::{PgError, Result};
+pub use jobs::{
+    retry_backoff_ms, FailureDisposition, IngestJob, IngestState, JobLease, JobStore, NewIngestJob,
+};
 pub use sql::{
     ann_index_sql, pgvector_search_sql, ChunkRow, SignalRow, SqlParam, VectorType, COLUMNS,
     PUBLICATION,
@@ -48,7 +52,7 @@ impl PgConfig {
 
 /// `ensure_schema` 的事务级 advisory lock key（固定常量，全副本同值才能互斥）。任意 i64；
 /// 取自 ASCII `"fss_ddl\0"` 的高位字节，避免与运维自用 advisory key 偶然撞号。
-const SCHEMA_DDL_LOCK_KEY: i64 = 0x6673_735f_6464_6c00;
+pub(crate) const SCHEMA_DDL_LOCK_KEY: i64 = 0x6673_735f_6464_6c00;
 
 /// Postgres 真源句柄。
 ///
@@ -971,7 +975,7 @@ fn row_to_signal(row: &Row) -> Result<Signal> {
 
 /// 校验 SQL 标识符（表名）：`[A-Za-z_][A-Za-z0-9_]*`，长度 ≤63（PG 上限）。
 /// 表名在 `sql.rs` 经 `format!` 拼进 SQL（值用参数化、标识符不能参数化），故在此把关。
-fn validate_identifier(name: &str) -> Result<()> {
+pub(crate) fn validate_identifier(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 63
         && name

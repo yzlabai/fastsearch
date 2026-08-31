@@ -34,6 +34,9 @@ pg_gates=(
   fs201_signal_reconciliation_and_acl_deletes
   fs201_signal_schema_publication_and_cdc_contract
   fs202_signal_vector_search_filters_and_orders
+  fs301_concurrent_claims_are_disjoint_and_stage_writes_are_fenced
+  fs301_expired_lease_is_reclaimed_and_retry_exhaustion_is_dead_letter
+  fs301_additive_upgrade_and_chunks_only_publication_hold_in_real_pg
   pgvector_backend_via_engine
   fs202_engine_fuses_three_real_recall_paths
   b6_cdc_write_through_to_pg_embedding

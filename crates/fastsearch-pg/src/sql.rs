@@ -36,6 +36,196 @@ impl VectorType {
 /// `chunk_signal` 等任何旁表不得加入，如需 CDC 必须新建 publication。
 pub const PUBLICATION: &str = "fastsearch_pub";
 
+/// Additive DDL for the ingestion work ledger. It is intentionally a normal table: no
+/// extension, trigger, queue extension, or logical-replication publication is involved.
+pub(crate) fn job_ddl(table: &str) -> Vec<String> {
+    let state_constraint = format!("{table}_state_check");
+    let retry_constraint = format!("{table}_retry_check");
+    vec![
+        format!(
+            "CREATE TABLE IF NOT EXISTS {table} (\n\
+             job_id text PRIMARY KEY,\n\
+             collection text NOT NULL,\n\
+             doc_id text NOT NULL,\n\
+             tenant text,\n\
+             acl text[] NOT NULL,\n\
+             source_uri text NOT NULL,\n\
+             content_sha256 text NOT NULL,\n\
+             content_bytes bigint NOT NULL,\n\
+             media_type text,\n\
+             filename text,\n\
+             parse_profile jsonb NOT NULL DEFAULT '{{}}'::jsonb,\n\
+             state text NOT NULL DEFAULT 'queued',\n\
+             stage_detail jsonb NOT NULL DEFAULT '{{}}'::jsonb,\n\
+             chunk_count integer NOT NULL DEFAULT 0,\n\
+             lease_owner text,\n\
+             lease_epoch bigint NOT NULL DEFAULT 0,\n\
+             lease_until timestamptz,\n\
+             heartbeat_at timestamptz,\n\
+             retry_count integer NOT NULL DEFAULT 0,\n\
+             max_retries integer NOT NULL DEFAULT 3,\n\
+             next_attempt_at timestamptz NOT NULL DEFAULT now(),\n\
+             error text,\n\
+             error_stage text,\n\
+             created_at timestamptz NOT NULL DEFAULT now(),\n\
+             updated_at timestamptz NOT NULL DEFAULT now(),\n\
+             started_at timestamptz,\n\
+             finished_at timestamptz,\n\
+             CONSTRAINT {state_constraint} CHECK (state IN ('queued','parsing','chunking','embedding','indexed','failed')),\n\
+             CONSTRAINT {retry_constraint} CHECK (retry_count >= 0 AND max_retries > 0 AND content_bytes >= 0)\n\
+             );"
+        ),
+        // Additive upgrades. Fields that were present in the initial design are included too so
+        // deployments created from an early prototype converge without destructive rewrites.
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS collection text NOT NULL DEFAULT '';"),
+        format!("ALTER TABLE {table} ALTER COLUMN collection DROP DEFAULT;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS doc_id text NOT NULL DEFAULT '';"),
+        format!("ALTER TABLE {table} ALTER COLUMN doc_id DROP DEFAULT;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS tenant text;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS acl text[] NOT NULL DEFAULT '{{}}';"),
+        format!("ALTER TABLE {table} ALTER COLUMN acl DROP DEFAULT;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS source_uri text NOT NULL DEFAULT '';"),
+        format!("ALTER TABLE {table} ALTER COLUMN source_uri DROP DEFAULT;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS content_sha256 text NOT NULL DEFAULT '';"),
+        format!("ALTER TABLE {table} ALTER COLUMN content_sha256 DROP DEFAULT;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS content_bytes bigint NOT NULL DEFAULT 0;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS media_type text;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS filename text;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS parse_profile jsonb NOT NULL DEFAULT '{{}}'::jsonb;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'queued';"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS stage_detail jsonb NOT NULL DEFAULT '{{}}'::jsonb;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS chunk_count integer NOT NULL DEFAULT 0;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS lease_owner text;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS lease_epoch bigint NOT NULL DEFAULT 0;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS lease_until timestamptz;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS heartbeat_at timestamptz;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS retry_count integer NOT NULL DEFAULT 0;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS max_retries integer NOT NULL DEFAULT 3;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz NOT NULL DEFAULT now();"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS error text;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS error_stage text;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS started_at timestamptz;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS finished_at timestamptz;"),
+        format!(
+            "DO $$ BEGIN ALTER TABLE {table} ADD CONSTRAINT {state_constraint} \
+             CHECK (state IN ('queued','parsing','chunking','embedding','indexed','failed')); \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+        ),
+        format!(
+            "DO $$ BEGIN ALTER TABLE {table} ADD CONSTRAINT {retry_constraint} \
+             CHECK (retry_count >= 0 AND max_retries > 0 AND content_bytes >= 0); \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+        ),
+        format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {table}_doc ON {table} \
+             (COALESCE(tenant, ''), collection, doc_id);"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {table}_claim ON {table} (next_attempt_at, created_at) \
+             WHERE state <> 'indexed';"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {table}_list ON {table} \
+             (COALESCE(tenant, ''), collection, doc_id);"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {table}_hash ON {table} \
+             (COALESCE(tenant, ''), collection, content_sha256);"
+        ),
+    ]
+}
+
+const JOB_RETURN_COLUMNS: &str = "job_id, collection, doc_id, tenant, acl, source_uri, \
+content_sha256, content_bytes, media_type, filename, parse_profile::text AS parse_profile, state, \
+stage_detail::text AS stage_detail, chunk_count, lease_owner, lease_epoch, \
+(extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, \
+(extract(epoch FROM heartbeat_at) * 1000)::bigint AS heartbeat_at_ms, retry_count, max_retries, \
+(extract(epoch FROM next_attempt_at) * 1000)::bigint AS next_attempt_at_ms, error, error_stage, \
+(extract(epoch FROM created_at) * 1000)::bigint AS created_at_ms, \
+(extract(epoch FROM updated_at) * 1000)::bigint AS updated_at_ms, \
+(extract(epoch FROM started_at) * 1000)::bigint AS started_at_ms, \
+(extract(epoch FROM finished_at) * 1000)::bigint AS finished_at_ms";
+
+pub(crate) fn enqueue_job_sql(table: &str) -> String {
+    format!(
+        "INSERT INTO {table} (job_id, collection, doc_id, tenant, acl, source_uri, \
+         content_sha256, content_bytes, media_type, filename, parse_profile, max_retries) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::text::jsonb,$12) \
+         RETURNING {JOB_RETURN_COLUMNS}"
+    )
+}
+
+pub(crate) fn get_job_sql(table: &str) -> String {
+    format!("SELECT {JOB_RETURN_COLUMNS} FROM {table} WHERE job_id = $1")
+}
+
+pub(crate) fn claim_jobs_sql(table: &str) -> String {
+    format!(
+        "WITH cand AS (\
+           SELECT job_id FROM {table} \
+            WHERE state <> 'indexed' \
+              AND retry_count < max_retries \
+              AND next_attempt_at <= clock_timestamp() \
+              AND (state IN ('queued','failed') OR lease_until IS NULL \
+                   OR lease_until < clock_timestamp()) \
+            ORDER BY next_attempt_at, created_at, job_id \
+            FOR UPDATE SKIP LOCKED LIMIT $1::bigint\
+         ), claimed AS (\
+         UPDATE {table} AS j \
+            SET state = 'parsing', lease_owner = $2, lease_epoch = j.lease_epoch + 1, \
+                lease_until = clock_timestamp() + make_interval(secs => $3::bigint::double precision / 1000.0), \
+                heartbeat_at = clock_timestamp(), started_at = COALESCE(j.started_at, clock_timestamp()), \
+                updated_at = clock_timestamp() \
+           FROM cand WHERE j.job_id = cand.job_id RETURNING j.*\
+         ) SELECT {JOB_RETURN_COLUMNS} FROM claimed"
+    )
+}
+
+pub(crate) fn heartbeat_job_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET heartbeat_at = clock_timestamp(), \
+         lease_until = clock_timestamp() + make_interval(secs => $4::bigint::double precision / 1000.0), \
+         updated_at = clock_timestamp() \
+         WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
+           AND state <> 'indexed' AND lease_until >= clock_timestamp() \
+         RETURNING job_id"
+    )
+}
+
+pub(crate) fn advance_job_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET state = $5, stage_detail = $6::text::jsonb, \
+         heartbeat_at = clock_timestamp(), \
+         lease_until = clock_timestamp() + make_interval(secs => $7::bigint::double precision / 1000.0), \
+         updated_at = clock_timestamp() \
+         WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 AND state = $4 \
+           AND lease_until >= clock_timestamp() RETURNING job_id"
+    )
+}
+
+pub(crate) fn finish_job_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET state = 'indexed', chunk_count = $4, error = NULL, \
+         error_stage = NULL, lease_owner = NULL, lease_until = NULL, finished_at = clock_timestamp(), \
+         updated_at = clock_timestamp() \
+         WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
+           AND state = 'embedding' AND lease_until >= clock_timestamp() RETURNING job_id"
+    )
+}
+
+pub(crate) fn fail_job_sql(table: &str) -> String {
+    format!(
+        "UPDATE {table} SET state = 'failed', error = $4, error_stage = $5, \
+         retry_count = retry_count + 1, next_attempt_at = to_timestamp($6::bigint::double precision / 1000.0), \
+         lease_owner = NULL, lease_until = NULL, updated_at = clock_timestamp() \
+         WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
+           AND state <> 'indexed' AND lease_until >= clock_timestamp() \
+         RETURNING retry_count, max_retries"
+    )
+}
+
 /// 幂等 DDL：扩展 + 表 + 索引 + publication。仅依赖 pgvector + 逻辑复制
 /// （不需任何 `shared_preload_libraries` 原生扩展，保证托管 PG 可移植）。
 pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<String> {
@@ -855,6 +1045,79 @@ impl ChunkRow {
 mod tests {
     use super::*;
     use fastsearch_core::{BBox, GlobalId, Signal, SignalStatus, SignalType};
+
+    #[test]
+    fn job_schema_is_one_portable_non_publication_table() {
+        let statements = job_ddl("fastsearch_ingest_jobs");
+        let ddl = statements.join("\n");
+        assert_eq!(ddl.matches("CREATE TABLE").count(), 1);
+        for required in [
+            "job_id text PRIMARY KEY",
+            "tenant text",
+            "acl text[] NOT NULL",
+            "lease_owner text",
+            "lease_epoch bigint NOT NULL DEFAULT 0",
+            "retry_count integer NOT NULL DEFAULT 0",
+            "CHECK (state IN ('queued','parsing','chunking','embedding','indexed','failed'))",
+            "fastsearch_ingest_jobs_doc",
+            "fastsearch_ingest_jobs_claim",
+            "fastsearch_ingest_jobs_list",
+            "fastsearch_ingest_jobs_hash",
+        ] {
+            assert!(ddl.contains(required), "missing {required:?} in {ddl}");
+        }
+        let upper = ddl.to_ascii_uppercase();
+        assert!(!upper.contains("PUBLICATION"));
+        assert!(!upper.contains("CREATE EXTENSION"));
+        for forbidden_column in [
+            "owner",
+            "role",
+            "member",
+            "group",
+            "parent",
+            "inherit",
+            "permission",
+            "dataset",
+            "version",
+            "revision",
+        ] {
+            assert!(
+                !ddl.lines().any(|line| {
+                    line.trim_start()
+                        .starts_with(&format!("{forbidden_column} "))
+                }),
+                "forbidden identity/product column {forbidden_column:?} in {ddl}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_claim_and_mutations_are_fenced() {
+        let claim = claim_jobs_sql("jobs");
+        assert!(claim.contains("FOR UPDATE SKIP LOCKED"));
+        assert!(claim.contains("retry_count < max_retries"));
+        assert!(claim.contains("lease_epoch = j.lease_epoch + 1"));
+        assert!(claim.contains("lease_until < clock_timestamp()"));
+
+        for sql in [
+            heartbeat_job_sql("jobs"),
+            advance_job_sql("jobs"),
+            finish_job_sql("jobs"),
+            fail_job_sql("jobs"),
+        ] {
+            assert!(
+                sql.contains("lease_owner = $2"),
+                "missing owner fence: {sql}"
+            );
+            assert!(
+                sql.contains("lease_epoch = $3"),
+                "missing epoch fence: {sql}"
+            );
+        }
+        let advance = advance_job_sql("jobs");
+        assert!(advance.contains("state = $4"));
+        assert!(advance.contains("state = $5"));
+    }
 
     fn sample() -> Chunk {
         Chunk {
