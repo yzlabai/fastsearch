@@ -125,6 +125,13 @@ def check_packages(checks: Checks) -> None:
         example.get("dependencies", {}).get("fastsearch-client") == "file:../clients/typescript",
         "example must consume the repository TypeScript SDK",
     )
+    example_lock = json.loads((ROOT / "example/package-lock.json").read_text(encoding="utf-8"))
+    locked_sdk = example_lock.get("packages", {}).get("node_modules/fastsearch-client", {})
+    checks.require(locked_sdk.get("link") is True, "example lock must link the repository SDK")
+    checks.require(
+        locked_sdk.get("resolved") == "../clients/typescript",
+        "example lock repository SDK path mismatch",
+    )
 
 
 def check_documents(checks: Checks) -> None:

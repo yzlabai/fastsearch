@@ -6,7 +6,7 @@
   "description": "知识库 Agent 例子：Hono + SQLite/Drizzle + Vercel AI SDK + Vite/React/shadcnUI，检索后端用 fastsearch REST，LLM 用 DeepSeek。",
   "scripts": {
     "prepare:sdk": "tsc -p ../clients/typescript/tsconfig.json",
-    "predev": "npm run prepare:sdk",
+    "predev:server": "npm run prepare:sdk",
     "prebuild": "npm run prepare:sdk",
     "pretypecheck": "npm run prepare:sdk",
     "pretest": "npm run prepare:sdk",

@@ -499,6 +499,70 @@ test("chunksFromDocparse: 图片三态映射，且 base64 必须解成字节数�
   assert.equal((region!.media as any).asset.page, 2);
 });
 
+test("chunksFromDocparse: 无 atob 时使用 Node Buffer 解码", () => {
+  const originalAtob = Object.getOwnPropertyDescriptor(globalThis, "atob");
+  try {
+    Object.defineProperty(globalThis, "atob", {
+      configurable: true,
+      value: undefined,
+    });
+    const [inline] = chunksFromDocparse(
+      [
+        {
+          id: 0,
+          kind: "image",
+          text: "图",
+          page: 1,
+          bbox: { x0: 0, y0: 0, x1: 1, y1: 1 },
+          image: { data_base64: "iVBORw==" },
+        },
+      ],
+      { docId: "d" },
+    );
+    assert.deepEqual(inline!.media_bytes, [0x89, 0x50, 0x4e, 0x47]);
+  } finally {
+    if (originalAtob) Object.defineProperty(globalThis, "atob", originalAtob);
+    else delete (globalThis as { atob?: unknown }).atob;
+  }
+});
+
+test("chunksFromDocparse: 无 atob/Buffer 时明确拒绝 base64 输入", () => {
+  const originalAtob = Object.getOwnPropertyDescriptor(globalThis, "atob");
+  const originalBuffer = Object.getOwnPropertyDescriptor(globalThis, "Buffer");
+  try {
+    Object.defineProperty(globalThis, "atob", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.defineProperty(globalThis, "Buffer", {
+      configurable: true,
+      value: undefined,
+    });
+    assert.throws(
+      () =>
+        chunksFromDocparse(
+          [
+            {
+              id: 0,
+              kind: "image",
+              text: "图",
+              page: 1,
+              bbox: { x0: 0, y0: 0, x1: 1, y1: 1 },
+              image: { data_base64: "iVBORw==" },
+            },
+          ],
+          { docId: "d" },
+        ),
+      /base64 decoder unavailable/,
+    );
+  } finally {
+    if (originalAtob) Object.defineProperty(globalThis, "atob", originalAtob);
+    else delete (globalThis as { atob?: unknown }).atob;
+    if (originalBuffer) Object.defineProperty(globalThis, "Buffer", originalBuffer);
+    else delete (globalThis as { Buffer?: unknown }).Buffer;
+  }
+});
+
 test("chunkText: markdown 标题维护 heading_path，段落成块", () => {
   const md = "# 年报\n\n第一段正文。\n\n## 财务\n\n毛利率 42%。";
   const out = chunkText(md, { docId: "n.md", targetChars: 10 });
