@@ -10,7 +10,7 @@ CDC 同步：把 Postgres（真源）的变更增量、可靠地应用到引擎�
 
 - **变更模型**：`Change`（Upsert/Delete/DeleteDoc/Clear/Batch，携带 collection+chunk 或删除键 + LSN）。
 - **Sink 抽象**：`IndexSink` trait（upsert chunk / delete by gid / delete by doc / clear），由 engine 桥接 text/vector 索引。
-- **Applier**：幂等地把 `Change` 应用到 sink；维护 `applied_lsn` 检查点；保证按序、删除/替换正确、重复消息无副作用（exactly-once 效果）。
+- **Applier**：供无 slot 的独立调用方/测试按事件 LSN 去重；生产 slot 消费不使用其水位，因为 pgoutput 行消息 LSN 可能是事务起点，生产检查点只采用本批最高 commit LSN。
 - **快照 + 增量切换**：初始全量快照建索引（用 pg.fetch 全表）→ 记 snapshot_lsn → 从该 LSN 起增量。
 - **复制连接 + pgoutput 解码**：连接 PG 复制 slot、解码 pgoutput → `Change`。**env-gated 集成**（无 PG 时不跑）；wire 解码逻辑尽量纯函数可单测。
 
@@ -50,7 +50,8 @@ impl Applier {
 
 ## 3. 行为规约
 
-- **幂等/续传**：`apply` 跳过 `lsn <= applied_lsn`（重启后从持久化的 applied_lsn 续传，重复消息无副作用）。返回是否实际应用。
+- **独立 Applier 幂等**：`apply` 跳过 `lsn <= applied_lsn`；该契约不用于生产 slot 消费。
+- **生产续传**：Engine 对 peek 批次全部幂等应用，以最高 commit LSN 持久化并 advance；事件 LSN 不参与首批跳过判断。
 - **按序**：apply_batch 假定输入按 LSN 升序；乱序中低于水位的被跳过。
 - **替换语义**：`DeleteDoc` 后跟同 doc 的 `Upsert` 序列 = doc_id 级替换（与 pg.upsert_doc 对应）。
 - **主键迁移**：Update 旧 key 与新 tuple 的 GlobalId 不同时，映射成同一 LSN 下有序的 `Batch[Delete(old), Upsert(new)]`；避免旧 citation 成为幽灵行，也不伪造递增 LSN。
@@ -99,6 +100,7 @@ impl Applier {
     - **端到端闭环**（`fastsearch-engine/tests/cdc_closed_loop.rs`，env-gated）：写 PgStore → slot 捕获 → `pull_changes` 解码 → `Applier` 应用到 `Engine` → 检索命中（引用正确）。Docker pgvector 上全绿、可幂等重跑。
   - [x] FS-101（2026-08-31，Docker pgvector:pg17 真机）：`map` 升级为零到多变更；PK UPDATE 输出有序 Delete+Upsert 复合事件；TRUNCATE 输出 Clear 并清 text/vector；Relation 改为 `ReplicationConfig.source_table` 精确限定表名 + 列形状双守卫。环境门禁现为 PG/CDC 21/21 executed。
   - [x] FS-102（2026-08-31，Docker pgvector:pg17 真机）：`apply_changes` 建立整批接缝，Engine 全批准备后发布；一次 `embed_multi`、PG 事务写穿、嵌入锁外等待与故障重试闭环落地。PG 写穿至本地发布期间由 Engine 锁阻断搜索；跨 PG/本地文件的进程崩溃恢复边界明确转入 FS-103。PG/CDC 显式门禁增至 24 项。
+  - [x] FS-103（2026-08-31，Docker pgvector:pg17 真机）：并发 `ensure_slot` 捕获 PG duplicate-object，8 副本首建全成功；生产路径移除 `Applier` 水位并统一为 commit LSN；PG 写穿/本地发布前原子落 `cdc-batch-intent.json`，persist 后更新阶段，slot advance 后清除。任何中途错误或崩溃均阻断 readiness，常规轮询按 GlobalId 幂等重放；不宣称跨 PG/本地文件 2PC。peek/apply/persist/advance 四边界恢复、恢复标记和状态指标均有实库回归。PG/CDC 显式门禁增至 28 项。
 
 **复测配方（Docker）：**
 ```bash
@@ -114,6 +116,5 @@ cargo test -p fastsearch-engine --test cdc_closed_loop      # CDC 闭环
 
 - `source_table` 当前是单个精确白名单项，因为 chunks publication 按不变量只含一个真源表；未来若确需同一消费者处理多张 chunk 真源表，再显式升级为集合，不以 shape guard 代替身份。
 - 低延迟**流式**消费（`START_REPLICATION` COPY + keepalive/standby 反馈）：当前用 SQL 轮询，足够正确性与中低频；流式待换支持复制协议的客户端（或自实现 wire）。
-- slot 生命周期监控（`max_slot_wal_keep_size`、滞留告警）、初始快照 + 无缝切换（B3）待续。
-- `initial_snapshot`/`stream` 集成函数待线缆层落地后补。
+- slot lag 已暴露；`max_slot_wal_keep_size` 自动治理、slot 失效后的自动重建仍待续。
 - IndexSink 由 fastsearch-engine 的适配器桥接 TextIndex（避免 text 反向依赖 sync）。

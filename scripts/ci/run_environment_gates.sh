@@ -35,6 +35,10 @@ pg_gates=(
   mm6_inline_serves_bytes_from_source_pg
   cdc_closed_loop_pg_to_search
   cdc_consume_persist_crashsafe
+  cdc_concurrent_slot_creation_is_idempotent
+  cdc_peek_exposes_commit_lsn_lag_and_dead_letters
+  cdc_failed_write_through_marks_recovery_until_replay_completes
+  cdc_crash_at_peek_persist_and_advance_recovers_without_loss_or_duplicates
   cdc_initial_snapshot_bootstrap
   cdc_batch_embedding_does_not_hold_engine_lock
   cdc_crash_after_apply_before_persist_retries_without_half_state

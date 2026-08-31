@@ -1,7 +1,7 @@
 # spec · fastsearch-server
 
 > 模块 #10，依赖：core、engine。阶段 P4。上游：[产品设计 §3.6/§3.8/§4](../plans/2026-06-24-产品设计文档.md)、需求 F43–F46/F50/F54。
-> 状态：**已完成 v2.6**（认证/ACL 不可绕过 + 指标/限流/审计 + 嵌入 + CDC 生命周期 +
+> 状态：**已完成 v2.7**（认证/ACL 不可绕过 + 指标/限流/审计 + 嵌入 + CDC 生命周期 +
 > 媒资网关 + 签名 URL + inline Range + 深分页 + 多向量后端 env）。MCP 第四张脸已独立成 `fastsearch-mcp` crate。
 
 ## 1. 目的与范围
@@ -31,7 +31,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 ```
 
 请求/响应：
-- `GET /healthz` 是进程存活探针；`GET /readyz` 是进程级就绪探针，返回 `{"ready":true,"scope":"process","dependencies_checked":false}`。它不检查 PG/CDC/embedder，依赖能力需结合 `/v1/collections` introspection 和 `/metrics` 判断。
+- `GET /healthz` 始终是进程存活探针。未启用 CDC 时，`GET /readyz` 返回进程级就绪；启用 CDC 后切换为依赖级探针，首轮源轮询成功且无恢复意图/死信漂移才返回 200，否则返回 503，并公开 commit LSN、slot lag、最近成功轮询、死信累计和 rebuild-needed。
 - `POST /v1/search` body 经 REST 外部契约解码为 `SearchRequest`。图片字节只接受 `query_image_base64`（或图片上传接口），内部字段 `query_image` 明确 400。当前嵌入后端是服务端级配置，`embedder != null` 的逐请求选择明确 400。ACL 只来自认证身份。`include_text`/`include_metadata` 默认 false；`explain=false` 时省略 `sources`，开启后每条命中附来源、rank、原始分和融合贡献。
 - `POST /v1/index` body = `{collection, doc_id, chunks:[Chunk]}` → ingest+commit，返回 `{indexed:n}`。Chunk 支持默认 `{}` 的 `metadata` 和默认 true 的 `searchable`；metadata 在副作用前校验。
 - chunk 管理端点以现有 `GlobalId=(collection,doc_id,chunk_id)` 寻址；batch 上限 1000。
@@ -60,7 +60,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 ## 5. 测试用例（用 tower oneshot 打 router，不起真端口）
 
 1. `/healthz` 无需 key → 200。
-2. `/readyz` 无需 key → 200，响应明确 `scope=process` 且 `dependencies_checked=false`。
+2. `/readyz` 无需 key；CDC 关闭时 200 且 `scope=process`，CDC 启用但未恢复时 503，成功轮询后 200 且 `scope=dependencies`。
 3. `/v1/search` 无 key → 401；错 key → 401；对 key → 200。
 4. **ACL 不可绕过**：两个 chunk（team-a / team-b，同 tenant）；以 team-a 的 key 搜 → 只回 team-a 的；即便请求 body 试图放宽也无效。
 5. `/v1/index` 写入后 `/v1/search` 能查到、带引用。
@@ -112,6 +112,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   详见 [plan §6.1](../plans/2026-08-24-index写穿pgvector对齐chunks.md)。
 - [x] v2.5（2026-08-31，FS-002）：OpenAPI SearchRequest 补齐 `fusion`/`embedder`/`explain`，Hit 补齐 `time`/`media`/`sources`；REST/OpenAPI 字段集与共享矩阵做精确集合断言。`explain=true` 的 server 路由测试证明来源明细可见，默认响应继续省略该字段。
 - [x] v2.6（2026-08-31，FS-003）：`/readyz` 改为结构化进程级就绪响应，明确不检查 PG/CDC/embedder；单测、OpenAPI 与真二进制 MCP↔server e2e 共同钉住语义。
+- [x] v2.7（2026-08-31，FS-103）：CDC 启用后 `/readyz` 升级为真实依赖探针；后台轮询共享 slot lag、最后 commit LSN、最后成功时间、死信累计和 rebuild-needed，Prometheus 同步暴露七项 CDC 指标。未启用 CDC 的进程级契约保持兼容。
 - [x] v2.4（2026-08-24，**fail-closed 默认 + 运行档如实标注**）：上游决策
   [职责边界：不承担身份与控制面](../governance/2026-08-24-职责边界-不承担身份与控制面.md)——
   身份归调用方，**正因 100% 依赖调用方接对，才不能在他没接对时替他猜**。两处"替他猜"已断根：

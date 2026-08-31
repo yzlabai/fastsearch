@@ -9,7 +9,9 @@
 use fastsearch_core::{BBox, Chunk, ChunkKind, SearchMode, SearchRequest};
 use fastsearch_engine::Engine;
 use fastsearch_pg::{PgConfig, PgStore};
-use fastsearch_sync::replication::{drop_slot, ensure_slot, pull_changes, ReplicationConfig};
+use fastsearch_sync::replication::{
+    drop_slot, ensure_slot, peek_batch, pull_changes, ReplicationConfig,
+};
 use fastsearch_sync::{Applier, Change, ChangeEvent, Lsn};
 use fastsearch_text::TextIndexConfig;
 use std::sync::OnceLock;
@@ -449,6 +451,96 @@ async fn cdc_pg_write_failure_rolls_back_and_retry_converges() {
     reset(&url, slot).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cdc_failed_write_through_marks_recovery_until_replay_completes() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!(
+            "skip cdc_failed_write_through_marks_recovery_until_replay_completes: DATABASE_URL not set"
+        );
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_recovery_marker_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
+    };
+    reset(&url, slot).await;
+
+    let store = std::sync::Arc::new(
+        PgStore::connect(PgConfig::new(url.clone()).with_vector_dim(8))
+            .await
+            .expect("pg connect"),
+    );
+    store.ensure_schema().await.expect("ensure_schema");
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+    store
+        .upsert_doc(
+            "kb",
+            "recovery.pdf",
+            &[
+                chunk("recovery.pdf", 1, "recovery marker one"),
+                chunk("recovery.pdf", 2, "recovery marker two"),
+            ],
+        )
+        .await
+        .expect("insert source rows");
+
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(
+            "CREATE OR REPLACE FUNCTION fs103_reject_second_embedding() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+               IF NEW.chunk_id = 2 AND NEW.embedding IS NOT NULL THEN \
+                 RAISE EXCEPTION 'injected pg write-through failure'; \
+               END IF; \
+               RETURN NEW; \
+             END $$; \
+             CREATE TRIGGER fs103_reject_second_embedding \
+             BEFORE UPDATE OF embedding ON fastsearch_chunks \
+             FOR EACH ROW EXECUTE FUNCTION fs103_reject_second_embedding();",
+        )
+        .await
+        .expect("install failure trigger");
+
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+    engine.set_embedder(fastsearch_embed::build_embedder(
+        &fastsearch_embed::EmbedderConfig::hash(8),
+    ));
+    engine.set_pg_vector(store);
+    engine.set_embed_model("fs103-test@8");
+    let engine = std::sync::Arc::new(tokio::sync::Mutex::new(engine));
+    let data = tempfile::tempdir().expect("tempdir");
+
+    let error = Engine::consume_once_shared(&engine, &rcfg, data.path())
+        .await
+        .expect_err("write-through must fail");
+    assert!(error.to_string().contains("pg write-through"));
+    assert!(Engine::cdc_recovery_pending(data.path()).unwrap());
+
+    client
+        .batch_execute(
+            "DROP TRIGGER fs103_reject_second_embedding ON fastsearch_chunks; \
+             DROP FUNCTION fs103_reject_second_embedding();",
+        )
+        .await
+        .expect("remove failure trigger");
+    let stats = Engine::consume_once_shared(&engine, &rcfg, data.path())
+        .await
+        .expect("replay consume");
+    assert_eq!(stats.applied, 2);
+    assert!(!Engine::cdc_recovery_pending(data.path()).unwrap());
+
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
 /// FS-102：外部嵌入等待期间，搜索仍应能取得 Engine 锁；只有本地发布/持久化短暂持锁。
 #[tokio::test(flavor = "multi_thread")]
 async fn cdc_batch_embedding_does_not_hold_engine_lock() {
@@ -547,6 +639,18 @@ async fn cdc_batch_embedding_does_not_hold_engine_lock() {
     let stats = consume.await.unwrap().unwrap();
     assert_eq!(stats.applied, 1);
     assert!(stats.prepare_micros >= 150_000);
+    // PG embedding 写穿本身可能产生一拍 publication 反馈；幂等 guard 会令下一拍稳定为空。
+    let feedback_stats = Engine::consume_once_shared(&engine, &rcfg, data.path())
+        .await
+        .expect("write-through feedback poll");
+    let idle_stats = Engine::consume_once_shared(&engine, &rcfg, data.path())
+        .await
+        .expect("idle CDC poll");
+    assert_eq!(idle_stats.applied, 0, "CDC feedback must converge");
+    assert_eq!(
+        idle_stats.last_applied_lsn, feedback_stats.last_applied_lsn,
+        "idle polls must retain the persisted last-applied commit LSN"
+    );
     assert!(
         engine
             .lock()
@@ -691,6 +795,96 @@ async fn cdc_crash_after_apply_before_persist_retries_without_half_state() {
     );
     assert_eq!(restarted.search(&vector_request, None).unwrap().len(), 1);
     drop_slot(&rcfg).await.expect("drop_slot");
+}
+
+/// FS-103：补齐 peek / persist / advance 三个崩溃边界；apply 边界由上一个测试覆盖。
+/// 每个边界重启后都只能得到一个最终 GlobalId，且 slot 最终无残留。
+#[tokio::test(flavor = "multi_thread")]
+async fn cdc_crash_at_peek_persist_and_advance_recovers_without_loss_or_duplicates() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!(
+            "skip cdc_crash_at_peek_persist_and_advance_recovers_without_loss_or_duplicates: DATABASE_URL not set"
+        );
+        return;
+    };
+    let _guard = serial_guard().await;
+
+    for (phase, expected_replay) in [("peek", 1), ("persist", 1), ("advance", 0)] {
+        let slot = format!("fastsearch_cdc_crash_{phase}_test");
+        let rcfg = ReplicationConfig {
+            url: url.clone(),
+            slot: slot.clone(),
+            publication: "fastsearch_pub".into(),
+            source_table: "public.fastsearch_chunks".into(),
+        };
+        reset(&url, &slot).await;
+        let store = PgStore::connect(PgConfig::new(url.clone()))
+            .await
+            .expect("pg connect");
+        store.ensure_schema().await.expect("ensure_schema");
+        ensure_slot(&rcfg).await.expect("ensure_slot");
+        let marker = format!("crash-{phase}-marker");
+        store
+            .upsert_doc(
+                "kb",
+                &format!("{phase}.pdf"),
+                &[chunk(&format!("{phase}.pdf"), 1, &marker)],
+            )
+            .await
+            .expect("insert source row");
+
+        let data = tempfile::tempdir().expect("tempdir");
+        {
+            let (mut engine, _) =
+                Engine::open(data.path(), TextIndexConfig::default()).expect("open engine");
+            let batch = peek_batch(&rcfg).await.expect("peek crash-point batch");
+            assert_eq!(batch.events.len(), 1);
+            if phase != "peek" {
+                let prepared = engine
+                    .cdc_batch_preparer()
+                    .prepare(batch.events.into_iter().map(|event| event.change).collect())
+                    .await
+                    .expect("prepare");
+                engine
+                    .apply_prepared_cdc_batch(prepared)
+                    .expect("apply prepared");
+                engine
+                    .persist(data.path(), batch.commit_lsn)
+                    .expect("persist");
+                if phase == "advance" {
+                    fastsearch_sync::replication::advance_slot(&rcfg, batch.commit_lsn)
+                        .await
+                        .expect("advance");
+                }
+            }
+            // 故障注入：分别在 peek、persist 或 advance 后直接 drop。
+        }
+
+        let (mut restarted, _) =
+            Engine::open(data.path(), TextIndexConfig::default()).expect("restart engine");
+        let replayed = restarted
+            .consume_once(&rcfg, data.path())
+            .await
+            .expect("recovery consume");
+        assert_eq!(replayed, expected_replay, "unexpected replay at {phase}");
+        let hits = restarted
+            .search(
+                &SearchRequest {
+                    query: marker,
+                    mode: SearchMode::Keyword,
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("search after recovery");
+        assert_eq!(hits.len(), 1, "loss or duplicate after {phase} crash");
+        assert!(fastsearch_sync::replication::peek_changes(&rcfg)
+            .await
+            .expect("peek after recovery")
+            .is_empty());
+        drop_slot(&rcfg).await.expect("drop_slot");
+    }
 }
 
 /// 崩溃安全的 CDC 消费 + 派生索引持久化（env-gated：仅需 PG；用 Hash 嵌入→离线确定性）：
@@ -890,6 +1084,79 @@ async fn cdc_initial_snapshot_bootstrap() {
         )
         .expect("search all");
     assert_eq!(all.len(), 3, "存量 2 + 增量 1 = 3，均可检索（不丢/不重）");
+
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
+/// FS-103：多副本并发首建同一 slot 必须全部成功；恰好一个实例拿到一致点，其余识别为已存在。
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cdc_concurrent_slot_creation_is_idempotent() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_concurrent_slot_creation_is_idempotent: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_concurrent_slot_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
+    };
+    reset(&url, slot).await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let cfg = rcfg.clone();
+        tasks.push(tokio::spawn(async move { ensure_slot(&cfg).await }));
+    }
+    let mut created = 0;
+    for task in tasks {
+        if task
+            .await
+            .expect("ensure_slot task")
+            .expect("ensure_slot")
+            .is_some()
+        {
+            created += 1;
+        }
+    }
+    assert_eq!(created, 1, "exactly one replica creates the slot");
+    assert!(ensure_slot(&rcfg).await.unwrap().is_none());
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
+#[tokio::test]
+async fn cdc_peek_exposes_commit_lsn_lag_and_dead_letters() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_peek_exposes_commit_lsn_lag_and_dead_letters: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_status_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
+    };
+    reset(&url, slot).await;
+
+    let store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("ensure_schema");
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+    store
+        .upsert_doc("kb", "status.pdf", &[chunk("status.pdf", 1, "cdc status")])
+        .await
+        .expect("upsert_doc");
+
+    let batch = peek_batch(&rcfg).await.expect("peek_batch");
+    assert_eq!(batch.events.len(), 1);
+    assert!(batch.commit_lsn > Lsn(0));
+    assert!(batch.slot_lag_bytes > 0);
+    assert_eq!(batch.dead_letters, 0);
 
     drop_slot(&rcfg).await.expect("drop_slot");
 }

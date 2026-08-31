@@ -16,8 +16,8 @@ use fastsearch_core::{
 };
 use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
-use fastsearch_sync::replication::{advance_slot, peek_with_lsn, ReplicationConfig};
-use fastsearch_sync::{Applier, Change, ChangeEvent, Lsn};
+use fastsearch_sync::replication::{advance_slot, peek_batch, ReplicationBatch, ReplicationConfig};
+use fastsearch_sync::{Change, IndexSink, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
 pub use fastsearch_vector::{
     HnswParams, VectorBackendKind, DEFAULT_BINARY_OVERSAMPLE, DEFAULT_QUANT_BITS,
@@ -54,20 +54,10 @@ fn vector_path(data_dir: &Path) -> std::path::PathBuf {
 
 const DERIVED_SCHEMA_VERSION: u32 = 2;
 
-async fn peek_nonempty_cdc_batch(
-    cfg: &ReplicationConfig,
-) -> Result<Option<(Vec<ChangeEvent>, Lsn)>> {
-    let (events, slot_lsn) = peek_with_lsn(cfg)
+async fn peek_cdc_batch(cfg: &ReplicationConfig) -> Result<ReplicationBatch> {
+    peek_batch(cfg)
         .await
-        .map_err(|error| EngineError::Cdc(format!("peek: {error}")))?;
-    if events.is_empty() {
-        if slot_lsn > Lsn(0) {
-            advance_cdc_slot(cfg, slot_lsn).await?;
-        }
-        Ok(None)
-    } else {
-        Ok(Some((events, slot_lsn)))
-    }
+        .map_err(|error| EngineError::Cdc(format!("peek: {error}")))
 }
 
 async fn advance_cdc_slot(cfg: &ReplicationConfig, slot_lsn: Lsn) -> Result<()> {
@@ -128,6 +118,63 @@ impl Checkpoint {
             .map_err(|e| EngineError::Persist(format!("rename checkpoint: {e}")))?;
         Ok(())
     }
+}
+
+/// 跨 PG 写穿与本地派生索引的持久化恢复意图。它不是跨存储 2PC：只负责让崩溃/错误
+/// 可见并强制 readiness 阻断，随后依赖未推进 slot 的幂等重放收敛。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CdcBatchIntent {
+    schema_version: u32,
+    commit_lsn: u64,
+    phase: CdcIntentPhase,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CdcIntentPhase {
+    Applying,
+    Persisted,
+}
+
+impl CdcBatchIntent {
+    fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join("cdc-batch-intent.json")
+    }
+
+    fn save(&self, data_dir: &Path) -> Result<()> {
+        let path = Self::path(data_dir);
+        let tmp = data_dir.join("cdc-batch-intent.json.tmp");
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| EngineError::Persist(format!("serialize CDC intent: {error}")))?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|error| EngineError::Persist(format!("create CDC intent: {error}")))?;
+            file.write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|error| EngineError::Persist(format!("write CDC intent: {error}")))?;
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|error| EngineError::Persist(format!("publish CDC intent: {error}")))?;
+        sync_directory(data_dir, "CDC intent")
+    }
+
+    fn clear(data_dir: &Path) -> Result<()> {
+        let path = Self::path(data_dir);
+        match std::fs::remove_file(path) {
+            Ok(()) => sync_directory(data_dir, "CDC intent removal"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(EngineError::Persist(format!("remove CDC intent: {error}"))),
+        }
+    }
+}
+
+fn sync_directory(path: &Path, operation: &str) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| {
+            EngineError::Persist(format!("fsync directory after {operation}: {error}"))
+        })
 }
 
 fn kind_str(k: ChunkKind) -> &'static str {
@@ -1063,6 +1110,26 @@ impl Engine {
         Ok(())
     }
 
+    /// 是否存在未完成的 CDC 跨存储批次。存在或文件损坏时调用方必须阻断 dependency
+    /// readiness，直到同一 slot 批次重放成功或执行从真源重建。
+    pub fn cdc_recovery_pending(data_dir: &Path) -> Result<bool> {
+        let path = CdcBatchIntent::path(data_dir);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| EngineError::Persist(format!("read CDC intent: {error}")))?;
+        let intent: CdcBatchIntent = serde_json::from_slice(&bytes)
+            .map_err(|error| EngineError::Persist(format!("parse CDC intent: {error}")))?;
+        if intent.schema_version != 1 {
+            return Err(EngineError::Persist(format!(
+                "unsupported CDC intent schema {}",
+                intent.schema_version
+            )));
+        }
+        Ok(true)
+    }
+
     /// **初始快照 bootstrap**：把已有 PG 行（`(collection, chunk)`）整批准备并发布
     /// （经 embedder 批量嵌入 passage → 写向量索引），再 `persist(data_dir, lsn)`。`lsn` 传 slot
     /// 一致点 → 之后从该 LSN 起增量；幂等保证重叠窗口不产生重复（见
@@ -1149,22 +1216,40 @@ impl Engine {
     /// **不靠 LSN 水位跳过**：`pg_logical_slot_peek` 的逐行 lsn 对一个事务的 Begin/Insert
     /// 报的是事务起点（首事务等于 slot 一致点），用它做水位会误跳首批。正确性靠：① slot
     /// 在 `advance` 前不重投；② 应用按 `GlobalId` upsert/delete **幂等**——崩溃重投同结果。
-    /// 故每拍用 `Applier::new(Lsn(0))` 应用全部 peek 到的变更。
+    /// 故每拍直接应用全部 peek 到的变更；生产检查点只记录本批最高 commit LSN。
     pub async fn consume_once(
         &mut self,
         cfg: &ReplicationConfig,
         data_dir: &Path,
     ) -> Result<usize> {
-        let Some((events, slot_lsn)) = peek_nonempty_cdc_batch(cfg).await? else {
+        let batch = peek_cdc_batch(cfg).await?;
+        if batch.events.is_empty() {
+            if batch.commit_lsn > Lsn(0) {
+                advance_cdc_slot(cfg, batch.commit_lsn).await?;
+            }
+            CdcBatchIntent::clear(data_dir)?;
             return Ok(0);
-        };
-        let mut applier = Applier::new(Lsn(0)); // 不跳过：应用全部（见上）
-        let applied = applier
-            .apply_batch(self, &events)
+        }
+        let applied = batch.events.len();
+        let changes: Vec<_> = batch.events.into_iter().map(|event| event.change).collect();
+        CdcBatchIntent {
+            schema_version: 1,
+            commit_lsn: batch.commit_lsn.0,
+            phase: CdcIntentPhase::Applying,
+        }
+        .save(data_dir)?;
+        IndexSink::apply_changes(self, &changes)
             .map_err(|e| EngineError::Cdc(format!("apply: {e}")))?;
         // 先落盘（索引 + 检查点=slot 高水位，含 Commit），后推进 slot —— 崩溃安全铁律。
-        self.persist(data_dir, slot_lsn)?;
-        advance_cdc_slot(cfg, slot_lsn).await?;
+        self.persist(data_dir, batch.commit_lsn)?;
+        CdcBatchIntent {
+            schema_version: 1,
+            commit_lsn: batch.commit_lsn.0,
+            phase: CdcIntentPhase::Persisted,
+        }
+        .save(data_dir)?;
+        advance_cdc_slot(cfg, batch.commit_lsn).await?;
+        CdcBatchIntent::clear(data_dir)?;
         Ok(applied)
     }
 
@@ -1175,22 +1260,40 @@ impl Engine {
         cfg: &ReplicationConfig,
         data_dir: &Path,
     ) -> Result<CdcConsumeStats> {
-        let Some((events, slot_lsn)) = peek_nonempty_cdc_batch(cfg).await? else {
-            return Ok(CdcConsumeStats::default());
-        };
+        let batch = peek_cdc_batch(cfg).await?;
+        if batch.events.is_empty() {
+            if batch.commit_lsn > Lsn(0) {
+                advance_cdc_slot(cfg, batch.commit_lsn).await?;
+            }
+            CdcBatchIntent::clear(data_dir)?;
+            let persisted_lsn = Lsn(Checkpoint::load(data_dir)?.applied_lsn);
+            return Ok(CdcConsumeStats {
+                last_applied_lsn: batch.commit_lsn.max(persisted_lsn),
+                slot_lag_bytes: batch.slot_lag_bytes,
+                dead_letters: batch.dead_letters,
+                ..CdcConsumeStats::default()
+            });
+        }
 
         let preparer = {
             let locked = engine.lock().await;
             locked.cdc_batch_preparer()
         };
-        let applied = events.len();
-        let changes = events.into_iter().map(|event| event.change).collect();
+        let applied = batch.events.len();
+        let changes = batch.events.into_iter().map(|event| event.change).collect();
         let prepare_started = std::time::Instant::now();
         let prepared = preparer
             .prepare(changes)
             .await
             .map_err(|error| EngineError::Cdc(format!("prepare: {error}")))?;
         let prepare_micros = prepare_started.elapsed().as_micros() as u64;
+
+        CdcBatchIntent {
+            schema_version: 1,
+            commit_lsn: batch.commit_lsn.0,
+            phase: CdcIntentPhase::Applying,
+        }
+        .save(data_dir)?;
 
         let lock_started = std::time::Instant::now();
         let mut locked = engine.lock().await;
@@ -1203,16 +1306,26 @@ impl Engine {
         locked
             .apply_prepared_cdc_batch(prepared)
             .map_err(|error| EngineError::Cdc(format!("apply prepared: {error}")))?;
-        locked.persist(data_dir, slot_lsn)?;
+        locked.persist(data_dir, batch.commit_lsn)?;
+        CdcBatchIntent {
+            schema_version: 1,
+            commit_lsn: batch.commit_lsn.0,
+            phase: CdcIntentPhase::Persisted,
+        }
+        .save(data_dir)?;
         let lock_hold_micros = hold_started.elapsed().as_micros() as u64;
         drop(locked);
 
-        advance_cdc_slot(cfg, slot_lsn).await?;
+        advance_cdc_slot(cfg, batch.commit_lsn).await?;
+        CdcBatchIntent::clear(data_dir)?;
         Ok(CdcConsumeStats {
             applied,
             prepare_micros,
             lock_wait_micros,
             lock_hold_micros,
+            last_applied_lsn: batch.commit_lsn,
+            slot_lag_bytes: batch.slot_lag_bytes,
+            dead_letters: batch.dead_letters,
         })
     }
 
@@ -2005,6 +2118,10 @@ pub struct CdcConsumeStats {
     pub prepare_micros: u64,
     pub lock_wait_micros: u64,
     pub lock_hold_micros: u64,
+    /// 已成功持久化并确认的批次 commit LSN；空轮询且无 WAL 时为 0。
+    pub last_applied_lsn: Lsn,
+    pub slot_lag_bytes: u64,
+    pub dead_letters: u64,
 }
 
 fn flatten_cdc_changes<'a>(changes: &'a [Change], out: &mut Vec<&'a Change>) {

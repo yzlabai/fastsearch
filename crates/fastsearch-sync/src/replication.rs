@@ -1,6 +1,6 @@
 //! CDC 线缆层：从 Postgres 逻辑复制 slot 拉取 **pgoutput** 二进制变更 → 解码
-//! （[`crate::pgoutput`]）→ 映射成 [`ChangeEvent`] → 交 [`Applier`](crate::Applier)
-//! 应用到引擎索引。
+//! （[`crate::pgoutput`]）→ 映射成 [`ChangeEvent`] → 交 engine 的整批 prepare/persist
+//! 消费接缝应用到派生索引。独立 [`Applier`](crate::Applier) 仍供无 slot 的调用方与测试使用。
 //!
 //! **传输**：用逻辑解码的 SQL 函数 `pg_logical_slot_get_binary_changes`（普通连接即可，
 //! 无需复制协议连接），这是一种合法的轮询式 CDC 消费方式（消费即推进 slot，崩溃后
@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use fastsearch_core::{Chunk, GlobalId};
 use fastsearch_pg::ChunkRow;
 use std::collections::HashMap;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
 /// 逻辑复制消费配置。
@@ -28,6 +29,18 @@ pub struct ReplicationConfig {
     pub publication: String,
     /// 唯一允许映射为 chunk 变更的限定表名（`schema.table`）。
     pub source_table: String,
+}
+
+/// 一次逻辑复制轮询的完整可观测结果。
+///
+/// `ChangeEvent::lsn` 是对应 WAL 消息/事务起点，不能作为已提交检查点；`commit_lsn` 是本批
+/// 包含 Begin/Commit 等消息后的最高 LSN，只有派生索引持久化成功后才可推进到这里。
+#[derive(Debug)]
+pub struct ReplicationBatch {
+    pub events: Vec<ChangeEvent>,
+    pub commit_lsn: Lsn,
+    pub slot_lag_bytes: u64,
+    pub dead_letters: u64,
 }
 
 /// 连接一个普通（非复制协议）客户端，后台驱动连接 future。
@@ -47,14 +60,20 @@ async fn connect(url: &str) -> Result<Client> {
 /// 初始快照与增量的衔接点）；**已存在**返回 `None`。WHERE 假时函数不求值（不建 slot）。
 pub async fn ensure_slot(cfg: &ReplicationConfig) -> Result<Option<Lsn>> {
     let client = connect(&cfg.url).await?;
-    let rows = client
+    let rows = match client
         .query(
             "SELECT (pg_create_logical_replication_slot($1, 'pgoutput')).lsn::text AS lsn \
              WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
             &[&cfg.slot],
         )
         .await
-        .context("create logical replication slot")?;
+    {
+        Ok(rows) => rows,
+        // `NOT EXISTS` 与创建之间存在竞态：另一个副本若先完成，当前调用应与“已存在”同义，
+        // 而不是让整个实例启动失败。连接级 slot 唯一约束是最终仲裁者。
+        Err(error) if error.code() == Some(&SqlState::DUPLICATE_OBJECT) => return Ok(None),
+        Err(error) => return Err(error).context("create logical replication slot"),
+    };
     match rows.first() {
         Some(r) => {
             let lsn_text: String = r.get(0);
@@ -86,7 +105,7 @@ pub async fn drop_slot(cfg: &ReplicationConfig) -> Result<()> {
 pub async fn pull_changes(cfg: &ReplicationConfig) -> Result<Vec<ChangeEvent>> {
     Ok(fetch_changes(cfg, "pg_logical_slot_get_binary_changes")
         .await?
-        .0)
+        .events)
 }
 
 /// 从 slot **查看**（`peek`，**不推进** slot）全部待处理变更。落盘后须显式
@@ -94,13 +113,19 @@ pub async fn pull_changes(cfg: &ReplicationConfig) -> Result<Vec<ChangeEvent>> {
 pub async fn peek_changes(cfg: &ReplicationConfig) -> Result<Vec<ChangeEvent>> {
     Ok(fetch_changes(cfg, "pg_logical_slot_peek_binary_changes")
         .await?
-        .0)
+        .events)
 }
 
 /// 同 [`peek_changes`]，外加**所有行的最高 LSN**（含 Begin/Commit 等非数据消息）——
 /// 这是 `advance_slot` 应推进到的位置（仅推到最后一条数据变更会漏掉更高的 Commit LSN，
 /// 导致下次 peek 重复返回该事务）。
 pub async fn peek_with_lsn(cfg: &ReplicationConfig) -> Result<(Vec<ChangeEvent>, Lsn)> {
+    let batch = peek_batch(cfg).await?;
+    Ok((batch.events, batch.commit_lsn))
+}
+
+/// 同 [`peek_with_lsn`]，并返回 slot 积压字节数与本批确定性死信数，供 readiness/metrics。
+pub async fn peek_batch(cfg: &ReplicationConfig) -> Result<ReplicationBatch> {
     fetch_changes(cfg, "pg_logical_slot_peek_binary_changes").await
 }
 
@@ -127,7 +152,7 @@ const MAX_CHANGES_PER_BATCH: i64 = 10_000;
 
 /// 用逻辑解码函数 `func`（get 或 peek）取变更并解码 + 映射成有序 `ChangeEvent`。
 /// `func` 为受控字面量（非用户输入）；slot/publication 单引号转义；批量上限为常量内插。
-async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<ChangeEvent>, Lsn)> {
+async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<ReplicationBatch> {
     let client = connect(&cfg.url).await?;
     let sql = format!(
         "SELECT lsn::text, data FROM {func}(\
@@ -191,7 +216,21 @@ async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<Chang
         };
         out.push(ChangeEvent { change, lsn });
     }
-    Ok((out, max_lsn))
+    let lag: i64 = client
+        .query_one(
+            "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&cfg.slot],
+        )
+        .await
+        .context("read replication slot lag")?
+        .get(0);
+    Ok(ReplicationBatch {
+        events: out,
+        commit_lsn: max_lsn,
+        slot_lag_bytes: lag.max(0) as u64,
+        dead_letters: dead as u64,
+    })
 }
 
 /// 逐条解码（parse）+ 映射（map），对**确定性毒丸容错**：单条 parse/map 失败（同字节必同错、

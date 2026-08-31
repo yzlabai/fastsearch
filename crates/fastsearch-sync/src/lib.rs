@@ -5,8 +5,9 @@
 //! 连接/pgoutput 解码解耦——后者作为 env-gated 集成层在后续迭代接入。
 //!
 //! 详见 [spec](../../docs/specs/13-sync.md)。设计要点：
-//! - **幂等/续传**：`lsn <= applied_lsn` 的事件被跳过（重启从持久化 LSN 续传，
-//!   重复消息无副作用）→ 达到 exactly-once 效果。
+//! - **独立 Applier 的幂等/续传**：`lsn <= applied_lsn` 的事件被跳过，适用于事件 LSN
+//!   确实是调用方检查点的场景。生产 slot 消费不使用该水位：事件 LSN 可能是事务起点，
+//!   Engine 会重放整批，并只以最高 commit LSN 作为 persist/advance 检查点。
 //! - **按序**：批量假定 LSN 升序；低于水位者跳过。
 //! - **替换语义**：`DeleteDoc` 后跟同 doc `Upsert` 序列 = doc_id 级替换。
 //! - **不静默吞错**：sink 错误向上传播，applied_lsn 仅在成功后推进。

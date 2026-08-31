@@ -23,7 +23,7 @@ use fastsearch_core::{
 };
 use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_engine::Engine;
-use fastsearch_engine::{AssetFetch, ObjectSigner};
+use fastsearch_engine::{AssetFetch, CdcConsumeStats, ObjectSigner};
 use fastsearch_sync::replication::ReplicationConfig;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -282,6 +282,33 @@ struct Metrics {
     lat_count: AtomicU64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct CdcHealthSnapshot {
+    enabled: bool,
+    phase: String,
+    last_applied_lsn: Option<u64>,
+    slot_lag_bytes: Option<u64>,
+    last_successful_poll_unix_seconds: Option<u64>,
+    dead_letter_count: u64,
+    rebuild_needed: bool,
+    last_error: Option<String>,
+}
+
+impl Default for CdcHealthSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phase: "disabled".into(),
+            last_applied_lsn: None,
+            slot_lag_bytes: None,
+            last_successful_poll_unix_seconds: None,
+            dead_letter_count: 0,
+            rebuild_needed: false,
+            last_error: None,
+        }
+    }
+}
+
 impl Metrics {
     /// 记录一次检索延迟（秒）到累积直方图。
     fn observe_search_latency(&self, secs: f64) {
@@ -387,6 +414,7 @@ pub struct ServerState {
     /// 服务实例接受的向量维度。PG vector 列和向量后端均为实例级固定维度；
     /// collection 注册时先校验，避免延迟到写入数据库才失败。
     vector_dim: Option<usize>,
+    cdc_health: Arc<std::sync::RwLock<CdcHealthSnapshot>>,
 }
 
 /// 集合注册表：`(所有者 tenant, 集合名) → 配置`。按租户隔离（M22）。
@@ -417,7 +445,62 @@ impl ServerState {
             public_base: None,
             collections: Arc::new(Mutex::new(HashMap::new())),
             vector_dim: None,
+            cdc_health: Arc::new(std::sync::RwLock::new(CdcHealthSnapshot::default())),
         }
+    }
+
+    /// 启用 CDC 依赖健康追踪。后台首轮成功前 readiness 保持阻断；若发现恢复意图，明确
+    /// 标为 rebuild_needed，直到 slot 幂等重放完成。
+    pub fn with_cdc_tracking(self, recovery_pending: bool) -> Self {
+        self.initialize_cdc_tracking(recovery_pending);
+        self
+    }
+
+    fn initialize_cdc_tracking(&self, recovery_pending: bool) {
+        let mut health = self.cdc_health.write().unwrap_or_else(|e| e.into_inner());
+        health.enabled = true;
+        health.phase = if recovery_pending {
+            "rebuild_needed".into()
+        } else {
+            "starting".into()
+        };
+        health.rebuild_needed = recovery_pending;
+        health.last_error = None;
+    }
+
+    fn cdc_health_snapshot(&self) -> CdcHealthSnapshot {
+        self.cdc_health
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn record_cdc_success(&self, stats: CdcConsumeStats, recovery_pending: bool) {
+        let mut health = self.cdc_health.write().unwrap_or_else(|e| e.into_inner());
+        health.dead_letter_count = health.dead_letter_count.saturating_add(stats.dead_letters);
+        health.rebuild_needed = recovery_pending || health.dead_letter_count > 0;
+        health.phase = if health.rebuild_needed {
+            "rebuild_needed".into()
+        } else {
+            "healthy".into()
+        };
+        if stats.last_applied_lsn.0 > 0 {
+            health.last_applied_lsn = Some(stats.last_applied_lsn.0);
+        }
+        health.slot_lag_bytes = Some(stats.slot_lag_bytes);
+        health.last_successful_poll_unix_seconds = Some(unix_now());
+        health.last_error = None;
+    }
+
+    fn record_cdc_error(&self, error: &str, recovery_pending: bool) {
+        let mut health = self.cdc_health.write().unwrap_or_else(|e| e.into_inner());
+        health.rebuild_needed = recovery_pending || health.dead_letter_count > 0;
+        health.phase = if health.rebuild_needed {
+            "rebuild_needed".into()
+        } else {
+            "source_error".into()
+        };
+        health.last_error = Some(error.to_string());
     }
 
     /// 声明服务实例接受的固定向量维度。
@@ -532,19 +615,34 @@ impl ServerState {
         data_dir: std::path::PathBuf,
         interval: std::time::Duration,
     ) {
+        let recovery_pending = Engine::cdc_recovery_pending(&data_dir).unwrap_or(true);
+        self.initialize_cdc_tracking(recovery_pending);
         let engine = self.engine.clone();
+        let state = self.clone();
         tokio::spawn(async move {
             loop {
                 match Engine::consume_once_shared(&engine, &cfg, &data_dir).await {
-                    Ok(stats) if stats.applied > 0 => eprintln!(
-                        "cdc: applied {} change(s), prepare={}us lock_wait={}us lock_hold={}us",
-                        stats.applied,
-                        stats.prepare_micros,
-                        stats.lock_wait_micros,
-                        stats.lock_hold_micros
-                    ),
-                    Ok(_) => {}
-                    Err(err) => eprintln!("cdc error: {err}"),
+                    Ok(stats) => {
+                        let pending = Engine::cdc_recovery_pending(&data_dir).unwrap_or(true);
+                        state.record_cdc_success(stats, pending);
+                        if stats.applied > 0 {
+                            eprintln!(
+                                "cdc: applied {} change(s), commit_lsn={} lag={}B dead={} prepare={}us lock_wait={}us lock_hold={}us",
+                                stats.applied,
+                                stats.last_applied_lsn.0,
+                                stats.slot_lag_bytes,
+                                stats.dead_letters,
+                                stats.prepare_micros,
+                                stats.lock_wait_micros,
+                                stats.lock_hold_micros
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        let pending = Engine::cdc_recovery_pending(&data_dir).unwrap_or(true);
+                        state.record_cdc_error(&err.to_string(), pending);
+                        eprintln!("cdc error: {err}");
+                    }
                 }
                 tokio::time::sleep(interval).await;
             }
@@ -637,14 +735,33 @@ pub fn router(state: ServerState) -> Router {
         .with_state(state)
 }
 
-/// 进程级 readiness：只说明 HTTP 路由已可接请求，不冒充 PG/CDC/embedder 依赖健康。
-/// 组件化依赖状态尚未实现前，调用方必须从 introspection/metrics 分别判断运行档。
-async fn process_ready() -> Json<Value> {
-    Json(json!({
-        "ready": true,
-        "scope": "process",
-        "dependencies_checked": false,
-    }))
+/// 未配置 CDC 时仍是进程级 readiness；启用 CDC 后切换为依赖级探针，首轮源轮询成功且
+/// 不存在恢复/死信漂移之前返回 503。
+async fn process_ready(State(s): State<ServerState>) -> Response {
+    let health = s.cdc_health_snapshot();
+    if !health.enabled {
+        return Json(json!({
+            "ready": true,
+            "scope": "process",
+            "dependencies_checked": false,
+        }))
+        .into_response();
+    }
+    let ready = health.phase == "healthy" && !health.rebuild_needed;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(json!({
+            "ready": ready,
+            "scope": "dependencies",
+            "dependencies_checked": true,
+            "cdc": health,
+        })),
+    )
+        .into_response()
 }
 
 /// OpenAPI 3.0 契约（手写、随 API 演进维护）。供 SDK 生成 / 文档 / 契约校验（F54）。
@@ -1114,10 +1231,13 @@ fn openapi_spec() -> Value {
             },
             "/healthz": {"get": {"summary": "存活探针", "security": [], "responses": {"200": {"description": "ok"}}}},
             "/readyz": {"get": {
-                "summary": "进程级就绪探针（不检查 PG/CDC/embedder）",
-                "description": "仅表示 HTTP 进程已开始接收请求；dependencies_checked 固定为 false。组件状态请结合 /v1/collections introspection 与 /metrics。",
+                "summary": "就绪探针（启用 CDC 后检查真源轮询与恢复状态）",
+                "description": "未配置 CDC 时仅表示 HTTP 进程可接请求；启用 CDC 后，首轮源轮询成功且没有未恢复批次/死信漂移才返回 200，并附 CDC LSN、lag、最近成功轮询和 rebuild-needed 状态。",
                 "security": [],
-                "responses": {"200": {"description": "{ready:true,scope:process,dependencies_checked:false}"}}
+                "responses": {
+                    "200": {"description": "进程级或依赖级 ready"},
+                    "503": {"description": "CDC 尚未完成首轮轮询、源错误或需要重放/重建"}
+                }
             }},
             "/metrics": {"get": {"summary": "Prometheus 指标", "security": [], "responses": {"200": {"description": "text/plain"}}}}
         }
@@ -1168,6 +1288,55 @@ async fn metrics(State(s): State<ServerState>) -> String {
         "fastsearch_rate_limited_total",
         "Total requests rejected by rate limit.",
         g(&m.rate_limited),
+    );
+
+    let cdc = s.cdc_health_snapshot();
+    let gauge = |out: &mut String, name: &str, help: &str, value: u64| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+        ));
+    };
+    gauge(
+        &mut out,
+        "fastsearch_cdc_enabled",
+        "CDC polling configured for this process (1/0).",
+        u64::from(cdc.enabled),
+    );
+    gauge(
+        &mut out,
+        "fastsearch_cdc_ready",
+        "CDC source has polled successfully with no rebuild requirement (1/0).",
+        u64::from(cdc.enabled && cdc.phase == "healthy" && !cdc.rebuild_needed),
+    );
+    gauge(
+        &mut out,
+        "fastsearch_cdc_slot_lag_bytes",
+        "Bytes between current WAL and the slot confirmed flush LSN.",
+        cdc.slot_lag_bytes.unwrap_or(0),
+    );
+    gauge(
+        &mut out,
+        "fastsearch_cdc_last_applied_lsn",
+        "Last persisted and confirmed CDC commit LSN as an integer.",
+        cdc.last_applied_lsn.unwrap_or(0),
+    );
+    gauge(
+        &mut out,
+        "fastsearch_cdc_last_successful_poll_timestamp_seconds",
+        "Unix timestamp of the last successful CDC source poll.",
+        cdc.last_successful_poll_unix_seconds.unwrap_or(0),
+    );
+    counter(
+        &mut out,
+        "fastsearch_cdc_dead_letters_total",
+        "Deterministic CDC records skipped since process start.",
+        cdc.dead_letter_count,
+    );
+    gauge(
+        &mut out,
+        "fastsearch_cdc_rebuild_needed",
+        "Derived indexes require replay or rebuild before CDC readiness (1/0).",
+        u64::from(cdc.rebuild_needed),
     );
 
     // 诚实记账（不变量 #2）：派生索引可重建性取决于是否配了 PG 真源。这不是配置声明，
@@ -4554,6 +4723,100 @@ mod tests {
                 "dependencies_checked": false,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn readyz_blocks_when_cdc_recovery_is_pending() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let state = ServerState::new(engine, keys()).with_cdc_tracking(true);
+        let app = router(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body_json(resp).await,
+            json!({
+                "ready": false,
+                "scope": "dependencies",
+                "dependencies_checked": true,
+                "cdc": {
+                    "enabled": true,
+                    "phase": "rebuild_needed",
+                    "last_applied_lsn": null,
+                    "slot_lag_bytes": null,
+                    "last_successful_poll_unix_seconds": null,
+                    "dead_letter_count": 0,
+                    "rebuild_needed": true,
+                    "last_error": null,
+                }
+            })
+        );
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let text = String::from_utf8(
+            metrics
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("fastsearch_cdc_enabled 1"));
+        assert!(text.contains("fastsearch_cdc_ready 0"));
+        assert!(text.contains("fastsearch_cdc_rebuild_needed 1"));
+        assert!(text.contains("fastsearch_cdc_dead_letters_total 0"));
+    }
+
+    #[tokio::test]
+    async fn readyz_becomes_dependency_ready_after_successful_cdc_poll() {
+        let engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+        let state = ServerState::new(engine, keys()).with_cdc_tracking(false);
+        state.record_cdc_success(
+            fastsearch_engine::CdcConsumeStats {
+                applied: 3,
+                last_applied_lsn: fastsearch_sync::Lsn(42),
+                slot_lag_bytes: 17,
+                dead_letters: 0,
+                ..Default::default()
+            },
+            false,
+        );
+        let resp = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["scope"], "dependencies");
+        assert_eq!(body["cdc"]["phase"], "healthy");
+        assert_eq!(body["cdc"]["last_applied_lsn"], 42);
+        assert_eq!(body["cdc"]["slot_lag_bytes"], 17);
+        assert!(body["cdc"]["last_successful_poll_unix_seconds"]
+            .as_u64()
+            .is_some_and(|timestamp| timestamp > 0));
     }
 
     #[tokio::test]
