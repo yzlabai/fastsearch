@@ -524,10 +524,8 @@ impl ServerState {
         }
     }
 
-    /// 启动**后台 CDC 同步循环**：每 `interval` 拍调一次 `engine.consume_once`
-    /// （peek→应用→落盘→advance，崩溃安全）。slot 位置由 PG 服务端持久，无需传 LSN。
-    /// 注意：consume 期间持有引擎锁（与检索串行）——v1 可接受，低延迟化待引擎并发优化。
-    /// 嵌入由引擎自身的 embedder 负责（需在建 state 前 `engine.set_embedder`）。
+    /// 启动**后台 CDC 同步循环**。peek 与批量嵌入在全局 Engine 锁外完成；PG 写穿事务、
+    /// 本地派生状态发布和持久化持锁，防止搜索读到跨索引半版本。slot 位置由 PG 服务端持久。
     pub fn spawn_cdc(
         &self,
         cfg: ReplicationConfig,
@@ -537,13 +535,16 @@ impl ServerState {
         let engine = self.engine.clone();
         tokio::spawn(async move {
             loop {
-                {
-                    let mut e = engine.lock().await;
-                    match e.consume_once(&cfg, &data_dir).await {
-                        Ok(n) if n > 0 => eprintln!("cdc: applied {n} change(s)"),
-                        Ok(_) => {}
-                        Err(err) => eprintln!("cdc error: {err}"),
-                    }
+                match Engine::consume_once_shared(&engine, &cfg, &data_dir).await {
+                    Ok(stats) if stats.applied > 0 => eprintln!(
+                        "cdc: applied {} change(s), prepare={}us lock_wait={}us lock_hold={}us",
+                        stats.applied,
+                        stats.prepare_micros,
+                        stats.lock_wait_micros,
+                        stats.lock_hold_micros
+                    ),
+                    Ok(_) => {}
+                    Err(err) => eprintln!("cdc error: {err}"),
                 }
                 tokio::time::sleep(interval).await;
             }

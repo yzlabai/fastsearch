@@ -5,7 +5,9 @@
 use std::time::Instant;
 
 use fastsearch_core::{BBox, Chunk, ChunkKind, SearchMode, SearchRequest};
+use fastsearch_embed::{EmbedInput, EmbedKind, Embedder, HashEmbedder};
 use fastsearch_engine::{Engine, HnswParams, VectorBackendKind};
+use fastsearch_sync::{Change, ChangeEvent, IndexSink, Lsn};
 use fastsearch_text::TextIndexConfig;
 
 const DIM: usize = 96;
@@ -163,5 +165,157 @@ fn bench_capacity() {
     println!(
         "BENCH hnsw recall@{K}={:.3} (vs brute)",
         hit as f64 / (K * QUERIES) as f64
+    );
+}
+
+struct LatencyEmbedder {
+    inner: HashEmbedder,
+    per_request: std::time::Duration,
+}
+
+impl Embedder for LatencyEmbedder {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn embed(&self, texts: &[String], kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.inner.embed(texts, kind)
+    }
+
+    fn embed_multi(&self, inputs: &[EmbedInput], kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>> {
+        std::thread::sleep(self.per_request);
+        self.inner.embed_multi(inputs, kind)
+    }
+}
+
+fn cdc_engine(delay: std::time::Duration) -> Engine {
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).unwrap();
+    engine.set_embedder(Box::new(LatencyEmbedder {
+        inner: HashEmbedder::new(DIM),
+        per_request: delay,
+    }));
+    engine
+}
+
+/// FS-102 的 before/after 数据源：legacy 逐 chunk 外部调用 vs CDC 整批 prepare。
+/// 默认 ignore，机器相关结果只作同机对拍，不设跨机器硬阈值。
+#[ignore]
+#[test]
+fn bench_cdc_batch() {
+    const CDC_N: usize = 64;
+    const SEARCH_PROBES: usize = 64;
+    let delay = std::time::Duration::from_millis(5);
+    let chunks: Vec<_> = (0..CDC_N as u64)
+        .map(|id| chunk(id, format!("cdc batch marker {}", text_for(id))))
+        .collect();
+
+    let events: Vec<_> = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| ChangeEvent {
+            change: Change::Upsert {
+                collection: "kb".into(),
+                chunk: Box::new(chunk.clone()),
+            },
+            lsn: Lsn(index as u64 + 1),
+        })
+        .collect();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (
+        legacy_elapsed,
+        legacy_search_p95,
+        batch_elapsed,
+        batch_search_p95,
+        prepare_elapsed,
+        batch_lock_wait,
+        batch_lock_hold,
+    ) = runtime.block_on(async {
+        let legacy = std::sync::Arc::new(tokio::sync::Mutex::new(cdc_engine(delay)));
+        let legacy_writer = legacy.clone();
+        let legacy_chunks = chunks.clone();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let legacy_started = Instant::now();
+        let legacy_task = tokio::spawn(async move {
+            let mut engine = legacy_writer.lock().await;
+            let _ = locked_tx.send(());
+            for chunk in &legacy_chunks {
+                engine.apply_upsert("kb", chunk).unwrap();
+            }
+            engine.commit().unwrap();
+        });
+        locked_rx.await.unwrap();
+        let mut legacy_searches = Vec::with_capacity(SEARCH_PROBES);
+        for _ in 0..SEARCH_PROBES {
+            let engine = legacy.clone();
+            legacy_searches.push(tokio::spawn(async move {
+                let started = Instant::now();
+                let locked = engine.lock().await;
+                locked.search(&kw_req("marker"), None).unwrap();
+                started.elapsed().as_secs_f64() * 1000.0
+            }));
+        }
+        legacy_task.await.unwrap();
+        let legacy_elapsed = legacy_started.elapsed();
+        let mut legacy_latencies = Vec::with_capacity(SEARCH_PROBES);
+        for search in legacy_searches {
+            legacy_latencies.push(search.await.unwrap());
+        }
+
+        let batched = std::sync::Arc::new(tokio::sync::Mutex::new(cdc_engine(delay)));
+        let preparer = batched.lock().await.cdc_batch_preparer();
+        let changes: Vec<Change> = events.iter().map(|event| event.change.clone()).collect();
+        let batch_started = Instant::now();
+        let prepare_started = Instant::now();
+        let prepare_task = tokio::spawn(async move { preparer.prepare(changes).await });
+        tokio::task::yield_now().await;
+        let mut batch_searches = Vec::with_capacity(SEARCH_PROBES);
+        for _ in 0..SEARCH_PROBES {
+            let engine = batched.clone();
+            batch_searches.push(tokio::spawn(async move {
+                let started = Instant::now();
+                let locked = engine.lock().await;
+                locked.search(&kw_req("marker"), None).unwrap();
+                started.elapsed().as_secs_f64() * 1000.0
+            }));
+        }
+        let prepared = prepare_task.await.unwrap().unwrap();
+        let prepare_elapsed = prepare_started.elapsed();
+        let lock_started = Instant::now();
+        let mut locked = batched.lock().await;
+        let batch_lock_wait = lock_started.elapsed();
+        let hold_started = Instant::now();
+        locked.apply_prepared_cdc_batch(prepared).unwrap();
+        locked.commit().unwrap();
+        let batch_lock_hold = hold_started.elapsed();
+        drop(locked);
+        let batch_elapsed = batch_started.elapsed();
+        let mut batch_latencies = Vec::with_capacity(SEARCH_PROBES);
+        for search in batch_searches {
+            batch_latencies.push(search.await.unwrap());
+        }
+
+        (
+            legacy_elapsed,
+            percentile(legacy_latencies, 0.95),
+            batch_elapsed,
+            percentile(batch_latencies, 0.95),
+            prepare_elapsed,
+            batch_lock_wait,
+            batch_lock_hold,
+        )
+    });
+
+    println!(
+        "BENCH cdc N={CDC_N} legacy={:.2} chunks/s batch={:.2} chunks/s speedup={:.2}x legacy_search_p95={legacy_search_p95:.3}ms batch_search_p95={batch_search_p95:.3}ms prepare={:.2}ms batch_lock_wait={:.3}ms batch_lock_hold={:.2}ms",
+        CDC_N as f64 / legacy_elapsed.as_secs_f64(),
+        CDC_N as f64 / batch_elapsed.as_secs_f64(),
+        legacy_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64(),
+        prepare_elapsed.as_secs_f64() * 1000.0,
+        batch_lock_wait.as_secs_f64() * 1000.0,
+        batch_lock_hold.as_secs_f64() * 1000.0,
     );
 }

@@ -190,6 +190,22 @@ impl TurboVectorIndex {
         self.bits
     }
 
+    pub(crate) fn validate_upsert_dimension(
+        &self,
+        vector_len: usize,
+        effective_dim: Option<usize>,
+    ) -> anyhow::Result<()> {
+        match effective_dim {
+            Some(dim) if dim != vector_len => {
+                anyhow::bail!("dimension mismatch: index dim {dim}, got {vector_len}")
+            }
+            None if vector_len == 0 || vector_len > MAX_DIM => {
+                anyhow::bail!("向量维度 {vector_len} 越界（1..={MAX_DIM}）")
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// dim 已知且旋转未建 → 惰性构建 FHT 旋转（固定种子，确定；O(d) 存储、无 d×d 矩阵、无 panic）。
     /// 维度上限由 `upsert`/`load` 的显式 `MAX_DIM` 早检守（FHT 无巨分配，故此处不再返 Result）。
     fn ensure_rotation(&mut self) {
@@ -397,17 +413,9 @@ impl TurboVectorIndex {
 
 impl VectorBackend for TurboVectorIndex {
     fn upsert(&mut self, gid: GlobalId, vector: Vec<f32>, meta: VecMeta) -> anyhow::Result<()> {
-        match self.dim {
-            Some(d) if d != vector.len() => {
-                anyhow::bail!("dimension mismatch: index dim {d}, got {}", vector.len())
-            }
-            None => {
-                if vector.is_empty() || vector.len() > MAX_DIM {
-                    anyhow::bail!("向量维度 {} 越界（1..={MAX_DIM}）", vector.len());
-                }
-                self.dim = Some(vector.len());
-            }
-            _ => {}
+        self.validate_upsert_dimension(vector.len(), self.dim)?;
+        if self.dim.is_none() {
+            self.dim = Some(vector.len());
         }
         let normalized = normalize(&vector); // 零/NaN → 全零（不 panic）
         self.ensure_rotation();

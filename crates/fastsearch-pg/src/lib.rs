@@ -82,6 +82,20 @@ pub struct DeletedCollection {
     pub object_uris: Vec<String>,
 }
 
+/// 一批 CDC 嵌入写穿中的单项操作。整批经 [`PgStore::write_embeddings_atomically`]
+/// 在一个数据库事务内提交，任一项失败则全部回滚。
+#[derive(Debug, Clone)]
+pub enum EmbeddingWrite {
+    Set {
+        gid: GlobalId,
+        embedding: Vec<f32>,
+        model: String,
+    },
+    Clear {
+        gid: GlobalId,
+    },
+}
+
 impl PgStore {
     /// 连接（后台驱动连接 future）。表名经标识符校验后才用于 SQL 拼接（防御性：表名是运维配置、
     /// 非客户端输入，但若未来被外部影响，此校验阻断注入面）。
@@ -499,6 +513,72 @@ impl PgStore {
             .await
             .execute(&sql, &[&collection, &doc_id, &(chunk_id as i64)])
             .await?)
+    }
+
+    /// 原子执行一批 embedding set/clear。所有向量先完成有限值校验，再开启事务；事务中任一
+    /// UPDATE 失败会显式 rollback，避免 CDC 批次只写穿前半部分。
+    pub async fn write_embeddings_atomically(&self, writes: &[EmbeddingWrite]) -> Result<Vec<u64>> {
+        for write in writes {
+            if let EmbeddingWrite::Set { embedding, .. } = write {
+                ensure_finite(embedding)?;
+            }
+        }
+        if writes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let set_sql = format!(
+            "UPDATE {} SET embedding = $1::text::vector, embed_model = $5, updated_at = now() \
+             WHERE collection = $2 AND doc_id = $3 AND chunk_id = $4 \
+             AND (embedding IS DISTINCT FROM $1::text::vector OR embed_model IS DISTINCT FROM $5)",
+            self.cfg.table
+        );
+        let clear_sql = format!(
+            "UPDATE {} SET embedding = NULL, embed_model = NULL, updated_at = now() \
+             WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 AND embedding IS NOT NULL",
+            self.cfg.table
+        );
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        let mut counts = Vec::with_capacity(writes.len());
+        for write in writes {
+            let result = match write {
+                EmbeddingWrite::Set {
+                    gid,
+                    embedding,
+                    model,
+                } => {
+                    let vector = format_vector(embedding);
+                    tx.execute(
+                        &set_sql,
+                        &[
+                            &vector,
+                            &gid.collection,
+                            &gid.doc_id,
+                            &(gid.chunk_id as i64),
+                            model,
+                        ],
+                    )
+                    .await
+                }
+                EmbeddingWrite::Clear { gid } => {
+                    tx.execute(
+                        &clear_sql,
+                        &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(count) => counts.push(count),
+                Err(error) => {
+                    tx.rollback().await?;
+                    return Err(error.into());
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(counts)
     }
 
     /// **B6 直查档**：pgvector ANN 检索（ANN 在 PG 跑）。`acl`+可翻译 `filter` 下推 SQL（精确）、

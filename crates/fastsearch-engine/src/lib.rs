@@ -17,7 +17,7 @@ use fastsearch_core::{
 use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_rerank::{LexicalOverlapReranker, Reranker};
 use fastsearch_sync::replication::{advance_slot, peek_with_lsn, ReplicationConfig};
-use fastsearch_sync::{Applier, Lsn};
+use fastsearch_sync::{Applier, Change, ChangeEvent, Lsn};
 use fastsearch_text::{TextHit, TextIndex, TextIndexConfig};
 pub use fastsearch_vector::{
     HnswParams, VectorBackendKind, DEFAULT_BINARY_OVERSAMPLE, DEFAULT_QUANT_BITS,
@@ -53,6 +53,28 @@ fn vector_path(data_dir: &Path) -> std::path::PathBuf {
 }
 
 const DERIVED_SCHEMA_VERSION: u32 = 2;
+
+async fn peek_nonempty_cdc_batch(
+    cfg: &ReplicationConfig,
+) -> Result<Option<(Vec<ChangeEvent>, Lsn)>> {
+    let (events, slot_lsn) = peek_with_lsn(cfg)
+        .await
+        .map_err(|error| EngineError::Cdc(format!("peek: {error}")))?;
+    if events.is_empty() {
+        if slot_lsn > Lsn(0) {
+            advance_cdc_slot(cfg, slot_lsn).await?;
+        }
+        Ok(None)
+    } else {
+        Ok(Some((events, slot_lsn)))
+    }
+}
+
+async fn advance_cdc_slot(cfg: &ReplicationConfig, slot_lsn: Lsn) -> Result<()> {
+    advance_slot(cfg, slot_lsn)
+        .await
+        .map_err(|error| EngineError::Cdc(format!("advance: {error}")))
+}
 
 /// pgvector 直查档的过取系数（PG 取 `candidates × 此值` 候选再精确后过滤，抵消损耗）。
 const PG_VECTOR_OVER_FETCH: usize = 4;
@@ -902,9 +924,9 @@ pub struct Engine {
     text: TextIndex,
     vector: VectorStore,
     reranker: Box<dyn Reranker + Send + Sync>,
-    /// 可选嵌入后端：设置后，**CDC 应用路径**（`IndexSink::apply_upsert`）会自动嵌入
+    /// 可选嵌入后端：设置后，**CDC 应用路径**（`IndexSink::apply_changes`）会自动嵌入
     /// chunk 正文并写向量索引（None=仅全文）。详见 `set_embedder`。
-    embedder: Option<Box<dyn Embedder + Send + Sync>>,
+    embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     /// 可选 **pgvector 直查档（B6）**：设置后，向量召回**绕过引擎侧索引、在 PG 跑 ANN**
     /// （filter/ACL 下推 + iterative scan + 精确后过滤）。仅在 **multi-thread tokio runtime** 下可用
     /// （`run` 内 `block_in_place` 桥接同步检索↔异步 PG 查询）。详见 `set_pg_vector`。
@@ -1041,8 +1063,8 @@ impl Engine {
         Ok(())
     }
 
-    /// **初始快照 bootstrap**：把已有 PG 行（`(collection, chunk)`）逐条 `apply_upsert`
-    /// （经 embedder 嵌入 passage → 写向量索引），再 `persist(data_dir, lsn)`。`lsn` 传 slot
+    /// **初始快照 bootstrap**：把已有 PG 行（`(collection, chunk)`）整批准备并发布
+    /// （经 embedder 批量嵌入 passage → 写向量索引），再 `persist(data_dir, lsn)`。`lsn` 传 slot
     /// 一致点 → 之后从该 LSN 起增量；幂等保证重叠窗口不产生重复（见
     /// [计划](../../docs/plans/2026-06-25-初始快照-bootstrap.md)）。返回导入条数。
     pub fn bootstrap_snapshot(
@@ -1051,31 +1073,42 @@ impl Engine {
         data_dir: &Path,
         lsn: Lsn,
     ) -> Result<usize> {
-        use fastsearch_sync::IndexSink;
-        for (collection, chunk) in rows {
-            self.apply_upsert(collection, chunk)
-                .map_err(|e| EngineError::Cdc(format!("bootstrap apply: {e}")))?;
-        }
+        let changes: Vec<_> = rows
+            .iter()
+            .map(|(collection, chunk)| Change::Upsert {
+                collection: collection.clone(),
+                chunk: Box::new(chunk.clone()),
+            })
+            .collect();
+        let prepared = self
+            .prepare_cdc_changes(&changes)
+            .map_err(|error| EngineError::Cdc(format!("bootstrap prepare: {error}")))?;
+        self.apply_prepared_cdc_batch(prepared)
+            .map_err(|error| EngineError::Cdc(format!("bootstrap apply: {error}")))?;
         self.persist(data_dir, lsn)?;
         Ok(rows.len())
     }
 
     /// **单集合原地重建**（坏索引/索引损坏 → 从真源 PG 重灌）：清空派生 text+vector 索引，
-    /// 用传入的 `rows`（PG 全表/单集合快照，真源）经 `apply_upsert` 重灌（含嵌入），统一
+    /// 用传入的 `rows`（PG 全表/单集合快照，真源）经批量准备/发布重灌（含嵌入），统一
     /// `commit` 成一次可见切换。**派生可重建**不变量的运维出口；**不读** PG，调用方负责 fetch。
-    /// （注：pgvector 直查档下 `apply_upsert` 会把重嵌的向量**写回** PG `embedding` 列——那是 B6
-    /// 写穿语义，直查档的向量本就归 PG；`set_embedding` 自带幂等守卫，同值不产生实际写。）
+    /// （注：pgvector 直查档下批处理会把重嵌的向量**写回** PG `embedding` 列——那是 B6
+    /// 写穿语义，直查档的向量本就归 PG；批量 UPDATE 带幂等守卫，同值不产生实际写。）
     ///
     /// 换分词器属"换 schema"，走另一条路（用新 `TextIndexConfig` 新建 Engine + `bootstrap_snapshot`）——
     /// 本方法保持同 schema。返回重灌条数。
     pub fn rebuild_from(&mut self, rows: &[(String, Chunk)]) -> Result<usize> {
-        use fastsearch_sync::IndexSink;
-        self.text.clear()?;
-        self.vector.clear();
-        for (collection, chunk) in rows {
-            self.apply_upsert(collection, chunk)
-                .map_err(|e| EngineError::Cdc(format!("rebuild apply: {e}")))?;
-        }
+        let mut changes = Vec::with_capacity(rows.len() + 1);
+        changes.push(Change::Clear);
+        changes.extend(rows.iter().map(|(collection, chunk)| Change::Upsert {
+            collection: collection.clone(),
+            chunk: Box::new(chunk.clone()),
+        }));
+        let prepared = self
+            .prepare_cdc_changes(&changes)
+            .map_err(|error| EngineError::Cdc(format!("rebuild prepare: {error}")))?;
+        self.apply_prepared_cdc_batch(prepared)
+            .map_err(|error| EngineError::Cdc(format!("rebuild apply: {error}")))?;
         self.text.commit()?;
         Ok(rows.len())
     }
@@ -1110,7 +1143,7 @@ impl Engine {
     }
 
     /// **崩溃安全地**消费一批 CDC 变更并落地（生产 CDC 主循环的一拍）：
-    /// `peek`（不推进 slot）→ 幂等应用全部（`apply_upsert` 含嵌入）→ `persist`（索引 +
+    /// `peek`（不推进 slot）→ 幂等应用全部（批量准备含嵌入）→ `persist`（索引 +
     /// 检查点=slot 高水位）→ **落盘成功后才** `advance_slot`。返回应用条数。
     ///
     /// **不靠 LSN 水位跳过**：`pg_logical_slot_peek` 的逐行 lsn 对一个事务的 Begin/Insert
@@ -1122,28 +1155,65 @@ impl Engine {
         cfg: &ReplicationConfig,
         data_dir: &Path,
     ) -> Result<usize> {
-        let (events, slot_lsn) = peek_with_lsn(cfg)
-            .await
-            .map_err(|e| EngineError::Cdc(format!("peek: {e}")))?;
-        if events.is_empty() {
-            // 仅非数据消息推进了 WAL：把 slot 推到已查看最高位，避免空转重读。
-            if slot_lsn > Lsn(0) {
-                advance_slot(cfg, slot_lsn)
-                    .await
-                    .map_err(|e| EngineError::Cdc(format!("advance: {e}")))?;
-            }
+        let Some((events, slot_lsn)) = peek_nonempty_cdc_batch(cfg).await? else {
             return Ok(0);
-        }
+        };
         let mut applier = Applier::new(Lsn(0)); // 不跳过：应用全部（见上）
         let applied = applier
             .apply_batch(self, &events)
             .map_err(|e| EngineError::Cdc(format!("apply: {e}")))?;
         // 先落盘（索引 + 检查点=slot 高水位，含 Commit），后推进 slot —— 崩溃安全铁律。
         self.persist(data_dir, slot_lsn)?;
-        advance_slot(cfg, slot_lsn)
-            .await
-            .map_err(|e| EngineError::Cdc(format!("advance: {e}")))?;
+        advance_cdc_slot(cfg, slot_lsn).await?;
         Ok(applied)
+    }
+
+    /// 面向 server 共享 Engine 的 CDC 单拍：peek、对象读取与批量嵌入在全局锁外；PG 写穿事务、
+    /// 本地派生状态发布和持久化持锁，避免搜索观察到 PG 新向量与旧关键词。返回阶段耗时供观测。
+    pub async fn consume_once_shared(
+        engine: &Arc<tokio::sync::Mutex<Engine>>,
+        cfg: &ReplicationConfig,
+        data_dir: &Path,
+    ) -> Result<CdcConsumeStats> {
+        let Some((events, slot_lsn)) = peek_nonempty_cdc_batch(cfg).await? else {
+            return Ok(CdcConsumeStats::default());
+        };
+
+        let preparer = {
+            let locked = engine.lock().await;
+            locked.cdc_batch_preparer()
+        };
+        let applied = events.len();
+        let changes = events.into_iter().map(|event| event.change).collect();
+        let prepare_started = std::time::Instant::now();
+        let prepared = preparer
+            .prepare(changes)
+            .await
+            .map_err(|error| EngineError::Cdc(format!("prepare: {error}")))?;
+        let prepare_micros = prepare_started.elapsed().as_micros() as u64;
+
+        let lock_started = std::time::Instant::now();
+        let mut locked = engine.lock().await;
+        let lock_wait_micros = lock_started.elapsed().as_micros() as u64;
+        let hold_started = std::time::Instant::now();
+        let prepared = preparer
+            .finish_write_through(prepared)
+            .await
+            .map_err(|error| EngineError::Cdc(format!("pg write-through: {error}")))?;
+        locked
+            .apply_prepared_cdc_batch(prepared)
+            .map_err(|error| EngineError::Cdc(format!("apply prepared: {error}")))?;
+        locked.persist(data_dir, slot_lsn)?;
+        let lock_hold_micros = hold_started.elapsed().as_micros() as u64;
+        drop(locked);
+
+        advance_cdc_slot(cfg, slot_lsn).await?;
+        Ok(CdcConsumeStats {
+            applied,
+            prepare_micros,
+            lock_wait_micros,
+            lock_hold_micros,
+        })
     }
 
     /// 替换 reranker（接入真 cross-encoder 时用）。
@@ -1151,18 +1221,18 @@ impl Engine {
         self.reranker = reranker;
     }
 
-    /// 设置嵌入后端：开启后 **CDC 落地（`apply_upsert`）自动嵌入 chunk 正文 → 写向量索引**，
+    /// 设置嵌入后端：开启后 **CDC 批量落地自动嵌入 chunk 正文 → 写向量索引**，
     /// 使"PG 写 → 复制 → 解码 → 嵌入 → 派生 BM25+向量"主循环完整成立。None=仅全文。
     pub fn set_embedder(&mut self, embedder: Box<dyn Embedder + Send + Sync>) {
-        self.embedder = Some(embedder);
+        self.embedder = Some(Arc::from(embedder));
     }
 
     /// 开启 **pgvector 直查档（B6）**：向量召回改在 PG 跑 ANN（见字段 `vector_pg`）。
     /// **要求 multi-thread tokio runtime**（检索在 `block_in_place` 里 `block_on` PG 异步查询）。
     /// 仅影响向量召回；keyword 仍走引擎 Tantivy。
     ///
-    /// **写穿（B6 续作）**：设此句柄后，CDC 落地路径 `apply_upsert` 会把嵌入**写回 PG `embedding`
-    /// 列**（`set_embedding`）而非引擎侧派生索引——直查档读 PG，故写也归 PG，闭环。复制流已排除
+    /// **写穿（B6 续作）**：设此句柄后，CDC 批量落地会把嵌入**写回 PG `embedding`
+    /// 列**（事务化批量 UPDATE）而非引擎侧派生索引——直查档读 PG，故写也归 PG，闭环。复制流已排除
     /// `embedding`/`embed_model`/`updated_at`（DDL 列清单 publication）→ 写穿不触发 CDC 反馈环。
     pub fn set_pg_vector(&mut self, store: std::sync::Arc<fastsearch_pg::PgStore>) {
         self.vector_pg = Some(store);
@@ -1331,33 +1401,6 @@ impl Engine {
                 _ => None,
             })
         }))
-    }
-
-    fn chunk_image_bytes(&self, chunk: &Chunk) -> anyhow::Result<Option<Vec<u8>>> {
-        if let Some(bytes) = &chunk.media_bytes {
-            return Ok(Some(bytes.clone()));
-        }
-        let Some(media) = &chunk.media else {
-            return Ok(None);
-        };
-        let AssetPointer::Object { uri } = &media.asset else {
-            return Ok(None);
-        };
-        let Some(store) = &self.object_store else {
-            return Ok(None);
-        };
-        match store.get(uri, 20 * 1024 * 1024) {
-            Ok(obj) => Ok(Some(obj.bytes)),
-            Err(e)
-                if matches!(
-                    e.kind,
-                    ObjectErrorKind::NotFound | ObjectErrorKind::Forbidden
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(anyhow::anyhow!("object get: {e}")),
-        }
     }
 
     /// 配置 **对象存储签名器（MM6-secure）**：`resolve_citation` 的 `Object` 路径据此签短时 URL。
@@ -1918,78 +1961,367 @@ fn collapse_groups(hits: Vec<SearchHit>, field: &str, max_per_group: usize) -> V
     out
 }
 
-/// CDC 落地：sync 的变更应用到 text 索引。放在 engine 而非 text，避免 text 反依赖 sync。
-impl fastsearch_sync::IndexSink for Engine {
-    fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()> {
-        chunk.validate_metadata()?;
-        if !chunk.searchable {
-            let gid = chunk.global_id(collection);
-            self.text.delete_by_global_id(&gid)?;
-            if let Some(pg) = &self.vector_pg {
-                block_on_pg(pg.clear_embedding(collection, &chunk.doc_id, chunk.chunk_id))
-                    .map_err(|e| anyhow::anyhow!("pg clear_embedding: {e}"))?;
-            } else {
-                self.vector.delete(&gid)?;
-            }
-            return Ok(());
+#[derive(Debug)]
+enum PreparedVectorMutation {
+    Keep,
+    Upsert(Vec<f32>),
+    Delete,
+    WrittenThrough,
+}
+
+#[derive(Debug)]
+enum PreparedCdcChange {
+    Upsert {
+        collection: String,
+        chunk: Box<Chunk>,
+        vector: PreparedVectorMutation,
+    },
+    Delete(GlobalId),
+    DeleteDoc(String, String),
+    Clear,
+}
+
+/// 可在全局 Engine 锁外执行的 CDC 准备器。持有的都是只读、可共享依赖；准备完成前不会
+/// 改变 text/vector 派生状态。
+#[derive(Clone)]
+pub struct CdcBatchPreparer {
+    embedder: Option<Arc<dyn Embedder + Send + Sync>>,
+    vector_pg: Option<Arc<fastsearch_pg::PgStore>>,
+    object_store: Option<Arc<dyn ObjectStore>>,
+    embed_model: String,
+}
+
+/// 已完成校验、媒资读取与批量嵌入的 CDC 批次。内部操作保持 WAL 顺序；若配置了 pgvector，
+/// 仍须先完成内含的事务写穿，再交回 [`Engine::apply_prepared_cdc_batch`] 发布到派生索引。
+pub struct PreparedCdcBatch {
+    changes: Vec<PreparedCdcChange>,
+    writes: Vec<fastsearch_pg::EmbeddingWrite>,
+    write_positions: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CdcConsumeStats {
+    pub applied: usize,
+    pub prepare_micros: u64,
+    pub lock_wait_micros: u64,
+    pub lock_hold_micros: u64,
+}
+
+fn flatten_cdc_changes<'a>(changes: &'a [Change], out: &mut Vec<&'a Change>) {
+    for change in changes {
+        match change {
+            Change::Batch(nested) => flatten_cdc_changes(nested, out),
+            other => out.push(other),
         }
-        self.text.upsert(collection, chunk)?;
-        // 配了嵌入后端则同步写向量索引（CDC 主循环：复制→解码→嵌入→派生向量）。
-        // **模态路由（MM5/MM10）**：① 图片 chunk 且后端支持图像、有 inline 字节、且
-        // 文图同空间（cross_modal）→ 图像嵌入；
-        // ② 其余有可检索文本（正文/caption/转录）→ 文本嵌入；
-        // ③ 都不满足（无文本图、纯文本后端）→ **不嵌**（避免空串退化向量污染 ANN；仍在 BM25 +
-        // modality fast field 可按模态召回）。真跨模态文↔图还需 `caps.cross_modal`（HashEmbedder 基线
-        // 为 false，仅图→图有意义；文→图待真跨模态模型）。
-        if let Some(emb) = &self.embedder {
-            let input: Option<EmbedInput> =
-                if chunk.kind == ChunkKind::Image && emb.caps().image && emb.caps().cross_modal {
-                    self.chunk_image_bytes(chunk)?.map(EmbedInput::Image)
-                } else if !chunk.text.trim().is_empty() {
-                    Some(EmbedInput::Text(chunk.text.clone()))
-                } else if emb.caps().image && emb.caps().cross_modal {
-                    self.chunk_image_bytes(chunk)?.map(EmbedInput::Image)
-                } else {
-                    None
-                };
-            match input {
-                Some(inp) => {
-                    let v = emb
-                        .embed_multi(std::slice::from_ref(&inp), EmbedKind::Passage)?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("embedder returned no vector"))?;
-                    if let Some(pg) = &self.vector_pg {
-                        // B6 写穿：pgvector 直查档——嵌入写回 PG `embedding` 列（直查读 PG，故写归 PG）；
-                        // 不写引擎侧派生索引（直查模式读路径不用它）。复制流已排除派生列 → 不触发反馈环。
-                        let model = self.embed_model.as_deref().unwrap_or("unknown");
-                        block_on_pg(pg.set_embedding(
-                            collection,
-                            &chunk.doc_id,
-                            chunk.chunk_id,
-                            &v,
-                            model,
-                        ))
-                        .map_err(|e| anyhow::anyhow!("pg set_embedding: {e}"))?;
+    }
+}
+
+impl CdcBatchPreparer {
+    fn cdc_embedding_input(
+        &self,
+        embedder: &dyn Embedder,
+        chunk: &Chunk,
+    ) -> anyhow::Result<Option<EmbedInput>> {
+        if chunk.kind == ChunkKind::Image && embedder.caps().image && embedder.caps().cross_modal {
+            self.chunk_image_bytes(chunk)
+                .map(|bytes| bytes.map(EmbedInput::Image))
+        } else if !chunk.text.trim().is_empty() {
+            Ok(Some(EmbedInput::Text(chunk.text.clone())))
+        } else if embedder.caps().image && embedder.caps().cross_modal {
+            self.chunk_image_bytes(chunk)
+                .map(|bytes| bytes.map(EmbedInput::Image))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn chunk_image_bytes(&self, chunk: &Chunk) -> anyhow::Result<Option<Vec<u8>>> {
+        if let Some(bytes) = &chunk.media_bytes {
+            return Ok(Some(bytes.clone()));
+        }
+        let Some(media) = &chunk.media else {
+            return Ok(None);
+        };
+        let AssetPointer::Object { uri } = &media.asset else {
+            return Ok(None);
+        };
+        let Some(store) = &self.object_store else {
+            return Ok(None);
+        };
+        match store.get(uri, 20 * 1024 * 1024) {
+            Ok(obj) => Ok(Some(obj.bytes)),
+            Err(error)
+                if matches!(
+                    error.kind,
+                    ObjectErrorKind::NotFound | ObjectErrorKind::Forbidden
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(anyhow::anyhow!("object get: {error}")),
+        }
+    }
+
+    fn prepare_local(&self, changes: &[Change]) -> anyhow::Result<PreparedCdcBatch> {
+        let mut flat = Vec::new();
+        flatten_cdc_changes(changes, &mut flat);
+        let mut prepared = Vec::with_capacity(flat.len());
+        let mut inputs = Vec::new();
+        let mut input_positions = Vec::new();
+
+        for change in flat {
+            match change {
+                Change::Upsert { collection, chunk } => {
+                    chunk.validate_metadata()?;
+                    let vector = if !chunk.searchable {
+                        PreparedVectorMutation::Delete
+                    } else if let Some(embedder) = self.embedder.as_deref() {
+                        match self.cdc_embedding_input(embedder, chunk)? {
+                            Some(input) => {
+                                inputs.push(input);
+                                input_positions.push(prepared.len());
+                                PreparedVectorMutation::Keep
+                            }
+                            None => PreparedVectorMutation::Delete,
+                        }
                     } else {
-                        self.vector
-                            .upsert(chunk.global_id(collection), v, vec_meta(collection, chunk))
-                            .map_err(|e| anyhow::anyhow!("vector upsert: {e}"))?;
+                        PreparedVectorMutation::Keep
+                    };
+                    prepared.push(PreparedCdcChange::Upsert {
+                        collection: collection.clone(),
+                        chunk: chunk.clone(),
+                        vector,
+                    });
+                }
+                Change::Delete { gid } => prepared.push(PreparedCdcChange::Delete(gid.clone())),
+                Change::DeleteDoc { collection, doc_id } => prepared.push(
+                    PreparedCdcChange::DeleteDoc(collection.clone(), doc_id.clone()),
+                ),
+                Change::Clear => prepared.push(PreparedCdcChange::Clear),
+                Change::Batch(_) => unreachable!("flatten_cdc_changes removes nested batches"),
+            }
+        }
+
+        if !inputs.is_empty() {
+            let embedder = self.embedder.as_deref().expect("inputs require embedder");
+            let vectors = embedder.embed_multi(&inputs, EmbedKind::Passage)?;
+            if vectors.len() != inputs.len() {
+                anyhow::bail!(
+                    "embedder returned {} vectors for {} inputs",
+                    vectors.len(),
+                    inputs.len()
+                );
+            }
+            for (position, vector) in input_positions.into_iter().zip(vectors) {
+                if vector.len() != embedder.dim() {
+                    anyhow::bail!(
+                        "embedding dimension mismatch: expected {}, got {}",
+                        embedder.dim(),
+                        vector.len()
+                    );
+                }
+                if let Some(i) = vector.iter().position(|value| !value.is_finite()) {
+                    anyhow::bail!("embedding contains non-finite value at dimension {i}");
+                }
+                let PreparedCdcChange::Upsert { vector: slot, .. } = &mut prepared[position] else {
+                    unreachable!("embedding position always refers to an upsert")
+                };
+                *slot = PreparedVectorMutation::Upsert(vector);
+            }
+        }
+
+        let mut writes = Vec::new();
+        let mut write_positions = Vec::new();
+        if self.vector_pg.is_some() {
+            for (position, change) in prepared.iter().enumerate() {
+                if let PreparedCdcChange::Upsert {
+                    collection,
+                    chunk,
+                    vector,
+                } = change
+                {
+                    match vector {
+                        PreparedVectorMutation::Upsert(values) => {
+                            writes.push(fastsearch_pg::EmbeddingWrite::Set {
+                                gid: chunk.global_id(collection),
+                                embedding: values.clone(),
+                                model: self.embed_model.clone(),
+                            });
+                            write_positions.push(position);
+                        }
+                        PreparedVectorMutation::Delete => {
+                            writes.push(fastsearch_pg::EmbeddingWrite::Clear {
+                                gid: chunk.global_id(collection),
+                            });
+                            write_positions.push(position);
+                        }
+                        PreparedVectorMutation::Keep | PreparedVectorMutation::WrittenThrough => {}
                     }
                 }
-                None if self.vector_pg.is_some() => {
-                    // 幂等：无可嵌入内容 → 清 PG `embedding`（设 NULL），避免直查命中残留向量。
-                    let pg = self.vector_pg.as_ref().unwrap();
-                    block_on_pg(pg.clear_embedding(collection, &chunk.doc_id, chunk.chunk_id))
-                        .map_err(|e| anyhow::anyhow!("pg clear_embedding: {e}"))?;
-                }
-                None => {
-                    // 幂等：覆盖更新时若旧版本有向量、新版本无可嵌入内容，删除旧向量避免残留。
-                    self.vector.delete(&chunk.global_id(collection))?;
-                }
             }
         }
+        Ok(PreparedCdcBatch {
+            changes: prepared,
+            writes,
+            write_positions,
+        })
+    }
+
+    async fn finish_write_through(
+        &self,
+        mut prepared: PreparedCdcBatch,
+    ) -> anyhow::Result<PreparedCdcBatch> {
+        if let Some(pg) = &self.vector_pg {
+            pg.write_embeddings_atomically(&prepared.writes)
+                .await
+                .map_err(|error| anyhow::anyhow!("pg embedding batch: {error}"))?;
+            for position in prepared.write_positions.drain(..) {
+                let PreparedCdcChange::Upsert { vector, .. } = &mut prepared.changes[position]
+                else {
+                    unreachable!("write position always refers to an upsert")
+                };
+                *vector = PreparedVectorMutation::WrittenThrough;
+            }
+        }
+        prepared.writes.clear();
+        Ok(prepared)
+    }
+
+    /// 在调用方异步任务中完成整批本地准备；同步嵌入/对象读取放入 blocking 池。
+    /// PG 写穿由共享消费路径取得 Engine 锁后提交，避免搜索观察到新 PG 向量与旧关键词。
+    pub async fn prepare(&self, changes: Vec<Change>) -> anyhow::Result<PreparedCdcBatch> {
+        let local = self.clone();
+        tokio::task::spawn_blocking(move || local.prepare_local(&changes))
+            .await
+            .map_err(|error| anyhow::anyhow!("cdc prepare task join: {error}"))?
+    }
+
+    fn prepare_blocking(&self, changes: &[Change]) -> anyhow::Result<PreparedCdcBatch> {
+        let prepared = self.prepare_local(changes)?;
+        if self.vector_pg.is_some() {
+            block_on_pg(self.finish_write_through(prepared))
+        } else {
+            Ok(prepared)
+        }
+    }
+}
+
+impl Engine {
+    /// 快照 CDC 准备所需的共享依赖。构造只克隆 Arc，不做网络或磁盘 I/O。
+    pub fn cdc_batch_preparer(&self) -> CdcBatchPreparer {
+        CdcBatchPreparer {
+            embedder: self.embedder.clone(),
+            vector_pg: self.vector_pg.clone(),
+            object_store: self.object_store.clone(),
+            embed_model: self
+                .embed_model
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        }
+    }
+
+    fn prepare_cdc_changes(&self, changes: &[Change]) -> anyhow::Result<PreparedCdcBatch> {
+        self.cdc_batch_preparer().prepare_blocking(changes)
+    }
+
+    /// 发布一批已准备变更。调用期间只做本地 text/vector 变更，不访问嵌入服务或 PostgreSQL。
+    pub fn apply_prepared_cdc_batch(&mut self, prepared: PreparedCdcBatch) -> anyhow::Result<()> {
+        if !prepared.writes.is_empty() {
+            anyhow::bail!(
+                "prepared CDC batch still has pending PG writes; publish through consume_once_shared"
+            );
+        }
+        let prepared = &prepared.changes;
+        // 先模拟会改变维度边界的操作，避免 Delete/Clear 已执行后才在后续 Upsert
+        // 发现维度不兼容。通过该预检后，本地后端的普通内存操作不会再因维度失败。
+        let mut effective_dim = self.vector.dim();
+        for change in prepared {
+            match change {
+                PreparedCdcChange::Clear => effective_dim = None,
+                PreparedCdcChange::Upsert {
+                    vector: PreparedVectorMutation::Upsert(values),
+                    ..
+                } => {
+                    self.vector
+                        .validate_upsert_dimension(values.len(), effective_dim)
+                        .map_err(|error| anyhow::anyhow!("vector publish {error}"))?;
+                    effective_dim.get_or_insert(values.len());
+                }
+                _ => {}
+            }
+        }
+        let apply_text = (|| -> anyhow::Result<()> {
+            for change in prepared {
+                match change {
+                    PreparedCdcChange::Upsert {
+                        collection, chunk, ..
+                    } if chunk.searchable => self.text.upsert(collection, chunk)?,
+                    PreparedCdcChange::Upsert {
+                        collection, chunk, ..
+                    } => self
+                        .text
+                        .delete_by_global_id(&chunk.global_id(collection))?,
+                    PreparedCdcChange::Delete(gid) => self.text.delete_by_global_id(gid)?,
+                    PreparedCdcChange::DeleteDoc(collection, doc_id) => {
+                        self.text.delete_by_doc(collection, doc_id)?
+                    }
+                    PreparedCdcChange::Clear => self.text.clear()?,
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = apply_text {
+            self.text.rollback()?;
+            return Err(error);
+        }
+
+        let apply_vector = (|| -> anyhow::Result<()> {
+            for change in prepared {
+                match change {
+                    PreparedCdcChange::Upsert {
+                        collection,
+                        chunk,
+                        vector: PreparedVectorMutation::Upsert(values),
+                    } => self.vector.upsert(
+                        chunk.global_id(collection),
+                        values.clone(),
+                        vec_meta(collection, chunk),
+                    )?,
+                    PreparedCdcChange::Upsert {
+                        collection,
+                        chunk,
+                        vector: PreparedVectorMutation::Delete,
+                    } => self.vector.delete(&chunk.global_id(collection))?,
+                    PreparedCdcChange::Delete(gid) => self.vector.delete(gid)?,
+                    PreparedCdcChange::DeleteDoc(collection, doc_id) => {
+                        self.vector.delete_doc(collection, doc_id)?
+                    }
+                    PreparedCdcChange::Clear => self.vector.clear(),
+                    PreparedCdcChange::Upsert {
+                        vector:
+                            PreparedVectorMutation::Keep | PreparedVectorMutation::WrittenThrough,
+                        ..
+                    } => {}
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = apply_vector {
+            self.text.rollback()?;
+            return Err(error);
+        }
         Ok(())
+    }
+}
+
+/// CDC 落地：sync 的变更应用到 text/vector 索引。放在 engine 而非 text，避免反向依赖。
+impl fastsearch_sync::IndexSink for Engine {
+    fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()> {
+        let prepared = self.prepare_cdc_changes(&[Change::Upsert {
+            collection: collection.to_string(),
+            chunk: Box::new(chunk.clone()),
+        }])?;
+        self.apply_prepared_cdc_batch(prepared)
     }
     fn apply_delete(&mut self, gid: &GlobalId) -> anyhow::Result<()> {
         self.text.delete_by_global_id(gid)?;
@@ -2005,6 +2337,10 @@ impl fastsearch_sync::IndexSink for Engine {
         self.text.clear()?;
         self.vector.clear();
         Ok(())
+    }
+    fn apply_changes(&mut self, changes: &[Change]) -> anyhow::Result<()> {
+        let prepared = self.prepare_cdc_changes(changes)?;
+        self.apply_prepared_cdc_batch(prepared)
     }
     fn commit(&mut self) -> anyhow::Result<()> {
         self.text.commit()?;
@@ -2065,6 +2401,85 @@ mod tests {
     use fastsearch_core::{BBox, ChunkKind, FieldValue, Filter};
     use fastsearch_embed::{EmbedCaps, EmbedInput, EmbedKind, Embedder, HashEmbedder};
     use fastsearch_sync::{Applier, Change, ChangeEvent, Lsn};
+
+    struct RejectingEmbedder(HashEmbedder);
+
+    impl Embedder for RejectingEmbedder {
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+
+        fn embed(&self, texts: &[String], kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.0.embed(texts, kind)
+        }
+
+        fn embed_multi(
+            &self,
+            inputs: &[EmbedInput],
+            kind: EmbedKind,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            if inputs.iter().any(|input| {
+                matches!(input, EmbedInput::Text(text) if text.contains("reject-embedding"))
+            }) {
+                anyhow::bail!("injected embedding timeout after 25ms");
+            }
+            self.0.embed_multi(inputs, kind)
+        }
+    }
+
+    struct BatchOnlyEmbedder {
+        inner: HashEmbedder,
+        expected: usize,
+    }
+
+    struct WrongSecondDimensionEmbedder(HashEmbedder);
+
+    impl Embedder for WrongSecondDimensionEmbedder {
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+
+        fn embed(&self, texts: &[String], kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.0.embed(texts, kind)
+        }
+
+        fn embed_multi(
+            &self,
+            inputs: &[EmbedInput],
+            kind: EmbedKind,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            let mut vectors = self.0.embed_multi(inputs, kind)?;
+            if let Some(second) = vectors.get_mut(1) {
+                second.pop();
+            }
+            Ok(vectors)
+        }
+    }
+
+    impl Embedder for BatchOnlyEmbedder {
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn embed(&self, texts: &[String], kind: EmbedKind) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.inner.embed(texts, kind)
+        }
+
+        fn embed_multi(
+            &self,
+            inputs: &[EmbedInput],
+            kind: EmbedKind,
+        ) -> anyhow::Result<Vec<Vec<f32>>> {
+            if inputs.len() != self.expected {
+                anyhow::bail!(
+                    "provider requires one batch of {}, got {}",
+                    self.expected,
+                    inputs.len()
+                );
+            }
+            self.inner.embed_multi(inputs, kind)
+        }
+    }
 
     struct CrossModalHashEmbedder(HashEmbedder);
 
@@ -3219,6 +3634,346 @@ mod tests {
         // jieba 默认分词器为 Default；中文用 Default 分词器命中可能受限，故用整词查询
         let hits = e.search(&req("新产品发布"), None).unwrap();
         assert!(hits.iter().any(|h| h.id.chunk_id == 2));
+    }
+
+    #[test]
+    fn cdc_embedding_timeout_leaves_no_committable_half_state() {
+        let mut e = engine();
+        e.set_embedder(Box::new(RejectingEmbedder(HashEmbedder::new(8))));
+        let mut ap = Applier::new(Lsn(0));
+        let events = vec![
+            ChangeEvent {
+                change: Change::Upsert {
+                    collection: "kb".into(),
+                    chunk: Box::new(chunk(
+                        "atomic.pdf",
+                        1,
+                        ChunkKind::Paragraph,
+                        "first-version-marker",
+                        1,
+                    )),
+                },
+                lsn: Lsn(1),
+            },
+            ChangeEvent {
+                change: Change::Upsert {
+                    collection: "kb".into(),
+                    chunk: Box::new(chunk(
+                        "atomic.pdf",
+                        2,
+                        ChunkKind::Paragraph,
+                        "reject-embedding second-version-marker",
+                        1,
+                    )),
+                },
+                lsn: Lsn(2),
+            },
+        ];
+
+        let err = ap.apply_batch(&mut e, &events).unwrap_err();
+        assert!(err.to_string().contains("injected embedding timeout"));
+        assert_eq!(ap.applied_lsn(), Lsn(0));
+
+        // 模拟之后一条无关写路径触发全局 commit：失败批次不能被顺带发布。
+        e.commit().unwrap();
+        assert!(e
+            .search(&req("first-version-marker"), None)
+            .unwrap()
+            .is_empty());
+        assert!(e
+            .search(&req("second-version-marker"), None)
+            .unwrap()
+            .is_empty());
+
+        e.set_embedder(Box::new(HashEmbedder::new(8)));
+        assert_eq!(ap.apply_batch(&mut e, &events).unwrap(), 2);
+        assert_eq!(ap.applied_lsn(), Lsn(2));
+        assert_eq!(e.search(&req("version-marker"), None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cdc_batch_works_with_batch_only_embedding_provider() {
+        let mut e = engine();
+        e.set_embedder(Box::new(BatchOnlyEmbedder {
+            inner: HashEmbedder::new(8),
+            expected: 3,
+        }));
+        let mut ap = Applier::new(Lsn(0));
+        let events: Vec<_> = (1..=3)
+            .map(|id| ChangeEvent {
+                change: Change::Upsert {
+                    collection: "kb".into(),
+                    chunk: Box::new(chunk(
+                        "batch.pdf",
+                        id,
+                        ChunkKind::Paragraph,
+                        &format!("batch-marker-{id}"),
+                        1,
+                    )),
+                },
+                lsn: Lsn(id),
+            })
+            .collect();
+
+        assert_eq!(ap.apply_batch(&mut e, &events).unwrap(), 3);
+        assert_eq!(ap.applied_lsn(), Lsn(3));
+        assert_eq!(e.search(&req("batch-marker"), None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn bootstrap_snapshot_uses_one_embedding_batch() {
+        let mut e = engine();
+        e.set_embedder(Box::new(BatchOnlyEmbedder {
+            inner: HashEmbedder::new(8),
+            expected: 3,
+        }));
+        let rows: Vec<_> = (1..=3)
+            .map(|id| {
+                (
+                    "kb".to_string(),
+                    chunk(
+                        "bootstrap.pdf",
+                        id,
+                        ChunkKind::Paragraph,
+                        &format!("bootstrap-batch-marker-{id}"),
+                        1,
+                    ),
+                )
+            })
+            .collect();
+        let data = tempfile::tempdir().unwrap();
+
+        assert_eq!(e.bootstrap_snapshot(&rows, data.path(), Lsn(9)).unwrap(), 3);
+        assert_eq!(
+            e.search(&req("bootstrap-batch-marker"), None)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn cdc_dimension_failure_keeps_keyword_and_vector_on_same_version() {
+        let mut e = engine();
+        e.set_embedder(Box::new(WrongSecondDimensionEmbedder(HashEmbedder::new(8))));
+        let mut ap = Applier::new(Lsn(0));
+        let events: Vec<_> = (1..=2)
+            .map(|id| ChangeEvent {
+                change: Change::Upsert {
+                    collection: "kb".into(),
+                    chunk: Box::new(chunk(
+                        "dimension.pdf",
+                        id,
+                        ChunkKind::Paragraph,
+                        &format!("dimension-marker-{id}"),
+                        1,
+                    )),
+                },
+                lsn: Lsn(id),
+            })
+            .collect();
+
+        let err = ap.apply_batch(&mut e, &events).unwrap_err();
+        assert!(err.to_string().contains("dimension mismatch"));
+        assert_eq!(ap.applied_lsn(), Lsn(0));
+        e.commit().unwrap();
+        assert!(e.search(&req("dimension-marker"), None).unwrap().is_empty());
+
+        let query_vector = HashEmbedder::new(8)
+            .embed(&["dimension-marker-1".into()], EmbedKind::Passage)
+            .unwrap()
+            .remove(0);
+        let vector_hits = e
+            .search(
+                &SearchRequest {
+                    query: String::new(),
+                    mode: SearchMode::Vector,
+                    vector: Some(query_vector),
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(vector_hits.is_empty());
+
+        e.set_embedder(Box::new(HashEmbedder::new(8)));
+        assert_eq!(ap.apply_batch(&mut e, &events).unwrap(), 2);
+        assert_eq!(e.search(&req("dimension-marker"), None).unwrap().len(), 2);
+        let vector_hits = e
+            .search(
+                &SearchRequest {
+                    query: String::new(),
+                    mode: SearchMode::Vector,
+                    vector: Some(
+                        HashEmbedder::new(8)
+                            .embed(&["dimension-marker-1".into()], EmbedKind::Passage)
+                            .unwrap()
+                            .remove(0),
+                    ),
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(vector_hits.len(), 2);
+    }
+
+    #[test]
+    fn cdc_publish_dimension_failure_does_not_apply_earlier_vector_delete() {
+        let mut e = engine();
+        let old = chunk(
+            "publish-dimension.pdf",
+            1,
+            ChunkKind::Paragraph,
+            "old-publish-version",
+            1,
+        );
+        e.ingest_vector("kb", &old, vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        e.commit().unwrap();
+        e.set_embedder(Box::new(HashEmbedder::new(3)));
+
+        let mut applier = Applier::new(Lsn(0));
+        let events = [
+            ChangeEvent {
+                change: Change::Delete {
+                    gid: old.global_id("kb"),
+                },
+                lsn: Lsn(1),
+            },
+            ChangeEvent {
+                change: Change::Upsert {
+                    collection: "kb".into(),
+                    chunk: Box::new(chunk(
+                        "publish-dimension.pdf",
+                        2,
+                        ChunkKind::Paragraph,
+                        "new-publish-version",
+                        1,
+                    )),
+                },
+                lsn: Lsn(2),
+            },
+        ];
+
+        let error = applier.apply_batch(&mut e, &events).unwrap_err();
+        assert!(error.to_string().contains("dimension mismatch"));
+        e.commit().unwrap();
+        assert_eq!(
+            e.search(&req("old-publish-version"), None).unwrap().len(),
+            1
+        );
+        assert!(e
+            .search(&req("new-publish-version"), None)
+            .unwrap()
+            .is_empty());
+        let vector_hits = e
+            .search(
+                &SearchRequest {
+                    query: String::new(),
+                    mode: SearchMode::Vector,
+                    vector: Some(vec![1.0, 0.0, 0.0, 0.0]),
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(vector_hits.len(), 1);
+        assert_eq!(vector_hits[0].id.chunk_id, 1);
+    }
+
+    #[test]
+    fn cdc_publish_backend_dimension_limit_does_not_apply_clear() {
+        let mut e = Engine::create_in_ram_with(
+            TextIndexConfig::default(),
+            VectorBackendKind::BruteBinaryRotated(8),
+        )
+        .unwrap();
+        let old = chunk(
+            "backend-limit.pdf",
+            1,
+            ChunkKind::Paragraph,
+            "old-backend-limit-version",
+            1,
+        );
+        e.ingest_vector("kb", &old, vec![1.0; 8]).unwrap();
+        e.commit().unwrap();
+        e.set_embedder(Box::new(HashEmbedder::new(8193)));
+
+        let mut applier = Applier::new(Lsn(0));
+        let error = applier
+            .apply_batch(
+                &mut e,
+                &[
+                    ChangeEvent {
+                        change: Change::Clear,
+                        lsn: Lsn(1),
+                    },
+                    ChangeEvent {
+                        change: Change::Upsert {
+                            collection: "kb".into(),
+                            chunk: Box::new(chunk(
+                                "backend-limit.pdf",
+                                2,
+                                ChunkKind::Paragraph,
+                                "new-backend-limit-version",
+                                1,
+                            )),
+                        },
+                        lsn: Lsn(2),
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("越界"));
+        e.commit().unwrap();
+        assert_eq!(
+            e.search(&req("old-backend-limit-version"), None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(e
+            .search(&req("new-backend-limit-version"), None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            e.search(
+                &SearchRequest {
+                    query: String::new(),
+                    mode: SearchMode::Vector,
+                    vector: Some(vec![1.0; 8]),
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn pending_pg_write_batch_cannot_be_published_directly() {
+        let mut e = engine();
+        let error = e
+            .apply_prepared_cdc_batch(PreparedCdcBatch {
+                changes: Vec::new(),
+                writes: vec![fastsearch_pg::EmbeddingWrite::Clear {
+                    gid: GlobalId {
+                        collection: "kb".into(),
+                        doc_id: "pending.pdf".into(),
+                        chunk_id: 1,
+                    },
+                }],
+                write_positions: Vec::new(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("pending PG writes"));
     }
 
     #[test]

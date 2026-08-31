@@ -232,6 +232,13 @@ impl TextIndex {
         Ok(())
     }
 
+    /// 丢弃上次成功 commit 之后排队的全部写操作，恢复干净 writer。
+    /// CDC 批次在后续派生步骤失败时用它阻止半批文本被其他 commit 顺带发布。
+    pub fn rollback(&mut self) -> Result<()> {
+        self.writer.rollback()?;
+        Ok(())
+    }
+
     /// 清空全部文档（保持同 schema/分词器），供单集合**原地重建**（坏索引→从真源重灌）。
     /// 不提交——由调用方在重灌后统一 `commit`，使"清空+重灌"成一次可见切换。
     pub fn clear(&mut self) -> Result<()> {

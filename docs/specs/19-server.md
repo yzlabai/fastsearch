@@ -23,7 +23,7 @@ REST 服务（四张脸之一）+ 安全 + 基础可观测。
 
 ```rust
 pub struct Principal { pub tenant: Option<String>, pub tags: Vec<String> }
-// 现状：engine 用 Arc<Mutex<Engine>>（写/CDC 与检索串行）；RwLock/副本去串行为未来优化。
+// 现状：engine 用 Arc<Mutex<Engine>>；CDC 嵌入准备锁外，PG 写穿/本地发布/持久化与检索串行。
 pub struct ServerState { engine: Arc<Mutex<Engine>>, keys, metrics, rate_limiter, audit, embedder }
 pub fn router(state) -> axum::Router;
 pub fn principal_from_headers(headers, keys) -> Option<Principal>;  // 纯, 可测
@@ -76,7 +76,7 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
 - [x] v1 完成：router + API-Key 认证 + **ACL 服务端注入不可绕过** + /v1/search + /v1/index + /healthz /readyz /metrics + 6 测试绿（HTTP oneshot：健康/认证 401/**acl_not_bypassable**/index→search/坏 body 400/纯函数）。clippy 净、fmt 净。
 - [x] 可运行二进制 `fastsearch-server`（main.rs，端口 + key 配置）。
 - [x] v1.1：Prometheus 指标完善 —— counters（requests/searches/indexed/**errors/unauthorized/rate_limited**）带标准 `# HELP`/`# TYPE`，+ **检索延迟直方图** `fastsearch_search_latency_seconds`（累积 le 桶 + _sum + _count）。+1 测试（指标含直方图与未授权计数）。
-- [x] v1.5（**后台 CDC 同步循环 + 落盘恢复，Docker PG+Ollama 活服务验证 done**，2026-06-25）：`Engine::open(data)` 落盘恢复（text+vector.bin+checkpoint）；`spawn_cdc` 后台任务每 `FASTSEARCH_CDC_INTERVAL_MS` 调 `consume_once`（peek→嵌入→落盘→advance，崩溃安全）。`FASTSEARCH_CDC=1`+`DATABASE_URL` 开启。**活服务验证**：写 PG → 日志 `cdc: applied 2` → 语义 vector 检索命中；**重启**从 checkpoint 续传（resume lsn 非 0）、向量不重嵌、立即可检索。注：consume 期间持引擎锁（与检索串行），低延迟化待引擎并发优化。
+- [x] v1.5（**后台 CDC 同步循环 + 落盘恢复，Docker PG+Ollama 活服务验证 done**，2026-06-25；FS-102 更新）：`Engine::open(data)` 落盘恢复（text+vector.bin+checkpoint）；`spawn_cdc` 后台任务每 `FASTSEARCH_CDC_INTERVAL_MS` 调 `consume_once_shared`（peek→锁外批量嵌入→锁内 PG 写穿/本地发布/落盘→advance）。`FASTSEARCH_CDC=1`+`DATABASE_URL` 开启。日志附带 prepare/lock_wait/lock_hold 微秒数；200ms 故障嵌入实测期间搜索可取得 Engine 锁。
   FS-101 起可用 `FASTSEARCH_CDC_SOURCE_TABLE=schema.table` 配置唯一真源 Relation 白名单（默认 `public.fastsearch_chunks`），防同形旁表进入 chunk 映射。
 - [x] v1.4（**真语义混合端到端 Ollama 验证 done**，2026-06-25）：接入可配置嵌入后端（`with_embedder`，从 `FASTSEARCH_EMBEDDER=ollama|openai` 构造）。`/v1/index` **锁外** `spawn_blocking` 嵌入每个 chunk 正文（passage）→ `ingest_vector`；`/v1/search` 在 Hybrid/Vector 模式且未传 vector 时锁外嵌入 query → 真混合。默认（无嵌入后端）行为不变（纯全文）。env-gated 测试：经 server 灌入 + 词面不重叠的语义查询走 vector → 语义最近 chunk 居首（本机 Ollama 验证）。
 - [x] v1.3：**OpenAPI 3.0 契约**导出 `GET /openapi.json`（手写、随 API 维护）—— 描述 /v1/search、/v1/index、健康/指标端点 + SearchRequest/Hit/IndexRequest schema + ApiKey 安全方案；version 取 crate 版本。供 SDK 生成/契约校验（F54）。+1 测试（免认证可取、含关键 path/schema）。

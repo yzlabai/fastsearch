@@ -124,6 +124,19 @@ impl HnswVectorIndex {
         self.dim
     }
 
+    pub(crate) fn validate_upsert_dimension(
+        &self,
+        vector_len: usize,
+        effective_dim: Option<usize>,
+    ) -> anyhow::Result<()> {
+        if let Some(dim) = effective_dim {
+            if dim != vector_len {
+                anyhow::bail!("dimension mismatch: index dim {dim}, got {vector_len}");
+            }
+        }
+        Ok(())
+    }
+
     /// 清空全部条目 + 重置图（供单集合原地重建）。
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -268,12 +281,9 @@ impl Default for HnswVectorIndex {
 
 impl VectorBackend for HnswVectorIndex {
     fn upsert(&mut self, gid: GlobalId, vector: Vec<f32>, meta: VecMeta) -> anyhow::Result<()> {
-        match self.dim {
-            Some(d) if d != vector.len() => {
-                anyhow::bail!("dimension mismatch: index dim {d}, got {}", vector.len())
-            }
-            None => self.dim = Some(vector.len()),
-            _ => {}
+        self.validate_upsert_dimension(vector.len(), self.dim)?;
+        if self.dim.is_none() {
+            self.dim = Some(vector.len());
         }
         // 更新：墓碑旧 id（向量留图中，检索时跳过），插入新 id。
         let was_update = if let Some(old) = self.gid_to_id.remove(&gid) {

@@ -7,6 +7,9 @@ release.
 
 ## [Unreleased]
 
+- CDC applies each batch through a prepare-then-publish boundary: embeddings are
+  computed in one request outside the global engine lock, pgvector write-through
+  uses one PostgreSQL transaction, and failed batches retain the prior checkpoint.
 - Logical-replication CDC now handles primary-key changes as an ordered delete
   plus upsert, clears derived text/vector indexes after source-table truncation,
   and filters relations through an exact configurable `schema.table` name.

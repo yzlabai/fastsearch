@@ -10,9 +10,39 @@ use fastsearch_core::{BBox, Chunk, ChunkKind, SearchMode, SearchRequest};
 use fastsearch_engine::Engine;
 use fastsearch_pg::{PgConfig, PgStore};
 use fastsearch_sync::replication::{drop_slot, ensure_slot, pull_changes, ReplicationConfig};
-use fastsearch_sync::{Applier, Lsn};
+use fastsearch_sync::{Applier, Change, ChangeEvent, Lsn};
 use fastsearch_text::TextIndexConfig;
 use std::sync::OnceLock;
+
+struct DelayedEmbedder {
+    inner: fastsearch_embed::HashEmbedder,
+    started: std::sync::Arc<tokio::sync::Notify>,
+    delay: std::time::Duration,
+}
+
+impl fastsearch_embed::Embedder for DelayedEmbedder {
+    fn dim(&self) -> usize {
+        fastsearch_embed::Embedder::dim(&self.inner)
+    }
+
+    fn embed(
+        &self,
+        texts: &[String],
+        kind: fastsearch_embed::EmbedKind,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        fastsearch_embed::Embedder::embed(&self.inner, texts, kind)
+    }
+
+    fn embed_multi(
+        &self,
+        inputs: &[fastsearch_embed::EmbedInput],
+        kind: fastsearch_embed::EmbedKind,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.started.notify_one();
+        std::thread::sleep(self.delay);
+        fastsearch_embed::Embedder::embed_multi(&self.inner, inputs, kind)
+    }
+}
 
 /// 两个集成测试共享同名 publication/表，必须串行（否则并发 reset 互相踩）。
 static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -274,6 +304,392 @@ async fn cdc_pk_update_and_truncate_converge() {
         assert!(hits.is_empty(), "{mode:?} 仍返回 TRUNCATE 前幽灵命中");
     }
 
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
+/// FS-102：pgvector 写穿必须是整批事务。第二条 UPDATE 注入失败时，第一条 embedding 也不得
+/// 对向量检索可见；解除故障后重试同一批，keyword/vector 应共同收敛。
+#[tokio::test(flavor = "multi_thread")]
+async fn cdc_pg_write_failure_rolls_back_and_retry_converges() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_pg_write_failure_rolls_back_and_retry_converges: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_pg_failure_test";
+    reset(&url, slot).await;
+
+    let store = std::sync::Arc::new(
+        PgStore::connect(PgConfig::new(url.clone()).with_vector_dim(8))
+            .await
+            .expect("pg connect"),
+    );
+    store.ensure_schema().await.expect("ensure_schema");
+    store
+        .upsert_doc(
+            "kb",
+            "failure.pdf",
+            &[
+                chunk("failure.pdf", 1, "pg-failure-marker common one"),
+                chunk("failure.pdf", 2, "pg-failure-marker common two"),
+            ],
+        )
+        .await
+        .expect("insert source rows");
+
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(
+            "CREATE OR REPLACE FUNCTION fs102_reject_second_embedding() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+               IF NEW.chunk_id = 2 AND NEW.embedding IS NOT NULL THEN \
+                 RAISE EXCEPTION 'injected pg write-through failure'; \
+               END IF; \
+               RETURN NEW; \
+             END $$; \
+             CREATE TRIGGER fs102_reject_second_embedding \
+             BEFORE UPDATE OF embedding ON fastsearch_chunks \
+             FOR EACH ROW EXECUTE FUNCTION fs102_reject_second_embedding();",
+        )
+        .await
+        .expect("install failure trigger");
+
+    let embed_cfg = fastsearch_embed::EmbedderConfig::hash(8);
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+    engine.set_embedder(fastsearch_embed::build_embedder(&embed_cfg));
+    engine.set_pg_vector(store);
+    engine.set_embed_model("fs102-test@8");
+    let events: Vec<_> = (1..=2)
+        .map(|id| ChangeEvent {
+            change: Change::Upsert {
+                collection: "kb".into(),
+                chunk: Box::new(chunk(
+                    "failure.pdf",
+                    id,
+                    &format!("pg-failure-marker common {id}"),
+                )),
+            },
+            lsn: Lsn(id),
+        })
+        .collect();
+    let mut applier = Applier::new(Lsn(0));
+    let err = applier.apply_batch(&mut engine, &events).unwrap_err();
+    assert!(
+        err.to_string().contains("pg embedding batch"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(applier.applied_lsn(), Lsn(0));
+    engine.commit().expect("unrelated commit after failure");
+
+    let keyword = engine
+        .search(
+            &SearchRequest {
+                query: "pg-failure-marker".into(),
+                mode: SearchMode::Keyword,
+                top_k: 5,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("keyword after failure");
+    assert!(keyword.is_empty());
+    let query_vector = fastsearch_embed::Embedder::embed(
+        &*fastsearch_embed::build_embedder(&embed_cfg),
+        &["pg-failure-marker common one".into()],
+        fastsearch_embed::EmbedKind::Passage,
+    )
+    .expect("embed query")
+    .remove(0);
+    let vector_request = SearchRequest {
+        query: String::new(),
+        mode: SearchMode::Vector,
+        vector: Some(query_vector),
+        top_k: 5,
+        ..Default::default()
+    };
+    assert!(
+        engine
+            .search(&vector_request, None)
+            .expect("vector after failure")
+            .is_empty(),
+        "失败事务的第一条 embedding 不得残留"
+    );
+
+    client
+        .batch_execute(
+            "DROP TRIGGER fs102_reject_second_embedding ON fastsearch_chunks; \
+             DROP FUNCTION fs102_reject_second_embedding();",
+        )
+        .await
+        .expect("remove failure trigger");
+    assert_eq!(applier.apply_batch(&mut engine, &events).unwrap(), 2);
+    assert_eq!(applier.applied_lsn(), Lsn(2));
+    assert_eq!(
+        engine
+            .search(
+                &SearchRequest {
+                    query: "pg-failure-marker".into(),
+                    mode: SearchMode::Keyword,
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(engine.search(&vector_request, None).unwrap().len(), 2);
+
+    reset(&url, slot).await;
+}
+
+/// FS-102：外部嵌入等待期间，搜索仍应能取得 Engine 锁；只有本地发布/持久化短暂持锁。
+#[tokio::test(flavor = "multi_thread")]
+async fn cdc_batch_embedding_does_not_hold_engine_lock() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_batch_embedding_does_not_hold_engine_lock: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_lock_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
+    };
+    reset(&url, slot).await;
+    let mut pg_cfg = PgConfig::new(url.clone());
+    pg_cfg.vector_dim = 8;
+    let store = std::sync::Arc::new(PgStore::connect(pg_cfg).await.expect("pg connect"));
+    store.ensure_schema().await.expect("ensure_schema");
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+    store
+        .upsert_doc(
+            "kb",
+            "lock.pdf",
+            &[chunk("lock.pdf", 1, "lock-free-embedding-marker")],
+        )
+        .await
+        .expect("insert source row");
+
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+    engine.set_embedder(Box::new(DelayedEmbedder {
+        inner: fastsearch_embed::HashEmbedder::new(8),
+        started: started.clone(),
+        delay: std::time::Duration::from_millis(200),
+    }));
+    engine.set_pg_vector(store.clone());
+    let engine = std::sync::Arc::new(tokio::sync::Mutex::new(engine));
+    let data = tempfile::tempdir().expect("tempdir");
+    let consume = tokio::spawn({
+        let engine = engine.clone();
+        let rcfg = rcfg.clone();
+        let data = data.path().to_path_buf();
+        async move { Engine::consume_once_shared(&engine, &rcfg, &data).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+        .await
+        .expect("embedding did not start");
+
+    let locked = tokio::time::timeout(std::time::Duration::from_millis(75), engine.lock())
+        .await
+        .expect("Engine lock was held during external embedding");
+    assert!(
+        locked
+            .search(
+                &SearchRequest {
+                    query: "lock-free-embedding-marker".into(),
+                    mode: SearchMode::Keyword,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .is_empty(),
+        "prepared batch must not publish before lock-protected apply"
+    );
+    let query_vector = fastsearch_embed::Embedder::embed(
+        &fastsearch_embed::HashEmbedder::new(8),
+        &["lock-free-embedding-marker".into()],
+        fastsearch_embed::EmbedKind::Passage,
+    )
+    .unwrap()
+    .remove(0);
+    // 继续占住 Engine 锁直到嵌入已经完成：旧实现会在锁外先提交 PG 写穿，导致这里
+    // 能看到新向量、上面的 keyword 仍为空。新实现必须等取得同一把锁后才写穿并发布。
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        locked
+            .search(
+                &SearchRequest {
+                    query: String::new(),
+                    mode: SearchMode::Vector,
+                    vector: Some(query_vector.clone()),
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .is_empty(),
+        "PG vector must not publish ahead of the lock-protected keyword batch"
+    );
+    drop(locked);
+
+    let stats = consume.await.unwrap().unwrap();
+    assert_eq!(stats.applied, 1);
+    assert!(stats.prepare_micros >= 150_000);
+    assert!(
+        engine
+            .lock()
+            .await
+            .search(
+                &SearchRequest {
+                    query: "lock-free-embedding-marker".into(),
+                    mode: SearchMode::Keyword,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .len()
+            == 1
+    );
+    assert_eq!(
+        engine
+            .lock()
+            .await
+            .search(
+                &SearchRequest {
+                    query: String::new(),
+                    mode: SearchMode::Vector,
+                    vector: Some(query_vector),
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
+/// FS-102：模拟进程在本地 apply 后、persist/slot advance 前退出。未持久化批次不得留下单路新版本；
+/// 重启后 slot 重放同批，keyword/vector 一起收敛。
+#[tokio::test(flavor = "multi_thread")]
+async fn cdc_crash_after_apply_before_persist_retries_without_half_state() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!(
+            "skip cdc_crash_after_apply_before_persist_retries_without_half_state: DATABASE_URL not set"
+        );
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_crash_before_persist_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
+    };
+    reset(&url, slot).await;
+    let store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("ensure_schema");
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+    store
+        .upsert_doc(
+            "kb",
+            "crash.pdf",
+            &[chunk("crash.pdf", 1, "crash-retry-marker")],
+        )
+        .await
+        .expect("insert source row");
+
+    let data = tempfile::tempdir().expect("tempdir");
+    let embed_cfg = fastsearch_embed::EmbedderConfig::hash(8);
+    {
+        let (mut engine, _) =
+            Engine::open(data.path(), TextIndexConfig::default()).expect("open engine");
+        engine.set_embedder(fastsearch_embed::build_embedder(&embed_cfg));
+        let (events, _) = fastsearch_sync::replication::peek_with_lsn(&rcfg)
+            .await
+            .expect("peek");
+        let prepared = engine
+            .cdc_batch_preparer()
+            .prepare(events.into_iter().map(|event| event.change).collect())
+            .await
+            .expect("prepare");
+        engine
+            .apply_prepared_cdc_batch(prepared)
+            .expect("apply prepared");
+        // 故障注入：此处直接 drop，刻意不 persist、不 advance slot。
+    }
+
+    let (mut restarted, lsn) =
+        Engine::open(data.path(), TextIndexConfig::default()).expect("restart after crash");
+    assert_eq!(lsn, Lsn(0));
+    assert!(restarted
+        .search(
+            &SearchRequest {
+                query: "crash-retry-marker".into(),
+                mode: SearchMode::Keyword,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .is_empty());
+    let query_vector = fastsearch_embed::Embedder::embed(
+        &*fastsearch_embed::build_embedder(&embed_cfg),
+        &["crash-retry-marker".into()],
+        fastsearch_embed::EmbedKind::Passage,
+    )
+    .unwrap()
+    .remove(0);
+    let vector_request = SearchRequest {
+        query: String::new(),
+        mode: SearchMode::Vector,
+        vector: Some(query_vector),
+        top_k: 5,
+        ..Default::default()
+    };
+    assert!(restarted.search(&vector_request, None).unwrap().is_empty());
+
+    restarted.set_embedder(fastsearch_embed::build_embedder(&embed_cfg));
+    assert_eq!(
+        restarted
+            .consume_once(&rcfg, data.path())
+            .await
+            .expect("retry consume"),
+        1
+    );
+    assert_eq!(
+        restarted
+            .search(
+                &SearchRequest {
+                    query: "crash-retry-marker".into(),
+                    mode: SearchMode::Keyword,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(restarted.search(&vector_request, None).unwrap().len(), 1);
     drop_slot(&rcfg).await.expect("drop_slot");
 }
 

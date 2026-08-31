@@ -34,6 +34,7 @@ pub trait IndexSink {
     fn apply_delete(&mut self, gid: &GlobalId) -> anyhow::Result<()>;
     fn apply_delete_doc(&mut self, collection: &str, doc_id: &str) -> anyhow::Result<()>;
     fn apply_clear(&mut self) -> anyhow::Result<()>;
+    fn apply_changes(&mut self, changes: &[Change]) -> anyhow::Result<()>;
     fn commit(&mut self) -> anyhow::Result<()>;
 }
 
@@ -55,12 +56,13 @@ impl Applier {
 - **主键迁移**：Update 旧 key 与新 tuple 的 GlobalId 不同时，映射成同一 LSN 下有序的 `Batch[Delete(old), Upsert(new)]`；避免旧 citation 成为幽灵行，也不伪造递增 LSN。
 - **TRUNCATE**：白名单真源表的 Truncate 映射为 `Clear`，由 Engine 清 text/vector 后在批末统一 commit。
 - **relation 白名单**：`ReplicationConfig.source_table` 以 `schema.table` 精确匹配 Relation，同时保留 chunks 必需列检查；同形旁表也不会产生 chunk 变更。
-- **提交边界**：apply_batch 末尾调用 `sink.commit()`（成功后才认为 applied_lsn 持久化点推进——持久化由调用方负责）。
+- **批次接缝**：`apply_batch` 将水位以上的有序 Change 一次交给 `sink.apply_changes`；默认实现逐项应用，Engine 覆写为全批 prepare→publish。
+- **提交边界**：apply_batch 末尾调用 `sink.commit()`；只有 apply 与 commit 都成功才把 `applied_lsn` 从批前水位推进到本批最大值。
 - **健壮**：sink 错误向上传播，不静默吞；applied_lsn 仅在 apply 成功后推进。
 
 ## 4. 快照 + 增量（集成层）—— ✅ 已实现（2026-06-25，Docker 验证）
 
-- **初始快照 bootstrap**：`ensure_slot -> Option<Lsn>`（新建返回一致点）；`pg::fetch_all_chunks` 全表读；`engine::bootstrap_snapshot(rows, data, consistent)` 逐行 apply_upsert（含嵌入）+ persist；server 首启 + 新建 slot 时自动 bootstrap 存量、再起增量。**正确性=一致点 + 幂等重叠**（不用 EXPORT_SNAPSHOT），详见 [计划](../plans/2026-06-25-初始快照-bootstrap.md)。
+- **初始快照 bootstrap**：`ensure_slot -> Option<Lsn>`（新建返回一致点）；`pg::fetch_all_chunks` 全表读；`engine::bootstrap_snapshot(rows, data, consistent)` 对全部行做一次批量 prepare + persist；server 首启 + 新建 slot 时自动 bootstrap 存量、再起增量。**正确性=一致点 + 幂等重叠**（不用 EXPORT_SNAPSHOT），详见 [计划](../plans/2026-06-25-初始快照-bootstrap.md)。
 - **增量消费**：`engine::consume_once`（peek→应用全部→persist→advance）。**关键修正**：peek 逐行 lsn 对首事务等于一致点，故 consume_once **不靠 LSN 水位跳过**，靠 slot-advance 不重投 + GlobalId 幂等。
 - 低延迟流式 `START_REPLICATION`（替代 SQL 轮询）仍为后续。
 
@@ -78,9 +80,11 @@ impl Applier {
 5. sink 错误传播：sink 返回 Err 时 apply 返回 Err 且 applied_lsn 不推进。
 6. 复合 PK Update：同一事件严格先 Delete(old) 再 Upsert(new)，水位只推进一次。
 7. TRUNCATE：Clear 传到 sink；同形不同名 Relation 被白名单拒绝。
+8. commit 失败不推进批次水位；embedding timeout/维度错误不留下可被后续 commit 发布的半状态。
 
 **集成（env-gated）**：
-8. 真 PG 修改三列主键后旧 citation 消失、新 citation 命中；TRUNCATE 后 keyword/vector/hybrid 均无旧命中。
+9. 真 PG 修改三列主键后旧 citation 消失、新 citation 命中；TRUNCATE 后 keyword/vector/hybrid 均无旧命中。
+10. PG 写穿中途失败整批回滚并可重试；外部 embedding 等待不持 Engine 锁；发布期索引维度/后端上限失败不先执行 Delete/Clear；纯本地 apply 后崩溃不推进 slot，重启重放后两路收敛。
 
 ## 7. 验收标准与状态
 
@@ -94,6 +98,7 @@ impl Applier {
     - **映射**：Relation 缓存 + Insert/Update→`Upsert`、Delete→`Delete`（PK→GlobalId）；行→Chunk 复用 `fastsearch_pg::ChunkRow::to_chunk`；含 `pg_lsn` 文本解析、Postgres `text[]` 数组字面量解析（+3 单测）。
     - **端到端闭环**（`fastsearch-engine/tests/cdc_closed_loop.rs`，env-gated）：写 PgStore → slot 捕获 → `pull_changes` 解码 → `Applier` 应用到 `Engine` → 检索命中（引用正确）。Docker pgvector 上全绿、可幂等重跑。
   - [x] FS-101（2026-08-31，Docker pgvector:pg17 真机）：`map` 升级为零到多变更；PK UPDATE 输出有序 Delete+Upsert 复合事件；TRUNCATE 输出 Clear 并清 text/vector；Relation 改为 `ReplicationConfig.source_table` 精确限定表名 + 列形状双守卫。环境门禁现为 PG/CDC 21/21 executed。
+  - [x] FS-102（2026-08-31，Docker pgvector:pg17 真机）：`apply_changes` 建立整批接缝，Engine 全批准备后发布；一次 `embed_multi`、PG 事务写穿、嵌入锁外等待与故障重试闭环落地。PG 写穿至本地发布期间由 Engine 锁阻断搜索；跨 PG/本地文件的进程崩溃恢复边界明确转入 FS-103。PG/CDC 显式门禁增至 24 项。
 
 **复测配方（Docker）：**
 ```bash

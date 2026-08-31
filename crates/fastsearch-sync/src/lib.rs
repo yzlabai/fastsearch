@@ -52,6 +52,22 @@ pub trait IndexSink {
     fn apply_delete(&mut self, gid: &GlobalId) -> anyhow::Result<()>;
     fn apply_delete_doc(&mut self, collection: &str, doc_id: &str) -> anyhow::Result<()>;
     fn apply_clear(&mut self) -> anyhow::Result<()>;
+    /// 准备并应用一组有序变更。实现可覆写此方法，在改变可见派生状态前完成批量嵌入等
+    /// 易失败工作；默认实现保持既有逐项行为。
+    fn apply_changes(&mut self, changes: &[Change]) -> anyhow::Result<()> {
+        for change in changes {
+            match change {
+                Change::Upsert { collection, chunk } => self.apply_upsert(collection, chunk)?,
+                Change::Delete { gid } => self.apply_delete(gid)?,
+                Change::DeleteDoc { collection, doc_id } => {
+                    self.apply_delete_doc(collection, doc_id)?
+                }
+                Change::Clear => self.apply_clear()?,
+                Change::Batch(nested) => self.apply_changes(nested)?,
+            }
+        }
+        Ok(())
+    }
     fn commit(&mut self) -> anyhow::Result<()>;
 }
 
@@ -107,13 +123,25 @@ impl Applier {
         sink: &mut dyn IndexSink,
         evs: &[ChangeEvent],
     ) -> anyhow::Result<usize> {
-        let mut applied = 0;
-        for ev in evs {
-            if self.apply(sink, ev)? {
-                applied += 1;
-            }
+        let starting_lsn = self.applied_lsn;
+        let pending: Vec<Change> = evs
+            .iter()
+            .filter(|ev| ev.lsn > starting_lsn)
+            .map(|ev| ev.change.clone())
+            .collect();
+        let applied = pending.len();
+        let final_lsn = evs
+            .iter()
+            .filter(|ev| ev.lsn > starting_lsn)
+            .map(|ev| ev.lsn)
+            .max()
+            .unwrap_or(starting_lsn);
+        sink.apply_changes(&pending)?;
+        if let Err(err) = sink.commit() {
+            self.applied_lsn = starting_lsn;
+            return Err(err);
         }
-        sink.commit()?;
+        self.applied_lsn = final_lsn;
         Ok(applied)
     }
 }
@@ -136,6 +164,7 @@ mod tests {
     struct MockSink {
         ops: Vec<Op>,
         fail: bool,
+        fail_commit: bool,
     }
     impl IndexSink for MockSink {
         fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()> {
@@ -159,6 +188,9 @@ mod tests {
             Ok(())
         }
         fn commit(&mut self) -> anyhow::Result<()> {
+            if self.fail_commit {
+                anyhow::bail!("commit failure");
+            }
             self.ops.push(Op::Commit);
             Ok(())
         }
@@ -354,6 +386,29 @@ mod tests {
         );
         assert!(ap.apply(&mut sink, &e).is_err());
         // 水位未推进，可重试
+        assert_eq!(ap.applied_lsn(), Lsn(0));
+    }
+
+    #[test]
+    fn commit_error_does_not_advance_watermark() {
+        let mut sink = MockSink {
+            fail_commit: true,
+            ..Default::default()
+        };
+        let mut ap = Applier::new(Lsn(0));
+        let err = ap
+            .apply_batch(
+                &mut sink,
+                &[ev(
+                    Change::Upsert {
+                        collection: "kb".into(),
+                        chunk: chunk("a", 1),
+                    },
+                    8,
+                )],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("commit failure"));
         assert_eq!(ap.applied_lsn(), Lsn(0));
     }
 }

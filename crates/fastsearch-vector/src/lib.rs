@@ -125,6 +125,20 @@ impl VectorStore {
         }
     }
 
+    /// 在 CDC 批次真正修改后端前校验某次 upsert 的维度。`effective_dim` 是按批次顺序
+    /// 模拟 Clear 后得到的维度边界，可能不同于当前存储的 `self.dim()`。
+    pub fn validate_upsert_dimension(
+        &self,
+        vector_len: usize,
+        effective_dim: Option<usize>,
+    ) -> anyhow::Result<()> {
+        match self {
+            VectorStore::Brute(index) => index.validate_upsert_dimension(vector_len, effective_dim),
+            VectorStore::Hnsw(index) => index.validate_upsert_dimension(vector_len, effective_dim),
+            VectorStore::Turbo(index) => index.validate_upsert_dimension(vector_len, effective_dim),
+        }
+    }
+
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         match self {
             VectorStore::Brute(m) => m.save(path),
@@ -362,6 +376,22 @@ impl MemVectorIndex {
         Self::default()
     }
 
+    fn validate_upsert_dimension(
+        &self,
+        vector_len: usize,
+        effective_dim: Option<usize>,
+    ) -> anyhow::Result<()> {
+        match effective_dim {
+            Some(dim) if dim != vector_len => {
+                anyhow::bail!("dimension mismatch: index dim {dim}, got {vector_len}")
+            }
+            None if self.rabitq_rotation && vector_len > fht::MAX_DIM => {
+                anyhow::bail!("旋转档维度 {vector_len} 越界（须 ≤{}）", fht::MAX_DIM)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// 开启二值量化两阶段粗筛（`oversample`≥1：粗筛候选数 = `k·oversample`）。
     /// `oversample` 越大召回越接近全局精确、越慢；`0` 视作 `1`。
     pub fn with_binary_prefilter(oversample: usize) -> Self {
@@ -551,19 +581,9 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 impl VectorBackend for MemVectorIndex {
     fn upsert(&mut self, gid: GlobalId, vector: Vec<f32>, meta: VecMeta) -> anyhow::Result<()> {
-        match self.dim {
-            Some(d) if d != vector.len() => {
-                anyhow::bail!("dimension mismatch: index dim {d}, got {}", vector.len())
-            }
-            None => {
-                // 旋转档：先校验维度上限，**再**赋 dim——避免超维首 upsert 把 dim 毒化成越界值
-                // （否则后续合法 upsert 全撞维度不匹配）。同 turbo 的"先验证后赋值"（review 跟进）。
-                if self.rabitq_rotation && vector.len() > fht::MAX_DIM {
-                    anyhow::bail!("旋转档维度 {} 越界（须 ≤{}）", vector.len(), fht::MAX_DIM);
-                }
-                self.dim = Some(vector.len());
-            }
-            _ => {}
+        self.validate_upsert_dimension(vector.len(), self.dim)?;
+        if self.dim.is_none() {
+            self.dim = Some(vector.len());
         }
         let normalized = normalize(&vector);
         self.ensure_rotation();
