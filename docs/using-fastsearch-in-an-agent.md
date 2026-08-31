@@ -276,6 +276,7 @@ Hits carry `media` (a media reference) and `time` (an audio/video interval); `re
 | `FASTSEARCH_EMBEDDER` | `ollama`\|`openai` (+ `FASTSEARCH_EMBED_*`) → real semantic embeddings (enables vector/hybrid) |
 | `FASTSEARCH_VECTOR_BACKEND` | `brute` (deterministic default) \| `hnsw` (large-scale approximate) \| `pgvector` (direct query, needs `DATABASE_URL`) |
 | `FASTSEARCH_CDC=1` | Enable background CDC: PG write → logical replication → auto-embed → index (needs `DATABASE_URL`) |
+| `FASTSEARCH_CDC_SOURCE_TABLE` | Exact CDC source-table allowlist entry as `schema.table` (default `public.fastsearch_chunks`); must match the table in the publication |
 | `FASTSEARCH_RATE_LIMIT` | `cap,refill` (per-key token bucket; 429 on overflow) |
 | `FASTSEARCH_AUDIT=1` | Emit an audit JSON line to stderr per successful request |
 | `FASTSEARCH_TOKENIZER` | `jieba` (default, Chinese) \| `default` (whitespace split) |

@@ -8,8 +8,8 @@
 
 CDC 同步：把 Postgres（真源）的变更增量、可靠地应用到引擎侧派生索引。
 
-- **变更模型**：`Change`（Insert/Update/Delete，携带 collection+chunk 或删除键 + LSN）。
-- **Sink 抽象**：`IndexSink` trait（upsert chunk / delete by gid / delete by doc），由 text/vector 索引实现。
+- **变更模型**：`Change`（Upsert/Delete/DeleteDoc/Clear/Batch，携带 collection+chunk 或删除键 + LSN）。
+- **Sink 抽象**：`IndexSink` trait（upsert chunk / delete by gid / delete by doc / clear），由 engine 桥接 text/vector 索引。
 - **Applier**：幂等地把 `Change` 应用到 sink；维护 `applied_lsn` 检查点；保证按序、删除/替换正确、重复消息无副作用（exactly-once 效果）。
 - **快照 + 增量切换**：初始全量快照建索引（用 pg.fetch 全表）→ 记 snapshot_lsn → 从该 LSN 起增量。
 - **复制连接 + pgoutput 解码**：连接 PG 复制 slot、解码 pgoutput → `Change`。**env-gated 集成**（无 PG 时不跑）；wire 解码逻辑尽量纯函数可单测。
@@ -24,6 +24,8 @@ pub enum Change {
     Upsert { collection: String, chunk: Chunk },
     Delete { gid: GlobalId },
     DeleteDoc { collection: String, doc_id: String },
+    Clear,
+    Batch(Vec<Change>),
 }
 pub struct ChangeEvent { pub change: Change, pub lsn: Lsn }
 
@@ -31,6 +33,7 @@ pub trait IndexSink {
     fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()>;
     fn apply_delete(&mut self, gid: &GlobalId) -> anyhow::Result<()>;
     fn apply_delete_doc(&mut self, collection: &str, doc_id: &str) -> anyhow::Result<()>;
+    fn apply_clear(&mut self) -> anyhow::Result<()>;
     fn commit(&mut self) -> anyhow::Result<()>;
 }
 
@@ -49,6 +52,9 @@ impl Applier {
 - **幂等/续传**：`apply` 跳过 `lsn <= applied_lsn`（重启后从持久化的 applied_lsn 续传，重复消息无副作用）。返回是否实际应用。
 - **按序**：apply_batch 假定输入按 LSN 升序；乱序中低于水位的被跳过。
 - **替换语义**：`DeleteDoc` 后跟同 doc 的 `Upsert` 序列 = doc_id 级替换（与 pg.upsert_doc 对应）。
+- **主键迁移**：Update 旧 key 与新 tuple 的 GlobalId 不同时，映射成同一 LSN 下有序的 `Batch[Delete(old), Upsert(new)]`；避免旧 citation 成为幽灵行，也不伪造递增 LSN。
+- **TRUNCATE**：白名单真源表的 Truncate 映射为 `Clear`，由 Engine 清 text/vector 后在批末统一 commit。
+- **relation 白名单**：`ReplicationConfig.source_table` 以 `schema.table` 精确匹配 Relation，同时保留 chunks 必需列检查；同形旁表也不会产生 chunk 变更。
 - **提交边界**：apply_batch 末尾调用 `sink.commit()`（成功后才认为 applied_lsn 持久化点推进——持久化由调用方负责）。
 - **健壮**：sink 错误向上传播，不静默吞；applied_lsn 仅在 apply 成功后推进。
 
@@ -70,9 +76,11 @@ impl Applier {
 3. apply_batch：混合 Upsert/Delete/DeleteDoc 按序应用，applied_lsn 推进到最大；返回实际应用数。
 4. 替换语义：DeleteDoc + 两个 Upsert → sink 记录 delete_doc 后 2 次 upsert。
 5. sink 错误传播：sink 返回 Err 时 apply 返回 Err 且 applied_lsn 不推进。
+6. 复合 PK Update：同一事件严格先 Delete(old) 再 Upsert(new)，水位只推进一次。
+7. TRUNCATE：Clear 传到 sink；同形不同名 Relation 被白名单拒绝。
 
 **集成（env-gated）**：
-6. pg 写入 → 近似 LSN → fetch 快照 → 内存 sink 得到对应 chunk。（完整 pgoutput 流式解码列为后续迭代。）
+8. 真 PG 修改三列主键后旧 citation 消失、新 citation 命中；TRUNCATE 后 keyword/vector/hybrid 均无旧命中。
 
 ## 7. 验收标准与状态
 
@@ -85,6 +93,7 @@ impl Applier {
     - ⚠️ **崩溃安全（当前为 v1 演示级，未达生产）**：`get_binary_changes` 是**消费即推进 slot**——"拉取后、派生索引落盘前崩溃"会丢这批变更（slot 已推进、内存索引未持久化）。生产正确姿势是 **peek + 先落盘后 `pg_replication_slot_advance`**（详见 [派生索引持久化与崩溃安全计划](../plans/2026-06-25-派生索引持久化与崩溃安全.md)）。当前 `pull_changes` 仅供"无持久化"的闭环演示/测试。
     - **映射**：Relation 缓存 + Insert/Update→`Upsert`、Delete→`Delete`（PK→GlobalId）；行→Chunk 复用 `fastsearch_pg::ChunkRow::to_chunk`；含 `pg_lsn` 文本解析、Postgres `text[]` 数组字面量解析（+3 单测）。
     - **端到端闭环**（`fastsearch-engine/tests/cdc_closed_loop.rs`，env-gated）：写 PgStore → slot 捕获 → `pull_changes` 解码 → `Applier` 应用到 `Engine` → 检索命中（引用正确）。Docker pgvector 上全绿、可幂等重跑。
+  - [x] FS-101（2026-08-31，Docker pgvector:pg17 真机）：`map` 升级为零到多变更；PK UPDATE 输出有序 Delete+Upsert 复合事件；TRUNCATE 输出 Clear 并清 text/vector；Relation 改为 `ReplicationConfig.source_table` 精确限定表名 + 列形状双守卫。环境门禁现为 PG/CDC 21/21 executed。
 
 **复测配方（Docker）：**
 ```bash
@@ -98,7 +107,7 @@ cargo test -p fastsearch-engine --test cdc_closed_loop      # CDC 闭环
 
 **已知限制 / 下一迭代：**
 
-- **relation 形状守卫（2026-08-25）**：`map()` 只按 `rel_oid` 取 Relation、不校验表身份，而 `row_to_gid` 只需 gid 三列 ⇒ 任何**恰好也有这三列**的旁表（如设计中的 `chunk_signal`）一条 DELETE 就会被映射成 `Change::Delete{gid}`、**误删整个 chunk**（Insert/Update 侧本就被`row_to_chunk` 需要 `kind`/`text` 挡住，只有 Delete 侧无防护）。已加 `relation_is_chunks` 按**声明列集合**判形状，非 chunks 形状一律 `Ok(None)` 忽略。**仍是形状判、非表名判**——真要按表名需给 `ReplicationConfig` 加字段并穿到 server 配置；若将来 publication 收多表，应升级为表名白名单。见 [devlog](../devlog/2026-08-25-Wave1复盘修复-诚实契约与CDC误删守卫.md)。
+- `source_table` 当前是单个精确白名单项，因为 chunks publication 按不变量只含一个真源表；未来若确需同一消费者处理多张 chunk 真源表，再显式升级为集合，不以 shape guard 代替身份。
 - 低延迟**流式**消费（`START_REPLICATION` COPY + keepalive/standby 反馈）：当前用 SQL 轮询，足够正确性与中低频；流式待换支持复制协议的客户端（或自实现 wire）。
 - slot 生命周期监控（`max_slot_wal_keep_size`、滞留告警）、初始快照 + 无缝切换（B3）待续。
 - `initial_snapshot`/`stream` 集成函数待线缆层落地后补。

@@ -36,6 +36,7 @@ pg_gates=(
   cdc_closed_loop_pg_to_search
   cdc_consume_persist_crashsafe
   cdc_initial_snapshot_bootstrap
+  cdc_pk_update_and_truncate_converge
   cdc_unchanged_toast_update_does_not_stall
   searchable_false_is_stored_in_pg_but_not_searchable
   index_writes_embedding_through_to_pg_in_pgvector_mode

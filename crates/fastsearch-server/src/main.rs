@@ -257,6 +257,8 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_else(|_| "fastsearch_slot".into()),
                     publication: std::env::var("FASTSEARCH_CDC_PUBLICATION")
                         .unwrap_or_else(|_| "fastsearch_pub".into()),
+                    source_table: std::env::var("FASTSEARCH_CDC_SOURCE_TABLE")
+                        .unwrap_or_else(|_| "public.fastsearch_chunks".into()),
                 };
                 let interval_ms: u64 = std::env::var("FASTSEARCH_CDC_INTERVAL_MS")
                     .ok()

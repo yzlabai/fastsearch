@@ -83,6 +83,7 @@ async fn cdc_closed_loop_pg_to_search() {
         url: url.clone(),
         slot: slot.into(),
         publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
     };
 
     // 0) 清理：重置 slot/publication/表，保证与运行顺序无关。
@@ -157,6 +158,125 @@ async fn cdc_closed_loop_pg_to_search() {
     drop_slot(&rcfg).await.expect("drop_slot");
 }
 
+/// FS-101：一条 PK UPDATE 必须按同一 WAL/LSN 有序执行 Delete(old)+Upsert(new)；
+/// TRUNCATE 必须清空 text/vector 两套派生索引，三种搜索模式均不能返回幽灵命中。
+#[tokio::test]
+async fn cdc_pk_update_and_truncate_converge() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_pk_update_and_truncate_converge: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_cdc_pk_truncate_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
+    };
+    reset(&url, slot).await;
+
+    let store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("ensure_schema");
+    ensure_slot(&rcfg).await.expect("ensure_slot");
+    store
+        .upsert_doc(
+            "kb",
+            "old.pdf",
+            &[chunk("old.pdf", 1, "migrationmarker source text")],
+        )
+        .await
+        .expect("insert source row");
+
+    let embed_cfg = fastsearch_embed::EmbedderConfig::hash(8);
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+    engine.set_embedder(fastsearch_embed::build_embedder(&embed_cfg));
+    let mut applier = Applier::new(Lsn(0));
+    let inserted = pull_changes(&rcfg).await.expect("pull insert");
+    applier
+        .apply_batch(&mut engine, &inserted)
+        .expect("apply insert");
+
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .execute(
+            "UPDATE fastsearch_chunks \
+             SET collection='kb2', doc_id='new.pdf', chunk_id=2 \
+             WHERE collection='kb' AND doc_id='old.pdf' AND chunk_id=1",
+            &[],
+        )
+        .await
+        .expect("update primary key");
+
+    let moved = pull_changes(&rcfg).await.expect("pull PK update");
+    assert_eq!(moved.len(), 1, "一条 WAL UPDATE 应保持为一个复合事件");
+    assert!(matches!(moved[0].change, fastsearch_sync::Change::Batch(_)));
+    applier
+        .apply_batch(&mut engine, &moved)
+        .expect("apply PK update");
+
+    let hits = engine
+        .search(
+            &SearchRequest {
+                query: "migrationmarker".into(),
+                mode: SearchMode::Keyword,
+                top_k: 5,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("keyword after PK update");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id.to_citation_id(), "kb2:new.pdf:2");
+
+    let query_vector = fastsearch_embed::Embedder::embed(
+        &*fastsearch_embed::build_embedder(&embed_cfg),
+        &["migrationmarker source text".to_string()],
+        fastsearch_embed::EmbedKind::Query,
+    )
+    .expect("embed query")
+    .remove(0);
+
+    client
+        .batch_execute("TRUNCATE fastsearch_chunks")
+        .await
+        .expect("truncate source table");
+    let truncated = pull_changes(&rcfg).await.expect("pull truncate");
+    assert_eq!(truncated.len(), 1);
+    assert!(matches!(
+        truncated[0].change,
+        fastsearch_sync::Change::Clear
+    ));
+    applier
+        .apply_batch(&mut engine, &truncated)
+        .expect("apply truncate");
+
+    for mode in [SearchMode::Keyword, SearchMode::Vector, SearchMode::Hybrid] {
+        let hits = engine
+            .search(
+                &SearchRequest {
+                    query: "migrationmarker".into(),
+                    mode,
+                    vector: (mode != SearchMode::Keyword).then(|| query_vector.clone()),
+                    top_k: 5,
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("search after truncate");
+        assert!(hits.is_empty(), "{mode:?} 仍返回 TRUNCATE 前幽灵命中");
+    }
+
+    drop_slot(&rcfg).await.expect("drop_slot");
+}
+
 /// 崩溃安全的 CDC 消费 + 派生索引持久化（env-gated：仅需 PG；用 Hash 嵌入→离线确定性）：
 ///
 ///   peek（不推进 slot）→ 应用（apply_upsert 含嵌入）→ persist（索引+检查点落盘）→
@@ -173,6 +293,7 @@ async fn cdc_consume_persist_crashsafe() {
         url: url.clone(),
         slot: slot.into(),
         publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
     };
     reset(&url, slot).await;
 
@@ -266,6 +387,7 @@ async fn cdc_initial_snapshot_bootstrap() {
         url: url.clone(),
         slot: slot.into(),
         publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
     };
     reset(&url, slot).await;
 
@@ -377,6 +499,7 @@ async fn cdc_embed_hybrid_full_loop() {
         url: url.clone(),
         slot: slot.into(),
         publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
     };
     reset(&url, slot).await;
 
@@ -454,6 +577,7 @@ async fn cdc_unchanged_toast_update_does_not_stall() {
         url: url.clone(),
         slot: slot.into(),
         publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
     };
     reset(&url, slot).await;
 

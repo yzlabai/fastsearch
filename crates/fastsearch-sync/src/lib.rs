@@ -32,6 +32,11 @@ pub enum Change {
     Delete { gid: GlobalId },
     /// 删除某 doc 的全部 chunk（doc_id 级替换的第一步）。
     DeleteDoc { collection: String, doc_id: String },
+    /// 清空真源表对应的全部派生索引（PG `TRUNCATE`）。
+    Clear,
+    /// 同一条 WAL 消息产生的有序复合单元（如 PK UPDATE 的 Delete(old) + Upsert(new)）。
+    /// 共用一个 LSN，必须作为单个 `ChangeEvent` 应用，不能伪造递增 LSN。
+    Batch(Vec<Change>),
 }
 
 /// 带 LSN 的变更事件。
@@ -46,6 +51,7 @@ pub trait IndexSink {
     fn apply_upsert(&mut self, collection: &str, chunk: &Chunk) -> anyhow::Result<()>;
     fn apply_delete(&mut self, gid: &GlobalId) -> anyhow::Result<()>;
     fn apply_delete_doc(&mut self, collection: &str, doc_id: &str) -> anyhow::Result<()>;
+    fn apply_clear(&mut self) -> anyhow::Result<()>;
     fn commit(&mut self) -> anyhow::Result<()>;
 }
 
@@ -72,16 +78,27 @@ impl Applier {
         if ev.lsn <= self.applied_lsn {
             return Ok(false);
         }
-        match &ev.change {
+        Self::apply_change(sink, &ev.change)?;
+        // 仅在整个 compound change 成功后推进水位（sink 出错则水位不动，可重试）。
+        self.applied_lsn = ev.lsn;
+        Ok(true)
+    }
+
+    fn apply_change(sink: &mut dyn IndexSink, change: &Change) -> anyhow::Result<()> {
+        match change {
             Change::Upsert { collection, chunk } => sink.apply_upsert(collection, chunk)?,
             Change::Delete { gid } => sink.apply_delete(gid)?,
             Change::DeleteDoc { collection, doc_id } => {
                 sink.apply_delete_doc(collection, doc_id)?
             }
+            Change::Clear => sink.apply_clear()?,
+            Change::Batch(changes) => {
+                for change in changes {
+                    Self::apply_change(sink, change)?;
+                }
+            }
         }
-        // 仅在成功后推进水位（sink 出错则水位不动，可重试）。
-        self.applied_lsn = ev.lsn;
-        Ok(true)
+        Ok(())
     }
 
     /// 批量应用（输入按 LSN 升序），末尾 `commit`。返回实际应用条数。
@@ -111,6 +128,7 @@ mod tests {
         Upsert(GlobalId),
         Delete(GlobalId),
         DeleteDoc(String, String),
+        Clear,
         Commit,
     }
 
@@ -134,6 +152,10 @@ mod tests {
         fn apply_delete_doc(&mut self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
             self.ops
                 .push(Op::DeleteDoc(collection.into(), doc_id.into()));
+            Ok(())
+        }
+        fn apply_clear(&mut self) -> anyhow::Result<()> {
+            self.ops.push(Op::Clear);
             Ok(())
         }
         fn commit(&mut self) -> anyhow::Result<()> {
@@ -283,6 +305,37 @@ mod tests {
         let n = ap.apply_batch(&mut sink, &evs).unwrap();
         assert_eq!(n, 1);
         assert_eq!(sink.ops, vec![Op::Upsert(gid("a", 2)), Op::Commit]);
+    }
+
+    #[test]
+    fn compound_pk_update_preserves_delete_then_upsert_at_one_lsn() {
+        let mut sink = MockSink::default();
+        let mut ap = Applier::new(Lsn(0));
+        let event = ev(
+            Change::Batch(vec![
+                Change::Delete { gid: gid("old", 1) },
+                Change::Upsert {
+                    collection: "kb".into(),
+                    chunk: chunk("new", 2),
+                },
+            ]),
+            7,
+        );
+        assert!(ap.apply(&mut sink, &event).unwrap());
+        assert_eq!(
+            sink.ops,
+            vec![Op::Delete(gid("old", 1)), Op::Upsert(gid("new", 2))]
+        );
+        assert_eq!(ap.applied_lsn(), Lsn(7));
+    }
+
+    #[test]
+    fn truncate_clears_the_sink() {
+        let mut sink = MockSink::default();
+        let mut ap = Applier::new(Lsn(0));
+        assert!(ap.apply(&mut sink, &ev(Change::Clear, 9)).unwrap());
+        assert_eq!(sink.ops, vec![Op::Clear]);
+        assert_eq!(ap.applied_lsn(), Lsn(9));
     }
 
     #[test]

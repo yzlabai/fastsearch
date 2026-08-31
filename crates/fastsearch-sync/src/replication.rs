@@ -26,6 +26,8 @@ pub struct ReplicationConfig {
     pub slot: String,
     /// publication 名（应与 pg DDL 的 `fastsearch_pub` 一致）。
     pub publication: String,
+    /// 唯一允许映射为 chunk 变更的限定表名（`schema.table`）。
+    pub source_table: String,
 }
 
 /// 连接一个普通（非复制协议）客户端，后台驱动连接 future。
@@ -148,40 +150,46 @@ async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<Chang
     }
 
     // 逐条解码 + 映射，对**确定性毒丸**（parse/map 失败）容错跳过（R4.1b，见 `decode_batch_lenient`）。
-    let (mapped, dead) = decode_batch_lenient(&items);
+    let (mapped, dead) = decode_batch_lenient(&items, &cfg.source_table);
     if dead > 0 {
         eprintln!("cdc: 本批共跳过 {dead} 条毒丸变更（slot 仍推进，避免单条卡死整个 CDC）");
     }
 
     let mut out = Vec::with_capacity(mapped.len());
-    for (lsn, m) in mapped {
-        match m {
-            Mapped::Ready(change) => out.push(ChangeEvent { change, lsn }),
-            Mapped::Refetch {
-                table,
-                collection,
-                doc_id,
-                chunk_id,
-            } => {
-                // 不完整 WAL（UnchangedToast）→ 从 PG 真源重取整行（H3）。行已被删（后续 Delete 事件
-                // 会清）→ 跳过，不 push（幂等安全：重取当前真源，索引收敛到真值）。
-                // refetch 错误**不跳过而是传播**：可能是瞬时（连接抖动），传播使整批重试（peek 未
-                // advance slot，不丢数据）；确定性毒丸只在 decode/map 阶段（那里同字节必同错、重试无益）。
-                if let Some((coll, chunk)) =
-                    fastsearch_pg::fetch_chunk(&client, &table, &collection, &doc_id, chunk_id)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("refetch on unchanged-toast: {e}"))?
-                {
-                    out.push(ChangeEvent {
-                        change: Change::Upsert {
+    for (lsn, mapped_changes) in mapped {
+        let mut changes = Vec::with_capacity(mapped_changes.len());
+        for m in mapped_changes {
+            match m {
+                Mapped::Ready(change) => changes.push(change),
+                Mapped::Refetch {
+                    table,
+                    collection,
+                    doc_id,
+                    chunk_id,
+                } => {
+                    // 不完整 WAL（UnchangedToast）→ 从 PG 真源重取整行（H3）。行已被删（后续 Delete 事件
+                    // 会清）→ 跳过，不 push（幂等安全：重取当前真源，索引收敛到真值）。
+                    // refetch 错误**不跳过而是传播**：可能是瞬时（连接抖动），传播使整批重试（peek 未
+                    // advance slot，不丢数据）；确定性毒丸只在 decode/map 阶段（那里同字节必同错、重试无益）。
+                    if let Some((coll, chunk)) =
+                        fastsearch_pg::fetch_chunk(&client, &table, &collection, &doc_id, chunk_id)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("refetch on unchanged-toast: {e}"))?
+                    {
+                        changes.push(Change::Upsert {
                             collection: coll,
                             chunk: Box::new(chunk),
-                        },
-                        lsn,
-                    });
+                        });
+                    }
                 }
             }
         }
+        let change = match changes.len() {
+            0 => continue,
+            1 => changes.pop().expect("length checked"),
+            _ => Change::Batch(changes),
+        };
+        out.push(ChangeEvent { change, lsn });
     }
     Ok((out, max_lsn))
 }
@@ -190,14 +198,17 @@ async fn fetch_changes(cfg: &ReplicationConfig, func: &str) -> Result<(Vec<Chang
 /// 重试无益）→ 计入死信、跳过，不阻塞整批、不 poison CDC（R4.1b）。返回 (映射结果, 死信数)；
 /// Refetch 标记留调用方用 PG 解析。跳过一条 = 该 chunk 的派生索引可能漂移，靠"从真源重建"自愈
 /// （PG 是真源、索引派生可重建，不变量 #2）。**不含 refetch**——那是 PG I/O、可能瞬时，见调用处。
-fn decode_batch_lenient(items: &[(Lsn, Vec<u8>)]) -> (Vec<(Lsn, Mapped)>, usize) {
+fn decode_batch_lenient(
+    items: &[(Lsn, Vec<u8>)],
+    source_table: &str,
+) -> (Vec<(Lsn, Vec<Mapped>)>, usize) {
     let mut relations: HashMap<u32, Relation> = HashMap::new();
     let mut out = Vec::new();
     let mut dead = 0usize;
     for (lsn, data) in items {
-        match pgoutput::parse_message(data).and_then(|pg| map(&mut relations, pg)) {
-            Ok(Some(m)) => out.push((*lsn, m)),
-            Ok(None) => {}
+        match pgoutput::parse_message(data).and_then(|pg| map(&mut relations, source_table, pg)) {
+            Ok(mapped) if mapped.is_empty() => {}
+            Ok(mapped) => out.push((*lsn, mapped)),
             Err(e) => {
                 dead += 1;
                 eprintln!(
@@ -236,62 +247,103 @@ fn quoted_table(rel: &Relation) -> String {
     format!("\"{}\".\"{}\"", q(&rel.namespace), q(&rel.name))
 }
 
-/// pgoutput 消息 → 可选 Mapped。Relation 入缓存；Insert/Update→Upsert（完整）或 Refetch（含 'u'）；
-/// Delete→Delete；Begin/Commit/Origin/Type/Truncate → None（消化）。
-fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<Mapped>> {
+/// pgoutput 消息 → 零到多个有序 Mapped。Relation 入缓存；PK Update 可生成
+/// Delete(old)+Upsert(new)；Truncate 真源表生成 Clear；非白名单表与控制消息生成空 Vec。
+fn map(
+    relations: &mut HashMap<u32, Relation>,
+    source_table: &str,
+    pg: PgMessage,
+) -> Result<Vec<Mapped>> {
     match pg {
         PgMessage::Relation(r) => {
             relations.insert(r.oid, r);
-            Ok(None)
+            Ok(vec![])
         }
-        PgMessage::Insert { rel_oid, tuple }
-        | PgMessage::Update {
-            rel_oid,
-            new: tuple,
-            ..
-        } => {
+        PgMessage::Insert { rel_oid, tuple } => {
             let rel = relation(relations, rel_oid)?;
             // 非 chunks 表 → 不是我们的数据，静默忽略（不是毒丸，不计死信）。
-            if !relation_is_chunks(rel) {
-                return Ok(None);
+            if !relation_is_source_chunks(rel, source_table) {
+                return Ok(vec![]);
             }
-            if tuple_has_unchanged_toast(&tuple) {
-                // gid 列不 TOAST、必在 → 取出后交 fetch_changes 从真源重取整行（不再对 'u' 报错卡死）。
-                let m = cols(rel, &tuple);
-                return Ok(Some(Mapped::Refetch {
-                    table: quoted_table(rel),
-                    collection: get(&m, "collection")?.to_string(),
-                    doc_id: get(&m, "doc_id")?.to_string(),
-                    chunk_id: get(&m, "chunk_id")?.parse().context("chunk_id")?,
+            Ok(vec![map_upsert(rel, tuple)?])
+        }
+        PgMessage::Update {
+            rel_oid,
+            key,
+            old,
+            new,
+        } => {
+            let rel = relation(relations, rel_oid)?;
+            if !relation_is_source_chunks(rel, source_table) {
+                return Ok(vec![]);
+            }
+            let new_gid = row_to_gid(rel, &new)?;
+            let upsert = map_upsert(rel, new)?;
+            let old_gid = key
+                .or(old)
+                .map(|tuple| row_to_gid(rel, &tuple))
+                .transpose()?;
+            let mut out = Vec::with_capacity(2);
+            if old_gid.as_ref().is_some_and(|old_gid| old_gid != &new_gid) {
+                out.push(Mapped::Ready(Change::Delete {
+                    gid: old_gid.expect("checked Some"),
                 }));
             }
-            let (collection, chunk) = row_to_chunk(rel, &tuple)?;
-            Ok(Some(Mapped::Ready(Change::Upsert {
-                collection,
-                chunk: Box::new(chunk),
-            })))
+            out.push(upsert);
+            Ok(out)
         }
         PgMessage::Delete { rel_oid, key, old } => {
             let rel = relation(relations, rel_oid)?;
             // **本守卫的主要目标**：见 `relation_is_chunks`。少了它，一张恰好有 gid 三列的
             // 旁表（如 `chunk_signal`）的 DELETE 会被当成 chunk 删除执行。
-            if !relation_is_chunks(rel) {
-                return Ok(None);
+            if !relation_is_source_chunks(rel, source_table) {
+                return Ok(vec![]);
             }
             let tuple = key
                 .or(old)
                 .context("Delete without key/old tuple (need REPLICA IDENTITY)")?;
-            Ok(Some(Mapped::Ready(Change::Delete {
+            Ok(vec![Mapped::Ready(Change::Delete {
                 gid: row_to_gid(rel, &tuple)?,
-            })))
+            })])
         }
-        _ => Ok(None),
+        PgMessage::Truncate { rel_oids, .. } => {
+            let clears_source = rel_oids.iter().any(|oid| {
+                relations
+                    .get(oid)
+                    .is_some_and(|rel| relation_is_source_chunks(rel, source_table))
+            });
+            Ok(if clears_source {
+                vec![Mapped::Ready(Change::Clear)]
+            } else {
+                vec![]
+            })
+        }
+        _ => Ok(vec![]),
     }
 }
 
-/// 该 Relation 看起来是不是 **chunks 真源表**（按**声明的列集合**判，不看元组）。
+fn map_upsert(rel: &Relation, tuple: TupleData) -> Result<Mapped> {
+    if tuple_has_unchanged_toast(&tuple) {
+        // gid 列不 TOAST、必在 → 取出后交 fetch_changes 从真源重取整行（不再对 'u' 报错卡死）。
+        let m = cols(rel, &tuple);
+        return Ok(Mapped::Refetch {
+            table: quoted_table(rel),
+            collection: get(&m, "collection")?.to_string(),
+            doc_id: get(&m, "doc_id")?.to_string(),
+            chunk_id: get(&m, "chunk_id")?.parse().context("chunk_id")?,
+        });
+    }
+    let (collection, chunk) = row_to_chunk(rel, &tuple)?;
+    Ok(Mapped::Ready(Change::Upsert {
+        collection,
+        chunk: Box::new(chunk),
+    }))
+}
+
+/// 该 Relation 是否是配置指定的 **chunks 真源表**：先按 `schema.table` 精确匹配，
+/// 再检查声明列集合（双守卫，不看元组）。
 ///
-/// **为什么需要这道守卫**：[`map`] 只按 `rel_oid` 取 Relation、从不校验表身份，而
+/// **为什么需要这道守卫**：旧 [`map`] 只按 `rel_oid` 取 Relation、不校验表身份，而
 /// [`row_to_gid`] 只需要 `collection`/`doc_id`/`chunk_id` 三列。任何**恰好也有这三列**的表
 /// （如设计中的 `chunk_signal`——它的主键正是这三列 + `signal_type`）一旦进了同一个 publication，
 /// 它的一条 DELETE 就会被映射成 `Change::Delete{gid}`，**把整个 chunk 从派生索引里删掉**。
@@ -299,15 +351,23 @@ fn map(relations: &mut HashMap<u32, Relation>, pg: PgMessage) -> Result<Option<M
 /// **只有 Delete 侧完全没有防护**——这道不对称正是本守卫要补的。
 ///
 /// 此前"安全"只是因为 DDL 用 `ALTER PUBLICATION … SET TABLE`（**替换**语义）使 publication
-/// 恒为单表，属于**碰巧**而非设计。守卫把它变成显式的：非 chunks 形状的 relation 一律不产生变更。
+/// 恒为单表，属于**碰巧**而非设计。FS-101 起 `ReplicationConfig.source_table` 把唯一允许的
+/// Relation 显式传入；即使旁表列形状完全相同，名字不匹配也不产生变更。
 ///
-/// 判据取 gid 三列 + `kind`/`text`——后两列是 chunks 表 NOT NULL 的正文列，
-/// 信号表/作业表都不会有（见 `fastsearch-pg` 的 `ddl`）。
-fn relation_is_chunks(rel: &Relation) -> bool {
+/// 列形状作为第二道防错，取 gid 三列 + `kind`/`text`——后两列是 chunks 表 NOT NULL 的正文列
+///（见 `fastsearch-pg` 的 `ddl`）；配置指错到别的表时不会仅凭名字就开始删索引。
+fn relation_is_source_chunks(rel: &Relation, source_table: &str) -> bool {
+    if qualified_table_name(rel) != source_table {
+        return false;
+    }
     const REQUIRED: [&str; 5] = ["collection", "doc_id", "chunk_id", "kind", "text"];
     REQUIRED
         .iter()
         .all(|need| rel.columns.iter().any(|c| c.name == *need))
+}
+
+fn qualified_table_name(rel: &Relation) -> String {
+    format!("{}.{}", rel.namespace, rel.name)
 }
 
 fn relation(relations: &HashMap<u32, Relation>, oid: u32) -> Result<&Relation> {
@@ -455,6 +515,8 @@ fn esc(s: &str) -> String {
 mod tests {
     use super::*;
 
+    const SOURCE_TABLE: &str = "public.fastsearch_chunks";
+
     #[test]
     fn pg_array_parsing() {
         assert_eq!(parse_pg_array("{}"), Vec::<String>::new());
@@ -513,6 +575,120 @@ mod tests {
         }
     }
 
+    fn chunk_tuple(collection: &str, doc_id: &str, chunk_id: &str, text: &str) -> TupleData {
+        let value = |s: &str| TupleValue::Bytes(s.as_bytes().to_vec());
+        TupleData {
+            values: vec![
+                value(collection),
+                value(doc_id),
+                value(chunk_id),
+                value("paragraph"),
+                value(text),
+                value("{}"),
+                value("t"),
+                value("1"),
+                value(r#"{"x0":0,"y0":0,"x1":1,"y1":1}"#),
+                value("{}"),
+                value("0"),
+                value("4"),
+                value("text"),
+                TupleValue::Null,
+                TupleValue::Null,
+                TupleValue::Null,
+                TupleValue::Null,
+                TupleValue::Null,
+                value("{public}"),
+            ],
+        }
+    }
+
+    #[test]
+    fn pk_update_maps_delete_old_then_upsert_new() {
+        let mut relations = HashMap::new();
+        relations.insert(9, rel_with(9, "fastsearch_chunks", fastsearch_pg::COLUMNS));
+        let out = map(
+            &mut relations,
+            SOURCE_TABLE,
+            PgMessage::Update {
+                rel_oid: 9,
+                key: Some(text_tuple(&["kb", "old.pdf", "1"])),
+                old: None,
+                new: chunk_tuple("kb2", "new.pdf", "2", "next"),
+            },
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            Mapped::Ready(Change::Delete { gid }) => {
+                assert_eq!(gid.to_citation_id(), "kb:old.pdf:1");
+            }
+            _ => panic!("PK UPDATE 第一条必须删除旧 gid"),
+        }
+        match &out[1] {
+            Mapped::Ready(Change::Upsert { collection, chunk }) => {
+                assert_eq!(collection, "kb2");
+                assert_eq!(
+                    chunk.global_id(collection).to_citation_id(),
+                    "kb2:new.pdf:2"
+                );
+            }
+            _ => panic!("PK UPDATE 第二条必须写入新 gid"),
+        }
+    }
+
+    #[test]
+    fn unchanged_pk_update_maps_only_upsert() {
+        let mut relations = HashMap::new();
+        relations.insert(9, rel_with(9, "fastsearch_chunks", fastsearch_pg::COLUMNS));
+        let out = map(
+            &mut relations,
+            SOURCE_TABLE,
+            PgMessage::Update {
+                rel_oid: 9,
+                key: Some(text_tuple(&["kb", "same.pdf", "1"])),
+                old: None,
+                new: chunk_tuple("kb", "same.pdf", "1", "next"),
+            },
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1, "主键未变不应先删再写");
+        assert!(matches!(out[0], Mapped::Ready(Change::Upsert { .. })));
+    }
+
+    #[test]
+    fn truncate_source_table_maps_clear() {
+        let mut relations = HashMap::new();
+        relations.insert(9, rel_with(9, "fastsearch_chunks", fastsearch_pg::COLUMNS));
+        relations.insert(10, rel_with(10, "other", fastsearch_pg::COLUMNS));
+        let out = map(
+            &mut relations,
+            SOURCE_TABLE,
+            PgMessage::Truncate {
+                options: 0,
+                rel_oids: vec![10, 9],
+            },
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Mapped::Ready(Change::Clear)));
+    }
+
+    #[test]
+    fn same_shape_wrong_table_is_ignored_by_name_whitelist() {
+        let mut relations = HashMap::new();
+        relations.insert(10, rel_with(10, "shadow_chunks", fastsearch_pg::COLUMNS));
+        let out = map(
+            &mut relations,
+            SOURCE_TABLE,
+            PgMessage::Insert {
+                rel_oid: 10,
+                tuple: chunk_tuple("kb", "shadow.pdf", "1", "shadow"),
+            },
+        )
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
     /// **旁表的 DELETE 绝不能被当成 chunk 删除。**
     ///
     /// `map` 只按 `rel_oid` 取 Relation、不校验表身份，而 `row_to_gid` 只要
@@ -531,6 +707,7 @@ mod tests {
 
         let out = map(
             &mut relations,
+            SOURCE_TABLE,
             PgMessage::Delete {
                 rel_oid: 77,
                 key: Some(text_tuple(&["kb", "r.pdf", "1", "vlm_caption"])),
@@ -539,7 +716,7 @@ mod tests {
         )
         .expect("旁表不该报错——它只是不关我们的事");
         assert!(
-            out.is_none(),
+            out.is_empty(),
             "旁表 DELETE 必须被忽略；映射成 Change::Delete 会误删整个 chunk"
         );
     }
@@ -558,6 +735,7 @@ mod tests {
         );
         let out = map(
             &mut relations,
+            SOURCE_TABLE,
             PgMessage::Delete {
                 rel_oid: 9,
                 key: Some(text_tuple(&["kb", "r.pdf", "1", "paragraph", "正文"])),
@@ -565,15 +743,16 @@ mod tests {
             },
         )
         .unwrap();
-        match out {
-            Some(Mapped::Ready(Change::Delete { gid })) => {
+        match out.as_slice() {
+            [Mapped::Ready(Change::Delete { gid })] => {
                 assert_eq!(gid.collection, "kb");
                 assert_eq!(gid.doc_id, "r.pdf");
                 assert_eq!(gid.chunk_id, 1);
             }
-            Some(Mapped::Refetch { .. }) => panic!("DELETE 不该走 Refetch 路径"),
-            None => panic!("真 chunks 表的 DELETE 必须映射成 Change::Delete，却被忽略了"),
-            Some(Mapped::Ready(other)) => panic!("期望 Change::Delete，得到 {other:?}"),
+            [Mapped::Refetch { .. }] => panic!("DELETE 不该走 Refetch 路径"),
+            [] => panic!("真 chunks 表的 DELETE 必须映射成 Change::Delete，却被忽略了"),
+            [Mapped::Ready(other)] => panic!("期望 Change::Delete，得到 {other:?}"),
+            _ => panic!("DELETE 应只映射一条变更"),
         }
     }
 
@@ -593,7 +772,7 @@ mod tests {
             (Lsn(2), truncated.clone()),
             (Lsn(3), truncated),
         ];
-        let (out, dead) = decode_batch_lenient(&items);
+        let (out, dead) = decode_batch_lenient(&items, SOURCE_TABLE);
         assert_eq!(dead, 2, "两条毒丸应计入死信并跳过");
         assert!(
             out.is_empty(),

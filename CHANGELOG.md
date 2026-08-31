@@ -7,6 +7,9 @@ release.
 
 ## [Unreleased]
 
+- Logical-replication CDC now handles primary-key changes as an ordered delete
+  plus upsert, clears derived text/vector indexes after source-table truncation,
+  and filters relations through an exact configurable `schema.table` name.
 - Multi-representation chunk signals, asynchronous ingestion jobs, and
   deployment-gated release validation remain planned in the active iteration.
 

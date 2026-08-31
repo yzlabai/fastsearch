@@ -2001,6 +2001,11 @@ impl fastsearch_sync::IndexSink for Engine {
         self.vector.delete_doc(collection, doc_id)?;
         Ok(())
     }
+    fn apply_clear(&mut self) -> anyhow::Result<()> {
+        self.text.clear()?;
+        self.vector.clear();
+        Ok(())
+    }
     fn commit(&mut self) -> anyhow::Result<()> {
         self.text.commit()?;
         Ok(())

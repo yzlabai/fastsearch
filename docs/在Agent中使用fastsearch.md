@@ -306,6 +306,7 @@ FASTSEARCH_KEYS="alice=acme:team-a,public; bob=acme:team-b; admin=:public"
 | `FASTSEARCH_EMBEDDER` | `ollama`\|`openai`（+ `FASTSEARCH_EMBED_*`）→ 真语义嵌入（开 vector/hybrid） |
 | `FASTSEARCH_VECTOR_BACKEND` | `brute`(默认确定)\|`hnsw`(大规模近似)\|`pgvector`(直查，需 `DATABASE_URL`) |
 | `FASTSEARCH_CDC=1` | 开后台 CDC：PG 写 → 逻辑复制 → 自动嵌入 → 索引（需 `DATABASE_URL`） |
+| `FASTSEARCH_CDC_SOURCE_TABLE` | CDC 真源表精确白名单，格式 `schema.table`（默认 `public.fastsearch_chunks`）；必须与 publication 中的表一致 |
 | `FASTSEARCH_RATE_LIMIT` | `cap,refill`（每 key 令牌桶，超限 429） |
 | `FASTSEARCH_AUDIT=1` | 每个成功请求向 stderr 输出审计 JSON |
 | `FASTSEARCH_TOKENIZER` | `jieba`(默认,中文)\|`default`(空白切分) |
