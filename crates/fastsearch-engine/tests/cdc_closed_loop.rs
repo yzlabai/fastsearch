@@ -6,7 +6,9 @@
 //! 未设 `DATABASE_URL` 则跳过（不算失败）。本测试自清理（重置 slot/publication/表），
 //! 与运行顺序无关。
 
-use fastsearch_core::{BBox, Chunk, ChunkKind, SearchMode, SearchRequest};
+use fastsearch_core::{
+    BBox, Chunk, ChunkKind, SearchMode, SearchRequest, Signal, SignalStatus, SignalType,
+};
 use fastsearch_engine::Engine;
 use fastsearch_pg::{PgConfig, PgStore};
 use fastsearch_sync::replication::{
@@ -98,7 +100,9 @@ async fn reset(url: &str, slot: &str) {
         .await;
     let _ = client
         .batch_execute(
-            "DROP PUBLICATION IF EXISTS fastsearch_pub; DROP TABLE IF EXISTS fastsearch_chunks;",
+            "DROP PUBLICATION IF EXISTS fastsearch_pub; \
+             DROP TABLE IF EXISTS fastsearch_chunks_signal; \
+             DROP TABLE IF EXISTS fastsearch_chunks;",
         )
         .await;
 }
@@ -188,6 +192,95 @@ async fn cdc_closed_loop_pg_to_search() {
 
     // 7) 清理 slot（避免 WAL 滞留）。
     drop_slot(&rcfg).await.expect("drop_slot");
+}
+
+/// FS-201 T8: source writes reconcile signal truth in the same transaction, while chunks-only
+/// CDC replays the updated chunk without treating sibling signal rows as poison or deletes.
+#[tokio::test]
+async fn cdc_chunk_replay_converges_signal_invalidation() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skip cdc_chunk_replay_converges_signal_invalidation: DATABASE_URL not set");
+        return;
+    };
+    let _guard = serial_guard().await;
+    let slot = "fastsearch_fs201_signal_replay_test";
+    let rcfg = ReplicationConfig {
+        url: url.clone(),
+        slot: slot.into(),
+        publication: "fastsearch_pub".into(),
+        source_table: "public.fastsearch_chunks".into(),
+    };
+    reset(&url, slot).await;
+    let store = PgStore::connect(PgConfig::new(url.clone()))
+        .await
+        .expect("pg connect");
+    store.ensure_schema().await.expect("schema");
+    ensure_slot(&rcfg).await.expect("slot");
+
+    let initial = chunk("signals.pdf", 1, "old body marker");
+    let gid = initial.global_id("kb");
+    store
+        .upsert_doc("kb", "signals.pdf", std::slice::from_ref(&initial))
+        .await
+        .expect("initial chunk");
+    for signal_type in SignalType::ALL {
+        store
+            .upsert_signal(&Signal {
+                gid: gid.clone(),
+                signal_type,
+                status: SignalStatus::Ready,
+                embedding: Some(vec![1.0, 2.0]),
+                ..Signal::default()
+            })
+            .await
+            .expect("signal");
+    }
+    // Consume initial chunk so the next poll isolates the update transaction.
+    let mut engine = Engine::create_in_ram(TextIndexConfig::default()).expect("engine");
+    let mut applier = Applier::new(Lsn(0));
+    let first = pull_changes(&rcfg).await.expect("initial pull");
+    assert_eq!(applier.apply_batch(&mut engine, &first).unwrap(), 1);
+
+    let changed = chunk("signals.pdf", 1, "new body marker");
+    store
+        .upsert_doc("kb", "signals.pdf", std::slice::from_ref(&changed))
+        .await
+        .expect("changed chunk");
+    let update = pull_changes(&rcfg).await.expect("update pull");
+    assert_eq!(
+        update.len(),
+        2,
+        "doc replace remains delete+insert for one chunk"
+    );
+    assert_eq!(applier.apply_batch(&mut engine, &update).unwrap(), 2);
+
+    let signals = store
+        .fetch_signals(&gid)
+        .await
+        .expect("signals after replay");
+    assert_eq!(signals.len(), 5, "signal rows must not enter or poison CDC");
+    for signal in signals {
+        let expected = if signal.signal_type.binds_body() {
+            SignalStatus::Stale
+        } else {
+            SignalStatus::Ready
+        };
+        assert_eq!(signal.status, expected, "{:?}", signal.signal_type);
+    }
+    let hits = engine
+        .search(
+            &SearchRequest {
+                query: "new body marker".into(),
+                mode: SearchMode::Keyword,
+                top_k: 5,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("search new body");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, gid);
+    drop_slot(&rcfg).await.expect("drop slot");
 }
 
 /// FS-101：一条 PK UPDATE 必须按同一 WAL/LSN 有序执行 Delete(old)+Upsert(new)；

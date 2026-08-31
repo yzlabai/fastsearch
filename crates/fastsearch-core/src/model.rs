@@ -198,6 +198,161 @@ impl ImageVectorStatus {
     }
 }
 
+/// A named representation attached to one chunk. Adding a variant requires explicitly
+/// deciding which source relationships invalidate it in [`SignalType::binds_body`] and
+/// [`SignalType::binds_artifact`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalType {
+    UserText,
+    Ocr,
+    Asr,
+    VlmCaption,
+    ImageBytes,
+}
+
+impl SignalType {
+    pub const ALL: [SignalType; 5] = [
+        SignalType::UserText,
+        SignalType::Ocr,
+        SignalType::Asr,
+        SignalType::VlmCaption,
+        SignalType::ImageBytes,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignalType::UserText => "user_text",
+            SignalType::Ocr => "ocr",
+            SignalType::Asr => "asr",
+            SignalType::VlmCaption => "vlm_caption",
+            SignalType::ImageBytes => "image_bytes",
+        }
+    }
+
+    /// Whether the signal asserts a relationship to `chunks.text`.
+    pub fn binds_body(self) -> bool {
+        match self {
+            SignalType::UserText | SignalType::Ocr | SignalType::Asr => true,
+            SignalType::VlmCaption | SignalType::ImageBytes => false,
+        }
+    }
+
+    /// Whether the signal asserts a relationship to the chunk media artifact.
+    pub fn binds_artifact(self) -> bool {
+        match self {
+            SignalType::UserText => false,
+            SignalType::Ocr | SignalType::Asr | SignalType::VlmCaption | SignalType::ImageBytes => {
+                true
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for SignalType {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "user_text" => Ok(SignalType::UserText),
+            "ocr" => Ok(SignalType::Ocr),
+            "asr" => Ok(SignalType::Asr),
+            "vlm_caption" => Ok(SignalType::VlmCaption),
+            "image_bytes" => Ok(SignalType::ImageBytes),
+            other => Err(CoreError::InvalidRequest(format!(
+                "unknown signal type '{other}'"
+            ))),
+        }
+    }
+}
+
+/// Lifecycle of one named chunk representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalStatus {
+    Pending,
+    Ready,
+    Stale,
+    Failed,
+    Unsupported,
+}
+
+impl SignalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignalStatus::Pending => "pending",
+            SignalStatus::Ready => "ready",
+            SignalStatus::Stale => "stale",
+            SignalStatus::Failed => "failed",
+            SignalStatus::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl std::str::FromStr for SignalStatus {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(SignalStatus::Pending),
+            "ready" => Ok(SignalStatus::Ready),
+            "stale" => Ok(SignalStatus::Stale),
+            "failed" => Ok(SignalStatus::Failed),
+            "unsupported" => Ok(SignalStatus::Unsupported),
+            other => Err(CoreError::InvalidRequest(format!(
+                "unknown signal status '{other}'"
+            ))),
+        }
+    }
+}
+
+/// One durable, named representation for a chunk. Hashes and `embedding_dim` are populated by
+/// the Postgres source-of-truth layer; callers do not choose those derived values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Signal {
+    pub gid: GlobalId,
+    pub signal_type: SignalType,
+    pub status: SignalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dim: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Default for Signal {
+    fn default() -> Self {
+        Self {
+            gid: GlobalId {
+                collection: String::new(),
+                doc_id: String::new(),
+                chunk_id: 0,
+            },
+            signal_type: SignalType::UserText,
+            status: SignalStatus::Pending,
+            model: None,
+            model_version: None,
+            artifact_hash: None,
+            body_hash: None,
+            signal_text: None,
+            embedding: None,
+            embedding_dim: None,
+            error: None,
+        }
+    }
+}
+
 /// 图片 chunk 的渲染/审计元数据（非图片 chunk 为 None）。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ImageMeta {
@@ -398,6 +553,49 @@ impl Citation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_binding_rules_are_exhaustive_and_stable() {
+        let cases = [
+            (SignalType::UserText, true, false, "user_text"),
+            (SignalType::Ocr, true, true, "ocr"),
+            (SignalType::Asr, true, true, "asr"),
+            (SignalType::VlmCaption, false, true, "vlm_caption"),
+            (SignalType::ImageBytes, false, true, "image_bytes"),
+        ];
+
+        for (signal_type, body, artifact, stable_name) in cases {
+            assert_eq!(signal_type.binds_body(), body);
+            assert_eq!(signal_type.binds_artifact(), artifact);
+            assert_eq!(signal_type.as_str(), stable_name);
+            assert_eq!(stable_name.parse::<SignalType>().unwrap(), signal_type);
+        }
+        assert!("unknown".parse::<SignalType>().is_err());
+        assert!("unknown".parse::<SignalStatus>().is_err());
+    }
+
+    #[test]
+    fn signal_model_roundtrips_auditable_fields() {
+        let signal = Signal {
+            gid: GlobalId {
+                collection: "kb".into(),
+                doc_id: "dir:sub:report.pdf".into(),
+                chunk_id: 9,
+            },
+            signal_type: SignalType::VlmCaption,
+            status: SignalStatus::Failed,
+            model: Some("ovis-ocr2".into()),
+            model_version: Some("v2".into()),
+            artifact_hash: Some("artifact-1".into()),
+            body_hash: None,
+            signal_text: Some("毛利率趋势图".into()),
+            embedding: None,
+            embedding_dim: None,
+            error: Some("asset unavailable".into()),
+        };
+        let json = serde_json::to_string(&signal).unwrap();
+        assert_eq!(serde_json::from_str::<Signal>(&json).unwrap(), signal);
+    }
 
     #[test]
     fn modality_derivation_and_serde() {

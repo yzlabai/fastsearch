@@ -1,8 +1,7 @@
 # KB-2.1 `chunk_signal` 多表示子表设计
 
-> 日期：2026-08-25 · 状态：**设计（未实施）**——本文只产出设计与验收，不改 `crates/` 下任何代码
-> （[迭代计划 §11.3-3](2026-08-24-知识库引擎迭代计划.md)）。本机**无 `DATABASE_URL`**，
-> 一切涉 PG 的结论一律标 `待运行验证`。
+> 日期：2026-08-25 · 状态：**FS-201 已完成（2026-08-31）**
+> D1–D4 已关闭，§8 T1–T12 已在 Docker pgvector:pg17 真库验证；完成摘要见 §14。
 > 上游条目：[知识库引擎迭代计划 §4 KB-2.1](2026-08-24-知识库引擎迭代计划.md)（含两条"必答的既有约束"）
 > 来源：[FastGPT 参考建议 §5.2-2 复核补充 / §P1-1](2026-08-24-fastgpt知识库与多模态检索参考建议.md)
 > 相关 spec：[12-pg](../specs/12-pg.md)、[13-sync](../specs/13-sync.md)、[10-core](../specs/10-core.md)
@@ -26,7 +25,7 @@ DDL 保持现有 `SET TABLE` 不改。任何第二张表（`chunk_signal`、`ing
 
 ## 1. 要做什么
 
-新增一张 PG 子表 `fastsearch_chunk_signal`，让**一个 chunk 能诚实地持有多路表示/信号**，
+新增一张 PG 子表 `{chunks_table}_signal`（默认 `fastsearch_chunks_signal`），让**一个 chunk 能诚实地持有多路表示/信号**，
 每一路都知道自己**来自谁、用什么模型、什么版本、当前什么状态、输入工件是什么**。
 
 - 键：`(collection, doc_id, chunk_id, signal_type)`——即 `GlobalId` + 信号类型。
@@ -68,13 +67,13 @@ ALTER PUBLICATION fastsearch_pub SET TABLE {table} ({collist});
 （且整段包在事务 + `pg_advisory_xact_lock` 里）。
 ⇒ **任何在别处 `ALTER PUBLICATION … ADD TABLE` 进来的第二张表，会在下次 server 启动时被静默移除。**
 
-### 3.2 但真正的风险不是"被移除"，而是"没被移除"——一条新发现的误删链路
+### 3.2 风险链路与已落地的双重防御
 
 比"表被悄悄踢出去"严重得多的是**表真的留在流里**。读
 `crates/fastsearch-sync/src/replication.rs` 的 `map` / `row_to_chunk` / `row_to_gid` 后确认：
 
-- `map` 只按 `rel_oid` 去 `relations` 缓存里取 `Relation`，**从不校验 `rel.name`**——
-  publication 里有几张表，解码器就把几张表的行**一视同仁当 chunk 行**处理。
+- 设计时 `map` 只按 `rel_oid` 取 `Relation`、未校验表名；**FS-101 已先行落地**
+  `ReplicationConfig.source_table` 精确表名 + chunks 列形状双守卫，旁表消息会被忽略。
 - `Insert`/`Update` → `row_to_chunk`，它 `get(&m, "kind")` / `get(&m, "text")` 取不到列就报错。
   该错误被 `decode_batch_lenient` 当**确定性毒丸**吞掉：计入死信、打一行 stderr、
   **slot 照常推进**。即：一张误入流的新表会让 CDC 持续刷死信日志，而不是显式失败。
@@ -84,7 +83,7 @@ ALTER PUBLICATION fastsearch_pub SET TABLE {table} ({collist});
   **把整个 chunk 从全文 + 向量派生索引里删掉**。
 
 ⇒ 结论：**"新表不进 publication"不是保守，是当前解码器的正确性前提。**
-在 `map` 具备 relation 白名单之前，任何新表进流都会造成"静默毒丸 + 误删 chunk"。
+因此 FS-201 上线时已有两层防御：DDL 不让旁表进流，解码器即使遇到误配消息也以白名单忽略。
 这条也顺带说明：`SET TABLE` 的替换语义在今天**恰好是一道安全网**——它会把误加的表踢出去。
 
 ### 3.3 决策：选 A —— `fastsearch_pub` 永远单表
@@ -104,7 +103,7 @@ ALTER PUBLICATION fastsearch_pub SET TABLE {table} ({collist});
    （`ADD` / `SET` / `DROP`）。要在**保留其他表**的前提下把 `fastsearch_chunks` 的**列清单**
    收敛到新的 `COLUMNS`（这正是现有 `SET TABLE` 分支存在的理由——让 additive 源列进入既有部署的 CDC），
    就必须 `DROP TABLE` + `ADD TABLE (collist)` 两条语句，并依赖它们在同一事务内原子生效。
-   而"一张表短暂不在 publication 中对并发逻辑解码的影响"是 `[待验证]` 的（本机无 PG）。
+   而"一张表短暂不在 publication 中对并发逻辑解码的影响"仍未验证；方案 B 已被否决，不为无需求的路径扩大验收面。
    A 一条 `SET TABLE` 就完成收敛，无窗口、无待验证项。
 4. **逃生门已经存在，且不需要动 DDL**：CDC 消费侧
    （`crates/fastsearch-sync/src/replication.rs` 的 `fetch_changes`）把
@@ -122,14 +121,12 @@ ALTER PUBLICATION fastsearch_pub SET TABLE {table} ({collist});
 1. **把隐性契约写成显式契约**：在 `crates/fastsearch-pg/src/sql.rs` 的 `PUBLICATION` 常量处
    写明"本 publication 专属 `fastsearch_chunks`，永不多表；第二张表另建 publication"。
 2. **纯函数单测钉死单表**：断言 `ddl()` 生成的 publication 语句中出现的表名有且只有入参 `table`。
-3. **集成测试把"静默移除"从 bug 升格为契约**（`待运行验证`）：手工
-   `ALTER PUBLICATION fastsearch_pub ADD TABLE fastsearch_chunk_signal` →
+3. **集成测试把"静默移除"从 bug 升格为契约**（已在 pgvector:pg17 验证）：手工
+   `ALTER PUBLICATION fastsearch_pub ADD TABLE fastsearch_chunks_signal` →
    再跑一次 `ensure_schema` → 断言 `pg_publication_rel` 里只剩 `fastsearch_chunks`。
    **这是期望行为，不是缺陷。**
 4. **给未来的第二张表留下唯一合法路径**：若哪天真要让 `chunk_signal` 进 CDC，
-   **前置条件是先给 `fastsearch-sync::replication::map` 加 relation 白名单**
-   （按 `rel.name` 判定，非 chunks 表的消息一律 `Ok(None)` 消化掉），
-   否则 §3.2 的误删链路立即成立。这条写进 13-sync 的"下一迭代"。
+   另建 publication 和独立消费语义；FS-101 已落地的 relation 白名单仍必须保留，不得以列形状代替表身份。
 
 ### 3.5 对既有部署的升级影响
 
@@ -138,7 +135,7 @@ ALTER PUBLICATION fastsearch_pub SET TABLE {table} ({collist});
 - **唯一需要主动告知的人群**：曾**手工**往 `fastsearch_pub` 里 `ADD TABLE` 过自有表的部署方。
   他们的表在下次 server 启动时会被移除——**这是现状行为，不是本次引入的**，
   本次只是把它写进文档并加测试钉死。给他们的迁移指引就是 §3.3-4 的逃生门（另建 publication）。
-- 回滚：`DROP TABLE fastsearch_chunk_signal;` 即可，`fastsearch_chunks` 与 publication 零改动（见 §9）。
+- 回滚：`DROP TABLE {chunks_table}_signal;` 即可，chunks 主表与 publication 零改动（见 §9）。
 
 ### 3.6 给 KB-3.1（`ingest_job`）的结论引用
 
@@ -157,7 +154,7 @@ KB-3.1 的 spec 直接引用本节即可，**不得重新定夺**（迭代计划
 生成，并入 `ddl()` 返回的语句序列（`ensure_schema` 已把整段包进事务 + advisory lock，无需额外并发处理）。
 
 ```sql
-CREATE TABLE IF NOT EXISTS fastsearch_chunk_signal (
+CREATE TABLE IF NOT EXISTS fastsearch_chunks_signal (
   collection      text   NOT NULL,
   doc_id          text   NOT NULL,
   chunk_id        bigint NOT NULL,
@@ -174,18 +171,18 @@ CREATE TABLE IF NOT EXISTS fastsearch_chunk_signal (
   updated_at      timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (collection, doc_id, chunk_id, signal_type)
 );
-CREATE INDEX IF NOT EXISTS fastsearch_chunk_signal_doc
-  ON fastsearch_chunk_signal (collection, doc_id);
-CREATE INDEX IF NOT EXISTS fastsearch_chunk_signal_worklist
-  ON fastsearch_chunk_signal (signal_type, status);
+CREATE INDEX IF NOT EXISTS fastsearch_chunks_signal_doc
+  ON fastsearch_chunks_signal (collection, doc_id);
+CREATE INDEX IF NOT EXISTS fastsearch_chunks_signal_worklist
+  ON fastsearch_chunks_signal (signal_type, status);
 ```
 
 对齐既有风格的几处刻意选择：
 
 - **表名跟随主表**：`{chunks_table}_signal`（默认 `fastsearch_chunks_signal`）或固定
-  `fastsearch_chunk_signal`——`PgConfig.table` 可配（`crates/fastsearch-pg/src/lib.rs`），
-  故信号表名必须**由主表名派生**，并同样过 `validate_identifier`。`[待决策 D1]`：派生规则取
-  `format!("{table}_signal")`（简单、随主表隔离多部署）——推荐这条，本文按它写。
+  `fastsearch_chunks_signal`——`PgConfig.table` 可配（`crates/fastsearch-pg/src/lib.rs`），
+  故信号表名必须**由主表名派生**，并同样过 `validate_identifier`。`[D1 已裁定]`：派生规则取
+  `format!("{table}_signal")`，随主表隔离多部署。
 - **不加 `CHECK` 约束**：与 `chunks.kind`（`text` 列 + Rust 侧 `kind_from_str` 报错）保持一致的
   惯例——词表在 Rust 侧收口，加新 `signal_type` 不需要 schema 迁移。
 - **不加外键**：见 §5.4，`upsert_doc` 的 doc 级 delete+insert 会让 `ON DELETE CASCADE`
@@ -216,11 +213,11 @@ pgvector 的 `vector`/`halfvec` 列**必须有固定 typmod 才能建 ANN 索引
 第一个真实的视觉信号就**写不进真源**（维度不符被 pgvector 拒收）——
 直接破坏不变量 #2（PG 是真源、派生可重建）。
 
-⇒ 本迭代取 **`real[]`**（PG 核心数组类型，IEEE single 无损，任意维，零扩展依赖）：
+⇒ `[D2 已裁定]` 本迭代取 **`real[]`**（PG 核心数组类型，IEEE single 无损，任意维，零扩展依赖）：
 
 - 保住"真源存得下任意一路向量、派生索引可从 PG 重建"；
 - 明确**不承诺**在信号表上做 ANN——本迭代信号表不进读路径，不需要；
-- `[待决策 D2]`：等 KB-2.2 真要在 PG 直查某一路时，再在**那时**选
+- `[FS-202 待决策]`：等 KB-2.2 真要在 PG 直查某一路时，再在**那时**选
   "按 dim 各开一个 typed 列 + 各自 HNSW" / "按 `signal_type` 分区表" / "只在引擎侧持多路向量"。
   两条约束先记下：① 只能用 pgvector + 普通表能力（不变量 #1）；
   ② 任何 typed 列都要有对应 opclass（`ann_index_sql` 的 `cosine_opclass` 已有先例：
@@ -258,7 +255,7 @@ pgvector 的 `vector`/`halfvec` 列**必须有固定 typmod 才能建 ANN 索引
 守不变量 #1），因此**外部直接写 PG 的调用方绕过我方代码改了正文时，审计查询依然能算出漂移**
 （见 §5.5）。这里 hash 只用于变更检测，不是安全原语。
 `[待验证]` FIPS 模式的 PG 构建可能禁用 md5；托管 PG（RDS/Supabase/Neon）默认不启用该模式。
-`[待验证]` `(jsonb)::text` 的规范化输出（键序、空白）跨 PG 版本稳定——预期稳定，本机无 PG 无法确认。
+`(jsonb)::text` 在本轮 PG17 写入/重放路径已稳定；跨 PG 主版本输出仍保留为发布前兼容性验证项。
 
 ### 5.2 规则表（**本文的第二条硬性结论**）
 
@@ -340,8 +337,8 @@ WHERE c.collection = s.collection AND c.doc_id = s.doc_id AND c.chunk_id = s.chu
 
 ### 5.5 `chunks.embedding` 的既有作废行为要不要一起收紧
 
-`[待决策 D4]`：把同样的 `body_hash` 守卫用到 `upsert_chunk_sql` 的
-`embedding = NULL`（即正文真没变时**不清**主 embedding）。
+`[D4 已裁定]`：**本迭代不改** `upsert_chunk_sql` 现有的无条件
+`embedding = NULL`；收紧主 embedding 作废判据改为后续可回滚的独立改动。
 
 - 赞成：省掉重复 index 同一 doc 的整轮重嵌；与信号表规则同源、一套心智。
 - 反对：它改动的是**已真机验证过的热写路径**，且 `/v1/index` 与 `/v1/chunks` 两条路径
@@ -420,8 +417,8 @@ publication 的**列清单只过滤"列的值"、不抑制"Update 事件本身"*
    - `upsert_signal_sql` 的 `ON CONFLICT DO UPDATE`：加
      `WHERE` 子句，全部字段与 EXCLUDED 逐一 `IS NOT DISTINCT FROM` 时不更新（避免空转刷 `updated_at`）。
    ⇒ **即使将来某个部署把信号表放进了流，值未变就是 0 行更新、就是无事件**，阻尼自带。
-3. **`map` 的 relation 白名单**是"新表进流"的**前置条件**（§3.4-4），不是可选加固。
-   本迭代不做（表不进流），但要写进 13-sync 的"下一迭代/已知限制"。
+3. **`map` 的 relation 白名单**是必要的第二道防线（§3.4-4）；FS-101 已实施，
+   FS-201 新增真 Engine CDC 回归确认 signal 行不会变成毒丸或 chunk 删除。
 
 ---
 
@@ -447,7 +444,7 @@ publication 的**列清单只过滤"列的值"、不抑制"Update 事件本身"*
    （同 `kind_from_str` 的先例）。
 8. 信号表名派生 `format!("{table}_signal")` 过 `validate_identifier`（含超长/非法主表名的负例）。
 
-### 8.2 集成（**需 `DATABASE_URL`，本机无 ⇒ 全部标 `待运行验证`**）
+### 8.2 集成（**需 `DATABASE_URL`；2026-08-31 已使用 Docker pgvector:pg17 运行**）
 
 写法沿用仓内既有惯例（`crates/fastsearch-pg/src/lib.rs` 的 `b6_set_embedding_idempotent_guard`
 与 `crates/fastsearch-engine/tests/cdc_closed_loop.rs`）：
@@ -476,13 +473,12 @@ publication 的**列清单只过滤"列的值"、不抑制"Update 事件本身"*
 - 收口三件套全过：`cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings`
   + `cargo test --workspace`。
 - §8.1 的 8 条单测在**无 PG 环境**全绿（这是本项能在本机被验证的全部）。
-- §8.2 的 12 条在有 `DATABASE_URL` 时全绿——**在真机跑过之前，一律标 `待运行验证`，
-  spec/看板不得写"已完成"**（DEV_SPEC §1「代码完成 ≠ 完成」、迭代计划 §11.3-6）。
+- §8.2 T1–T12 已在 Docker pgvector:pg17 真机全绿；无 `DATABASE_URL` 时仍显式输出 skip，CI 环境门禁对其执行数做硬断言。
 - 逐条核对迭代计划 §7 的八条：
   ① 可移植 ✅（零新扩展，§8.2-10）；② PG 真源派生可重建 ✅（向量落 `real[]`，§4.3）；
   ③ ACL 不可绕过 ✅（无第二套 ACL 真源，§8.2-11）；④ 确定性 —— 本迭代不动排序，n/a；
   ⑤ 预过滤两端一致 —— 本迭代不动过滤，n/a；⑥ ADR 边界 ✅（无产品对象/版本/层级，§10-D5）；
-  ⑦ 热路径零 docparse ✅（不碰 cli/vendor）；⑧ 诚实记账 ✅（本文全部 PG 结论标 `待运行验证`）。
+  ⑦ 热路径零 docparse ✅（不碰 cli/vendor）；⑧ 诚实记账 ✅（本地 PG17 已验证，托管/FIPS/跨版本项继续单独标记）。
 
 ---
 
@@ -494,7 +490,7 @@ publication 的**列清单只过滤"列的值"、不抑制"Update 事件本身"*
    仍在既有的事务 + `pg_advisory_xact_lock` 内 ⇒ 并发 boot 安全性不变。
 2. 老部署升级后得到一张**空表**。既有 chunk 行**不需要回填** `body_hash`——
    信号行还不存在，没有可比较的对象；第一条信号写入时 hash 由 SQL 现算。
-3. `fastsearch_chunks` **零改动**（除非采纳 `[待决策 D4]`，本文建议不采纳）。
+3. `fastsearch_chunks` **零改动**（D4 已关闭：本项不改主 embedding 作废语义）。
 4. publication、slot、CDC 配置**零改动**（结论 A）。
 
 **回滚**：`DROP TABLE {table}_signal;` + 撤掉 `signal_ddl()` 调用即可，
@@ -507,12 +503,12 @@ publication 的**列清单只过滤"列的值"、不抑制"Update 事件本身"*
 | `crates/fastsearch-pg/src/sql.rs` / `lib.rs` | 新增 `signal_ddl` 等纯函数 + `PgStore` 信号方法；`upsert_doc`/`upsert_chunks`/三条删除路径在**同事务内**增发信号语句 | 本项 |
 | `crates/fastsearch-core/src/model.rs` | 新增 `SignalType` / `SignalStatus`（纯类型，无后端依赖） | 本项 |
 | `docs/specs/12-pg.md` | 回写表结构、行为规约（作废规则表）、测试与状态 | 本项 |
-| `docs/specs/13-sync.md` | 回写"已知限制/下一迭代"：`map` 无 relation 白名单 ⇒ 新表**禁止**进流（§3.2 的误删链路） | 本项 |
+| `docs/specs/13-sync.md` | 回写 chunks-only publication + FS-101 relation 白名单的双重防御与真 CDC 回归 | 本项 |
 | `crates/fastsearch-vector/src/lib.rs` `VectorBackend::upsert(gid, vector, meta)` | **一个 `GlobalId` 只能持一条向量**。多路向量真正进检索时，键必须扩成 `(GlobalId, SignalType)` 或按信号分索引——**这是 KB-2.2 的前置改动，本项不动** | KB-2.2 |
 | `crates/fastsearch-engine/src/lib.rs` `ingest_vector` / `apply_upsert` / `run` | 同上：写入与召回都以 gid 为单位；具名 N 路要等 `fuse` 泛化 | KB-2.2 |
 | `crates/fastsearch-sync/src/lib.rs` `IndexSink` 三个方法 | 均以 gid/doc 为单位，无信号维度；多路落地后需决定"信号是否经 CDC 进派生索引" | KB-2.2+ |
 | `crates/fastsearch-server/src/lib.rs` `/v1/index`、`/v1/chunks`、`/v1/images` | 本项**不改**；将来产 caption/OCR 信号的写路径要在这里挂 | KB-1.x / KB-2.2 |
-| `chunks.image_vector_status` | 与 `chunk_signal(image_bytes).status` 语义重叠 ⇒ 见 `[待决策 D3]` | — |
+| `chunks.image_vector_status` | 与 `chunk_signal(image_bytes).status` 语义重叠；D3 已关闭：FS-201 保留且不双写 | FS-202 重评读路径真源 |
 
 ## 11. 不做什么（明确排除）
 
@@ -526,31 +522,30 @@ publication 的**列清单只过滤"列的值"、不抑制"Update 事件本身"*
 - **不引入任何 PG 扩展**（`pgcrypto` 也不行，故用核心 `md5()`）、**不引入 Rust 新依赖**。
 - **不实现 caption/OCR/ASR 的生产者**：那是 KB-1.x 与 P1-2 的事，且 VLM 区域级调用形态
   已被仓内实测证伪（FastGPT 参考建议 §8-3），本表只负责"生产者产出来之后存哪、怎么作废"。
-- **不动 `chunks.image_vector_status`**（`[待决策 D3]`）。
-- **不改 `upsert_chunk_sql` 现有的 `embedding = NULL` 行为**（`[待决策 D4]`，建议单独一轮）。
+- **不动 `chunks.image_vector_status`**（D3 已关闭：FS-201 保留且不双写）。
+- **不改 `upsert_chunk_sql` 现有的 `embedding = NULL` 行为**（D4 已关闭，如改则单独一轮）。
 
 ## 12. 待决策 / 待验证清单
 
 **`[待决策]`**
 
-- **D1 · 信号表名派生规则**：`format!("{table}_signal")`（本文按此写，推荐）vs 固定
-  `fastsearch_chunk_signal`。前者随 `PgConfig.table` 隔离多部署，后者名字更短。
-  影响面仅限 DDL 与测试常量。
-- **D2 · 信号向量的可检索形态**：本迭代 `real[]`（真源可重建、不可 ANN）。
+- **D1 · 已关闭**：采用 `format!("{table}_signal")`，并对派生名再执行
+  `validate_identifier`；多部署随 `PgConfig.table` 自然隔离。
+- **D2 · 已关闭（FS-201 范围）**：信号真源向量采用 `real[]`（可重建、不可 ANN）。
   KB-2.2 若要 PG 直查某一路，选 typed-列-按-dim + 各自 HNSW / 按 `signal_type` 分区表 /
   只在引擎侧持多路。**本文不定夺**，只记两条约束（§4.3）。
-- **D3 · `chunks.image_vector_status` 的归宿**：本迭代它**仍是唯一真源**
+- **D3 · 已关闭（FS-201 范围）**：`chunks.image_vector_status` 保留且**仍是现有读路径唯一真源**
   （信号表不进读路径 ⇒ 不产生第二个真源）。KB-2.2 让读路径感知信号后，
   要么把它降级为只读镜像、要么移除。**在那之前不得双写。**
-- **D4 · `upsert_chunk_sql` 的 `embedding = NULL` 是否也加 `body_hash` 守卫**：
-  本文建议**不在 KB-2.1 一起做**（§5.5）。
+- **D4 · 已关闭**：不在 KB-2.1 修改 `upsert_chunk_sql` 现有的
+  `embedding = NULL` 行为（§5.5），保持新表的 additive 回滚边界。
 - **D5 · 信号是否需要对外可读的入口**（`GET /v1/chunks/{id}/signals` 之类）：
   本迭代**不做**。一旦要做，它是新检索/读取入口 ⇒ 必须走 ACL 服务端注入 +
   "越权用例进测试"（不变量 #3），且要先确认它不是在把控制面做回来（ADR）。
 
-**`[待验证]`**（本机无 `DATABASE_URL`，全部无法在本轮确认）
+**`[待验证]`**
 
-- V1 · §8.2 的**全部 12 条集成用例**——整体标 `待运行验证`。
+- V1 · **已关闭**：§8.2 T1–T12 已在 Docker pgvector:pg17 真库执行通过；显式环境门禁记账见 FS-201 完成记录。
 - V2 · `md5()` 在托管 PG（RDS/Supabase/Neon）与 FIPS 构建下的可用性。
 - V3 · `(jsonb)::text` 规范化输出跨 PG 版本/跨 `jsonb` 写入路径的稳定性
   （决定 `artifact_hash` 对 Object/DocRegion 指针是否稳定）。
@@ -575,3 +570,11 @@ publication 的**列清单只过滤"列的值"、不抑制"Update 事件本身"*
   （§3.4-3），但**它依然是静默的**：不打日志、不报错。若将来觉得这不可接受，
   正确的加固是在 `ensure_schema` 里先查 `pg_publication_rel`、发现非预期表时**打警告**，
   而不是改成 `ADD/DROP`（§3.3 的理由不变）。
+
+## 14. FS-201 实施完成记录（2026-08-31）
+
+- `SignalType` / `SignalStatus` / `Signal` 及穷尽 body/artifact 绑定规则已落在 core；新增类型必须回答两类作废关系。
+- `ensure_schema` additive 创建经安全派生的 `{chunks_table}_signal`、两个普通索引和 `real[]` 向量列；表、索引名均纳入 63 字节校验。
+- PgStore 落地幂等 upsert/fetch/set-embedding/孤儿审计；主写路径同事务精确 stale，doc/collection/ACL chunk 删除同事务回收信号。
+- `fastsearch_pub` 真库验证始终只剩 chunks 主表；signal 写入后 slot 为 0 事件，后续 chunk 更新仍能解码与应用。
+- T1–T12 映射到 core/SQL/PgStore/Engine 自动测试后在 Docker pgvector:pg17 通过；全量环境门禁记账 `pg executed=32 skipped=0 missing=0`。

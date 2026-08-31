@@ -30,10 +30,14 @@ pg_gates=(
   integration_time_filter_null_column_superset
   b6_set_embedding_idempotent_guard
   integration_pgvector_search
+  fs201_signal_crud_and_invalidation
+  fs201_signal_reconciliation_and_acl_deletes
+  fs201_signal_schema_publication_and_cdc_contract
   pgvector_backend_via_engine
   b6_cdc_write_through_to_pg_embedding
   mm6_inline_serves_bytes_from_source_pg
   cdc_closed_loop_pg_to_search
+  cdc_chunk_replay_converges_signal_invalidation
   cdc_consume_persist_crashsafe
   cdc_concurrent_slot_creation_is_idempotent
   cdc_peek_exposes_commit_lsn_lag_and_dead_letters

@@ -9,14 +9,15 @@ mod sql;
 
 pub use error::{PgError, Result};
 pub use sql::{
-    ann_index_sql, pgvector_search_sql, ChunkRow, SqlParam, VectorType, COLUMNS, PUBLICATION,
+    ann_index_sql, pgvector_search_sql, ChunkRow, SignalRow, SqlParam, VectorType, COLUMNS,
+    PUBLICATION,
 };
 
-use fastsearch_core::{AclFilter, AssetPointer, Chunk, GlobalId, MediaRef};
+use fastsearch_core::{AclFilter, AssetPointer, Chunk, GlobalId, MediaRef, Signal, SignalType};
 use std::collections::HashSet;
 use tokio::sync::Mutex;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, NoTls, Row};
+use tokio_postgres::{Client, NoTls, Row, Transaction};
 
 /// 连接配置。
 #[derive(Debug, Clone)]
@@ -74,6 +75,7 @@ const SCHEMA_DDL_LOCK_KEY: i64 = 0x6673_735f_6464_6c00;
 pub struct PgStore {
     client: Mutex<Client>,
     cfg: PgConfig,
+    signal_table: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +103,7 @@ impl PgStore {
     /// 非客户端输入，但若未来被外部影响，此校验阻断注入面）。
     pub async fn connect(cfg: PgConfig) -> Result<Self> {
         validate_identifier(&cfg.table)?;
+        let signal_table = signal_table_name(&cfg.table)?;
         let (client, connection) = tokio_postgres::connect(&cfg.url, NoTls).await?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -110,6 +113,7 @@ impl PgStore {
         Ok(PgStore {
             client: Mutex::new(client),
             cfg,
+            signal_table,
         })
     }
 
@@ -213,6 +217,13 @@ impl PgStore {
             ];
             n += tx.execute(&ins, &params).await?;
         }
+        let chunk_ids: Vec<i64> = chunks.iter().map(|chunk| chunk.chunk_id as i64).collect();
+        tx.execute(
+            &sql::reconcile_doc_signals_sql(&self.signal_table),
+            &[&collection, &doc_id, &chunk_ids],
+        )
+        .await?;
+        stale_doc_signals(&tx, &self.signal_table, &self.cfg.table, collection, doc_id).await?;
         tx.commit().await?;
         Ok(n)
     }
@@ -220,12 +231,16 @@ impl PgStore {
     /// 删除某 doc 全部 chunk。
     pub async fn delete_doc(&self, collection: &str, doc_id: &str) -> Result<u64> {
         let del = sql::delete_doc_sql(&self.cfg.table);
-        Ok(self
-            .client
-            .lock()
-            .await
-            .execute(&del, &[&collection, &doc_id])
-            .await?)
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
+        tx.execute(
+            &sql::delete_doc_signals_sql(&self.signal_table),
+            &[&collection, &doc_id],
+        )
+        .await?;
+        let deleted = tx.execute(&del, &[&collection, &doc_id]).await?;
+        tx.commit().await?;
+        Ok(deleted)
     }
 
     /// 读取某 doc 全部 chunk（按 chunk_id 升序）。
@@ -238,6 +253,116 @@ impl PgStore {
             .query(&q, &[&collection, &doc_id])
             .await?;
         rows.iter().map(row_to_chunk).collect()
+    }
+
+    /// Insert or update one named chunk representation. The chunk must already exist; body and
+    /// artifact hashes plus `embedding_dim` are derived inside Postgres and caller values for
+    /// those fields are ignored. Identical writes return `0` and leave `updated_at` unchanged.
+    pub async fn upsert_signal(&self, signal: &Signal) -> Result<u64> {
+        if let Some(embedding) = &signal.embedding {
+            ensure_finite(embedding)?;
+        }
+        let row = SignalRow::from_signal(signal);
+        let statement = sql::upsert_signal_sql(&self.signal_table, &self.cfg.table);
+        let params: [&(dyn ToSql + Sync); 10] = [
+            &row.collection,
+            &row.doc_id,
+            &row.chunk_id,
+            &row.signal_type,
+            &row.status,
+            &row.model,
+            &row.model_version,
+            &row.signal_text,
+            &row.embedding,
+            &row.error,
+        ];
+        let updated = self
+            .client
+            .lock()
+            .await
+            .query_opt(&statement, &params)
+            .await?;
+        if updated.is_some() {
+            return Ok(1);
+        }
+        if self
+            .batch_get(std::slice::from_ref(&signal.gid))
+            .await?
+            .first()
+            .is_some_and(Option::is_none)
+        {
+            return Err(PgError::Conflict(format!(
+                "cannot attach signal to missing chunk {}",
+                signal.gid.to_citation_id()
+            )));
+        }
+        Ok(0)
+    }
+
+    /// Read all named signals for one chunk in stable `signal_type` order. This is an audit and
+    /// rebuild library API; it is not wired into search or any external endpoint in FS-201.
+    pub async fn fetch_signals(&self, gid: &GlobalId) -> Result<Vec<Signal>> {
+        let statement = sql::fetch_signals_sql(&self.signal_table);
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(
+                &statement,
+                &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+            )
+            .await?;
+        rows.iter().map(row_to_signal).collect()
+    }
+
+    /// Set one signal vector and mark it ready. Identical writes return `0`, preventing empty
+    /// updates and future replication feedback even if an operator misconfigures publications.
+    pub async fn set_signal_embedding(
+        &self,
+        gid: &GlobalId,
+        signal_type: SignalType,
+        embedding: &[f32],
+        model: &str,
+        model_version: Option<&str>,
+    ) -> Result<u64> {
+        ensure_finite(embedding)?;
+        let statement = sql::set_signal_embedding_sql(&self.signal_table);
+        let chunk_id = gid.chunk_id as i64;
+        let signal_type = signal_type.as_str();
+        let embedding = embedding.to_vec();
+        Ok(self
+            .client
+            .lock()
+            .await
+            .execute(
+                &statement,
+                &[
+                    &gid.collection,
+                    &gid.doc_id,
+                    &chunk_id,
+                    &signal_type,
+                    &embedding,
+                    &model,
+                    &model_version,
+                ],
+            )
+            .await?)
+    }
+
+    /// Count signal rows whose parent chunk is missing. Normal PgStore write/delete paths keep
+    /// this at zero; the audit remains necessary because the additive table intentionally has no
+    /// foreign key and external SQL writers can bypass those paths.
+    pub async fn orphan_signal_count(&self) -> Result<usize> {
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(
+                &sql::orphan_signals_sql(&self.signal_table, &self.cfg.table),
+                &[],
+            )
+            .await?;
+        Ok(rows.len())
     }
 
     /// 批量按 GlobalId 读取，返回项与请求严格同序；不存在的项为 None。
@@ -276,6 +401,7 @@ impl PgStore {
         let mut client = self.client.lock().await;
         let tx = client.transaction().await?;
         let mut count = 0u64;
+        let mut touched_docs = HashSet::new();
         for (collection, chunk) in rows {
             let row = ChunkRow::from_chunk(collection, chunk)?;
             let params: [&(dyn ToSql + Sync); 20] = [
@@ -306,7 +432,20 @@ impl PgStore {
                     collection, chunk.doc_id, chunk.chunk_id
                 )));
             }
+            touched_docs.insert((collection.clone(), chunk.doc_id.clone()));
             count += 1;
+        }
+        let mut touched_docs: Vec<_> = touched_docs.into_iter().collect();
+        touched_docs.sort();
+        for (collection, doc_id) in touched_docs {
+            stale_doc_signals(
+                &tx,
+                &self.signal_table,
+                &self.cfg.table,
+                &collection,
+                &doc_id,
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(count)
@@ -343,6 +482,9 @@ impl PgStore {
                 )
                 .await?
             };
+            if row.is_some() {
+                delete_signals_for_chunk(&tx, &self.signal_table, id).await?;
+            }
             deleted.push(row.is_some());
         }
         tx.commit().await?;
@@ -397,24 +539,22 @@ impl PgStore {
         owner_tenant: Option<&str>,
     ) -> Result<DeletedCollection> {
         let q = sql::delete_collection_sql(&self.cfg.table, owner_tenant.is_some());
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await?;
         let rows = match owner_tenant {
-            Some(tenant) => {
-                self.client
-                    .lock()
-                    .await
-                    .query(&q, &[&collection, &tenant])
-                    .await?
-            }
-            None => self.client.lock().await.query(&q, &[&collection]).await?,
+            Some(tenant) => tx.query(&q, &[&collection, &tenant]).await?,
+            None => tx.query(&q, &[&collection]).await?,
         };
         let mut ids = Vec::with_capacity(rows.len());
         let mut object_uris = HashSet::new();
         for row in rows {
-            ids.push(GlobalId {
+            let gid = GlobalId {
                 collection: row.try_get("collection")?,
                 doc_id: row.try_get("doc_id")?,
                 chunk_id: row.try_get::<_, i64>("chunk_id")? as u64,
-            });
+            };
+            delete_signals_for_chunk(&tx, &self.signal_table, &gid).await?;
+            ids.push(gid);
             if let Some(media_json) = row.try_get::<_, Option<String>>("media")? {
                 let media: MediaRef = serde_json::from_str(&media_json)?;
                 collect_object_uri(&media.asset, &mut object_uris);
@@ -423,6 +563,7 @@ impl PgStore {
                 }
             }
         }
+        tx.commit().await?;
         let mut object_uris: Vec<String> = object_uris.into_iter().collect();
         object_uris.sort();
         Ok(DeletedCollection { ids, object_uris })
@@ -652,10 +793,72 @@ impl PgStore {
     }
 }
 
+async fn stale_doc_signals(
+    tx: &Transaction<'_>,
+    signal_table: &str,
+    chunks_table: &str,
+    collection: &str,
+    doc_id: &str,
+) -> Result<()> {
+    let body_bound: Vec<&str> = SignalType::ALL
+        .into_iter()
+        .filter(|signal_type| signal_type.binds_body())
+        .map(SignalType::as_str)
+        .collect();
+    let artifact_bound: Vec<&str> = SignalType::ALL
+        .into_iter()
+        .filter(|signal_type| signal_type.binds_artifact())
+        .map(SignalType::as_str)
+        .collect();
+    tx.execute(
+        &sql::stale_body_bound_signals_sql(signal_table, chunks_table),
+        &[&collection, &doc_id, &body_bound],
+    )
+    .await?;
+    tx.execute(
+        &sql::stale_artifact_bound_signals_sql(signal_table, chunks_table),
+        &[&collection, &doc_id, &artifact_bound],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn delete_signals_for_chunk(
+    tx: &Transaction<'_>,
+    signal_table: &str,
+    gid: &GlobalId,
+) -> Result<()> {
+    tx.execute(
+        &sql::delete_chunk_signals_sql(signal_table),
+        &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+    )
+    .await?;
+    Ok(())
+}
+
 fn collect_object_uri(asset: &AssetPointer, out: &mut HashSet<String>) {
     if let AssetPointer::Object { uri } = asset {
         out.insert(uri.clone());
     }
+}
+
+fn row_to_signal(row: &Row) -> Result<Signal> {
+    SignalRow {
+        collection: row.try_get("collection")?,
+        doc_id: row.try_get("doc_id")?,
+        chunk_id: row.try_get("chunk_id")?,
+        signal_type: row.try_get("signal_type")?,
+        status: row.try_get("status")?,
+        model: row.try_get("model")?,
+        model_version: row.try_get("model_version")?,
+        artifact_hash: row.try_get("artifact_hash")?,
+        body_hash: row.try_get("body_hash")?,
+        signal_text: row.try_get("signal_text")?,
+        embedding: row.try_get("embedding")?,
+        embedding_dim: row.try_get("embedding_dim")?,
+        error: row.try_get("error")?,
+    }
+    .to_signal()
 }
 
 /// 校验 SQL 标识符（表名）：`[A-Za-z_][A-Za-z0-9_]*`，长度 ≤63（PG 上限）。
@@ -674,6 +877,14 @@ fn validate_identifier(name: &str) -> Result<()> {
             "invalid table identifier: {name:?}"
         )))
     }
+}
+
+fn signal_table_name(chunks_table: &str) -> Result<String> {
+    let signal_table = format!("{chunks_table}_signal");
+    validate_identifier(&signal_table)?;
+    validate_identifier(&format!("{signal_table}_doc"))?;
+    validate_identifier(&format!("{signal_table}_worklist"))?;
+    Ok(signal_table)
 }
 
 /// f32 向量 → pgvector 文本字面 `[v1,v2,...]`（配合 SQL 内 `$1::text::vector`：先 text 再 vector，
@@ -894,6 +1105,19 @@ mod tests {
         }
     }
 
+    fn database_url_with_name(url: &str, database: &str) -> String {
+        let (base, query) = url
+            .split_once('?')
+            .map_or((url, ""), |(base, query)| (base, query));
+        let slash = base.rfind('/').expect("DATABASE_URL must contain a path");
+        let suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{query}")
+        };
+        format!("{}{database}{suffix}", &base[..=slash])
+    }
+
     #[test]
     fn rejects_bad_table_identifiers() {
         assert!(validate_identifier("fastsearch_chunks").is_ok());
@@ -903,6 +1127,20 @@ mod tests {
         assert!(validate_identifier("a;DROP TABLE x").is_err());
         assert!(validate_identifier("a b").is_err());
         assert!(validate_identifier("a\"b").is_err());
+    }
+
+    #[test]
+    fn derived_signal_table_identifier_is_validated() {
+        assert_eq!(
+            signal_table_name("fastsearch_chunks").unwrap(),
+            "fastsearch_chunks_signal"
+        );
+        let valid_parent_but_derived_too_long = format!("a{}", "x".repeat(47));
+        assert!(validate_identifier(&valid_parent_but_derived_too_long).is_ok());
+        assert!(
+            validate_identifier(&format!("{valid_parent_but_derived_too_long}_signal")).is_ok()
+        );
+        assert!(signal_table_name(&valid_parent_but_derived_too_long).is_err());
     }
 
     /// 并发 boot 回归（需 DATABASE_URL）：8 个连接同时对**同一 schema** `ensure_schema`，
@@ -929,6 +1167,24 @@ mod tests {
                 .expect("join")
                 .expect("并发 ensure_schema 应成功（advisory lock 串行化 DDL）");
         }
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_chunks_it".into();
+        let store = PgStore::connect(cfg).await.expect("verification connect");
+        let signal_exists: bool = store
+            .client
+            .lock()
+            .await
+            .query_one(
+                "SELECT to_regclass('fastsearch_chunks_it_signal') IS NOT NULL",
+                &[],
+            )
+            .await
+            .expect("signal table lookup")
+            .get(0);
+        assert!(
+            signal_exists,
+            "concurrent boot must create the derived signal table"
+        );
     }
 
     #[tokio::test]
@@ -1004,6 +1260,594 @@ mod tests {
             store.fetch_doc("kb", "a.pdf").await.expect("fetch3").len(),
             0
         );
+    }
+
+    /// FS-201 T1–T4: named signals coexist, derived hashes/dimensions round-trip, and body versus
+    /// artifact changes stale exactly the exhaustive rule-table subset.
+    #[tokio::test]
+    async fn fs201_signal_crud_and_invalidation() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip fs201_signal_crud_and_invalidation: DATABASE_URL not set");
+            return;
+        };
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_fs201_signal_it".into();
+        cfg.vector_dim = 4;
+        cfg.vector_type = VectorType::Vector;
+        let store = PgStore::connect(cfg).await.expect("connect");
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(
+                "DROP TABLE IF EXISTS fastsearch_fs201_signal_it_signal CASCADE; \
+                 DROP TABLE IF EXISTS fastsearch_fs201_signal_it CASCADE;",
+            )
+            .await
+            .expect("clean schema");
+        store.ensure_schema().await.expect("schema");
+
+        let mut chunk = sample("dir:sub:report.pdf", 1);
+        chunk.media_bytes = Some(vec![1, 2, 3]);
+        let gid = chunk.global_id("fs201-crud");
+        store
+            .upsert_chunks(&[(gid.collection.clone(), chunk.clone())])
+            .await
+            .expect("chunk");
+
+        for (index, signal_type) in SignalType::ALL.into_iter().enumerate() {
+            let signal = Signal {
+                gid: gid.clone(),
+                signal_type,
+                status: fastsearch_core::SignalStatus::Ready,
+                model: Some(format!("model-{index}")),
+                model_version: Some("v1".into()),
+                artifact_hash: Some("caller-must-not-win".into()),
+                body_hash: Some("caller-must-not-win".into()),
+                signal_text: (signal_type != SignalType::ImageBytes)
+                    .then(|| "中文表示".to_string()),
+                embedding: Some(vec![index as f32, 1.0]),
+                embedding_dim: Some(999),
+                error: None,
+            };
+            assert_eq!(
+                store.upsert_signal(&signal).await.expect("upsert signal"),
+                1
+            );
+            assert_eq!(store.upsert_signal(&signal).await.expect("idempotent"), 0);
+        }
+
+        let initial = store.fetch_signals(&gid).await.expect("fetch signals");
+        assert_eq!(initial.len(), 5);
+        assert!(initial.iter().all(|signal| signal.embedding_dim == Some(2)));
+        assert!(initial.iter().all(|signal| {
+            signal.body_hash.as_deref() != Some("caller-must-not-win")
+                && signal.artifact_hash.as_deref() != Some("caller-must-not-win")
+        }));
+        assert_eq!(
+            store
+                .set_signal_embedding(
+                    &gid,
+                    SignalType::VlmCaption,
+                    &[3.0, 2.0, 1.0],
+                    "caption-model",
+                    Some("v2"),
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .set_signal_embedding(
+                    &gid,
+                    SignalType::VlmCaption,
+                    &[3.0, 2.0, 1.0],
+                    "caption-model",
+                    Some("v2"),
+                )
+                .await
+                .unwrap(),
+            0,
+            "identical vector/provenance must not update"
+        );
+        let visual_updated_at: Vec<String> = store
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT updated_at::text FROM fastsearch_fs201_signal_it_signal \
+                 WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 \
+                   AND signal_type IN ('vlm_caption', 'image_bytes') ORDER BY signal_type",
+                &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+
+        let unchanged_timestamps: Vec<String> = store
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT updated_at::text FROM fastsearch_fs201_signal_it_signal \
+                 WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 ORDER BY signal_type",
+                &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        store
+            .upsert_chunks(&[(gid.collection.clone(), chunk.clone())])
+            .await
+            .expect("unchanged chunk upsert");
+        assert!(store
+            .fetch_signals(&gid)
+            .await
+            .unwrap()
+            .iter()
+            .all(|signal| signal.status == fastsearch_core::SignalStatus::Ready));
+        let after_unchanged: Vec<String> = store
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT updated_at::text FROM fastsearch_fs201_signal_it_signal \
+                 WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 ORDER BY signal_type",
+                &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            after_unchanged, unchanged_timestamps,
+            "unchanged chunk upsert must update zero signal rows"
+        );
+
+        chunk.text = "body changed".into();
+        store
+            .upsert_chunks(&[(gid.collection.clone(), chunk.clone())])
+            .await
+            .expect("body update");
+        let after_body = store.fetch_signals(&gid).await.unwrap();
+        for signal in &after_body {
+            if signal.signal_type.binds_body() {
+                assert_eq!(signal.status, fastsearch_core::SignalStatus::Stale);
+                assert!(signal.embedding.is_none());
+            } else {
+                assert_eq!(signal.status, fastsearch_core::SignalStatus::Ready);
+                assert!(signal.embedding.is_some());
+            }
+        }
+        let visual_after: Vec<String> = store
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT updated_at::text FROM fastsearch_fs201_signal_it_signal \
+                 WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 \
+                   AND signal_type IN ('vlm_caption', 'image_bytes') ORDER BY signal_type",
+                &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            visual_after, visual_updated_at,
+            "visual rows must not be touched"
+        );
+
+        // Rebuild all signals against the new body/current artifact, then change only the bytes.
+        for signal_type in SignalType::ALL {
+            let signal = Signal {
+                gid: gid.clone(),
+                signal_type,
+                status: fastsearch_core::SignalStatus::Ready,
+                embedding: Some(vec![9.0, 8.0, 7.0]),
+                model: Some("rebuilt".into()),
+                model_version: Some("v2".into()),
+                ..Signal::default()
+            };
+            store.upsert_signal(&signal).await.unwrap();
+        }
+        let user_text_before_artifact: String = store
+            .client
+            .lock()
+            .await
+            .query_one(
+                "SELECT updated_at::text FROM fastsearch_fs201_signal_it_signal \
+                 WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 \
+                   AND signal_type = 'user_text'",
+                &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        chunk.media_bytes = Some(vec![9, 9, 9]);
+        store
+            .upsert_chunks(&[(gid.collection.clone(), chunk)])
+            .await
+            .expect("artifact update");
+        let after_artifact = store.fetch_signals(&gid).await.unwrap();
+        for signal in after_artifact {
+            let expected = if signal.signal_type.binds_artifact() {
+                fastsearch_core::SignalStatus::Stale
+            } else {
+                fastsearch_core::SignalStatus::Ready
+            };
+            assert_eq!(signal.status, expected, "{:?}", signal.signal_type);
+            if signal.signal_type.binds_artifact() {
+                assert!(signal.embedding.is_none(), "{:?}", signal.signal_type);
+            } else {
+                assert!(signal.embedding.is_some(), "{:?}", signal.signal_type);
+            }
+        }
+        let user_text_after_artifact: String = store
+            .client
+            .lock()
+            .await
+            .query_one(
+                "SELECT updated_at::text FROM fastsearch_fs201_signal_it_signal \
+                 WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 \
+                   AND signal_type = 'user_text'",
+                &[&gid.collection, &gid.doc_id, &(gid.chunk_id as i64)],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            user_text_after_artifact, user_text_before_artifact,
+            "artifact-only changes must not touch user_text"
+        );
+
+        let missing = Signal {
+            gid: GlobalId {
+                chunk_id: 999,
+                ..gid.clone()
+            },
+            ..Signal::default()
+        };
+        assert!(matches!(
+            store.upsert_signal(&missing).await,
+            Err(PgError::Conflict(_))
+        ));
+    }
+
+    /// FS-201 T5/T6/T11: doc replacement reconciles removed chunk ids, and every authorized
+    /// delete path removes signals in the same transaction without creating a second ACL source.
+    #[tokio::test]
+    async fn fs201_signal_reconciliation_and_acl_deletes() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip fs201_signal_reconciliation_and_acl_deletes: DATABASE_URL not set");
+            return;
+        };
+        let mut cfg = PgConfig::new(url);
+        cfg.table = "fastsearch_fs201_delete_it".into();
+        cfg.vector_dim = 4;
+        cfg.vector_type = VectorType::Vector;
+        let store = PgStore::connect(cfg).await.expect("connect");
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(
+                "DROP TABLE IF EXISTS fastsearch_fs201_delete_it_signal CASCADE; \
+                 DROP TABLE IF EXISTS fastsearch_fs201_delete_it CASCADE;",
+            )
+            .await
+            .expect("clean schema");
+        store.ensure_schema().await.expect("schema");
+
+        let collection = "fs201-delete";
+        let mut kept = sample("report.pdf", 1);
+        kept.tenant = Some("tenant-a".into());
+        kept.acl = vec!["team-a".into()];
+        kept.media_bytes = Some(vec![1]);
+        let mut removed = sample("report.pdf", 2);
+        removed.tenant = Some("tenant-a".into());
+        removed.acl = vec!["team-a".into()];
+        removed.media_bytes = Some(vec![2]);
+        store
+            .upsert_doc(collection, "report.pdf", &[kept.clone(), removed.clone()])
+            .await
+            .unwrap();
+        for chunk in [&kept, &removed] {
+            store
+                .upsert_signal(&Signal {
+                    gid: chunk.global_id(collection),
+                    signal_type: SignalType::ImageBytes,
+                    status: fastsearch_core::SignalStatus::Ready,
+                    embedding: Some(vec![1.0, 2.0]),
+                    ..Signal::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        let kept_gid = kept.global_id(collection);
+        let removed_gid = removed.global_id(collection);
+        store
+            .upsert_doc(collection, "report.pdf", &[kept.clone()])
+            .await
+            .expect("replace with one chunk");
+        assert_eq!(store.fetch_signals(&kept_gid).await.unwrap().len(), 1);
+        assert!(store.fetch_signals(&removed_gid).await.unwrap().is_empty());
+        assert_eq!(store.orphan_signal_count().await.unwrap(), 0);
+
+        let denied_acl = AclFilter {
+            tenant: Some("tenant-b".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        assert_eq!(
+            store
+                .delete_chunks_visible(std::slice::from_ref(&kept_gid), &denied_acl)
+                .await
+                .unwrap(),
+            vec![false]
+        );
+        assert_eq!(store.fetch_signals(&kept_gid).await.unwrap().len(), 1);
+        let allowed_acl = AclFilter {
+            tenant: Some("tenant-a".into()),
+            allowed_tags: vec!["team-a".into()],
+        };
+        assert_eq!(
+            store
+                .delete_chunks_visible(std::slice::from_ref(&kept_gid), &allowed_acl)
+                .await
+                .unwrap(),
+            vec![true]
+        );
+        assert!(store.fetch_signals(&kept_gid).await.unwrap().is_empty());
+        assert_eq!(store.orphan_signal_count().await.unwrap(), 0);
+
+        // Recreate and cover both broader delete paths.
+        store
+            .upsert_doc(collection, "report.pdf", &[kept.clone()])
+            .await
+            .unwrap();
+        store
+            .upsert_signal(&Signal {
+                gid: kept_gid.clone(),
+                signal_type: SignalType::VlmCaption,
+                status: fastsearch_core::SignalStatus::Ready,
+                ..Signal::default()
+            })
+            .await
+            .unwrap();
+        store.delete_doc(collection, "report.pdf").await.unwrap();
+        assert_eq!(store.orphan_signal_count().await.unwrap(), 0);
+
+        store
+            .upsert_doc(collection, "report.pdf", &[kept])
+            .await
+            .unwrap();
+        store
+            .upsert_signal(&Signal {
+                gid: kept_gid,
+                signal_type: SignalType::VlmCaption,
+                status: fastsearch_core::SignalStatus::Ready,
+                ..Signal::default()
+            })
+            .await
+            .unwrap();
+        store
+            .delete_collection(collection, Some("tenant-a"))
+            .await
+            .unwrap();
+        assert_eq!(store.orphan_signal_count().await.unwrap(), 0);
+    }
+
+    /// FS-201 T7/T9/T10: the signal table is portable core PG storage, is removed from the
+    /// chunks-only publication by schema reconciliation, and produces no pgoutput changes.
+    #[tokio::test]
+    async fn fs201_signal_schema_publication_and_cdc_contract() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs201_signal_schema_publication_and_cdc_contract: DATABASE_URL not set"
+            );
+            return;
+        };
+        // This test deliberately rewrites the fixed publication. Give it a private database so
+        // parallel PG tests cannot deadlock on whichever test table was previously published.
+        let database = format!("fastsearch_fs201_pub_{}", std::process::id());
+        let (admin, admin_connection) = tokio_postgres::connect(&url, NoTls)
+            .await
+            .expect("admin connect");
+        tokio::spawn(async move {
+            let _ = admin_connection.await;
+        });
+        admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE);"))
+            .await
+            .expect("drop stale private database");
+        admin
+            .batch_execute(&format!("CREATE DATABASE {database};"))
+            .await
+            .expect("private database");
+        let isolated_url = database_url_with_name(&url, &database);
+        let mut cfg = PgConfig::new(isolated_url);
+        cfg.table = "fastsearch_fs201_pub_it".into();
+        cfg.vector_dim = 4;
+        cfg.vector_type = VectorType::Vector;
+        let store = PgStore::connect(cfg).await.expect("connect");
+
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(
+                "DROP PUBLICATION IF EXISTS fastsearch_pub; \
+                 DROP TABLE IF EXISTS fastsearch_fs201_pub_it_signal CASCADE; \
+                 DROP TABLE IF EXISTS fastsearch_fs201_pub_it CASCADE;",
+            )
+            .await
+            .expect("clean schema");
+        store.ensure_schema().await.expect("schema");
+
+        let columns = store
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT column_name, data_type, udt_name FROM information_schema.columns \
+                 WHERE table_name = 'fastsearch_fs201_pub_it_signal' ORDER BY ordinal_position",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(columns.len(), 14);
+        assert!(!columns.iter().any(|row| {
+            matches!(
+                row.get::<_, String>("column_name").as_str(),
+                "tenant" | "acl"
+            )
+        }));
+        let embedding = columns
+            .iter()
+            .find(|row| row.get::<_, String>("column_name") == "embedding")
+            .unwrap();
+        assert_eq!(embedding.get::<_, String>("data_type"), "ARRAY");
+        assert_eq!(embedding.get::<_, String>("udt_name"), "_float4");
+        let foreign_keys: i64 = store
+            .client
+            .lock()
+            .await
+            .query_one(
+                "SELECT count(*) FROM information_schema.table_constraints \
+                 WHERE table_name = 'fastsearch_fs201_pub_it_signal' \
+                   AND constraint_type = 'FOREIGN KEY'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(foreign_keys, 0);
+
+        // An operator adds the sibling table by mistake; ensure_schema must restore one table.
+        store
+            .client
+            .lock()
+            .await
+            .batch_execute(
+                "ALTER PUBLICATION fastsearch_pub ADD TABLE fastsearch_fs201_pub_it_signal;",
+            )
+            .await
+            .expect("misconfigure publication");
+        store.ensure_schema().await.expect("reconcile publication");
+        let publication_tables: Vec<String> = store
+            .client
+            .lock()
+            .await
+            .query(
+                "SELECT c.relname FROM pg_publication_rel pr \
+                 JOIN pg_publication p ON p.oid = pr.prpubid \
+                 JOIN pg_class c ON c.oid = pr.prrelid \
+                 WHERE p.pubname = 'fastsearch_pub' ORDER BY c.relname",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(publication_tables, vec!["fastsearch_fs201_pub_it"]);
+
+        let mut chunk = sample("cdc.pdf", 1);
+        chunk.media_bytes = Some(vec![1, 2, 3]);
+        let gid = chunk.global_id("fs201-cdc");
+        store
+            .upsert_chunks(&[(gid.collection.clone(), chunk.clone())])
+            .await
+            .unwrap();
+        let slot = format!("fs201_signal_{}", std::process::id());
+        store
+            .client
+            .lock()
+            .await
+            .execute(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                 WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .unwrap();
+        store
+            .client
+            .lock()
+            .await
+            .query_one(
+                "SELECT * FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+                &[&slot],
+            )
+            .await
+            .expect("slot");
+        store
+            .upsert_signal(&Signal {
+                gid: gid.clone(),
+                signal_type: SignalType::VlmCaption,
+                status: fastsearch_core::SignalStatus::Ready,
+                signal_text: Some("图表说明".into()),
+                ..Signal::default()
+            })
+            .await
+            .unwrap();
+        let after_signal: i64 = store
+            .client
+            .lock()
+            .await
+            .query_one(
+                "SELECT count(*) FROM pg_logical_slot_peek_binary_changes( \
+                 $1, NULL, NULL, 'proto_version', '1', 'publication_names', 'fastsearch_pub')",
+                &[&slot],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            after_signal, 0,
+            "signal table must not emit publication changes"
+        );
+        chunk.text = "normal chunk update".into();
+        store
+            .upsert_chunks(&[(gid.collection.clone(), chunk)])
+            .await
+            .unwrap();
+        let after_chunk: i64 = store
+            .client
+            .lock()
+            .await
+            .query_one(
+                "SELECT count(*) FROM pg_logical_slot_peek_binary_changes( \
+                 $1, NULL, NULL, 'proto_version', '1', 'publication_names', 'fastsearch_pub')",
+                &[&slot],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            after_chunk > 0,
+            "normal chunks update must still be published"
+        );
+        store
+            .client
+            .lock()
+            .await
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .await
+            .expect("drop slot");
+        drop(store);
+        admin
+            .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE);"))
+            .await
+            .expect("drop private database");
     }
 
     #[tokio::test]

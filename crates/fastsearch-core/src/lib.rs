@@ -15,7 +15,7 @@ pub use filter::{AclFilter, FieldSource, FieldValue, Filter};
 pub use fusion::{fuse, fuse_n, fuse_n_with_sources, Fusion, RecallList, Scored, SourceHit};
 pub use model::{
     AssetPointer, BBox, Chunk, ChunkKind, Citation, GlobalId, ImageMeta, ImageVectorStatus,
-    MediaRef, Metadata, Modality, PublicAssetPointer, PublicMediaRef, TimeSpan, MAX_METADATA_BYTES,
-    MAX_METADATA_DEPTH, MAX_METADATA_KEYS,
+    MediaRef, Metadata, Modality, PublicAssetPointer, PublicMediaRef, Signal, SignalStatus,
+    SignalType, TimeSpan, MAX_METADATA_BYTES, MAX_METADATA_DEPTH, MAX_METADATA_KEYS,
 };
 pub use query::{Collapse, RerankSpec, SearchMode, SearchRequest};

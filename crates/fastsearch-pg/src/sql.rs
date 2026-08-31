@@ -1,7 +1,11 @@
 //! 纯 SQL 生成 + Chunk↔行映射（无 PG 依赖，可单测）。
 
 use crate::error::{PgError, Result};
-use fastsearch_core::{AclFilter, BBox, Chunk, ChunkKind, FieldValue, Filter};
+use fastsearch_core::{
+    AclFilter, BBox, Chunk, ChunkKind, FieldValue, Filter, GlobalId, Signal, SignalStatus,
+    SignalType,
+};
+use std::str::FromStr;
 
 /// 向量列类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,13 +32,14 @@ impl VectorType {
     }
 }
 
-/// 逻辑复制 publication 名（固定）。
+/// 逻辑复制 publication 名（固定）。该 publication 永远专属 chunks 主表；
+/// `chunk_signal` 等任何旁表不得加入，如需 CDC 必须新建 publication。
 pub const PUBLICATION: &str = "fastsearch_pub";
 
 /// 幂等 DDL：扩展 + 表 + 索引 + publication。仅依赖 pgvector + 逻辑复制
 /// （不需任何 `shared_preload_libraries` 原生扩展，保证托管 PG 可移植）。
 pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<String> {
-    vec![
+    let mut statements = vec![
         "CREATE EXTENSION IF NOT EXISTS vector;".to_string(),
         format!(
             "CREATE TABLE IF NOT EXISTS {table} (\n\
@@ -108,6 +113,41 @@ pub fn ddl(table: &str, vector_type: VectorType, vector_dim: usize) -> Vec<Strin
              END IF;\n\
              END $$;",
             collist = COLUMNS.join(", ")
+        ),
+    ];
+    statements.extend(signal_ddl(&format!("{table}_signal")));
+    statements
+}
+
+/// Additive source-of-truth table for named chunk representations. It deliberately has no
+/// foreign key and no publication statement: document replacement temporarily deletes the
+/// parent rows, while reconciliation in the same transaction preserves valid artifact signals.
+pub fn signal_ddl(signal_table: &str) -> Vec<String> {
+    vec![
+        format!(
+            "CREATE TABLE IF NOT EXISTS {signal_table} (\n\
+             collection text NOT NULL,\n\
+             doc_id text NOT NULL,\n\
+             chunk_id bigint NOT NULL,\n\
+             signal_type text NOT NULL,\n\
+             status text NOT NULL DEFAULT 'pending',\n\
+             model text,\n\
+             model_version text,\n\
+             artifact_hash text,\n\
+             body_hash text,\n\
+             signal_text text,\n\
+             embedding real[],\n\
+             embedding_dim integer,\n\
+             error text,\n\
+             updated_at timestamptz NOT NULL DEFAULT now(),\n\
+             PRIMARY KEY (collection, doc_id, chunk_id, signal_type)\n\
+             );"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {signal_table}_doc ON {signal_table} (collection, doc_id);"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {signal_table}_worklist ON {signal_table} (signal_type, status);"
         ),
     ]
 }
@@ -363,6 +403,109 @@ pub fn upsert_chunk_sql(table: &str) -> String {
     )
 }
 
+fn artifact_hash_sql(chunk_alias: &str) -> String {
+    format!("COALESCE(md5({chunk_alias}.media_bytes), md5(({chunk_alias}.media -> 'asset')::text))")
+}
+
+/// Insert or replace one named signal. Hashes and dimensions are always derived from the chunk
+/// row inside Postgres, so direct library callers cannot introduce a second invalidation rule.
+pub fn upsert_signal_sql(signal_table: &str, chunks_table: &str) -> String {
+    let artifact_hash = artifact_hash_sql("c");
+    format!(
+        "INSERT INTO {signal_table} AS target \
+         (collection, doc_id, chunk_id, signal_type, status, model, model_version, \
+          artifact_hash, body_hash, signal_text, embedding, embedding_dim, error, updated_at) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, {artifact_hash}, md5(c.text), $8, \
+                $9::real[], cardinality($9::real[]), $10, now() \
+         FROM {chunks_table} AS c \
+         WHERE c.collection = $1 AND c.doc_id = $2 AND c.chunk_id = $3 \
+         ON CONFLICT (collection, doc_id, chunk_id, signal_type) DO UPDATE SET \
+         status = EXCLUDED.status, model = EXCLUDED.model, model_version = EXCLUDED.model_version, \
+         artifact_hash = EXCLUDED.artifact_hash, body_hash = EXCLUDED.body_hash, \
+         signal_text = EXCLUDED.signal_text, embedding = EXCLUDED.embedding, \
+         embedding_dim = EXCLUDED.embedding_dim, error = EXCLUDED.error, updated_at = now() \
+         WHERE target.status IS DISTINCT FROM EXCLUDED.status \
+            OR target.model IS DISTINCT FROM EXCLUDED.model \
+            OR target.model_version IS DISTINCT FROM EXCLUDED.model_version \
+            OR target.artifact_hash IS DISTINCT FROM EXCLUDED.artifact_hash \
+            OR target.body_hash IS DISTINCT FROM EXCLUDED.body_hash \
+            OR target.signal_text IS DISTINCT FROM EXCLUDED.signal_text \
+            OR target.embedding IS DISTINCT FROM EXCLUDED.embedding \
+            OR target.embedding_dim IS DISTINCT FROM EXCLUDED.embedding_dim \
+            OR target.error IS DISTINCT FROM EXCLUDED.error \
+         RETURNING 1"
+    )
+}
+
+/// Write a signal embedding and provenance only when at least one durable value differs.
+pub fn set_signal_embedding_sql(signal_table: &str) -> String {
+    format!(
+        "UPDATE {signal_table} SET embedding = $5::real[], embedding_dim = cardinality($5::real[]), \
+         status = 'ready', model = $6, model_version = $7, error = NULL, updated_at = now() \
+         WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 AND signal_type = $4 \
+         AND (embedding IS DISTINCT FROM $5::real[] OR status IS DISTINCT FROM 'ready' \
+              OR model IS DISTINCT FROM $6 OR model_version IS DISTINCT FROM $7 OR error IS NOT NULL)"
+    )
+}
+
+/// Mark body-bound signals stale after a chunk write. Signal type values are supplied by the
+/// exhaustive Rust enum rules rather than duplicated as literals in SQL.
+pub fn stale_body_bound_signals_sql(signal_table: &str, chunks_table: &str) -> String {
+    format!(
+        "UPDATE {signal_table} AS s SET status = 'stale', embedding = NULL, \
+         embedding_dim = NULL, updated_at = now() FROM {chunks_table} AS c \
+         WHERE c.collection = s.collection AND c.doc_id = s.doc_id AND c.chunk_id = s.chunk_id \
+         AND s.collection = $1 AND s.doc_id = $2 AND s.signal_type = ANY($3::text[]) \
+         AND s.body_hash IS DISTINCT FROM md5(c.text) \
+         AND (s.status <> 'stale' OR s.embedding IS NOT NULL)"
+    )
+}
+
+/// Mark artifact-bound signals stale after a chunk media write.
+pub fn stale_artifact_bound_signals_sql(signal_table: &str, chunks_table: &str) -> String {
+    let artifact_hash = artifact_hash_sql("c");
+    format!(
+        "UPDATE {signal_table} AS s SET status = 'stale', embedding = NULL, \
+         embedding_dim = NULL, updated_at = now() FROM {chunks_table} AS c \
+         WHERE c.collection = s.collection AND c.doc_id = s.doc_id AND c.chunk_id = s.chunk_id \
+         AND s.collection = $1 AND s.doc_id = $2 AND s.signal_type = ANY($3::text[]) \
+         AND s.artifact_hash IS DISTINCT FROM {artifact_hash} \
+         AND (s.status <> 'stale' OR s.embedding IS NOT NULL)"
+    )
+}
+
+pub fn fetch_signals_sql(signal_table: &str) -> String {
+    format!(
+        "SELECT collection, doc_id, chunk_id, signal_type, status, model, model_version, \
+         artifact_hash, body_hash, signal_text, embedding, embedding_dim, error \
+         FROM {signal_table} WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3 \
+         ORDER BY signal_type"
+    )
+}
+
+pub fn reconcile_doc_signals_sql(signal_table: &str) -> String {
+    format!(
+        "DELETE FROM {signal_table} WHERE collection = $1 AND doc_id = $2 \
+         AND chunk_id <> ALL($3::bigint[])"
+    )
+}
+
+pub fn delete_doc_signals_sql(signal_table: &str) -> String {
+    format!("DELETE FROM {signal_table} WHERE collection = $1 AND doc_id = $2")
+}
+
+pub fn delete_chunk_signals_sql(signal_table: &str) -> String {
+    format!("DELETE FROM {signal_table} WHERE collection = $1 AND doc_id = $2 AND chunk_id = $3")
+}
+
+pub fn orphan_signals_sql(signal_table: &str, chunks_table: &str) -> String {
+    format!(
+        "SELECT s.collection, s.doc_id, s.chunk_id, s.signal_type FROM {signal_table} AS s \
+         LEFT JOIN {chunks_table} AS c USING (collection, doc_id, chunk_id) \
+         WHERE c.collection IS NULL ORDER BY s.collection, s.doc_id, s.chunk_id, s.signal_type"
+    )
+}
+
 /// 批量主键读取；LEFT JOIN + ordinality 保持请求顺序并显式保留缺失项。
 pub fn batch_get_sql(table: &str) -> String {
     format!(
@@ -475,6 +618,64 @@ fn kind_from_str(s: &str) -> Result<ChunkKind> {
         .map_err(|e| PgError::Mapping(format!("bad kind '{s}': {e}")))
 }
 
+/// Owned database representation of one chunk signal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignalRow {
+    pub collection: String,
+    pub doc_id: String,
+    pub chunk_id: i64,
+    pub signal_type: String,
+    pub status: String,
+    pub model: Option<String>,
+    pub model_version: Option<String>,
+    pub artifact_hash: Option<String>,
+    pub body_hash: Option<String>,
+    pub signal_text: Option<String>,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_dim: Option<i32>,
+    pub error: Option<String>,
+}
+
+impl SignalRow {
+    pub fn from_signal(signal: &Signal) -> Self {
+        Self {
+            collection: signal.gid.collection.clone(),
+            doc_id: signal.gid.doc_id.clone(),
+            chunk_id: signal.gid.chunk_id as i64,
+            signal_type: signal.signal_type.as_str().to_string(),
+            status: signal.status.as_str().to_string(),
+            model: signal.model.clone(),
+            model_version: signal.model_version.clone(),
+            artifact_hash: signal.artifact_hash.clone(),
+            body_hash: signal.body_hash.clone(),
+            signal_text: signal.signal_text.clone(),
+            embedding: signal.embedding.clone(),
+            embedding_dim: signal.embedding_dim.map(|dim| dim as i32),
+            error: signal.error.clone(),
+        }
+    }
+
+    pub fn to_signal(&self) -> Result<Signal> {
+        Ok(Signal {
+            gid: GlobalId {
+                collection: self.collection.clone(),
+                doc_id: self.doc_id.clone(),
+                chunk_id: self.chunk_id as u64,
+            },
+            signal_type: SignalType::from_str(&self.signal_type)?,
+            status: SignalStatus::from_str(&self.status)?,
+            model: self.model.clone(),
+            model_version: self.model_version.clone(),
+            artifact_hash: self.artifact_hash.clone(),
+            body_hash: self.body_hash.clone(),
+            signal_text: self.signal_text.clone(),
+            embedding: self.embedding.clone(),
+            embedding_dim: self.embedding_dim.map(|dim| dim as u32),
+            error: self.error.clone(),
+        })
+    }
+}
+
 /// 列值的拥有式视图：写入时按列借引用作参数，读取时从此构造 [`Chunk`]。
 /// jsonb 列以文本承载（`bbox`/`media`）。
 #[derive(Debug, Clone, PartialEq)]
@@ -584,7 +785,7 @@ impl ChunkRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastsearch_core::BBox;
+    use fastsearch_core::{BBox, GlobalId, Signal, SignalStatus, SignalType};
 
     fn sample() -> Chunk {
         Chunk {
@@ -648,6 +849,75 @@ mod tests {
         assert!(!pub_line.contains("updated_at"), "updated_at 不应被发布");
         // 但源列要在。
         assert!(pub_line.contains("text") && pub_line.contains("acl"));
+    }
+
+    #[test]
+    fn signal_schema_and_mutations_preserve_single_table_publication() {
+        let joined = signal_ddl("fastsearch_chunks_signal").join("\n");
+        assert!(joined.contains("CREATE TABLE IF NOT EXISTS fastsearch_chunks_signal"));
+        assert!(joined.contains("PRIMARY KEY (collection, doc_id, chunk_id, signal_type)"));
+        assert!(joined.contains("embedding real[]"));
+        assert!(joined.contains("fastsearch_chunks_signal_doc"));
+        assert!(joined.contains("fastsearch_chunks_signal_worklist"));
+        assert!(!joined.contains("CREATE EXTENSION"));
+        assert!(!joined.contains("FOREIGN KEY"));
+        assert!(!joined.contains("ALTER PUBLICATION"));
+
+        let all = ddl("fastsearch_chunks", VectorType::HalfVec, 384).join("\n");
+        assert!(all.contains("CREATE TABLE IF NOT EXISTS fastsearch_chunks_signal"));
+        let publication = all
+            .lines()
+            .filter(|line| line.contains("PUBLICATION"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!publication.contains("fastsearch_chunks_signal"));
+
+        let stale_body = stale_body_bound_signals_sql("sig", "chunks");
+        assert!(stale_body.contains("signal_type = ANY($3::text[])"));
+        assert!(stale_body.contains("body_hash IS DISTINCT FROM md5(c.text)"));
+        assert!(stale_body.contains("s.status <> 'stale' OR s.embedding IS NOT NULL"));
+
+        let stale_artifact = stale_artifact_bound_signals_sql("sig", "chunks");
+        assert!(stale_artifact.contains("COALESCE(md5(c.media_bytes)"));
+        assert!(stale_artifact.contains("c.media -> 'asset'"));
+        assert!(stale_artifact.contains("artifact_hash IS DISTINCT FROM"));
+
+        let set_embedding = set_signal_embedding_sql("sig");
+        assert!(set_embedding.contains("embedding IS DISTINCT FROM $5"));
+        assert!(set_embedding.contains("status IS DISTINCT FROM 'ready'"));
+
+        let upsert = upsert_signal_sql("sig", "chunks");
+        assert!(upsert.contains("ON CONFLICT (collection, doc_id, chunk_id, signal_type)"));
+        assert!(upsert.contains("IS DISTINCT FROM EXCLUDED"));
+    }
+
+    #[test]
+    fn signal_row_roundtrips_optional_vector_and_error() {
+        let signal = Signal {
+            gid: GlobalId {
+                collection: "kb".into(),
+                doc_id: "dir:sub:report.pdf".into(),
+                chunk_id: 42,
+            },
+            signal_type: SignalType::Ocr,
+            status: SignalStatus::Failed,
+            model: Some("ovis-ocr2".into()),
+            model_version: Some("v2".into()),
+            artifact_hash: Some("artifact-hash".into()),
+            body_hash: Some("body-hash".into()),
+            signal_text: Some("中文 OCR".into()),
+            embedding: None,
+            embedding_dim: None,
+            error: Some("decode failed".into()),
+        };
+        let row = SignalRow::from_signal(&signal);
+        assert_eq!(row.to_signal().unwrap(), signal);
+        assert!(SignalRow {
+            signal_type: "unknown".into(),
+            ..row
+        }
+        .to_signal()
+        .is_err());
     }
 
     #[test]
