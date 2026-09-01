@@ -4,6 +4,7 @@
 //! 仅依赖 pgvector + 逻辑复制，**不要求任何 `shared_preload_libraries` 原生扩展**
 //! （托管 PG 可移植，见需求 N1b）。详见 [spec](../../docs/specs/12-pg.md)。
 
+mod connection;
 mod error;
 mod jobs;
 mod sql;
@@ -21,9 +22,8 @@ pub use sql::{
 
 use fastsearch_core::{AclFilter, AssetPointer, Chunk, GlobalId, MediaRef, Signal, SignalType};
 use std::collections::{BTreeMap, HashSet};
-use tokio::sync::Mutex;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, NoTls, Row, Transaction};
+use tokio_postgres::{Client, Row, Transaction};
 
 /// 连接配置。
 #[derive(Debug, Clone)]
@@ -58,7 +58,7 @@ pub(crate) const SCHEMA_DDL_LOCK_KEY: i64 = 0x6673_735f_6464_6c00;
 
 /// Postgres 真源句柄。
 ///
-/// # 为什么 `client` 是 `Mutex<Client>`
+/// # 为什么 `client` 由可重连的 `Mutex<Client>` 持有
 ///
 /// `tokio_postgres::Client::query/execute/batch_execute` 都只借 `&self`（内部走 channel 与连接
 /// task 通信，`Client` 本身 `Send + Sync`），唯独 `transaction()` 要 `&mut self`（类型系统强制
@@ -79,7 +79,7 @@ pub(crate) const SCHEMA_DDL_LOCK_KEY: i64 = 0x6673_735f_6464_6c00;
 /// / `bb8`）：读走池化连接，写事务独占一个连接，彻底解除 Mutex 串行化。当前单连接 + Mutex
 /// 是"正确性优先、最小依赖"的 v1 选择。
 pub struct PgStore {
-    client: Mutex<Client>,
+    client: connection::ReconnectingClient,
     cfg: PgConfig,
     signal_table: String,
 }
@@ -126,31 +126,16 @@ impl PgStore {
     pub async fn connect(cfg: PgConfig) -> Result<Self> {
         validate_identifier(&cfg.table)?;
         let signal_table = signal_table_name(&cfg.table)?;
-        let (client, connection) = tokio_postgres::connect(&cfg.url, NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("fastsearch-pg connection error: {e}");
-            }
-        });
+        let client = connection::ReconnectingClient::connect(&cfg.url, "source").await?;
         Ok(PgStore {
-            client: Mutex::new(client),
+            client,
             cfg,
             signal_table,
         })
     }
 
     async fn client(&self) -> Result<tokio::sync::MutexGuard<'_, Client>> {
-        let mut client = self.client.lock().await;
-        if client.is_closed() {
-            let (replacement, connection) = tokio_postgres::connect(&self.cfg.url, NoTls).await?;
-            tokio::spawn(async move {
-                if let Err(error) = connection.await {
-                    eprintln!("fastsearch-pg replacement connection error: {error}");
-                }
-            });
-            *client = replacement;
-        }
-        Ok(client)
+        self.client.get().await
     }
 
     /// 幂等建表/扩展/索引/publication。
@@ -345,7 +330,12 @@ impl PgStore {
             &row.embedding,
             &row.error,
         ];
-        let updated = self.client().await?.query_opt(&statement, &params).await?;
+        let updated = self
+            .client
+            .get()
+            .await?
+            .query_opt(&statement, &params)
+            .await?;
         if updated.is_some() {
             return Ok(1);
         }
@@ -1241,6 +1231,7 @@ pub async fn fetch_chunk(
 mod tests {
     use super::*;
     use fastsearch_core::{BBox, ChunkKind, SignalStatus};
+    use tokio_postgres::NoTls;
 
     #[test]
     fn ensure_finite_rejects_nan_inf() {
@@ -1401,12 +1392,12 @@ mod tests {
             .expect("terminate source connection")
             .get::<_, bool>(0));
         for _ in 0..50 {
-            if store.client.lock().await.is_closed() {
+            if store.client.raw().await.is_closed() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(store.client.lock().await.is_closed());
+        assert!(store.client.raw().await.is_closed());
         assert_eq!(
             store
                 .client()

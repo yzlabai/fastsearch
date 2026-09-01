@@ -2,10 +2,9 @@ use crate::error::{PgError, Result};
 use crate::{sql, validate_identifier, SCHEMA_DDL_LOCK_KEY};
 use fastsearch_core::AclFilter;
 use serde_json::Value;
-use tokio::sync::Mutex;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, NoTls, Row};
+use tokio_postgres::{Client, Row};
 
 /// The six authoritative states of a document-ingestion job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,8 +261,7 @@ impl Default for DocumentListOptions {
 /// concurrency slot, so claim transactions never serialize through the search source-of-truth
 /// connection.
 pub struct JobStore {
-    client: Mutex<Client>,
-    database_url: String,
+    client: crate::connection::ReconnectingClient,
     table: String,
     chunks_table: String,
 }
@@ -282,33 +280,16 @@ impl JobStore {
         let chunks_table = chunks_table.into();
         validate_job_identifiers(&table)?;
         validate_identifier(&chunks_table)?;
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                eprintln!("fastsearch-pg job connection error: {error}");
-            }
-        });
+        let client = crate::connection::ReconnectingClient::connect(url, "job").await?;
         Ok(Self {
-            client: Mutex::new(client),
-            database_url: url.to_string(),
+            client,
             table,
             chunks_table,
         })
     }
 
     async fn client(&self) -> Result<tokio::sync::MutexGuard<'_, Client>> {
-        let mut client = self.client.lock().await;
-        if client.is_closed() {
-            let (replacement, connection) =
-                tokio_postgres::connect(&self.database_url, NoTls).await?;
-            tokio::spawn(async move {
-                if let Err(error) = connection.await {
-                    eprintln!("fastsearch-pg replacement job connection error: {error}");
-                }
-            });
-            *client = replacement;
-        }
-        Ok(client)
+        self.client.get().await
     }
 
     pub fn table(&self) -> &str {
@@ -863,6 +844,7 @@ impl JobStore {
                 &format!(
                     "UPDATE {} SET state = 'indexed', chunk_count = $4, error = NULL, \
                      error_stage = NULL, error_retryable = NULL, lease_owner = NULL, lease_until = NULL, \
+                     last_worker_owner = $2, last_worker_seen_at = clock_timestamp(), \
                      finished_at = clock_timestamp(), updated_at = clock_timestamp() \
                      WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
                      AND state = 'embedding' RETURNING job_id",
@@ -1152,6 +1134,7 @@ fn row_to_document(row: &Row) -> Result<DocumentSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_postgres::NoTls;
 
     fn sample_job(job_id: &str, doc_id: &str, max_retries: i32) -> NewIngestJob {
         NewIngestJob {
@@ -1771,6 +1754,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fs304_operational_metrics_keep_recent_worker_and_reset_ready_age() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip fs304_operational_metrics_keep_recent_worker_and_reset_ready_age: DATABASE_URL not set"
+            );
+            return;
+        };
+        let table = format!("fs304_metric_truth_{}", std::process::id());
+        let store = JobStore::connect(&url, &table).await.expect("connect");
+        store
+            .client()
+            .await
+            .expect("cleanup client")
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table} CASCADE;"))
+            .await
+            .expect("clean");
+        store.ensure_schema().await.expect("schema");
+        let original = sample_job("metric-job", "metric.md", 3);
+        store.submit_upload(&original).await.expect("submit");
+
+        // Make the document old enough that using immutable created_at for queue age is visible.
+        tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+        let lease = store
+            .claim("worker-metric", 1, 10_000)
+            .await
+            .expect("claim")
+            .pop()
+            .expect("lease");
+        assert!(store
+            .advance(
+                &lease,
+                IngestState::Parsing,
+                IngestState::Chunking,
+                &serde_json::json!({}),
+                10_000,
+            )
+            .await
+            .expect("chunking"));
+        assert!(store
+            .advance(
+                &lease,
+                IngestState::Chunking,
+                IngestState::Embedding,
+                &serde_json::json!({}),
+                10_000,
+            )
+            .await
+            .expect("embedding"));
+        assert!(store.finish(&lease, 1).await.expect("finish"));
+
+        let finished = store.ingest_metrics().await.expect("finished metrics");
+        assert_eq!(
+            finished.workers_seen_recently, 1,
+            "a worker completed within the 120-second observation window"
+        );
+
+        let mut replacement = original;
+        replacement.job_id = "replacement-id-is-not-adopted".into();
+        replacement.source_uri = "local://acme/kb/metric-v2.md".into();
+        replacement.content_sha256 = "b".repeat(64);
+        assert_eq!(
+            store
+                .submit_upload(&replacement)
+                .await
+                .expect("replace")
+                .disposition,
+            UploadDisposition::Replaced
+        );
+        let reopened = store.ingest_metrics().await.expect("reopened metrics");
+        assert_eq!(
+            reopened.oldest_ready_age_seconds, 0,
+            "ready age starts when this version becomes claimable, not at original document creation"
+        );
+
+        store
+            .client()
+            .await
+            .expect("cleanup client")
+            .batch_execute(&format!("DROP TABLE {table} CASCADE;"))
+            .await
+            .expect("cleanup");
+    }
+
+    #[tokio::test]
     async fn fs304_job_store_reconnects_after_backend_termination() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!(
@@ -1807,12 +1874,12 @@ mod tests {
             .expect("terminate job connection")
             .get::<_, bool>(0));
         for _ in 0..50 {
-            if store.client.lock().await.is_closed() {
+            if store.client.raw().await.is_closed() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(store.client.lock().await.is_closed());
+        assert!(store.client.raw().await.is_closed());
         assert!(store
             .get("reconnect-job")
             .await
@@ -1999,7 +2066,7 @@ mod tests {
             .ensure_schema()
             .await
             .expect_err("global-coordinate upgrade must reject historical duplicates");
-        let client = store.client.lock().await;
+        let client = store.client.raw().await;
         let duplicate_count: i64 = client
             .query_one(
                 &format!(

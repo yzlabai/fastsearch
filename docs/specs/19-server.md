@@ -152,7 +152,14 @@ pub fn acl_for(principal) -> AclFilter;                              // 纯, 可
   详见 [plan §6.1](../plans/2026-08-24-index写穿pgvector对齐chunks.md)。
 - [x] v2.5（2026-08-31，FS-002）：OpenAPI SearchRequest 补齐 `fusion`/`embedder`/`explain`，Hit 补齐 `time`/`media`/`sources`；REST/OpenAPI 字段集与共享矩阵做精确集合断言。`explain=true` 的 server 路由测试证明来源明细可见，默认响应继续省略该字段。
 - [x] v2.6（2026-08-31，FS-003）：`/readyz` 改为结构化进程级就绪响应，明确不检查 PG/CDC/embedder；单测、OpenAPI 与真二进制 MCP↔server e2e 共同钉住语义。
-- [x] v2.7（2026-08-31，FS-103）：CDC 启用后 `/readyz` 升级为真实依赖探针；后台轮询共享 slot lag、最后 commit LSN、最后成功时间、死信累计和 rebuild-needed，Prometheus 同步暴露七项 CDC 指标。未启用 CDC 的进程级契约保持兼容。
+- [x] v2.7（2026-08-31，FS-103；2026-09-01 FS-304 复审增强）：CDC 启用后 `/readyz`
+  升级为真实依赖探针；后台轮询共享 slot lag、最后 commit LSN、最后成功时间、死信累计和
+  rebuild-needed，Prometheus 暴露原七项 CDC 指标及 applied batch/row 累计值、recovery-pending
+  gauge。readiness CDC 快照同步返回三个新增字段；未启用 CDC 的进程级契约保持兼容。
+- [x] v3.1（2026-09-01，FS-304 复审）：摄取事件计数、失败分类不变量及权威 PG job gauge 渲染
+  下沉至独立 `operational_metrics` 模块；真实 PG + server 路由覆盖同一 job 在 derived 发布失败后
+  回报失败、租约 epoch 递增重领并最终使 keyword/vector 同版本收敛；真实 logical replication
+  另覆盖 persist 后、slot advance 前重启恢复，并验证 batch/row/recovery 指标与 slot 状态一致。
 - [x] v2.8（2026-08-31，FS-202）：OpenAPI `Hit.sources.items` 增加非必填 `model/model_version`；REST 直接复用 `SourceHit` serde，旧来源不输出空字段，默认 `explain=false` 仍省略整个 sources。
 - [x] v2.9（2026-08-31，FS-203）：REST/OpenAPI 增加仅 explain 请求可见的可选 `rerank_explain{status,model,reason?}`；默认响应字节保持不变。真实二进制中纯标点 rerank 返回 200、保留 `[3,2,1]` 与 3 条数量并给出 `empty_query_tokens`，正常文本返回 `applied`。
   显式启用 CDC 但缺 `DATABASE_URL` 时拒绝启动；死信/rebuild 状态持久化，不能靠重启恢复 ready。真实 server + curl 已验证 PG 停止时 200→503、恢复后 503→200。

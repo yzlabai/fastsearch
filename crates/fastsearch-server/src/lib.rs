@@ -7,6 +7,8 @@
 
 #![recursion_limit = "256"]
 
+mod operational_metrics;
+
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
@@ -27,6 +29,7 @@ use fastsearch_embed::{EmbedInput, EmbedKind, Embedder};
 use fastsearch_engine::Engine;
 use fastsearch_engine::{AssetFetch, CdcConsumeStats, ObjectSigner};
 use fastsearch_sync::replication::ReplicationConfig;
+use operational_metrics::{counter, gauge, IngestEvent, IngestTelemetry};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -283,14 +286,7 @@ struct Metrics {
     errors: AtomicU64,
     unauthorized: AtomicU64,
     rate_limited: AtomicU64,
-    ingest_uploads: AtomicU64,
-    ingest_deduplicated: AtomicU64,
-    ingest_failures: AtomicU64,
-    ingest_retryable_failures: AtomicU64,
-    ingest_terminal_failures: AtomicU64,
-    ingest_manual_retries: AtomicU64,
-    ingest_sync_hits: AtomicU64,
-    ingest_sync_timeouts: AtomicU64,
+    ingest: IngestTelemetry,
     /// 累积桶计数：`lat_buckets[i]` = 延迟 ≤ `LAT_BUCKETS[i]` 的检索数。
     lat_buckets: [AtomicU64; LAT_BUCKETS.len()],
     lat_sum_micros: AtomicU64,
@@ -315,6 +311,9 @@ struct CdcHealthSnapshot {
     slot_lag_bytes: Option<u64>,
     last_successful_poll_unix_seconds: Option<u64>,
     dead_letter_count: u64,
+    batches_applied_total: u64,
+    rows_applied_total: u64,
+    recovery_pending: bool,
     rebuild_needed: bool,
     last_error: Option<String>,
 }
@@ -328,6 +327,9 @@ impl Default for CdcHealthSnapshot {
             slot_lag_bytes: None,
             last_successful_poll_unix_seconds: None,
             dead_letter_count: 0,
+            batches_applied_total: 0,
+            rows_applied_total: 0,
+            recovery_pending: false,
             rebuild_needed: false,
             last_error: None,
         }
@@ -528,6 +530,7 @@ impl ServerState {
         let mut health = self.cdc_health.write().unwrap_or_else(|e| e.into_inner());
         health.enabled = true;
         health.dead_letter_count = dead_letter_count;
+        health.recovery_pending = recovery_pending;
         health.rebuild_needed = recovery_pending || dead_letter_count > 0;
         health.phase = if health.rebuild_needed {
             CdcHealthPhase::RebuildNeeded
@@ -552,6 +555,13 @@ impl ServerState {
     ) {
         let mut health = self.cdc_health.write().unwrap_or_else(|e| e.into_inner());
         health.dead_letter_count = dead_letter_count;
+        if stats.applied > 0 {
+            health.batches_applied_total = health.batches_applied_total.saturating_add(1);
+            health.rows_applied_total = health
+                .rows_applied_total
+                .saturating_add(stats.applied as u64);
+        }
+        health.recovery_pending = recovery_pending;
         health.rebuild_needed = recovery_pending || dead_letter_count > 0;
         health.phase = if health.rebuild_needed {
             CdcHealthPhase::RebuildNeeded
@@ -576,6 +586,7 @@ impl ServerState {
         if let Some(count) = dead_letter_count {
             health.dead_letter_count = count;
         }
+        health.recovery_pending = recovery_pending;
         health.rebuild_needed = recovery_pending || health.dead_letter_count > 0;
         health.phase = if health.rebuild_needed {
             CdcHealthPhase::RebuildNeeded
@@ -1588,16 +1599,6 @@ async fn metrics(State(s): State<ServerState>) -> String {
     let m = &s.metrics;
     let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let mut out = String::new();
-    let counter = |out: &mut String, name: &str, help: &str, v: u64| {
-        out.push_str(&format!(
-            "# HELP {name} {help}\n# TYPE {name} counter\n{name} {v}\n"
-        ));
-    };
-    let gauge = |out: &mut String, name: &str, help: &str, value: u64| {
-        out.push_str(&format!(
-            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
-        ));
-    };
     counter(
         &mut out,
         "fastsearch_requests_total",
@@ -1634,52 +1635,7 @@ async fn metrics(State(s): State<ServerState>) -> String {
         "Total requests rejected by rate limit.",
         g(&m.rate_limited),
     );
-    counter(
-        &mut out,
-        "fastsearch_ingest_uploads_total",
-        "Document upload submissions resolved by the job store.",
-        g(&m.ingest_uploads),
-    );
-    counter(
-        &mut out,
-        "fastsearch_ingest_deduplicated_total",
-        "Document uploads deduplicated or coalesced with existing work.",
-        g(&m.ingest_deduplicated),
-    );
-    counter(
-        &mut out,
-        "fastsearch_ingest_failures_total",
-        "Worker failures accepted by the fenced job state machine.",
-        g(&m.ingest_failures),
-    );
-    out.push_str(
-        "# HELP fastsearch_ingest_failures_classified_total Worker failures by durable classification.\n\
-         # TYPE fastsearch_ingest_failures_classified_total counter\n",
-    );
-    out.push_str(&format!(
-        "fastsearch_ingest_failures_classified_total{{classification=\"retryable\"}} {}\n\
-         fastsearch_ingest_failures_classified_total{{classification=\"terminal\"}} {}\n",
-        g(&m.ingest_retryable_failures),
-        g(&m.ingest_terminal_failures)
-    ));
-    counter(
-        &mut out,
-        "fastsearch_ingest_manual_retries_total",
-        "Dead-letter ingest jobs manually requeued by their owner.",
-        g(&m.ingest_manual_retries),
-    );
-    counter(
-        &mut out,
-        "fastsearch_ingest_sync_hit_total",
-        "Synchronous upload waits that observed an indexed terminal state.",
-        g(&m.ingest_sync_hits),
-    );
-    counter(
-        &mut out,
-        "fastsearch_ingest_sync_timeout_total",
-        "Synchronous upload waits that degraded to asynchronous polling.",
-        g(&m.ingest_sync_timeouts),
-    );
+    m.ingest.render(&mut out);
 
     if let Some(jobs) = &s.jobs {
         let ingest = {
@@ -1701,61 +1657,7 @@ async fn metrics(State(s): State<ServerState>) -> String {
             }
         };
         if let Some(ingest) = ingest {
-            out.push_str(
-                "# HELP fastsearch_ingest_jobs_total Current ingest jobs by authoritative state.\n\
-                 # TYPE fastsearch_ingest_jobs_total gauge\n",
-            );
-            for (state, count) in ingest.state_counts {
-                out.push_str(&format!(
-                    "fastsearch_ingest_jobs_total{{state=\"{}\"}} {count}\n",
-                    state.as_str()
-                ));
-            }
-            out.push_str(&format!(
-                "# HELP fastsearch_ingest_dead_letter_total Current failed ingest jobs whose retry budget is exhausted.\n\
-                 # TYPE fastsearch_ingest_dead_letter_total gauge\n\
-                 fastsearch_ingest_dead_letter_total {}\n",
-                ingest.dead_letter_count.max(0)
-            ));
-            for (name, help, value) in [
-                (
-                    "fastsearch_ingest_retryable_failed",
-                    "Current failed ingest jobs classified as retryable.",
-                    ingest.retryable_failed_count,
-                ),
-                (
-                    "fastsearch_ingest_jobs_source_pending",
-                    "Current ingest jobs waiting for their reserved raw source.",
-                    ingest.source_pending_count,
-                ),
-                (
-                    "fastsearch_ingest_jobs_cleanup_pending",
-                    "Current ingest jobs retaining a superseded raw object cleanup hint.",
-                    ingest.cleanup_pending_count,
-                ),
-                (
-                    "fastsearch_ingest_leases_active",
-                    "Current unexpired ingest worker leases.",
-                    ingest.active_lease_count,
-                ),
-                (
-                    "fastsearch_ingest_leases_expired",
-                    "Current expired ingest worker leases awaiting reclaim.",
-                    ingest.expired_lease_count,
-                ),
-                (
-                    "fastsearch_ingest_workers_seen_recently",
-                    "Distinct ingest workers heartbeating in the last 120 seconds.",
-                    ingest.workers_seen_recently,
-                ),
-                (
-                    "fastsearch_ingest_oldest_ready_age_seconds",
-                    "Age of the oldest claimable or retryable ready ingest job.",
-                    ingest.oldest_ready_age_seconds,
-                ),
-            ] {
-                gauge(&mut out, name, help, value.max(0) as u64);
-            }
+            IngestTelemetry::render_snapshot(&mut out, &ingest);
         }
     }
 
@@ -1795,6 +1697,24 @@ async fn metrics(State(s): State<ServerState>) -> String {
         "fastsearch_cdc_dead_letters_total",
         "Deterministic CDC records skipped since process start.",
         cdc.dead_letter_count,
+    );
+    counter(
+        &mut out,
+        "fastsearch_cdc_batches_applied_total",
+        "Non-empty CDC batches durably applied since process start.",
+        cdc.batches_applied_total,
+    );
+    counter(
+        &mut out,
+        "fastsearch_cdc_rows_applied_total",
+        "CDC source rows durably applied since process start.",
+        cdc.rows_applied_total,
+    );
+    gauge(
+        &mut out,
+        "fastsearch_cdc_recovery_pending",
+        "A persisted CDC batch requires replay before readiness (1/0).",
+        u64::from(cdc.recovery_pending),
     );
     gauge(
         &mut out,
@@ -2956,16 +2876,9 @@ async fn update_ingest_job_status(
         ));
     }
     if body.command == WorkerStatusCommand::Failed {
-        s.metrics.ingest_failures.fetch_add(1, Ordering::Relaxed);
-        if body.retryable {
-            s.metrics
-                .ingest_retryable_failures
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            s.metrics
-                .ingest_terminal_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        s.metrics.ingest.record(IngestEvent::Failure {
+            retryable: body.retryable,
+        });
     }
     let current = jobs
         .get(&job_id)
@@ -3332,7 +3245,7 @@ async fn upload_document(
             });
         }
     };
-    s.metrics.ingest_uploads.fetch_add(1, Ordering::Relaxed);
+    s.metrics.ingest.record(IngestEvent::Upload);
 
     if resolution.disposition == fastsearch_pg::UploadDisposition::CleanupPending {
         if let Some(old_uri) = resolution.job.cleanup_source_uri.clone() {
@@ -3433,9 +3346,7 @@ async fn upload_document(
             | fastsearch_pg::UploadDisposition::Coalesced
     );
     if deduplicated {
-        s.metrics
-            .ingest_deduplicated
-            .fetch_add(1, Ordering::Relaxed);
+        s.metrics.ingest.record(IngestEvent::Deduplicated);
     }
     let should_wait = match wait {
         UploadWait::Never => false,
@@ -3477,16 +3388,14 @@ async fn upload_document(
         }
     }
     if should_wait && job.state == fastsearch_pg::IngestState::Indexed {
-        s.metrics.ingest_sync_hits.fetch_add(1, Ordering::Relaxed);
+        s.metrics.ingest.record(IngestEvent::SyncHit);
     } else if entered_sync_window
         && !matches!(
             job.state,
             fastsearch_pg::IngestState::Indexed | fastsearch_pg::IngestState::Failed
         )
     {
-        s.metrics
-            .ingest_sync_timeouts
-            .fetch_add(1, Ordering::Relaxed);
+        s.metrics.ingest.record(IngestEvent::SyncTimeout);
     }
     let status = match job.state {
         fastsearch_pg::IngestState::Indexed => StatusCode::OK,
@@ -3596,9 +3505,7 @@ async fn retry_ingest_job(
                 "job state changed before it could be retried".into(),
             )
         })?;
-    s.metrics
-        .ingest_manual_retries
-        .fetch_add(1, Ordering::Relaxed);
+    s.metrics.ingest.record(IngestEvent::ManualRetry);
     s.emit_audit(AuditEvent {
         endpoint: "/v1/jobs/{id}/retry",
         tenant: principal.tenant,
@@ -7931,6 +7838,9 @@ mod tests {
                     "slot_lag_bytes": null,
                     "last_successful_poll_unix_seconds": null,
                     "dead_letter_count": 0,
+                    "batches_applied_total": 0,
+                    "rows_applied_total": 0,
+                    "recovery_pending": true,
                     "rebuild_needed": true,
                     "last_error": null,
                 }
@@ -7958,6 +7868,7 @@ mod tests {
         assert!(text.contains("fastsearch_cdc_enabled 1"));
         assert!(text.contains("fastsearch_cdc_ready 0"));
         assert!(text.contains("fastsearch_cdc_rebuild_needed 1"));
+        assert!(text.contains("fastsearch_cdc_recovery_pending 1"));
         assert!(text.contains("fastsearch_cdc_dead_letters_total 0"));
     }
 
@@ -7977,7 +7888,9 @@ mod tests {
             false,
             0,
         );
-        let resp = router(state)
+        let app = router(state);
+        let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/readyz")
@@ -7996,6 +7909,161 @@ mod tests {
         assert!(body["cdc"]["last_successful_poll_unix_seconds"]
             .as_u64()
             .is_some_and(|timestamp| timestamp > 0));
+        let metrics = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let metrics = String::from_utf8(metrics.to_vec()).unwrap();
+        assert!(metrics.contains("fastsearch_cdc_batches_applied_total 1"));
+        assert!(metrics.contains("fastsearch_cdc_rows_applied_total 3"));
+        assert!(metrics.contains("fastsearch_cdc_recovery_pending 0"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn t20d_real_cdc_persist_replay_reports_batch_row_and_recovery_metrics() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "skip t20d_real_cdc_persist_replay_reports_batch_row_and_recovery_metrics: DATABASE_URL not set"
+            );
+            return;
+        };
+        let slot = "fastsearch_server_t20d_metrics";
+        let cfg = ReplicationConfig {
+            url: url.clone(),
+            slot: slot.into(),
+            publication: "fastsearch_pub".into(),
+            source_table: "public.fastsearch_chunks".into(),
+        };
+        fastsearch_sync::replication::drop_slot(&cfg)
+            .await
+            .expect("drop stale slot");
+        let store = fastsearch_pg::PgStore::connect(fastsearch_pg::PgConfig::new(url))
+            .await
+            .expect("connect PG source");
+        store.ensure_schema().await.expect("ensure source schema");
+        let doc_id = "server-t20d.pdf";
+        store
+            .delete_doc("kb", doc_id)
+            .await
+            .expect("clear stale document");
+        fastsearch_sync::replication::ensure_slot(&cfg)
+            .await
+            .expect("create logical slot");
+        let mut first = chunk(1, "server-t20d alpha", vec!["public"]);
+        first.doc_id = doc_id.into();
+        let mut second = chunk(2, "server-t20d beta", vec!["public"]);
+        second.doc_id = doc_id.into();
+        store
+            .upsert_doc("kb", doc_id, &[first, second])
+            .await
+            .expect("publish two source rows");
+
+        let data = tempfile::tempdir().expect("CDC data dir");
+        let (mut crashed, _) =
+            Engine::open(data.path(), TextIndexConfig::default()).expect("open pre-crash engine");
+        let batch = fastsearch_sync::replication::peek_batch(&cfg)
+            .await
+            .expect("peek source batch");
+        assert_eq!(batch.events.len(), 2);
+        let prepared = crashed
+            .cdc_batch_preparer()
+            .prepare(batch.events.into_iter().map(|event| event.change).collect())
+            .await
+            .expect("prepare batch");
+        crashed
+            .apply_prepared_cdc_batch(prepared)
+            .expect("apply before crash");
+        crashed
+            .persist(data.path(), batch.commit_lsn)
+            .expect("persist before crash");
+        std::fs::write(
+            data.path().join("cdc-batch-intent.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "commit_lsn": batch.commit_lsn.0,
+                "phase": "persisted"
+            }))
+            .expect("serialize persisted intent"),
+        )
+        .expect("record persisted crash intent");
+        drop(crashed); // failpoint: durable derived state exists, slot has not advanced.
+
+        let (restarted, _) = Engine::open(data.path(), TextIndexConfig::default())
+            .expect("restart after persist crash");
+        let state = ServerState::new(restarted, keys());
+        let pending = Engine::cdc_recovery_pending(data.path()).expect("read recovery intent");
+        state.initialize_cdc_tracking(pending, 0);
+        assert!(state.cdc_health_snapshot().recovery_pending);
+
+        let stats = Engine::consume_once_shared(&state.engine, &cfg, data.path())
+            .await
+            .expect("replay and advance");
+        let (pending, dead_letters) = load_cdc_disk_health(data.path()).expect("disk health");
+        state.record_cdc_success(stats, pending, dead_letters);
+        let health = state.cdc_health_snapshot();
+        assert_eq!(health.batches_applied_total, 1);
+        assert_eq!(health.rows_applied_total, 2);
+        assert!(!health.recovery_pending);
+        assert!(fastsearch_sync::replication::peek_batch(&cfg)
+            .await
+            .expect("peek advanced slot")
+            .events
+            .is_empty());
+        assert_eq!(
+            state
+                .engine
+                .lock()
+                .await
+                .search(
+                    &SearchRequest {
+                        query: "server-t20d".into(),
+                        mode: SearchMode::Keyword,
+                        top_k: 5,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .expect("search recovered index")
+                .len(),
+            2
+        );
+
+        let metrics = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let metrics = String::from_utf8(metrics.to_vec()).unwrap();
+        assert!(metrics.contains("fastsearch_cdc_batches_applied_total 1"));
+        assert!(metrics.contains("fastsearch_cdc_rows_applied_total 2"));
+        assert!(metrics.contains("fastsearch_cdc_recovery_pending 0"));
+
+        fastsearch_sync::replication::drop_slot(&cfg)
+            .await
+            .expect("drop test slot");
+        store
+            .delete_doc("kb", doc_id)
+            .await
+            .expect("cleanup source document");
     }
 
     #[tokio::test]

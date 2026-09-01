@@ -70,9 +70,11 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
              stage_detail jsonb NOT NULL DEFAULT '{{}}'::jsonb,\n\
              chunk_count integer NOT NULL DEFAULT 0,\n\
              lease_owner text,\n\
+             last_worker_owner text,\n\
              lease_epoch bigint NOT NULL DEFAULT 0,\n\
              lease_until timestamptz,\n\
              heartbeat_at timestamptz,\n\
+             last_worker_seen_at timestamptz,\n\
              retry_count integer NOT NULL DEFAULT 0,\n\
              max_retries integer NOT NULL DEFAULT 3,\n\
              next_attempt_at timestamptz NOT NULL DEFAULT now(),\n\
@@ -110,9 +112,11 @@ pub(crate) fn job_ddl(table: &str) -> Vec<String> {
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS stage_detail jsonb NOT NULL DEFAULT '{{}}'::jsonb;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS chunk_count integer NOT NULL DEFAULT 0;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS lease_owner text;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS last_worker_owner text;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS lease_epoch bigint NOT NULL DEFAULT 0;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS lease_until timestamptz;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS heartbeat_at timestamptz;"),
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS last_worker_seen_at timestamptz;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS retry_count integer NOT NULL DEFAULT 0;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS max_retries integer NOT NULL DEFAULT 3;"),
         format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz NOT NULL DEFAULT now();"),
@@ -234,7 +238,8 @@ pub(crate) fn claim_jobs_sql(table: &str) -> String {
          UPDATE {table} AS j \
             SET state = 'parsing', lease_owner = $2, lease_epoch = j.lease_epoch + 1, \
                 lease_until = clock_timestamp() + make_interval(secs => $3::bigint::double precision / 1000.0), \
-                heartbeat_at = clock_timestamp(), started_at = COALESCE(j.started_at, clock_timestamp()), \
+                heartbeat_at = clock_timestamp(), last_worker_owner = $2, \
+                last_worker_seen_at = clock_timestamp(), started_at = COALESCE(j.started_at, clock_timestamp()), \
                 updated_at = clock_timestamp() \
            FROM cand WHERE j.job_id = cand.job_id RETURNING j.*\
          ) SELECT {JOB_RETURN_COLUMNS} FROM claimed"
@@ -243,7 +248,8 @@ pub(crate) fn claim_jobs_sql(table: &str) -> String {
 
 pub(crate) fn heartbeat_job_sql(table: &str) -> String {
     format!(
-        "UPDATE {table} SET heartbeat_at = clock_timestamp(), \
+        "UPDATE {table} SET heartbeat_at = clock_timestamp(), last_worker_owner = $2, \
+         last_worker_seen_at = clock_timestamp(), \
          lease_until = clock_timestamp() + make_interval(secs => $4::bigint::double precision / 1000.0), \
          updated_at = clock_timestamp() \
          WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
@@ -255,7 +261,8 @@ pub(crate) fn heartbeat_job_sql(table: &str) -> String {
 pub(crate) fn advance_job_sql(table: &str) -> String {
     format!(
         "UPDATE {table} SET state = $5, stage_detail = $6::text::jsonb, \
-         heartbeat_at = clock_timestamp(), \
+         heartbeat_at = clock_timestamp(), last_worker_owner = $2, \
+         last_worker_seen_at = clock_timestamp(), \
          lease_until = clock_timestamp() + make_interval(secs => $7::bigint::double precision / 1000.0), \
          updated_at = clock_timestamp() \
          WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 AND state = $4 \
@@ -267,6 +274,7 @@ pub(crate) fn finish_job_sql(table: &str) -> String {
     format!(
         "UPDATE {table} SET state = 'indexed', chunk_count = $4, error = NULL, \
          error_stage = NULL, error_retryable = NULL, lease_owner = NULL, lease_until = NULL, finished_at = clock_timestamp(), \
+         last_worker_owner = $2, last_worker_seen_at = clock_timestamp(), \
          updated_at = clock_timestamp() \
          WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
            AND state = 'embedding' AND lease_until >= clock_timestamp() RETURNING job_id"
@@ -278,6 +286,7 @@ pub(crate) fn fail_job_sql(table: &str) -> String {
         "UPDATE {table} SET state = 'failed', error = $4, error_stage = $5, error_retryable = $7, \
          retry_count = CASE WHEN $7 THEN retry_count + 1 ELSE max_retries END, \
          next_attempt_at = to_timestamp($6::bigint::double precision / 1000.0), \
+         last_worker_owner = $2, last_worker_seen_at = clock_timestamp(), \
          lease_owner = NULL, lease_until = NULL, updated_at = clock_timestamp() \
          WHERE job_id = $1 AND lease_owner = $2 AND lease_epoch = $3 \
            AND state <> 'indexed' AND lease_until >= clock_timestamp() \
@@ -292,8 +301,11 @@ pub(crate) fn ingest_operational_metrics_sql(table: &str) -> String {
          count(*) FILTER (WHERE cleanup_source_uri IS NOT NULL)::bigint AS cleanup_pending_count, \
          count(*) FILTER (WHERE lease_owner IS NOT NULL AND lease_until >= clock_timestamp())::bigint AS active_lease_count, \
          count(*) FILTER (WHERE lease_owner IS NOT NULL AND lease_until < clock_timestamp())::bigint AS expired_lease_count, \
-         count(DISTINCT lease_owner) FILTER (WHERE heartbeat_at >= clock_timestamp() - interval '120 seconds')::bigint AS workers_seen_recently, \
-         COALESCE(floor(max(extract(epoch FROM (clock_timestamp() - created_at))) FILTER (\
+         count(DISTINCT last_worker_owner) FILTER (WHERE last_worker_seen_at >= clock_timestamp() - interval '120 seconds')::bigint AS workers_seen_recently, \
+         COALESCE(floor(max(extract(epoch FROM (clock_timestamp() - CASE \
+           WHEN state IN ('queued', 'failed') THEN GREATEST(updated_at, next_attempt_at) \
+           WHEN lease_until IS NOT NULL THEN GREATEST(updated_at, lease_until) \
+           ELSE updated_at END))) FILTER (\
            WHERE source_ready AND state <> 'indexed' AND retry_count < max_retries \
              AND next_attempt_at <= clock_timestamp() \
              AND (state IN ('queued', 'failed') OR lease_until IS NULL OR lease_until < clock_timestamp())\
@@ -1137,6 +1149,8 @@ mod tests {
             "tenant text",
             "acl text[] NOT NULL",
             "lease_owner text",
+            "last_worker_owner text",
+            "last_worker_seen_at timestamptz",
             "lease_epoch bigint NOT NULL DEFAULT 0",
             "retry_count integer NOT NULL DEFAULT 0",
             "CHECK (state IN ('queued','parsing','chunking','embedding','indexed','failed'))",
@@ -1251,7 +1265,10 @@ mod tests {
             "workers_seen_recently",
             "oldest_ready_age_seconds",
             "retryable_failed_count",
-            "count(DISTINCT lease_owner)",
+            "count(DISTINCT last_worker_owner)",
+            "last_worker_seen_at >= clock_timestamp() - interval '120 seconds'",
+            "GREATEST(updated_at, next_attempt_at)",
+            "GREATEST(updated_at, lease_until)",
             "next_attempt_at <= clock_timestamp()",
             "state IN ('queued', 'failed') OR lease_until IS NULL OR lease_until < clock_timestamp()",
         ] {
